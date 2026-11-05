@@ -9,8 +9,10 @@
 
 #include <fb303/BaseService.h>
 #include <folly/CancellationToken.h>
+#include <folly/Executor.h>
 #include <folly/coro/Task.h>
 #include <folly/coro/safe/NowTask.h>
+#include <folly/futures/Future.h>
 #include <atomic>
 #include <optional>
 #include "eden/common/os/ProcessId.h"
@@ -46,6 +48,7 @@ struct EntryAttributes;
 struct EntryAttributeFlags;
 template <typename T>
 class ImmediateFuture;
+struct UnmountOptions;
 
 extern const char* const kServiceName;
 
@@ -61,20 +64,38 @@ struct RequestCancellationInfo {
   std::optional<folly::CancellationSource> cancellationSource;
   RequestStatus status = RequestStatus::ACTIVE;
   std::optional<std::chrono::steady_clock::time_point> cancellationRequestedAt;
-  std::string endpoint;
+  // The Thrift method, pointing at its static name.
+  std::string_view endpoint;
+  OptionalProcessId clientPid;
+  std::chrono::steady_clock::time_point startedAt =
+      std::chrono::steady_clock::now();
+  // A streaming request stays open until the client disconnects or the
+  // request is cancelled, so it is not counted as a long-running request.
+  bool stream = false;
+  // Work that continues after its Thrift response, such as a background glob
+  // or prefetch. It is cancelled with everything else, but nothing waits for
+  // it and it holds no connection, so it is not counted as long-running or
+  // reported at the stop deadline.
+  bool background = false;
 
   RequestCancellationInfo() = default;
 
   RequestCancellationInfo(
       folly::CancellationSource source,
-      std::string endpoint)
+      std::string_view endpoint,
+      OptionalProcessId clientPid = std::nullopt)
       : cancellationSource(std::move(source)),
         status(RequestStatus::ACTIVE),
-        endpoint(std::move(endpoint)) {}
+        endpoint(endpoint),
+        clientPid(clientPid) {}
 
-  static RequestCancellationInfo createUncancelable() {
+  static RequestCancellationInfo createUncancelable(
+      std::string_view endpoint = {},
+      OptionalProcessId clientPid = std::nullopt) {
     RequestCancellationInfo info;
     info.status = RequestStatus::UNCANCELABLE;
+    info.endpoint = endpoint;
+    info.clientPid = clientPid;
     return info;
   }
 
@@ -161,6 +182,16 @@ class EdenServiceHandler
 
   folly::SemiFuture<folly::Unit> semifuture_unmountV2(
       std::unique_ptr<UnmountArgument> unmountArg) override;
+
+  /**
+   * Waits for the unmount, or answers the request with an error once it is
+   * cancelled, as EdenServer::stop() cancels every active request. The mount's
+   * shutdown is not affected.
+   */
+  ImmediateFuture<folly::Unit> unmountUnlessCancelled(
+      uint64_t requestId,
+      AbsolutePath mountPath,
+      UnmountOptions options);
 
   void listMounts(std::vector<MountInfo>& results) override;
 
@@ -270,20 +301,14 @@ class EdenServiceHandler
       DebugGetRawJournalResponse& out,
       std::unique_ptr<DebugGetRawJournalParams> params) override;
 
-  folly::SemiFuture<std::unique_ptr<std::vector<EntryInformationOrError>>>
-  semifuture_getEntryInformation(
+  folly::coro::Task<std::unique_ptr<std::vector<EntryInformationOrError>>>
+  co_getEntryInformation(
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync) override;
 
-  folly::SemiFuture<std::unique_ptr<std::vector<EntryInformationOrError>>>
-  semifuture_getEntryInformationImpl(
-      std::unique_ptr<std::string> mountPoint,
-      std::unique_ptr<std::vector<std::string>> paths,
-      std::unique_ptr<SyncBehavior> sync);
-
   folly::coro::now_task<std::unique_ptr<std::vector<EntryInformationOrError>>>
-  co_getEntryInformationImpl(
+  getEntryInformationImpl(
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync);
@@ -327,22 +352,11 @@ class EdenServiceHandler
   folly::coro::now_task<std::unique_ptr<Glob>> co_globFilesImpl(
       std::unique_ptr<GlobParams> params);
 
-  folly::coro::Task<void> co_prefetchFiles(
-      std::unique_ptr<PrefetchParams> params) override;
-
   folly::coro::Task<std::unique_ptr<PrefetchResult>> co_prefetchFilesV2(
       std::unique_ptr<PrefetchParams> params) override;
 
   folly::coro::now_task<std::unique_ptr<PrefetchResult>> prefetchFilesV2Impl(
       std::unique_ptr<PrefetchParams> params);
-
-  folly::SemiFuture<std::unique_ptr<Glob>> semifuture_predictiveGlobFiles(
-      std::unique_ptr<GlobParams> params) override;
-
-  folly::SemiFuture<folly::Unit> semifuture_chown(
-      std::unique_ptr<std::string> mountPoint,
-      int32_t uid,
-      int32_t gid) override;
 
   folly::SemiFuture<std::unique_ptr<ChangeOwnershipResponse>>
   semifuture_changeOwnership(
@@ -396,12 +410,6 @@ class EdenServiceHandler
   semifuture_matchFilesystem(
       std::unique_ptr<MatchFileSystemRequest> params) override;
 
-  void debugGetScmTree(
-      std::vector<ScmTreeEntry>& entries,
-      std::unique_ptr<std::string> mountPoint,
-      std::unique_ptr<std::string> id,
-      bool localStoreOnly) override;
-
   folly::SemiFuture<std::unique_ptr<DebugGetScmBlobResponse>>
   semifuture_debugGetBlob(
       std::unique_ptr<DebugGetScmBlobRequest> request) override;
@@ -444,8 +452,6 @@ class EdenServiceHandler
   void debugOutstandingThriftRequests(
       std::vector<ThriftRequestMetadata>& outstandingCalls) override;
 
-  bool debugLogError() override;
-
   void debugOutstandingHgEvents(
       std::vector<HgEvent>& outstandingEvents,
       std::unique_ptr<std::string> mountPoint) override;
@@ -475,12 +481,6 @@ class EdenServiceHandler
 
   void getAccessCounts(GetAccessCountsResult& result, int64_t duration)
       override;
-
-  void clearAndCompactLocalStore() override;
-
-  void debugClearLocalStoreCaches() override;
-
-  void debugCompactLocalStorage() override;
 
   int64_t debugDropAllPendingRequests() override;
 
@@ -630,7 +630,8 @@ class EdenServiceHandler
   void insertCancellationSource(
       uint64_t requestId,
       folly::CancellationSource cancellationSource,
-      std::string endpoint);
+      std::string_view endpoint,
+      OptionalProcessId clientPid = std::nullopt);
 
   std::optional<folly::CancellationSource> getCancellationSource(
       uint64_t requestId);
@@ -641,7 +642,43 @@ class EdenServiceHandler
 
   size_t getActiveCancellationSourceCount() const;
 
-  void insertUncancelableRequest(uint64_t requestId);
+  void insertUncancelableRequest(
+      uint64_t requestId,
+      std::string_view endpoint = {},
+      OptionalProcessId clientPid = std::nullopt);
+
+  /**
+   * Record that a request is a stream that stays open until its client
+   * disconnects. Cancelling the request ends the stream.
+   */
+  void markRequestAsStream(uint64_t requestId);
+
+  /**
+   * Record that a request's work continues after its response was sent, see
+   * RequestCancellationInfo::background.
+   */
+  void markRequestAsBackground(uint64_t requestId);
+
+  /**
+   * End every open stream that was marked with markRequestAsStream(). EdenFS
+   * does this when it stops, because the Thrift server cannot shut down while
+   * a stream keeps its connection busy.
+   */
+  void closeTraceStreams();
+
+  struct LongRunningRequest {
+    uint64_t requestId;
+    std::string method;
+    OptionalProcessId clientPid;
+    std::chrono::steady_clock::duration age;
+    bool cancelable;
+  };
+
+  /**
+   * The requests, streams excluded, that started at least minAge ago.
+   */
+  std::vector<LongRunningRequest> getRequestsRunningLongerThan(
+      std::chrono::steady_clock::duration minAge) const;
 
   std::optional<RequestStatus> getRequestStatus(uint64_t requestId);
 
@@ -659,10 +696,41 @@ class EdenServiceHandler
    */
   void cancelAllActiveRequests(std::string_view reason);
 
+  /**
+   * Log every Thrift request that is still in flight, with its method, age,
+   * client and whether it can be cancelled. Called when the daemon stops, so
+   * a drain that later times out can be read back to the request it waited
+   * on.
+   */
+  void logOutstandingThriftRequests(std::string_view reason);
+
+  /**
+   * Cancel every request that is still active once the delay has passed,
+   * unless disarmDelayedCancellation() has run by then. The timer does not
+   * depend on the main event base, which is blocked while the Thrift server
+   * waits for its requests to finish. Arming again replaces a pending timer.
+   */
+  void cancelActiveRequestsAfter(
+      std::chrono::nanoseconds delay,
+      std::string reason);
+
+  /**
+   * Cancel the timer armed by cancelActiveRequestsAfter(), if it has not
+   * fired. A daemon that resumes serving after a failed takeover must not
+   * have its new requests cancelled by the timer the takeover armed.
+   */
+  void disarmDelayedCancellation();
+
   void beginStreamJournalChangedShutdown();
 
  private:
   EdenMountHandle lookupMount(const MountId& mountId);
+
+  /**
+   * Where a trace stream's request scope is destroyed once the stream ends,
+   * since that may otherwise happen on a TraceBus thread.
+   */
+  std::shared_ptr<folly::Executor> getTraceStreamExecutor();
   EdenMountHandle lookupMount(const std::unique_ptr<std::string>& mountId);
   EdenMountHandle lookupMount(apache::thrift::field_ref<std::string&> mountId);
   EdenMountHandle lookupMount(
@@ -721,6 +789,14 @@ class EdenServiceHandler
 
   folly::Synchronized<std::unordered_map<uint64_t, ThriftRequestTraceEvent>>
       outstandingThriftRequests_;
+
+  // The timer armed by cancelActiveRequestsAfter(). The generation tells a
+  // timer that fires while it is being disarmed that it has nothing to do.
+  struct DelayedCancellation {
+    uint64_t generation = 0;
+    std::optional<folly::Future<folly::Unit>> timer;
+  };
+  folly::Synchronized<DelayedCancellation> delayedCancellation_;
 
   folly::Synchronized<std::unordered_map<uint64_t, RequestCancellationInfo>>
       requestCancellationStore_;

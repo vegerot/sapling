@@ -27,7 +27,6 @@
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/common/utils/RefPtr.h"
-#include "eden/fs/config/InodeCatalogOptions.h"
 #include "eden/fs/config/InodeCatalogType.h"
 #include "eden/fs/config/ReloadableConfig.h"
 #include "eden/fs/inodes/InodeNumber.h"
@@ -38,7 +37,6 @@
 #ifndef _WIN32
 #include "eden/fs/inodes/fscatalog/EphemeralFsInodeCatalog.h"
 #include "eden/fs/inodes/fscatalog/FsInodeCatalog.h"
-#include "eden/fs/inodes/fscatalog_dev/FsInodeCatalogDev.h"
 #endif
 
 namespace facebook::eden {
@@ -97,7 +95,6 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
       AbsolutePathPiece localDir,
       CaseSensitivity caseSensitive,
       InodeCatalogType inodeCatalogType,
-      InodeCatalogOptions inodeCatalogOptions,
       std::shared_ptr<EdenFsEventsLogger> logger,
       ErrorLogger& errorLogger,
       EdenStatsPtr stats,
@@ -158,7 +155,8 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
   /**
    * True if either a new overlay was created on disk or initialize() returned
    * after opening an overlay that had been cleanly shut down. False prior to
-   * initialize() being called or if a consistency check was required.
+   * initialize() being called or after an unclean shutdown, including when
+   * a reservation lets startup skip the offline consistency check.
    */
   bool hadCleanStartup() const {
     return hadCleanStartup_;
@@ -168,6 +166,10 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
    * Get the maximum inode number that has ever been allocated to an inode.
    */
   InodeNumber getMaxInodeNumber();
+
+  bool usesOnlineFsck() const {
+    return useOnlineFsck_;
+  }
 
   /**
    * allocateInodeNumber() should only be called by TreeInode.
@@ -353,13 +355,6 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
       const DirContents& srcContent,
       const DirContents& dstContent);
 
-  /*
-   * Some inode catalogs (SqliteInodeCatalog) requires periodic task to maintain
-   * their underlying storage. This method is called periodically by an
-   * EdenServer task in the configured interval.
-   */
-  void maintenance();
-
   /**
    * Update a child entry in the overlay to mark it as materialized
    * (clear its source control hash). When WAL is enabled, appends a
@@ -430,7 +425,6 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
       AbsolutePathPiece localDir,
       CaseSensitivity caseSensitive,
       InodeCatalogType inodeCatalogType,
-      InodeCatalogOptions inodeCatalogOptions,
       std::shared_ptr<EdenFsEventsLogger> logger,
       ErrorLogger& errorLogger,
       EdenStatsPtr stats,
@@ -474,17 +468,34 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
    * path also runs synchronously under the contents lock, so the worst
    * case matches pre-WAL behavior.
    *
-   * Caller must hold the parent TreeInode's contents lock.
+   * Caller must hold the parent TreeInode's contents lock. Returns whether
+   * the directory was compacted.
    */
-  void maybeCompactWal(
+  bool maybeCompactWal(
       InodeNumber parent,
       const DirContents& content,
       uint64_t walFileSizeBytes);
 
   /**
-   * Append a WAL entry and immediately roll for inline compaction. This
-   * is the single entry point used by every WAL-using fast path in
-   * Overlay (`addChild`, `removeChild`, `renameChild`, `materializeChild`).
+   * Append a WAL entry and return the WAL file's size afterwards. An entry
+   * that does not fit the WAL format is persisted by rewriting the base
+   * record instead, which retires the WAL; nothing is returned then.
+   *
+   * Callers must hold the parent TreeInode's contents lock so that
+   * `content` is consistent with the WAL file on disk.
+   */
+  std::optional<uint64_t> appendWalEntryOrRewrite(
+      InodeNumber parent,
+      WalOpType op,
+      PathComponentPiece childName,
+      const overlay::OverlayEntry* entry,
+      const DirContents& content);
+
+  /**
+   * Append a WAL entry and immediately roll for inline compaction. Every
+   * WAL-using fast path in Overlay (`addChild`, `removeChild`,
+   * `renameChild`, `materializeChild`) goes through this, except that a
+   * rename across directories appends to both before rolling for either.
    * Bundling the two steps in one call ensures the compaction trigger
    * cannot be forgotten when a new WAL op is added later — a missed
    * `maybeCompactWal` would let the WAL grow unbounded for that op.
@@ -501,8 +512,8 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
 
   /**
    * A request for the background GC thread.  There are three types of
-   * requests: recursively forget data underneath a given directory, perform
-   * some maintenance of the overlay or complete a promise.  The latter is used
+   * requests: recursively forget data underneath a given directory or
+   * complete a promise.  The latter is used
    * for synchronization with the GC thread, primarily in unit tests.
    *
    * If additional request types are added in the future, consider renaming to
@@ -515,9 +526,6 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
 
     using FlushRequest = folly::Promise<folly::Unit>;
     explicit GCRequest(FlushRequest p) : requestType{std::move(p)} {}
-
-    struct MaintenanceRequest {};
-    explicit GCRequest(MaintenanceRequest req) : requestType{std::move(req)} {}
 
     /**
      * Request to recursively remove an overlay directory tree in the
@@ -538,7 +546,6 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
     explicit GCRequest(RemoveInodeRequest req) : requestType{std::move(req)} {}
 
     std::variant<
-        MaintenanceRequest,
         overlay::OverlayDir,
         FlushRequest,
         InodeNumber,
@@ -580,12 +587,20 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
   /**
    * Process overlay entries from the given source, handling inode allocation
    * and AppleDouble filtering. Appends processed entries to the output vector.
-   * Returns true if the overlay should be rewritten.
+   * Returns true if the overlay should be rewritten and reports whether an
+   * invalid entry was dropped.
    */
   bool buildDirEntries(
       InodeNumber inodeNumber,
       OverlayEntrySource source,
-      folly::fbvector<std::pair<PathComponent, DirEntry>>& entries);
+      folly::fbvector<std::pair<PathComponent, DirEntry>>& entries,
+      bool& droppedCorruptEntry);
+
+  void validateOverlayEntry(
+      InodeNumber parentInodeNumber,
+      std::string_view name,
+      const overlay::OverlayEntry& entry,
+      std::string_view source) const;
 
   bool tryIncOutstandingIORequests();
   void decOutstandingIORequests();
@@ -595,7 +610,14 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
   void initializeInodeReservation(uint64_t nextInodeNumber);
   void ensureInodeReservation(uint64_t allocatedEnd);
   void saveInodeReservation(uint64_t reservation);
+
+  const AbsolutePath& getOrCreateOnlineRepairDir();
+  void archiveOverlayFile(
+      InodeNumber inodeNumber,
+      folly::StringPiece suffix,
+      bool wal);
 #endif
+  void recoverOverlayDir(InodeNumber inodeNumber, const DirContents& dir);
 
   bool hadCleanStartup_{false};
 
@@ -623,7 +645,6 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
   std::unique_ptr<FileContentStore> fileContentStore_;
   std::unique_ptr<InodeCatalog> inodeCatalog_;
   InodeCatalogType inodeCatalogType_;
-  InodeCatalogOptions inodeCatalogOptions_;
 
   /**
    * Indicates if the backing overlay supports semantic operations, see
@@ -691,9 +712,13 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
 
   friend class IORequest;
 
-  bool useDirectFileWrites_;
-
   bool useInodeReservation_;
+  bool useOnlineFsck_;
+
+#ifndef _WIN32
+  std::mutex onlineRepairMutex_;
+  std::optional<AbsolutePath> onlineRepairDir_;
+#endif
 
   bool useWal_{false};
   bool backgroundInodeRemoval_{false};
@@ -752,7 +777,6 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
   std::vector<PreparedFile> preallocPool_;
   std::vector<InodeNumber> preallocDirPool_;
   bool preallocStop_{false};
-  bool preallocBroken_{false};
   std::thread preallocThread_;
 #endif // !_WIN32
 
@@ -795,11 +819,6 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
   // checkout threads, read by parallel inode-load workers in loadOverlayDir().
   std::atomic<uint32_t> checkoutDeferralCount_{0};
 };
-
-constexpr InodeCatalogType kDefaultInodeCatalogType =
-    folly::kIsWindows ? InodeCatalogType::Sqlite : InodeCatalogType::Legacy;
-constexpr InodeCatalogOptions kDefaultInodeCatalogOptions =
-    INODE_CATALOG_DEFAULT;
 
 /**
  * Used to reference count IO requests. In any place that there

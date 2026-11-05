@@ -11,8 +11,8 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:conv",
         "//eden/fs/utils:chrono",
-        "//folly:conv",
     ],
 )
 
@@ -24,6 +24,17 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gtest",
         "//eden/fs/utils:chrono",
+    ],
+)
+
+cpp_unittest(
+    name = "nfs_socket",
+    srcs = ["NfsSocketTest.cpp"],
+    network_access = network_access_utils.none(),
+    supports_static_listing = False,
+    deps = [
+        "fbsource//third-party/googletest:gtest",
+        "//eden/fs/utils:nfs_socket",
     ],
 )
 
@@ -53,9 +64,9 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:portability",
         "//eden/common/utils:path",
         "//eden/fs/utils:proc_util",
-        "//folly:portability",
     ],
 )
 
@@ -79,9 +90,9 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:cancellation_token",
+        "fbsource//xplat/folly:scope_guard",
         "//eden/fs/utils:invalidation_queue",
-        "//folly:cancellation_token",
-        "//folly:scope_guard",
     ],
 )
 
@@ -136,20 +147,6 @@ cpp_unittest(
 )
 
 cpp_unittest(
-    name = "glob_path_test",
-    srcs = ["GlobPathTest.cpp"],
-    network_access = network_access_utils.none(),
-    supports_static_listing = False,
-    deps = [
-        "fbsource//third-party/googletest:gtest",
-        "//eden/fs/utils:glob_path",
-        "//thrift/lib/cpp2/op:encode",
-        "//thrift/lib/cpp2/protocol:protocol",
-        "//thrift/lib/cpp2/type:tag",
-    ],
-)
-
-cpp_unittest(
     name = "request_permit_vendor_test",
     srcs = ["RequestPermitVendorTest.cpp"],
     network_access = network_access_utils.none(),
@@ -166,9 +163,9 @@ cpp_unittest(
     network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
+        "fbsource//xplat/folly/portability:gtest",
         "//eden/fs/store:filtered_backing_store",
         "//eden/fs/utils:filter_utils",
-        "//folly/portability:gtest",
     ],
 )
 
@@ -178,8 +175,8 @@ cpp_unittest(
     network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
+        "fbsource//xplat/folly/portability:gtest",
         "//eden/fs/utils:mini_tracer",
-        "//folly/portability:gtest",
     ],
 )
 
@@ -200,9 +197,9 @@ cpp_unittest(
     network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
+        "fbsource//xplat/folly/portability:gtest",
         "//eden/fs/utils:mount_info_table",
         "//eden/fs/utils:statmount",
-        "//folly/portability:gtest",
     ],
 )
 
@@ -212,8 +209,9 @@ cpp_unittest(
     network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
+        "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/folly/system:thread_id",
         "//eden/fs/utils:mount_health_check",
-        "//folly/portability:gtest",
     ],
 )
 
@@ -234,9 +232,9 @@ cpp_unittest(
     }),
     supports_static_listing = False,
     deps = [
+        "fbsource//xplat/folly:c_portability",
+        "fbsource//xplat/folly/portability:gtest",
         "//eden/fs/utils:win_stacktrace",
-        "//folly:c_portability",
-        "//folly/portability:gtest",
     ],
 )
 

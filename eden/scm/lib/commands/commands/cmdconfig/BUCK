@@ -7,13 +7,9 @@ sl_rust_library(
     srcs = glob(["src/**/*.rs"]),
     autocargo = {
         "cargo_toml_config": {
-            "lib": {"name": "cmdconfig"},
             "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
                 "license": "GPL-2.0-only",
                 "name": "cmdconfig",
-                "repository": "https://github.com/facebook/sapling",
             },
         },
     },
@@ -25,7 +21,10 @@ sl_rust_library(
         "//eden/scm/lib/commands/cmdutil:cmdutil",
         "//eden/scm/lib/config/loader:configloader",
         "//eden/scm/lib/config/model:configmodel",
+        "//eden/scm/lib/config/rcutil:rcutil",
         "//eden/scm/lib/formatter:formatter",
+        "//eden/scm/lib/identity:identity",
         "//eden/scm/lib/minibytes:minibytes",
+        "//eden/scm/lib/util:util",
     ],
 )

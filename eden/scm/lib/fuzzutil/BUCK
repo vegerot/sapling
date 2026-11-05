@@ -1,0 +1,20 @@
+load("//eden/scm:targets.bzl", "sl_rust_library")
+
+oncall("sapling")
+
+sl_rust_library(
+    name = "fuzzutil",
+    srcs = glob(["src/**/*.rs"]),
+    autocargo = {
+        "cargo_toml_config": {
+            "package": {
+                "description": "Shared helpers for the Sapling on-disk format fuzz targets.",
+            },
+        },
+    },
+    crate_root = "src/lib.rs",
+    deps = [
+        "fbsource//third-party/rust:tempfile",
+        "//eden/scm/lib/indexedlog:indexedlog",
+    ],
+)

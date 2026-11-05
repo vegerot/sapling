@@ -7,8 +7,6 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2 or any later version.
 
-# pyre-unsafe
-
 # Modifying this script is tricky because it has many modes:
 #   - serial vs parallel (default) (-jN, N > 1)
 #   - no coverage (default) vs coverage (-c, -C, -s)
@@ -220,9 +218,8 @@ def checksocketfamily(name, port=20058):
     if family is None:
         return False
     try:
-        s = socket.socket(family, socket.SOCK_STREAM)
-        s.bind(("localhost", port))
-        s.close()
+        with socket.socket(family, socket.SOCK_STREAM) as s:
+            s.bind(("localhost", port))
         return True
     except socket.error as exc:
         if exc.errno == errno.EADDRINUSE:
@@ -246,13 +243,12 @@ def checkportisavailable(port):
     else:
         family = socket.AF_INET
     try:
-        s = socket.socket(family, socket.SOCK_STREAM)
-        s.bind(("localhost", port))
-        s.close()
+        with socket.socket(family, socket.SOCK_STREAM) as s:
+            s.bind(("localhost", port))
         return True
     except socket.error as exc:
         # pyrefly: ignore [missing-attribute]
-        if os.name == "nt" and exc.errno == errno.WSAEACCES:
+        if os.name == "nt" and exc.winerror == errno.WSAEACCES:
             return False
         elif exc.errno in (
             errno.EADDRINUSE,
@@ -3157,6 +3153,7 @@ class TextTestRunner(unittest.TextTestRunner):
             )
             # pyrefly: ignore [missing-attribute]
             result.testsSkipped = skipped + ignored
+            result.testsPassed = len(result.successes)
             if failed:
                 self.stream.writeln(
                     "python hash seed: %s" % os.environ["PYTHONHASHSEED"]
@@ -3344,6 +3341,7 @@ class TextTestRunner(unittest.TextTestRunner):
 class TestpilotTestResult:
     def __init__(self, testpilotjson):
         self.testsSkipped = 0
+        self.testsPassed = 0
         self.errors = 0
         self.failures = []
 
@@ -3351,7 +3349,9 @@ class TestpilotTestResult:
             for line in fp:
                 result = json.loads(line)
                 summary = result["summary"]
-                if summary != "passed":
+                if summary == "passed":
+                    self.testsPassed += 1
+                else:
                     if summary == "OMITTED" or summary == "skipped":
                         self.testsSkipped += 1
                     else:
@@ -3404,6 +3404,20 @@ class TestpilotTestRunner:
         )
 
         return TestpilotTestResult(testpilotjson)
+
+
+KICKSTART_FSEVENTSD = "/usr/local/bin/kickstart-fseventsd"
+
+
+def startfseventsd():
+    """Start fseventsd on macOS hosts that provide KICKSTART_FSEVENTSD.
+
+    Watchman cannot watch anything on macOS without fseventsd. Sandcastle's
+    Mac VM images keep it off and provide the script, which the job user may
+    run with ``sudo -n``; other hosts do not have the script.
+    """
+    if sys.platform == "darwin" and os.access(KICKSTART_FSEVENTSD, os.X_OK):
+        subprocess.call(["sudo", "-n", KICKSTART_FSEVENTSD])
 
 
 class TestRunner:
@@ -3612,6 +3626,7 @@ class TestRunner:
             # pyrefly: ignore [missing-attribute]
             self._watchman = self.options.with_watchman or "watchman"
             os.environ["HGFSMONITOR_TESTS"] = "1"
+            startfseventsd()
         else:
             os.environ["BINDIR"] = self._bindir
             self._watchman = None
@@ -3853,8 +3868,9 @@ class TestRunner:
                     self._usecorrecthg()
 
                     result = runner.run(suite)
-                    if tests and result.testsSkipped == len(tests):
-                        allskipped = True
+                    allskipped = result.testsSkipped > 0 and not (
+                        result.testsPassed or result.failures or result.errors
+                    )
                     if tests and result.errors:
                         errored = True
 
@@ -3881,7 +3897,9 @@ class TestRunner:
         if failed:
             return 1
         elif allskipped:
-            return 0
+            # Preserve skips for unittestify without changing the default CLI
+            # exit status for an all-skipped run.
+            return Test.SKIPPED_STATUS if os.environ.get("HGTEST_REPORT_SKIPS") else 0
         elif errored:
             return 2
 

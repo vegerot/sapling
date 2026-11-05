@@ -8,14 +8,15 @@ edition = "2024"
 homepage = "https://sapling-scm.com/"
 repository = "https://github.com/facebook/sapling"
 license = "MIT"
+exclude = ["BUCK"]
 
 [lib]
 name = "io"
 
 [dependencies]
-parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard", "serde"] }
 pipe = "0.2"
-sapling-configmodel = { version = "0.1.0", path = "../config/model" }
+sapling-configmodel = { version = "0.2.0", path = "../config/model" }
 sapling-hgplain = { version = "0.1.0", path = "../util/hgplain" }
 sapling-spawn-ext = { version = "0.1.0", path = "../spawn-ext" }
 sapling-streampager = { version = "0.12.0", path = "../third-party/streampager" }

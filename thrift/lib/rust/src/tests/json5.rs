@@ -15,6 +15,7 @@
  */
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 
 use bytes::Bytes;
@@ -24,6 +25,23 @@ use crate::TType;
 use crate::json5_protocol;
 use crate::json5_protocol::Json5ProtocolDeserializer;
 use crate::json5_protocol::Json5WriterOptions;
+
+struct FloatSet(Vec<f64>);
+
+impl crate::GetTType for FloatSet {
+    const TTYPE: TType = TType::Set;
+}
+
+impl<P: crate::ProtocolWriter> crate::Serialize<P> for FloatSet {
+    fn rs_thrift_write(&self, protocol: &mut P) {
+        protocol.write_set_begin(TType::Double, self.0.len());
+        for value in &self.0 {
+            protocol.write_set_value_begin();
+            protocol.write_double(*value);
+        }
+        protocol.write_set_end();
+    }
+}
 
 #[test]
 fn accepts_json5_syntax_and_compatibility_scalars() {
@@ -49,6 +67,16 @@ fn accepts_json5_syntax_and_compatibility_scalars() {
     let nan: f64 = json5_protocol::deserialize("+NaN").expect("positive NaN");
     assert_eq!(infinity, f64::INFINITY);
     assert!(nan.is_nan() && nan.is_sign_positive());
+}
+
+#[test]
+fn skips_empty_collections_without_end_callbacks() {
+    for (input, collection_type) in [("{}", TType::Map), ("[]", TType::Set), ("[]", TType::List)] {
+        let mut reader = Json5ProtocolDeserializer::new(input.as_bytes());
+        reader
+            .skip(collection_type)
+            .expect("empty collection must be skipped");
+    }
 }
 
 #[test]
@@ -95,6 +123,43 @@ fn serializes_binary_using_utf8_or_base64url_wrapper() {
         .expect("valid padded base64url binary wrapper");
     assert_eq!(utf8, Bytes::from_static(b"hello"));
     assert_eq!(base64url, Bytes::from_static(&[0xff, 0x00]));
+}
+
+#[test]
+fn serializes_binary_as_base64_strings_when_enabled() {
+    for options in [
+        Json5WriterOptions::default(),
+        Json5WriterOptions::basic_json(),
+        Json5WriterOptions::json5(),
+    ] {
+        for (input, expected) in [
+            (&b""[..], r#""""#),
+            (&b"hello"[..], r#""aGVsbG8""#),
+            (&b"hello\0"[..], r#""aGVsbG8A""#),
+            (&[0xff][..], r#""/w""#),
+            (&[0xfb, 0xff][..], r#""+/8""#),
+        ] {
+            let value = Bytes::copy_from_slice(input);
+            let encoded = json5_protocol::serialize_with_options(
+                value.clone(),
+                options.with_binary_as_base64_string(true),
+            );
+            assert_eq!(encoded, expected);
+            let decoded: Bytes =
+                json5_protocol::deserialize(&encoded).expect("base64 output must round-trip");
+            assert_eq!(decoded, value);
+            assert_eq!(
+                json5_protocol::serialize_with_options(
+                    value.clone(),
+                    options
+                        .with_binary_as_base64_string(true)
+                        .with_binary_as_base64_string(false),
+                ),
+                json5_protocol::serialize_with_options(value, options),
+                "disabling the option restores tagged binary output"
+            );
+        }
+    }
 }
 
 #[test]
@@ -178,6 +243,37 @@ fn hash_map_output_is_deterministic() {
     let encoded = json5_protocol::serialize(value);
 
     assert_eq!(encoded, r#"{"first":1,"second":2,"third":3}"#);
+}
+
+#[test]
+fn float_set_output_is_deterministic_with_nan() {
+    let first = json5_protocol::serialize(FloatSet(vec![f64::NAN, 2.0, 1.0]));
+    let second = json5_protocol::serialize(FloatSet(vec![2.0, f64::NAN, 1.0]));
+
+    assert_eq!(first, second);
+    assert_eq!(first, r#"[1.0,2.0,"NaN"]"#);
+}
+
+#[test]
+fn deserializes_empty_collections() {
+    assert_eq!(
+        json5_protocol::deserialize::<Vec<i32>, _, _>("[]").expect("empty list"),
+        Vec::<i32>::new()
+    );
+    assert_eq!(
+        json5_protocol::deserialize::<BTreeSet<i32>, _, _>("[]").expect("empty set"),
+        BTreeSet::new()
+    );
+    assert_eq!(
+        json5_protocol::deserialize::<BTreeMap<String, i32>, _, _>("{}")
+            .expect("empty string-key map"),
+        BTreeMap::new()
+    );
+    assert_eq!(
+        json5_protocol::deserialize::<BTreeMap<i32, i32>, _, _>("[]")
+            .expect("empty non-string-key map"),
+        BTreeMap::new()
+    );
 }
 
 #[test]

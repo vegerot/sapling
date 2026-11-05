@@ -41,8 +41,22 @@ from typing import Optional
 
 from bindings import cats, clientinfo, zstd
 
-from . import edenapi, error, httpconnection, progress, sslutil, stdiopeer, url, util
+from . import (
+    bookmarks,
+    eagerpeer,
+    edenapi,
+    error,
+    httpconnection,
+    peer,
+    progress,
+    sslutil,
+    stdiopeer,
+    url,
+    util,
+    wireproto,
+)
 from .i18n import _
+from .node import bin, hex
 from .thirdparty.pysocks import socks
 
 # Netencoding special characters
@@ -217,6 +231,66 @@ def maybestripsquarebrackets(hostname: str):
     return hostname
 
 
+def _listbookmarks(api, patterns, kinds):
+    """List bookmarks matching patterns over SLAPI, passing `kinds` through.
+
+    Returns a sortdict of {name: hexnode} ordered by name.
+    """
+    result = api.listbookmarkpatterns(patterns, kinds=kinds)
+    return util.sortdict(
+        sorted((name, node) for name, node in result.items() if node is not None)
+    )
+
+
+# Capabilities in Mononoke's `hello` reply (`wireprotocaps()` and `bundle2caps()`
+# in `eden/mononoke/repo_client/src/client.rs`).
+_MONONOKE_CAPABILITIES = frozenset(
+    [
+        "lookup",
+        "known",
+        "unbundle=HG10GZ,HG10BZ,HG10UN",
+        "unbundlereplay",
+        "remotefilelog",
+        "pushkey",
+        "bundle2=HG20%0Achangegroup%3D02%2C03%0Ab2x%3Ainfinitepush%0Ab2x%3Ainfinitepushscratchbookmarks%0Apushkey%0Atreemanifestserver%3DTrue%0Ab2x%3Arebase%0Ab2x%3Arebasepackpart%0Aphases%3Dheads%0Aobsmarkers%3DV1%0Alistkeys%0Ab2x%3Ainfinitepushmutation",
+    ]
+)
+
+
+_GITLOOKUP_SCHEMES = (
+    ("_gitlookup_git_", "GitSha1", "Hg"),
+    ("_gitlookup_hg_", "Hg", "GitSha1"),
+)
+
+
+def _gitlookup(api, key):
+    """Translate a `_gitlookup_git_<sha1>` or `_gitlookup_hg_<node>` key over SLAPI.
+
+    Returns the 20-byte id on the other side of the git mapping, or None if key
+    is not such a key, its id is not 40 hex digits, or the commit has no
+    mapping.
+    """
+    for prefix, fromscheme, toscheme in _GITLOOKUP_SCHEMES:
+        if not key.startswith(prefix):
+            continue
+        hexid = key[len(prefix) :]
+        if len(hexid) != 40:
+            return None
+        try:
+            fromid = bin(hexid)
+        except (TypeError, ValueError):
+            return None
+        resp = list(
+            api.committranslateids(
+                [{fromscheme: fromid}], toscheme, lookup_behavior="exact"
+            )
+        )
+        if not resp:
+            return None
+        return resp[0]["translated"].get(toscheme)
+    return None
+
+
 class mononokepeer(stdiopeer.stdiopeer):
     def __init__(self, ui, path, create=False, initial_config: Optional[str] = None):
         super(mononokepeer, self).__init__(
@@ -289,12 +363,26 @@ class mononokepeer(stdiopeer.stdiopeer):
                 error.RepoError(_("creating repositories in Mononoke is not supported"))
             )
 
+        self._lazyconnect = ui.configbool("experimental", "mononokepeer-lazy-connect")
+        if self._lazyconnect:
+            self._caps.update(_MONONOKE_CAPABILITIES)
+        else:
+            self._connect()
+
+    def _connect(self):
         with (
             self.ui.timeblockedsection("mononokesetup"),
             progress.suspend(),
             util.traced("mononoke_setup", cat="blocked"),
         ):
             self._validaterepo()
+
+    def _callstream(self, cmd, **args):
+        # Every wire command starts here, so a lazy peer connects on its first
+        # one. `_validaterepo` opens the pipe before it sends `hello`.
+        if self._lazyconnect and self._pipeo is None:
+            self._connect()
+        return super()._callstream(cmd, **args)
 
     def _connectionerror(self, ex, tlserror=False):
         msg = ""
@@ -370,6 +458,75 @@ class mononokepeer(stdiopeer.stdiopeer):
         except Exception as e:
             self._ui.debug("failed to build SLAPI client for %s: %s\n" % (self._url, e))
             return None
+
+    def _slapibookmarks(self):
+        """SLAPI client that serves bookmark reads, or None to use wireproto."""
+        if self.ui.configbool("experimental", "slapi-listkeys-bookmarks", True):
+            return self.nullableedenapi
+        return None
+
+    def _slapilookup(self):
+        """SLAPI client that serves lookup and known, or None to use wireproto."""
+        if self.ui.configbool("experimental", "slapi-lookup", True):
+            return self.nullableedenapi
+        return None
+
+    def iterbatch(self):
+        if self._slapibookmarks() is not None or self._slapilookup() is not None:
+            return peer.localiterbatcher(self)
+        return super().iterbatch()
+
+    def lookup(self, key):
+        api = self._slapilookup()
+        if api is None:
+            return super().lookup(key)
+        node = _gitlookup(api, key)
+        if node is not None:
+            return node
+        node, candidates = eagerpeer.apilookup(api, key)
+        if node is not None:
+            return node
+        if candidates:
+            raise error.RepoError(
+                _("ambiguous identifier '%s'") % key,
+                hint=_("suggestions are: %s") % ", ".join(hex(n) for n in candidates),
+            )
+        raise error.RepoError(_("%s not found") % key)
+
+    def known(self, nodes):
+        api = self._slapilookup()
+        if api is None:
+            return super().known(nodes)
+        return eagerpeer.apiknown(api, list(nodes))
+
+    def listkeys(self, namespace):
+        """As Mononoke does, returns no keys for a namespace other than
+        `bookmarks`."""
+        api = self._slapibookmarks()
+        if api is None:
+            return super().listkeys(namespace)
+        if namespace != "bookmarks":
+            return util.sortdict()
+        # Without kinds, SLAPI lists every non-scratch bookmark.
+        return _listbookmarks(api, ["*"], [])
+
+    def listkeyspatterns(self, namespace, patterns):
+        """As Mononoke does, rejects a namespace other than `bookmarks`."""
+        api = self._slapibookmarks()
+        if api is None:
+            return super().listkeyspatterns(namespace, patterns)
+        if namespace != "bookmarks":
+            raise error.Abort(
+                _("unsupported listkeyspatterns namespace: %s") % namespace
+            )
+        return _listbookmarks(api, list(patterns), bookmarks.ALL_BOOKMARK_KINDS)
+
+    # A wire batch (only used when SLAPI is off) encodes these calls as their
+    # wireproto commands.
+    listkeys.batchable = wireproto.wirepeer.listkeys.batchable
+    listkeyspatterns.batchable = wireproto.wirepeer.listkeyspatterns.batchable
+    lookup.batchable = wireproto.wirepeer.lookup.batchable
+    known.batchable = wireproto.wirepeer.known.batchable
 
     def _validaterepo(self):
         # cleanup up previous run

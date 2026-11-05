@@ -34,6 +34,7 @@ use edenapi_types::AlterSnapshotRequest;
 use edenapi_types::AlterSnapshotResponse;
 use edenapi_types::AnyFileContentId;
 use edenapi_types::BlameResult;
+use edenapi_types::BonsaiChangesetId;
 use edenapi_types::BookmarkKind;
 use edenapi_types::BubbleUploadProperties;
 use edenapi_types::CacheableSnapshot;
@@ -53,6 +54,7 @@ use edenapi_types::CommitKnownResponse;
 use edenapi_types::CommitLocationToHashResponse;
 use edenapi_types::CommitRevlogData;
 use edenapi_types::CommitTranslateIdResponse;
+use edenapi_types::EphemeralExtendRequest;
 use edenapi_types::EphemeralExtendResponse;
 use edenapi_types::EphemeralPrepareResponse;
 use edenapi_types::FetchSnapshotRequest;
@@ -98,6 +100,7 @@ use pyconfigloader::config;
 use pyrevisionstore::edenapifilestore;
 use pyrevisionstore::edenapitreestore;
 use pyrevisionstore::filescmstore;
+use repourl::RepoUrl;
 use revisionstore::SaplingRemoteApiFileStore;
 use revisionstore::SaplingRemoteApiTreeStore;
 use types::FetchContext;
@@ -125,22 +128,24 @@ py_class!(pub class client |py| {
         path: Option<String> = None,
     ) -> PyResult<client> {
         let mut config = config.get_cfg(py);
-        let mut reponame = reponame;
+        let repo_url = path
+            .as_deref()
+            .and_then(|path| RepoUrl::from_str(&config, path).ok());
+        // The repo name of an explicit path wins over `remotefilelog.reponame`, which
+        // belongs to `paths.default`.
+        let reponame = reponame
+            .or_else(|| repo_url.as_ref()?.repo_name().map(ToString::to_string));
 
         if let Some(path) = path {
-            if reponame.is_none() {
-                // This sets reponame properly for mononoke:// URLs.
-                reponame = repourl::repo_name_from_url(&config, &path);
-            }
             // This is required for eager:// URLs.
             config.set("paths", "default", Some(path), &"pyedenapi".into());
         }
 
-        let inner = Builder::from_config(&config)
-            .map_pyerr(py)?
-            .repo_name(reponame)
-            .build()
-            .map_pyerr(py)?;
+        let mut builder = Builder::from_config(&config).map_pyerr(py)?;
+        if let Some(repo_url) = &repo_url {
+            builder = builder.repo_url(repo_url).map_pyerr(py)?;
+        }
+        let inner = builder.repo_name(reponame).build().map_pyerr(py)?;
 
         Self::create_instance(py, inner, Arc::new(config))
     }
@@ -248,9 +253,10 @@ py_class!(pub class client |py| {
     ///
     /// List bookmarks matching patterns. Patterns can be exact names or
     /// prefix patterns ending with '*' (e.g., "foo*" matches "foo", "foobar", etc.).
-    /// `kinds` is an optional list of strings specifying which bookmark kinds to
-    /// include: "Scratch", "Publishing", "PullDefaultPublishing".
-    /// When kinds is None or empty, only PullDefaultPublishing bookmarks are returned.
+    /// `kinds` is an optional list of bookmark kinds: "Scratch", "Publishing",
+    /// "PullDefaultPublishing". A prefix pattern returns every non-scratch
+    /// bookmark with that prefix, and scratch bookmarks too if `kinds` contains
+    /// "Scratch". An exact name returns a bookmark of any kind.
     def listbookmarkpatterns(
         &self,
         patterns: Vec<String>,
@@ -276,6 +282,8 @@ py_class!(pub class client |py| {
     /// land_stack(bookmark, head, base, pushvars) -> {old_hgids: [node], new_hgids: [node]}
     ///
     /// Land a stack of already-uploaded commits by rebasing onto a bookmark and updating the bookmark.
+    /// `base` must be the merge base of `head` and the bookmark. The commits between them are
+    /// rebased; other ancestors of `head` that are not on the bookmark land unchanged.
     def landstack(
         &self,
         bookmark: String,
@@ -543,15 +551,35 @@ py_class!(pub class client |py| {
             .map(Serde)
     }
 
-    def ephemeralextend(&self, bubble_id: u64, custom_duration_secs: Option<u64>)
-        -> PyResult<Serde<EphemeralExtendResponse>>
+    def ephemeralextend(
+        &self,
+        bubble_id: Option<u64>,
+        custom_duration_secs: Option<u64>,
+        snapshot_id: Option<Serde<BonsaiChangesetId>> = None
+    ) -> PyResult<Serde<EphemeralExtendResponse>>
     {
         let api = self.inner(py).as_ref();
-        let bubble_id = NonZeroU64::new(bubble_id).ok_or_else(|| {
-            PyErr::new::<cpython::exc::ValueError, _>(py, "bubble_id must be non-zero")
-        })?;
+        let bubble_id = bubble_id
+            .map(|id| {
+                NonZeroU64::new(id).ok_or_else(|| {
+                    PyErr::new::<cpython::exc::ValueError, _>(py, "bubble_id must be non-zero")
+                })
+            })
+            .transpose()?;
+        let snapshot_id = snapshot_id.map(|id| id.0);
+        if bubble_id.is_none() && snapshot_id.is_none() {
+            return Err(PyErr::new::<cpython::exc::ValueError, _>(
+                py,
+                "either bubble_id or snapshot_id must be provided",
+            ));
+        }
+        let request = EphemeralExtendRequest {
+            bubble_id,
+            custom_duration_secs,
+            snapshot_id,
+        };
         py
-            .allow_threads(|| block_on(api.ephemeral_extend(bubble_id, custom_duration_secs)))
+            .allow_threads(|| block_on(api.ephemeral_extend(request)))
             .map_pyerr(py)
             .map(Serde)
     }

@@ -8,13 +8,14 @@ edition = "2024"
 homepage = "https://sapling-scm.com/"
 repository = "https://github.com/facebook/sapling"
 license = "MIT"
+exclude = ["BUCK"]
 
 [lib]
 name = "nodemap"
 
 [dependencies]
 anyhow = "1.0.104"
-sapling-indexedlog = { version = "0.1.0", path = "../indexedlog" }
+sapling-indexedlog = { version = "0.2.0", path = "../indexedlog" }
 sapling-types = { version = "0.1.0", path = "../types" }
 thiserror = "2.0.21"
 

@@ -37,6 +37,7 @@ use mercurial_types::NonRootMPath;
 use mercurial_types::RepoPath;
 use mercurial_types::blobs::ChangesetMetadata;
 use mercurial_types::subtree::HgSubtreeChanges;
+use mercurial_types::subtree::ShallowSubtreeCopiesUnsupported;
 use mononoke_types::BonsaiChangeset;
 use scuba_ext::MononokeScubaSampleBuilder;
 use thiserror::Error;
@@ -51,8 +52,8 @@ pub type Filelogs = HashMap<HgNodeKey, <Filelog as UploadableHgBlob>::Value>;
 pub type Manifests = HashMap<HgNodeKey, <TreemanifestEntry as UploadableHgBlob>::Value>;
 pub type UploadedChangesets = HashMap<HgChangesetId, ChangesetHandle>;
 
-/// An uploaded changeset contains shallow subtree copies while
-/// manifest-altering subtree changes are disabled.
+/// An uploaded changeset contains shallow subtree copies, which are not
+/// supported.
 #[derive(Debug, Error)]
 #[error(
     "Changeset {0} contains shallow subtree copies, which are not supported: use a deep subtree copy instead"
@@ -305,17 +306,14 @@ pub async fn upload_changeset(
     let p2 = get_parent(ctx.clone(), &repo, &uploaded_changesets, revlog_cs.p2);
 
     let subtree_changes = if let Some(subtree) = cs_metadata.extra.get(b"subtree".as_slice()) {
-        let subtree_changes = HgSubtreeChanges::from_json(subtree)?;
-        if !subtree_changes.copies.is_empty()
-            && !justknobs::eval(
-                "scm/mononoke:enable_manifest_altering_subtree_changes",
-                None,
-                Some(repo.repo_identity().name()),
-            )
-        {
-            STATS::rejected_shallow_subtree_copy.add_value(1);
-            return Err(ShallowSubtreeCopyRejected(node).into());
-        }
+        let subtree_changes = HgSubtreeChanges::from_json(subtree).map_err(|e| {
+            if e.is::<ShallowSubtreeCopiesUnsupported>() {
+                STATS::rejected_shallow_subtree_copy.add_value(1);
+                ShallowSubtreeCopyRejected(node).into()
+            } else {
+                e
+            }
+        })?;
         let hg_cs_ids = subtree_changes.source_changeset_ids();
         let sources = hg_cs_ids
             .into_iter()

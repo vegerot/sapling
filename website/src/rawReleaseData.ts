@@ -8,68 +8,68 @@
  */
 
 /*
- * @generated SignedSource<<3a6310bc9c3eba79e196f50235dd1d0f>>
+ * @generated SignedSource<<d1f2d22c44509be73b8423c06bf7b971>>
  * Run `./scripts/gen_release_data.py` to regenerate.
  */
 
 export const latestReleaseAssets = {
   "assets": [
     {
-      "apiUrl": "https://api.github.com/repos/facebook/sapling/releases/assets/598825545",
+      "apiUrl": "https://api.github.com/repos/meta/sapling/releases/assets/707580530",
       "contentType": "application/x-xz",
-      "createdAt": "2026-09-29T17:43:33Z",
-      "digest": "sha256:428d2314f7d13c3162a99413e734adf481a7059223a8e8003d124d0db2dadae0",
-      "downloadCount": 6,
-      "id": "RA_kwDOA3c_bc4jsVpJ",
+      "createdAt": "2026-11-04T00:07:35Z",
+      "digest": "sha256:a8bb6388703c30630219933e482955faa33744cfb06bcd201910785cbe3c5749",
+      "downloadCount": 1,
+      "id": "RA_kwDOA3c_bc4qLNJy",
       "label": "",
-      "name": "sapling-0.2.20260929-102736+288e0c2d-linux-arm64.tar.xz",
-      "size": 34938384,
+      "name": "sapling-0.2.20261103-145137+6282ac56-linux-arm64.tar.xz",
+      "size": 35170488,
       "state": "uploaded",
-      "updatedAt": "2026-09-29T17:43:34Z",
-      "url": "https://github.com/facebook/sapling/releases/download/0.2.20260929-102736%2B288e0c2d/sapling-0.2.20260929-102736%2B288e0c2d-linux-arm64.tar.xz"
+      "updatedAt": "2026-11-04T00:07:38Z",
+      "url": "https://github.com/meta/sapling/releases/download/0.2.20261103-145137%2B6282ac56/sapling-0.2.20261103-145137%2B6282ac56-linux-arm64.tar.xz"
     },
     {
-      "apiUrl": "https://api.github.com/repos/facebook/sapling/releases/assets/598825547",
+      "apiUrl": "https://api.github.com/repos/meta/sapling/releases/assets/707580527",
       "contentType": "application/x-xz",
-      "createdAt": "2026-09-29T17:43:33Z",
-      "digest": "sha256:f296b4b7d598dc099d4000e9f2ef656e366b63986db69c8910fe6d85e72d073c",
-      "downloadCount": 24,
-      "id": "RA_kwDOA3c_bc4jsVpL",
+      "createdAt": "2026-11-04T00:07:35Z",
+      "digest": "sha256:682f965b3abeae0a5ca0e1d64f35558679bad2fc79d5f6df34c7e82a52f9788c",
+      "downloadCount": 2,
+      "id": "RA_kwDOA3c_bc4qLNJv",
       "label": "",
-      "name": "sapling-0.2.20260929-102736+288e0c2d-linux-x64.tar.xz",
-      "size": 36415336,
+      "name": "sapling-0.2.20261103-145137+6282ac56-linux-x64.tar.xz",
+      "size": 36792204,
       "state": "uploaded",
-      "updatedAt": "2026-09-29T17:43:34Z",
-      "url": "https://github.com/facebook/sapling/releases/download/0.2.20260929-102736%2B288e0c2d/sapling-0.2.20260929-102736%2B288e0c2d-linux-x64.tar.xz"
+      "updatedAt": "2026-11-04T00:07:38Z",
+      "url": "https://github.com/meta/sapling/releases/download/0.2.20261103-145137%2B6282ac56/sapling-0.2.20261103-145137%2B6282ac56-linux-x64.tar.xz"
     },
     {
-      "apiUrl": "https://api.github.com/repos/facebook/sapling/releases/assets/598857807",
+      "apiUrl": "https://api.github.com/repos/meta/sapling/releases/assets/707615603",
       "contentType": "application/zip",
-      "createdAt": "2026-09-29T18:00:33Z",
-      "digest": "sha256:b3999541b4d921794eb606bf58fe680e4f39b3ae4e12b507b2662b07c96e9b15",
-      "downloadCount": 26,
-      "id": "RA_kwDOA3c_bc4jsdhP",
+      "createdAt": "2026-11-04T00:20:49Z",
+      "digest": "sha256:3f9283258ec8edbab3fe2d9e424318a7e496151578dbb620b97b11f3e04c06d6",
+      "downloadCount": 0,
+      "id": "RA_kwDOA3c_bc4qLVtz",
       "label": "",
-      "name": "sapling-0.2.20260929-102736+288e0c2d-windows-x64.zip",
-      "size": 56226879,
+      "name": "sapling-0.2.20261103-145137+6282ac56-windows-x64.zip",
+      "size": 56375559,
       "state": "uploaded",
-      "updatedAt": "2026-09-29T18:00:35Z",
-      "url": "https://github.com/facebook/sapling/releases/download/0.2.20260929-102736%2B288e0c2d/sapling-0.2.20260929-102736%2B288e0c2d-windows-x64.zip"
+      "updatedAt": "2026-11-04T00:20:52Z",
+      "url": "https://github.com/meta/sapling/releases/download/0.2.20261103-145137%2B6282ac56/sapling-0.2.20261103-145137%2B6282ac56-windows-x64.zip"
     },
     {
-      "apiUrl": "https://api.github.com/repos/facebook/sapling/releases/assets/598817612",
+      "apiUrl": "https://api.github.com/repos/meta/sapling/releases/assets/707565961",
       "contentType": "application/x-gtar",
-      "createdAt": "2026-09-29T17:39:20Z",
-      "digest": "sha256:9e732c2a164c81dee7d7f9a1872826447abe053ab731a4b6f86f978daa9505e4",
-      "downloadCount": 8,
-      "id": "RA_kwDOA3c_bc4jsTtM",
+      "createdAt": "2026-11-04T00:02:27Z",
+      "digest": "sha256:cce2367f911f4f0d3f8d92617af875b27301613c5afd95a16b6b25c076ed51b9",
+      "downloadCount": 2,
+      "id": "RA_kwDOA3c_bc4qLJmJ",
       "label": "",
-      "name": "sapling-0.2.20260929-102736+288e0c2d.arm64_sequoia.bottle.tar.gz",
-      "size": 39966302,
+      "name": "sapling-0.2.20261103-145137+6282ac56.arm64_sequoia.bottle.tar.gz",
+      "size": 40163275,
       "state": "uploaded",
-      "updatedAt": "2026-09-29T17:39:22Z",
-      "url": "https://github.com/facebook/sapling/releases/download/0.2.20260929-102736%2B288e0c2d/sapling-0.2.20260929-102736%2B288e0c2d.arm64_sequoia.bottle.tar.gz"
+      "updatedAt": "2026-11-04T00:02:28Z",
+      "url": "https://github.com/meta/sapling/releases/download/0.2.20261103-145137%2B6282ac56/sapling-0.2.20261103-145137%2B6282ac56.arm64_sequoia.bottle.tar.gz"
     }
   ],
-  "name": "0.2.20260929-102736+288e0c2d"
+  "name": "0.2.20261103-145137+6282ac56"
 };

@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use async_process_traits::Child;
 use async_process_traits::Command;
 use async_process_traits::CommandSpawner;
+use async_process_traits::ExitStatus;
 use async_process_traits::TokioCommandSpawner;
 use lru_cache::LruCache;
 use tokio::io::AsyncBufReadExt;
@@ -146,7 +147,10 @@ where
             .collect::<Vec<String>>()
     });
 
-    {
+    // A request without `second` compares `first` against the working copy,
+    // so its answer is not a function of the key and must not be cached.
+    let cacheable = params.second.is_some();
+    if cacheable {
         let mut lru_cache = STATUS_LRU_CACHE.lock().unwrap();
         let entry = lru_cache.get_mut(&params).cloned();
         if let Some(entry) = entry {
@@ -206,11 +210,21 @@ where
             }
         }
 
+        let exit_status = child.wait().await?;
+        if !exit_status.success() {
+            return Err(SaplingError::Other(format!(
+                "'sl status' exited with status {:?}",
+                exit_status.code()
+            )));
+        }
+
         SaplingGetStatusResult::Normal(status)
     };
 
-    let mut lru_cache = STATUS_LRU_CACHE.lock().unwrap();
-    lru_cache.insert(params, result.clone());
+    if cacheable {
+        let mut lru_cache = STATUS_LRU_CACHE.lock().unwrap();
+        lru_cache.insert(params, result.clone());
+    }
     Ok(result)
 }
 
@@ -275,6 +289,74 @@ mod tests {
 
     const FIRST_COMMIT_ID: &str = "0000111122223333444455556666777788889999";
     const SECOND_COMMIT_ID: &str = "999988887777666655554444333322221100000";
+
+    #[tokio::test]
+    pub async fn test_get_status_when_sl_exits_non_zero() -> Result<()> {
+        let spawner = get_mock_spawner(
+            get_sapling_executable_path(),
+            None,
+            Some((255, Some(Vec::new()))),
+        );
+        let params = GetStatusParams {
+            first: "aaaa111122223333444455556666777788889999".to_string(),
+            second: Some("aaaa999988887777666655554444333322221111".to_string()),
+            limit_results: 1000,
+            case_insensitive_suffix_compares: false,
+            repository_root: None,
+            root: None,
+            included_roots: None,
+            included_suffixes: None,
+            excluded_roots: None,
+            excluded_suffixes: None,
+        };
+        let result = get_status_impl(&spawner, params).await;
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn test_get_status_against_the_working_copy_twice() -> Result<()> {
+        let params = GetStatusParams {
+            first: "cccc111122223333444455556666777788889999".to_string(),
+            second: None,
+            limit_results: 1000,
+            case_insensitive_suffix_compares: false,
+            repository_root: None,
+            root: None,
+            included_roots: None,
+            included_suffixes: None,
+            excluded_roots: None,
+            excluded_suffixes: None,
+        };
+        let before_edit = get_mock_spawner(
+            get_sapling_executable_path(),
+            None,
+            Some((0, Some(b"M first.txt\n".to_vec()))),
+        );
+        let result = get_status_impl(&before_edit, params.clone()).await?;
+        assert_eq!(
+            result,
+            SaplingGetStatusResult::Normal(vec![(
+                SaplingStatus::Modified,
+                "first.txt".to_string()
+            )])
+        );
+
+        let after_edit = get_mock_spawner(
+            get_sapling_executable_path(),
+            None,
+            Some((0, Some(b"M second.txt\n".to_vec()))),
+        );
+        let result = get_status_impl(&after_edit, params).await?;
+        assert_eq!(
+            result,
+            SaplingGetStatusResult::Normal(vec![(
+                SaplingStatus::Modified,
+                "second.txt".to_string()
+            )])
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     pub async fn test_get_status_basic() -> Result<()> {

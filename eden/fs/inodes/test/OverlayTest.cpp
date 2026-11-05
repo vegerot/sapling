@@ -11,8 +11,6 @@
 #include "eden/fs/inodes/fscatalog/FsInodeCatalog.h"
 #include "eden/fs/inodes/test/OverlayTestUtil.h"
 
-#include <boost/filesystem/operations.hpp>
-#include <boost/filesystem/path.hpp>
 #include <fmt/format.h>
 #include <folly/Exception.h>
 #include <folly/Expected.h>
@@ -20,6 +18,8 @@
 #include <folly/Range.h>
 #include <folly/ScopeGuard.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/io/FsUtil.h>
+#include <folly/io/IOBufQueue.h>
 #include <folly/logging/test/TestLogHandler.h>
 #include <folly/synchronization/Baton.h>
 #include <folly/synchronization/LifoSem.h>
@@ -27,9 +27,12 @@
 #include <folly/test/TestUtils.h>
 #include <folly/testing/TestUtil.h>
 #include <gtest/gtest.h>
+#include <thrift/lib/cpp2/protocol/CompactProtocol.h>
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -64,7 +67,6 @@ using namespace folly::string_piece_literals;
 namespace facebook::eden {
 
 constexpr InodeCatalogType kInodeCatalogType = InodeCatalogType::Legacy;
-constexpr InodeCatalogOptions kInodeCatalogOptions = INODE_CATALOG_DEFAULT;
 
 TEST(OverlayGoldMasterTest, can_load_overlay_v2) {
   // eden/test-data/overlay-v2.tgz contains a saved copy of an overlay
@@ -91,7 +93,6 @@ TEST(OverlayGoldMasterTest, can_load_overlay_v2) {
       realpath(tmpdir.path().string()) + "overlay-v2"_pc,
       kPathMapDefaultCaseSensitive,
       kInodeCatalogType,
-      kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
@@ -267,6 +268,201 @@ TEST_P(OverlayTest, roundTripThroughSaveAndLoad) {
   EXPECT_TRUE(two.isMaterialized());
 }
 
+TEST_P(OverlayTest, dropsInvalidModeBeforeConstructingDirEntry) {
+  auto overlay = mount_.getEdenMount()->getOverlay();
+  auto parent = overlay->allocateInodeNumber();
+  auto child = overlay->allocateInodeNumber();
+  auto* catalog = overlay->getRawInodeCatalog();
+
+  catalog->saveOverlayEntries(
+      parent, 1, [&](InodeCatalog::OverlayEntryVisitor visitor) {
+        overlay::OverlayEntry entry;
+        entry.mode() = 0xffffffff;
+        entry.inodeNumber() = child.get();
+        visitor("bad-mode", entry);
+      });
+
+  EXPECT_TRUE(overlay->loadOverlayDir(parent).empty());
+  auto rewritten = catalog->loadOverlayDir(parent);
+  ASSERT_TRUE(rewritten.has_value());
+  EXPECT_TRUE(rewritten->entries()->empty());
+}
+
+TEST_P(OverlayTest, dropsMaterializedEntryWithoutInodeAndKeepsFollowingEntry) {
+  auto overlay = mount_.getEdenMount()->getOverlay();
+  auto parent = overlay->allocateInodeNumber();
+  auto child = overlay->allocateInodeNumber();
+  auto* catalog = overlay->getRawInodeCatalog();
+
+  catalog->saveOverlayEntries(
+      parent, 2, [&](InodeCatalog::OverlayEntryVisitor visitor) {
+        overlay::OverlayEntry entry;
+        entry.mode() = S_IFREG | 0644;
+        visitor("bad", entry);
+        entry.inodeNumber() = child.get();
+        visitor("valid", entry);
+      });
+
+  auto loaded = overlay->loadOverlayDir(parent);
+  ASSERT_EQ(1u, loaded.size());
+  EXPECT_EQ(child, loaded.find("valid"_pc)->second.getInodeNumber());
+
+  auto rewritten = catalog->loadOverlayDir(parent);
+  ASSERT_TRUE(rewritten.has_value());
+  EXPECT_EQ(1u, rewritten->entries()->size());
+  EXPECT_EQ(1u, rewritten->entries()->count("valid"));
+}
+
+TEST_P(OverlayTest, dropsDuplicateNames) {
+  auto overlay = mount_.getEdenMount()->getOverlay();
+  auto parent = overlay->allocateInodeNumber();
+  auto first = overlay->allocateInodeNumber();
+  auto second = overlay->allocateInodeNumber();
+  auto* catalog = overlay->getRawInodeCatalog();
+
+  catalog->saveOverlayEntries(
+      parent, 2, [&](InodeCatalog::OverlayEntryVisitor visitor) {
+        overlay::OverlayEntry entry;
+        entry.mode() = S_IFREG | 0644;
+        entry.inodeNumber() = first.get();
+        visitor("duplicate", entry);
+        entry.inodeNumber() = second.get();
+        visitor("duplicate", entry);
+      });
+
+  auto loaded = overlay->loadOverlayDir(parent);
+  ASSERT_EQ(1u, loaded.size());
+  EXPECT_EQ(first, loaded.find("duplicate"_pc)->second.getInodeNumber());
+  auto rewritten = catalog->loadOverlayDir(parent);
+  ASSERT_TRUE(rewritten.has_value());
+  EXPECT_EQ(1u, rewritten->entries()->size());
+}
+
+TEST_P(OverlayTest, dropsSelfReferenceAndRewritesDirectory) {
+  auto overlay = mount_.getEdenMount()->getOverlay();
+  auto parent = overlay->allocateInodeNumber();
+  auto child = overlay->allocateInodeNumber();
+  auto* catalog = overlay->getRawInodeCatalog();
+
+  catalog->saveOverlayEntries(
+      parent, 2, [&](InodeCatalog::OverlayEntryVisitor visitor) {
+        overlay::OverlayEntry entry;
+        entry.mode() = S_IFREG | 0644;
+        entry.inodeNumber() = parent.get();
+        visitor("self", entry);
+        entry.inodeNumber() = child.get();
+        visitor("valid", entry);
+      });
+
+  auto loaded = overlay->loadOverlayDir(parent);
+  ASSERT_EQ(1u, loaded.size());
+  EXPECT_EQ(child, loaded.find("valid"_pc)->second.getInodeNumber());
+
+  auto rewritten = catalog->loadOverlayDir(parent);
+  ASSERT_TRUE(rewritten.has_value());
+  EXPECT_EQ(1u, rewritten->entries()->size());
+  EXPECT_EQ(1u, rewritten->entries()->count("valid"));
+}
+
+TEST_P(OverlayTest, dropsInvalidNameAndRewritesDirectory) {
+  auto overlay = mount_.getEdenMount()->getOverlay();
+  auto parent = overlay->allocateInodeNumber();
+  auto child = overlay->allocateInodeNumber();
+  auto* catalog = overlay->getRawInodeCatalog();
+
+  catalog->saveOverlayEntries(
+      parent, 2, [&](InodeCatalog::OverlayEntryVisitor visitor) {
+        overlay::OverlayEntry entry;
+        entry.mode() = S_IFREG | 0644;
+        entry.inodeNumber() = child.get();
+        visitor("", entry);
+        visitor("valid", entry);
+      });
+
+  auto loaded = overlay->loadOverlayDir(parent);
+  ASSERT_EQ(1u, loaded.size());
+  EXPECT_EQ(child, loaded.find("valid"_pc)->second.getInodeNumber());
+
+  auto rewritten = catalog->loadOverlayDir(parent);
+  ASSERT_TRUE(rewritten.has_value());
+  EXPECT_EQ(1u, rewritten->entries()->size());
+  EXPECT_EQ(1u, rewritten->entries()->count("valid"));
+}
+
+TEST_P(OverlayTest, logsInvalidEntryValues) {
+  auto logHandler = std::make_shared<folly::TestLogHandler>();
+  auto* logCategory =
+      folly::LoggerDB::get().getCategory("eden/fs/inodes/Overlay");
+  auto previousHandlers = logCategory->getHandlers();
+  logCategory->replaceHandlers({logHandler});
+  SCOPE_EXIT {
+    logCategory->replaceHandlers(std::move(previousHandlers));
+  };
+
+  auto overlay = mount_.getEdenMount()->getOverlay();
+  auto parent = overlay->allocateInodeNumber();
+  auto child = overlay->allocateInodeNumber();
+  auto* catalog = overlay->getRawInodeCatalog();
+  catalog->saveOverlayEntries(
+      parent, 6, [&](InodeCatalog::OverlayEntryVisitor visitor) {
+        overlay::OverlayEntry entry;
+        entry.inodeNumber() = child.get();
+        entry.mode() = -1;
+        visitor("bad-mode", entry);
+        entry.mode() = S_IFREG | 0644;
+        entry.inodeNumber() = -42;
+        visitor("bad-inode", entry);
+        entry.inodeNumber() = child.get();
+        visitor(std::string{"bad\0/name", 9}, entry);
+        entry.inodeNumber() = parent.get();
+        visitor("self", entry);
+        entry.inodeNumber() = 0;
+        visitor("zero", entry);
+        entry.inodeNumber() = child.get();
+        visitor("valid", entry);
+      });
+
+  auto loaded = overlay->loadOverlayDir(parent);
+  ASSERT_EQ(1u, loaded.size());
+  EXPECT_EQ(child, loaded.find("valid"_pc)->second.getInodeNumber());
+  const auto messages = logHandler->getMessageValues();
+  for (const auto* expected :
+       {"invalid mode 37777777777 in overlay entry",
+        "invalid inode number -42 in overlay entry",
+        "invalid overlay name (hex \"626164002f6e616d65\")",
+        "self-referencing overlay base entry",
+        "materialized overlay entry has no inode number"}) {
+    EXPECT_EQ(
+        1,
+        std::count_if(
+            messages.begin(),
+            messages.end(),
+            [&](const auto& message) {
+              return message.find(expected) != std::string::npos &&
+                  message.find(fmt::format("parent inode {}", parent)) !=
+                  std::string::npos &&
+                  message.find("base entry") != std::string::npos;
+            }))
+        << expected;
+  }
+  for (const auto& context :
+       {fmt::format("name hex \"6261642d6d6f6465\", inode {}", child),
+        std::string{"name hex \"6261642d696e6f6465\", inode -42"},
+        fmt::format("parent inode {}, inode {}", parent, child),
+        fmt::format("name hex \"73656c66\", inode {}", parent),
+        std::string{"name hex \"7a65726f\", inode 0"}}) {
+    EXPECT_EQ(
+        1,
+        std::count_if(
+            messages.begin(),
+            messages.end(),
+            [&](const auto& message) {
+              return message.find(context) != std::string::npos;
+            }))
+        << context;
+  }
+}
+
 TEST_P(OverlayTest, roundTripThroughSaveAndLoadPreservesIsRestricted) {
   auto id = ObjectId::fromHex("0123456789012345678901234567890123456789");
   auto overlay = mount_.getEdenMount()->getOverlay();
@@ -305,7 +501,6 @@ class OverlayWalDeferralTest : public ::testing::Test {
         canonicalPath(testDir_.path().string()),
         kPathMapDefaultCaseSensitive,
         kInodeCatalogType,
-        kInodeCatalogOptions,
         makeTestEdenFsEventsLogger(),
         /*errorLogger=*/noopErrorLogger_,
         makeRefPtr<EdenStats>(),
@@ -321,7 +516,9 @@ class OverlayWalDeferralTest : public ::testing::Test {
     overlay_->saveOverlayDir(parent, dir);
   }
 
-  overlay::OverlayEntry makeWalEntry(mode_t mode, InodeNumber ino) {
+  // Keep the serialized width: macOS mode_t would truncate corrupt values such
+  // as -1 to 16 bits before the overlay can validate them.
+  overlay::OverlayEntry makeWalEntry(int32_t mode, InodeNumber ino) {
     overlay::OverlayEntry entry;
     entry.mode() = mode;
     entry.inodeNumber() = ino.get();
@@ -370,6 +567,89 @@ TEST_F(OverlayWalDeferralTest, tornWalHealedDespiteDeferral) {
   EXPECT_TRUE(result.find("drop"_pc) == result.end());
 }
 
+TEST_F(OverlayWalDeferralTest, duplicateNamesRewrittenDespiteDeferral) {
+  const auto parent = kRootNodeId;
+  const auto first = overlay_->allocateInodeNumber();
+  const auto second = overlay_->allocateInodeNumber();
+  const auto added = overlay_->allocateInodeNumber();
+  auto* catalog = overlay_->getRawInodeCatalog();
+  auto firstEntry = makeWalEntry(S_IFREG | 0644, first);
+  auto secondEntry = makeWalEntry(S_IFREG | 0644, second);
+  catalog->saveOverlayEntries(
+      parent, 2, [&](InodeCatalog::OverlayEntryVisitor visitor) {
+        visitor("duplicate", firstEntry);
+        visitor("duplicate", secondEntry);
+      });
+  auto addedEntry = makeWalEntry(S_IFREG | 0644, added);
+  catalog->appendWalEntry(parent, WalOpType::ADD, "added"_pc, &addedEntry);
+  ASSERT_TRUE(catalog->hasWal(parent));
+
+  overlay_->enterCheckoutDeferral();
+  auto result = overlay_->loadOverlayDir(parent);
+  overlay_->exitCheckoutDeferral();
+
+  ASSERT_EQ(2u, result.size());
+  EXPECT_EQ(first, result.at("duplicate"_pc).getInodeNumber());
+  EXPECT_EQ(added, result.at("added"_pc).getInodeNumber());
+  // Duplicate base names require a rewrite even with a clean WAL and checkout
+  // deferral. Inspect the disk base, not just the deduplicated runtime map.
+  EXPECT_FALSE(catalog->hasWal(parent));
+  auto persisted = catalog->loadOverlayDir(parent);
+  ASSERT_TRUE(persisted.has_value());
+  ASSERT_EQ(2u, persisted->entries()->size());
+  EXPECT_EQ(first.get(), *persisted->entries()->at("duplicate").inodeNumber());
+  EXPECT_EQ(added.get(), *persisted->entries()->at("added").inodeNumber());
+}
+
+TEST_F(OverlayWalDeferralTest, logsInvalidWalEntryContext) {
+  auto logHandler = std::make_shared<folly::TestLogHandler>();
+  auto* logCategory =
+      folly::LoggerDB::get().getCategory("eden/fs/inodes/Overlay");
+  auto previousHandlers = logCategory->getHandlers();
+  logCategory->replaceHandlers({logHandler});
+  SCOPE_EXIT {
+    logCategory->replaceHandlers(std::move(previousHandlers));
+  };
+
+  const auto parent = overlay_->allocateInodeNumber();
+  const auto child = overlay_->allocateInodeNumber();
+  // A second ADD of `child` would turn this name into a REMOVE before
+  // validation sees it, so the bad-mode entry gets an inode of its own.
+  const auto badModeChild = overlay_->allocateInodeNumber();
+  auto* catalog = overlay_->getRawInodeCatalog();
+  auto badMode = makeWalEntry(-1, badModeChild);
+  catalog->appendWalEntry(parent, WalOpType::ADD, "bad-mode"_pc, &badMode);
+  auto self = makeWalEntry(S_IFREG | 0644, parent);
+  catalog->appendWalEntry(parent, WalOpType::ADD, "self"_pc, &self);
+  auto valid = makeWalEntry(S_IFREG | 0644, child);
+  catalog->appendWalEntry(parent, WalOpType::ADD, "valid"_pc, &valid);
+
+  auto loaded = overlay_->loadOverlayDir(parent);
+  ASSERT_EQ(1u, loaded.size());
+  EXPECT_EQ(child, loaded.at("valid"_pc).getInodeNumber());
+  const auto messages = logHandler->getMessageValues();
+  for (
+      const auto& expected :
+      {fmt::format(
+           "overlay WAL ADD entry: parent inode {}, name hex \"6261642d6d6f6465\", inode {}",
+           parent,
+           badModeChild),
+       fmt::format(
+           "self-referencing inode in overlay WAL ADD (parent inode {}, name hex \"73656c66\", inode {})",
+           parent,
+           parent)}) {
+    EXPECT_EQ(
+        1,
+        std::count_if(
+            messages.begin(),
+            messages.end(),
+            [&](const auto& message) {
+              return message.find(expected) != std::string::npos;
+            }))
+        << expected;
+  }
+}
+
 TEST_F(OverlayWalDeferralTest, cleanWalDeferred) {
   auto rootIno = kRootNodeId;
   saveBaseDir(rootIno, overlay_->allocateInodeNumber());
@@ -387,6 +667,80 @@ TEST_F(OverlayWalDeferralTest, cleanWalDeferred) {
   // so it stays on disk even though it was merged into the returned contents.
   EXPECT_TRUE(catalog->hasWal(rootIno));
   EXPECT_TRUE(result.find("added"_pc) != result.end());
+}
+
+class OverlayWalReplayTest : public OverlayWalDeferralTest {};
+
+TEST_F(OverlayWalReplayTest, tornRenameKeepsOnlyTheDestinationName) {
+  auto rootIno = kRootNodeId;
+  auto fileIno = overlay_->allocateInodeNumber();
+  saveBaseDir(rootIno, fileIno);
+
+  // renameChild appends ADD(destination) before REMOVE(source); the daemon
+  // died between the two.
+  auto* catalog = overlay_->getRawInodeCatalog();
+  auto entry = makeWalEntry(S_IFREG | 0644, fileIno);
+  catalog->appendWalEntry(rootIno, WalOpType::ADD, "renamed"_pc, &entry);
+
+  auto result = overlay_->loadOverlayDir(rootIno);
+  EXPECT_TRUE(result.find("renamed"_pc) != result.end());
+  EXPECT_TRUE(result.find("existing"_pc) == result.end());
+}
+
+TEST_F(OverlayWalReplayTest, theLaterAddWinsWhenTwoNamesShareAnInode) {
+  auto rootIno = kRootNodeId;
+  saveBaseDir(rootIno, overlay_->allocateInodeNumber());
+
+  // A file written under a temporary name and renamed over its final name,
+  // with the REMOVE of the temporary name lost. The final name sorts first,
+  // so only the record order says which name is current.
+  auto fileIno = overlay_->allocateInodeNumber();
+  auto* catalog = overlay_->getRawInodeCatalog();
+  auto entry = makeWalEntry(S_IFREG | 0644, fileIno);
+  catalog->appendWalEntry(rootIno, WalOpType::ADD, "tmp.final"_pc, &entry);
+  catalog->appendWalEntry(rootIno, WalOpType::ADD, "final"_pc, &entry);
+
+  auto result = overlay_->loadOverlayDir(rootIno);
+  EXPECT_TRUE(result.find("final"_pc) != result.end());
+  EXPECT_TRUE(result.find("tmp.final"_pc) == result.end());
+  EXPECT_TRUE(result.find("existing"_pc) != result.end());
+}
+
+TEST_F(OverlayWalReplayTest, renameCompactsOnlyAfterBothWalAppends) {
+  // Every compaction roll hits.
+  OverlayTestHelper::setWalCompactionRng(*overlay_, [] { return 0u; });
+  auto srcIno = overlay_->allocateInodeNumber();
+  auto dstIno = overlay_->allocateInodeNumber();
+  auto fileIno = overlay_->allocateInodeNumber();
+  DirContents srcBefore(kPathMapDefaultCaseSensitive);
+  srcBefore.emplace("tmp"_pc, S_IFREG | 0644, fileIno);
+  overlay_->saveOverlayDir(srcIno, srcBefore);
+  overlay_->saveOverlayDir(dstIno, DirContents(kPathMapDefaultCaseSensitive));
+
+  // The source REMOVE cannot be appended: a directory sits where the source
+  // WAL file would be created. On disk this is a daemon that died between the
+  // rename's two appends.
+  auto srcWalPath = canonicalPath(testDir_.path().string()) +
+      RelativePathPiece{FsFileContentStore::getWalPath(srcIno)};
+  ASSERT_TRUE(folly::fs::create_directory(srcWalPath.c_str()));
+
+  DirContents srcAfter(kPathMapDefaultCaseSensitive);
+  DirContents dstAfter(kPathMapDefaultCaseSensitive);
+  dstAfter.emplace("final"_pc, S_IFREG | 0644, fileIno);
+  EXPECT_THROW(
+      overlay_->renameChild(
+          srcIno, dstIno, "tmp"_pc, "final"_pc, srcAfter, dstAfter),
+      std::system_error);
+
+  // The destination ADD is still in the destination WAL, which is what tells
+  // fsck that `final` is the newer of the two names.
+  auto* catalog = overlay_->getRawInodeCatalog();
+  EXPECT_TRUE(catalog->hasWal(dstIno));
+  auto dst = overlay_->loadOverlayDir(dstIno);
+  EXPECT_TRUE(dst.find("final"_pc) != dst.end());
+  folly::fs::remove(srcWalPath.c_str());
+  auto src = overlay_->loadOverlayDir(srcIno);
+  EXPECT_TRUE(src.find("tmp"_pc) != src.end());
 }
 
 TEST(OverlayFilePathTest, getFilePath) {
@@ -413,7 +767,6 @@ TEST(PlainOverlayTest, new_overlay_is_clean) {
       canonicalPath(testDir.path().string()),
       kPathMapDefaultCaseSensitive,
       kInodeCatalogType,
-      kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
@@ -434,7 +787,6 @@ TEST(PlainOverlayTest, reopened_overlay_is_clean) {
         canonicalPath(testDir.path().string()),
         kPathMapDefaultCaseSensitive,
         kInodeCatalogType,
-        kInodeCatalogOptions,
         makeTestEdenFsEventsLogger(),
         /*errorLogger=*/noopErrorLogger,
         makeRefPtr<EdenStats>(),
@@ -450,7 +802,6 @@ TEST(PlainOverlayTest, reopened_overlay_is_clean) {
       canonicalPath(testDir.path().string()),
       kPathMapDefaultCaseSensitive,
       kInodeCatalogType,
-      kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
@@ -473,7 +824,6 @@ TEST(PlainOverlayTest, unclean_overlay_is_dirty) {
         localDir,
         kPathMapDefaultCaseSensitive,
         kInodeCatalogType,
-        kInodeCatalogOptions,
         makeTestEdenFsEventsLogger(),
         /*errorLogger=*/noopErrorLogger,
         makeRefPtr<EdenStats>(),
@@ -493,7 +843,6 @@ TEST(PlainOverlayTest, unclean_overlay_is_dirty) {
       localDir,
       kPathMapDefaultCaseSensitive,
       kInodeCatalogType,
-      kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
@@ -542,7 +891,6 @@ class RawOverlayTest : public ::testing::TestWithParam<OverlayRestartMode> {
         getLocalDir(),
         kPathMapDefaultCaseSensitive,
         kInodeCatalogType,
-        kInodeCatalogOptions,
         makeTestEdenFsEventsLogger(),
         /*errorLogger=*/noopErrorLogger_,
         makeRefPtr<EdenStats>(),
@@ -616,7 +964,7 @@ TEST_P(RawOverlayTest, closed_overlay_stress_test) {
 
       try {
         char data[] = "new contents";
-        struct iovec iov;
+        struct iovec iov{};
         iov.iov_base = data;
         iov.iov_len = sizeof(data);
         result.pwritev(&iov, 1, FsFileContentStore::kHeaderLength).value();
@@ -652,7 +1000,7 @@ TEST_P(RawOverlayTest, cannot_create_overlay_file_in_corrupt_overlay) {
 
   // Remove the overlay directory in order to make file creation fail.
   auto path = testDir_.path();
-  boost::filesystem::remove_all(path);
+  folly::fs::remove_all(path);
 
   EXPECT_THROW(
       overlay->createOverlayFile(ino2, folly::ByteRange{"contents"_sp}),
@@ -660,7 +1008,7 @@ TEST_P(RawOverlayTest, cannot_create_overlay_file_in_corrupt_overlay) {
 
   // Restore the overlay directory and make sure we can create an overlay file
   // and close the overlay.
-  boost::filesystem::create_directory(path);
+  folly::fs::create_directory(path);
   loadOverlay();
 
   ino2 = overlay->allocateInodeNumber();
@@ -684,7 +1032,6 @@ TEST(OverlayErrorLoggingTest, createOverlayFileLogsErrorOnFailure) {
       canonicalPath(testDir.path().string()),
       kPathMapDefaultCaseSensitive,
       kInodeCatalogType,
-      kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       errorLogger,
       makeRefPtr<EdenStats>(),
@@ -698,7 +1045,7 @@ TEST(OverlayErrorLoggingTest, createOverlayFileLogsErrorOnFailure) {
   auto ino = overlay->allocateInodeNumber();
 
   // Remove the overlay directory to force createOverlayFile to fail
-  boost::filesystem::remove_all(testDir.path());
+  folly::fs::remove_all(testDir.path());
 
   EXPECT_THROW(
       overlay->createOverlayFile(ino, folly::ByteRange{"contents"_sp}),
@@ -812,27 +1159,23 @@ TEST_P(RawOverlayTest, persistsInodeReservation) {
       (getLocalDir() + "inode-reservation"_pc).asString();
   const auto initialReservation = std::to_string(2 + reservationSize);
   const auto secondReservation = std::to_string(2 + 2 * reservationSize);
-  EXPECT_TRUE(boost::filesystem::is_symlink(reservationPath));
+  EXPECT_TRUE(folly::fs::is_symlink(reservationPath));
   EXPECT_EQ(
-      initialReservation,
-      boost::filesystem::read_symlink(reservationPath).string());
+      initialReservation, folly::fs::read_symlink(reservationPath).string());
 
   EXPECT_EQ(2_ino, overlay->allocateInodeNumbers(reservationSize));
   EXPECT_EQ(
-      initialReservation,
-      boost::filesystem::read_symlink(reservationPath).string());
+      initialReservation, folly::fs::read_symlink(reservationPath).string());
 
   EXPECT_EQ(InodeNumber{2 + reservationSize}, overlay->allocateInodeNumber());
   EXPECT_EQ(
-      secondReservation,
-      boost::filesystem::read_symlink(reservationPath).string());
+      secondReservation, folly::fs::read_symlink(reservationPath).string());
 
   overlay->close();
   ASSERT_EQ(0, unlink((getLocalDir() + "next-inode-number"_pc).c_str()));
-  EXPECT_TRUE(boost::filesystem::is_symlink(reservationPath));
+  EXPECT_TRUE(folly::fs::is_symlink(reservationPath));
   EXPECT_EQ(
-      secondReservation,
-      boost::filesystem::read_symlink(reservationPath).string());
+      secondReservation, folly::fs::read_symlink(reservationPath).string());
 }
 
 TEST_P(RawOverlayTest, replacesInvalidInodeReservation) {
@@ -847,7 +1190,25 @@ TEST_P(RawOverlayTest, replacesInvalidInodeReservation) {
   EXPECT_NO_THROW(loadOverlay());
   EXPECT_EQ(
       std::to_string(2 + reservationSize),
-      boost::filesystem::read_symlink(reservationPath).string());
+      folly::fs::read_symlink(reservationPath).string());
+}
+
+TEST_P(RawOverlayTest, replacesOverflowingInodeReservation) {
+  constexpr uint64_t reservationSize = 4096;
+  const auto reservationPath =
+      (getLocalDir() + "inode-reservation"_pc).asString();
+  overlay->close();
+  overlay = nullptr;
+  ASSERT_EQ(0, unlink(reservationPath.c_str()));
+  const auto overflowingReservation =
+      std::to_string(std::numeric_limits<uint64_t>::max());
+  ASSERT_EQ(
+      0, symlink(overflowingReservation.c_str(), reservationPath.c_str()));
+
+  EXPECT_NO_THROW(loadOverlay());
+  EXPECT_EQ(
+      std::to_string(2 + reservationSize),
+      folly::fs::read_symlink(reservationPath).string());
 }
 
 TEST_P(RawOverlayTest, inodeReservationWriteFailureFailsInitialization) {
@@ -857,7 +1218,7 @@ TEST_P(RawOverlayTest, inodeReservationWriteFailureFailsInitialization) {
   overlay->close();
   overlay = nullptr;
   ASSERT_EQ(0, unlink(reservationPath.c_str()));
-  ASSERT_TRUE(boost::filesystem::create_directory(tempPath));
+  ASSERT_TRUE(folly::fs::create_directory(tempPath));
 
   EXPECT_THROW(loadOverlay(), std::system_error);
 }
@@ -1040,13 +1401,13 @@ TEST_P(RawOverlayTest, inode_numbers_not_reused_after_unclean_shutdown) {
 
 TEST_P(RawOverlayTest, close_overlay_after_removing_overlay_dir) {
   auto path = testDir_.path();
-  boost::filesystem::remove_all(path);
+  folly::fs::remove_all(path);
 
   // Should not crash.
   overlay->close();
   overlay = nullptr;
 
-  boost::filesystem::create_directory(path);
+  folly::fs::create_directory(path);
 }
 
 TEST_P(RawOverlayTest, inode_numbers_after_takeover) {
@@ -1109,7 +1470,6 @@ class DebugDumpOverlayInodesTest : public ::testing::Test {
             canonicalPath(testDir_.path().string()),
             kPathMapDefaultCaseSensitive,
             kInodeCatalogType,
-            kInodeCatalogOptions,
             makeTestEdenFsEventsLogger(),
             /*errorLogger=*/noopErrorLogger_,
             makeRefPtr<EdenStats>(),
@@ -1308,7 +1668,6 @@ void createDirtyOverlay(const AbsolutePath& dir) {
       dir,
       kPathMapDefaultCaseSensitive,
       kInodeCatalogType,
-      kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
@@ -1339,14 +1698,89 @@ std::shared_ptr<Overlay> createTestOverlay(
       dir,
       kPathMapDefaultCaseSensitive,
       kInodeCatalogType,
-      kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/errorLogger,
       makeRefPtr<EdenStats>(),
       *EdenConfig::createTestEdenConfig());
 }
 
+void expectOnlineFsckFallsBackToStartupScan(const AbsolutePath& localDir) {
+  auto rawConfig = EdenConfig::createTestEdenConfig();
+  rawConfig->overlayOnlineFsck.setValue(true, ConfigSourceType::CommandLine);
+  auto config = std::make_shared<ReloadableConfig>(rawConfig);
+  auto noopErrorLogger = makeTestErrorLogger();
+  auto overlay = Overlay::create(
+      localDir,
+      kPathMapDefaultCaseSensitive,
+      kInodeCatalogType,
+      makeTestEdenFsEventsLogger(),
+      /*errorLogger=*/noopErrorLogger,
+      makeRefPtr<EdenStats>(),
+      *rawConfig);
+  bool ranFsck = false;
+  overlay->setFsckCallback([&] { ranFsck = true; });
+
+  overlay->initialize(config).get();
+  EXPECT_TRUE(ranFsck);
+  EXPECT_FALSE(overlay->hadCleanStartup());
+  EXPECT_TRUE(overlay->usesOnlineFsck());
+  overlay->close();
+}
+
 } // namespace
+
+TEST(PlainOverlayTest, onlineFsckUsesReservationWithoutStartupScan) {
+  folly::test::TemporaryDirectory testDir("overlay_online_fsck");
+  auto localDir = canonicalPath(testDir.path().string());
+  createDirtyOverlay(localDir);
+
+  auto rawConfig = EdenConfig::createTestEdenConfig();
+  rawConfig->overlayOnlineFsck.setValue(true, ConfigSourceType::CommandLine);
+  auto config = std::make_shared<ReloadableConfig>(rawConfig);
+  auto noopErrorLogger = makeTestErrorLogger();
+  auto overlay = Overlay::create(
+      localDir,
+      kPathMapDefaultCaseSensitive,
+      kInodeCatalogType,
+      makeTestEdenFsEventsLogger(),
+      /*errorLogger=*/noopErrorLogger,
+      makeRefPtr<EdenStats>(),
+      *rawConfig);
+  bool ranFsck = false;
+  overlay->setFsckCallback([&] { ranFsck = true; });
+
+  overlay->initialize(config).get();
+  EXPECT_FALSE(ranFsck);
+  EXPECT_FALSE(overlay->hadCleanStartup());
+  EXPECT_TRUE(overlay->usesOnlineFsck());
+  overlay->close();
+}
+
+TEST(PlainOverlayTest, onlineFsckScansWhenReservationIsMalformed) {
+  folly::test::TemporaryDirectory testDir(
+      "overlay_online_fsck_bad_reservation");
+  auto localDir = canonicalPath(testDir.path().string());
+  createDirtyOverlay(localDir);
+  auto reservationPath = (localDir + "inode-reservation"_pc).asString();
+  ASSERT_EQ(0, unlink(reservationPath.c_str()));
+  ASSERT_EQ(0, symlink("invalid", reservationPath.c_str()));
+
+  expectOnlineFsckFallsBackToStartupScan(localDir);
+}
+
+TEST(PlainOverlayTest, onlineFsckScansWhenReservationCannotBeRead) {
+  folly::test::TemporaryDirectory testDir(
+      "overlay_online_fsck_unreadable_reservation");
+  auto localDir = canonicalPath(testDir.path().string());
+  createDirtyOverlay(localDir);
+  auto reservationPath = (localDir + "inode-reservation"_pc).asString();
+  ASSERT_EQ(0, unlink(reservationPath.c_str()));
+  ASSERT_TRUE(
+      folly::writeFile(
+          folly::StringPiece{"not a symlink"}, reservationPath.c_str()));
+
+  expectOnlineFsckFallsBackToStartupScan(localDir);
+}
 
 TEST(PlainOverlayTest, semaphore_serializes_fsck) {
   folly::test::TemporaryDirectory testDir1("overlay_sem_test1");
@@ -1478,13 +1912,24 @@ WalLifecycleOverlay makeWalLifecycleOverlay(
     uint64_t walMinCompactionThreshold = 0,
     bool cacheWalFiles = true,
     bool useWal = true,
-    bool writeWalV2 = false) {
+    bool writeWalV2 = false,
+    bool onlineFsck = false,
+    std::optional<size_t> walCompactionMultiplier = std::nullopt) {
+  if (onlineFsck) {
+    createDirtyOverlay(dir);
+  }
   auto rawConfig = EdenConfig::createTestEdenConfig();
   rawConfig->overlayUseWal.setValue(useWal, ConfigSourceType::CommandLine);
   rawConfig->overlayWalWriteV2.setValue(
       writeWalV2, ConfigSourceType::CommandLine);
+  if (walCompactionMultiplier) {
+    rawConfig->overlayWalCompactionMultiplier.setValue(
+        *walCompactionMultiplier, ConfigSourceType::CommandLine);
+  }
   rawConfig->experimentalOverlayCacheWalFiles.setValue(
       cacheWalFiles, ConfigSourceType::CommandLine);
+  rawConfig->overlayOnlineFsck.setValue(
+      onlineFsck, ConfigSourceType::CommandLine);
   rawConfig->experimentalOverlayWalMinCompactionThreshold.setValue(
       walMinCompactionThreshold, ConfigSourceType::CommandLine);
   auto reloadable = std::make_shared<ReloadableConfig>(rawConfig);
@@ -1494,12 +1939,12 @@ WalLifecycleOverlay makeWalLifecycleOverlay(
       dir,
       caseSensitive,
       kInodeCatalogType,
-      kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/*errorLogger,
       stats.copy(),
       *rawConfig);
   overlay->initialize(reloadable).get();
+  EXPECT_EQ(onlineFsck, overlay->usesOnlineFsck());
   // Probabilistic WAL compaction would make hasWal assertions flaky; the
   // production default uses folly::Random::rand32(). Force a "never
   // compact" RNG by default and let individual tests override.
@@ -1510,8 +1955,8 @@ WalLifecycleOverlay makeWalLifecycleOverlay(
 }
 
 /// Return the temporary base-file path used when saving an overlay directory.
-boost::filesystem::path overlayDirTempFilePath(
-    const boost::filesystem::path& root,
+folly::fs::path overlayDirTempFilePath(
+    const folly::fs::path& root,
     InodeNumber inode) {
   return root / "sharded_tmp" / fmt::format("{:02x}", inode.get() % 256) /
       std::to_string(inode.get());
@@ -1524,10 +1969,71 @@ TEST(OverlayWalLifecycleTest, writeFailureKeepsErrorLoggerAlive) {
   auto bundle = makeWalLifecycleOverlay(canonicalPath(tmp.path().string()));
   const auto parent = bundle.overlay->allocateInodeNumber();
   const auto blocker = overlayDirTempFilePath(tmp.path(), parent);
-  ASSERT_TRUE(boost::filesystem::create_directory(blocker));
+  ASSERT_TRUE(folly::fs::create_directory(blocker));
   DirContents content(kPathMapDefaultCaseSensitive);
   EXPECT_THROW(
       bundle.overlay->saveOverlayDir(parent, content), std::system_error);
+  bundle.overlay->close();
+}
+
+TEST(OverlayLoadTest, dropsEntryWithoutModeAndKeepsFollowingEntry) {
+  folly::test::TemporaryDirectory tmp("eden_overlay_missing_mode");
+  auto dir = canonicalPath(tmp.path().string());
+  auto bundle = makeWalLifecycleOverlay(dir);
+  ASSERT_NE(nullptr, bundle.store);
+
+  auto parent = bundle.overlay->allocateInodeNumber();
+  auto badChild = bundle.overlay->allocateInodeNumber();
+  auto goodChild = bundle.overlay->allocateInodeNumber();
+  bundle.overlay->saveOverlayDir(
+      parent, DirContents{kPathMapDefaultCaseSensitive});
+
+  folly::IOBufQueue queue;
+  apache::thrift::CompactProtocolWriter writer;
+  using apache::thrift::protocol::TType;
+  writer.setOutput(&queue);
+  writer.writeStructBegin("OverlayDir");
+  writer.writeFieldBegin("entries", TType::T_MAP, 1);
+  writer.writeMapBegin(TType::T_STRING, TType::T_STRUCT, 2);
+  auto writeEntry = [&](folly::StringPiece name,
+                        std::optional<int32_t> mode,
+                        InodeNumber inodeNumber) {
+    writer.writeString(name);
+    writer.writeStructBegin("OverlayEntry");
+    if (mode.has_value()) {
+      writer.writeFieldBegin("mode", TType::T_I32, 1);
+      writer.writeI32(*mode);
+      writer.writeFieldEnd();
+    }
+    writer.writeFieldBegin("inodeNumber", TType::T_I64, 2);
+    writer.writeI64(inodeNumber.get());
+    writer.writeFieldEnd();
+    writer.writeFieldStop();
+    writer.writeStructEnd();
+  };
+  writeEntry("bad", std::nullopt, badChild);
+  writeEntry("good", S_IFREG | 0644, goodChild);
+  writer.writeMapEnd();
+  writer.writeFieldEnd();
+  writer.writeFieldStop();
+  writer.writeStructEnd();
+
+  auto path = bundle.store->getAbsoluteFilePath(parent);
+  std::string contents;
+  ASSERT_TRUE(folly::readFile(path.c_str(), contents));
+  ASSERT_GE(contents.size(), FsFileContentStore::kHeaderLength);
+  contents.resize(FsFileContentStore::kHeaderLength);
+  contents.append(queue.move()->to<std::string>());
+  ASSERT_TRUE(folly::writeFile(contents, path.c_str()));
+
+  auto loaded = bundle.overlay->loadOverlayDir(parent);
+  ASSERT_EQ(1u, loaded.size());
+  EXPECT_EQ(goodChild, loaded.find("good"_pc)->second.getInodeNumber());
+
+  auto rewritten = bundle.overlay->getRawInodeCatalog()->loadOverlayDir(parent);
+  ASSERT_TRUE(rewritten.has_value());
+  EXPECT_EQ(1u, rewritten->entries()->size());
+  EXPECT_EQ(1u, rewritten->entries()->count("good"));
   bundle.overlay->close();
 }
 
@@ -1586,6 +2092,31 @@ TEST(OverlayWalLifecycleTest, recursiveRemoveDoesNotLeaveOrphanWal) {
 
   bundle.overlay->recursivelyRemoveOverlayDir(parent);
   EXPECT_FALSE(bundle.store->hasWal(parent));
+
+  bundle.overlay->close();
+}
+
+TEST(OverlayWalLifecycleTest, onlineFsckReclaimsDiskOnlyDirectory) {
+  folly::test::TemporaryDirectory tmp("eden_online_fsck_gc");
+  auto dir = canonicalPath(tmp.path().string());
+  auto bundle = makeWalLifecycleOverlay(
+      dir,
+      kPathMapDefaultCaseSensitive,
+      0,
+      /*cacheWalFiles=*/true,
+      /*useWal=*/true,
+      /*writeWalV2=*/false,
+      /*onlineFsck=*/true);
+  ASSERT_NE(nullptr, bundle.store);
+
+  auto parent = bundle.overlay->allocateInodeNumber();
+  bundle.overlay->saveOverlayDir(
+      parent, DirContents{kPathMapDefaultCaseSensitive});
+  ASSERT_TRUE(bundle.overlay->hasOverlayDir(parent));
+
+  bundle.overlay->recursivelyRemoveOverlayDir(parent);
+  bundle.overlay->flushPendingAsync().get();
+  EXPECT_FALSE(bundle.overlay->hasOverlayDir(parent));
 
   bundle.overlay->close();
 }
@@ -1665,6 +2196,31 @@ TEST(WalCompactionTest, compactsWhenRngHits) {
   bundle.overlay->close();
 }
 
+TEST(WalCompactionTest, zeroMultiplierWithoutMinimumThreshold) {
+  folly::test::TemporaryDirectory tmp("eden_wal_compact");
+  auto dir = canonicalPath(tmp.path().string());
+  auto bundle = makeWalLifecycleOverlay(
+      dir,
+      kPathMapDefaultCaseSensitive,
+      /*walMinCompactionThreshold=*/0,
+      /*cacheWalFiles=*/true,
+      /*useWal=*/true,
+      /*writeWalV2=*/false,
+      /*onlineFsck=*/false,
+      /*walCompactionMultiplier=*/0);
+  ASSERT_NE(nullptr, bundle.store);
+  OverlayTestHelper::setWalCompactionRng(*bundle.overlay, [] { return 7u; });
+
+  auto parent = bundle.overlay->allocateInodeNumber();
+  DirContents content(kPathMapDefaultCaseSensitive);
+  bundle.store->appendWalEntry(
+      parent, WalOpType::REMOVE, PathComponentPiece{"x"}, nullptr);
+  OverlayTestHelper::maybeCompactWal(*bundle.overlay, parent, content);
+  EXPECT_FALSE(bundle.store->hasWal(parent));
+
+  bundle.overlay->close();
+}
+
 TEST(WalCompactionTest, smallDirectoryUsesMinimumThreshold) {
   folly::test::TemporaryDirectory tmp("eden_wal_compact");
   auto dir = canonicalPath(tmp.path().string());
@@ -1695,7 +2251,6 @@ TEST(WalCompactionTest, nonWalCatalogDoesNotInvokeRng) {
       path,
       kPathMapDefaultCaseSensitive,
       InodeCatalogType::LegacyEphemeral,
-      kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
@@ -1725,7 +2280,6 @@ TEST(PlainOverlayTest, inMemoryRequiresWindows) {
           canonicalPath(testDir.path().string()),
           kPathMapDefaultCaseSensitive,
           InodeCatalogType::InMemory,
-          kInodeCatalogOptions,
           makeTestEdenFsEventsLogger(),
           /*errorLogger=*/noopErrorLogger,
           makeRefPtr<EdenStats>(),
@@ -1809,6 +2363,126 @@ TEST(OverlayLoadWalTest, loadAppliesDelta) {
   bundle.overlay->close();
 }
 
+TEST(OverlayLoadTest, onlineFsckArchivesAndRepairsDirectoryPrefix) {
+  folly::test::TemporaryDirectory tmp("eden_online_fsck_dir");
+  auto root = canonicalPath(tmp.path().string());
+  auto dir = root + "overlay"_pc;
+  ASSERT_TRUE(folly::fs::create_directory(dir.asString()));
+  auto bundle = makeWalLifecycleOverlay(
+      dir,
+      kPathMapDefaultCaseSensitive,
+      0,
+      /*cacheWalFiles=*/true,
+      /*useWal=*/true,
+      /*writeWalV2=*/false,
+      /*onlineFsck=*/true);
+  ASSERT_NE(nullptr, bundle.store);
+
+  auto parent = bundle.overlay->allocateInodeNumber();
+  auto child = bundle.overlay->allocateInodeNumber();
+  DirContents base(kPathMapDefaultCaseSensitive);
+  base.emplace("kept"_pc, S_IFREG | 0644, child);
+  bundle.overlay->saveOverlayDir(parent, base);
+
+  auto path = bundle.store->getAbsoluteFilePath(parent);
+  std::string contents;
+  ASSERT_TRUE(folly::readFile(path.c_str(), contents));
+  contents.push_back('\0');
+  ASSERT_TRUE(folly::writeFile(contents, path.c_str()));
+
+  auto loaded = bundle.overlay->loadOverlayDir(parent);
+  EXPECT_NE(loaded.end(), loaded.find("kept"_pc));
+  EXPECT_TRUE(folly::fs::is_directory((root + "fsck"_pc).asString()));
+  EXPECT_NO_THROW(bundle.overlay->loadOverlayDir(parent));
+
+  bundle.overlay->close();
+}
+
+TEST(OverlayLoadTest, onlineFsckArchivesBeforeDroppingInvalidDirectoryEntry) {
+  folly::test::TemporaryDirectory tmp("eden_online_fsck_bad_entry");
+  auto root = canonicalPath(tmp.path().string());
+  auto dir = root + "overlay"_pc;
+  ASSERT_TRUE(folly::fs::create_directory(dir.asString()));
+  auto bundle = makeWalLifecycleOverlay(
+      dir,
+      kPathMapDefaultCaseSensitive,
+      0,
+      /*cacheWalFiles=*/true,
+      /*useWal=*/true,
+      /*writeWalV2=*/false,
+      /*onlineFsck=*/true);
+  ASSERT_NE(nullptr, bundle.store);
+
+  auto parent = bundle.overlay->allocateInodeNumber();
+  auto child = bundle.overlay->allocateInodeNumber();
+  bundle.overlay->getRawInodeCatalog()->saveOverlayEntries(
+      parent, 1, [&](InodeCatalog::OverlayEntryVisitor visitor) {
+        overlay::OverlayEntry entry;
+        entry.mode() = 0xffffffff;
+        entry.inodeNumber() = child.get();
+        visitor("bad-mode", entry);
+      });
+
+  EXPECT_TRUE(bundle.overlay->loadOverlayDir(parent).empty());
+  EXPECT_TRUE(folly::fs::is_directory((root + "fsck"_pc).asString()));
+  auto rewritten = bundle.overlay->getRawInodeCatalog()->loadOverlayDir(parent);
+  ASSERT_TRUE(rewritten.has_value());
+  EXPECT_TRUE(rewritten->entries()->empty());
+
+  bundle.overlay->close();
+}
+
+TEST(OverlayLoadTest, onlineFsckArchivesAndRepairsWalPrefix) {
+  folly::test::TemporaryDirectory tmp("eden_online_fsck_wal");
+  auto root = canonicalPath(tmp.path().string());
+  auto dir = root + "overlay"_pc;
+  ASSERT_TRUE(folly::fs::create_directory(dir.asString()));
+  auto bundle = makeWalLifecycleOverlay(
+      dir,
+      kPathMapDefaultCaseSensitive,
+      0,
+      /*cacheWalFiles=*/true,
+      /*useWal=*/true,
+      /*writeWalV2=*/false,
+      /*onlineFsck=*/true);
+  ASSERT_NE(nullptr, bundle.store);
+
+  auto parent = bundle.overlay->allocateInodeNumber();
+  bundle.overlay->saveOverlayDir(
+      parent, DirContents{kPathMapDefaultCaseSensitive});
+  overlay::OverlayEntry entry;
+  entry.mode() = S_IFREG | 0644;
+  entry.inodeNumber() = bundle.overlay->allocateInodeNumber().get();
+  auto walPath = FsFileContentStore::getWalPath(parent);
+  auto fullWalPath = dir + RelativePathPiece{walPath.c_str()};
+  auto appendTornWal = [&] {
+    bundle.store->appendWalEntry(parent, WalOpType::ADD, "kept"_pc, &entry);
+    bundle.store->appendWalEntry(parent, WalOpType::ADD, "dropped"_pc, &entry);
+    std::string wal;
+    ASSERT_TRUE(folly::readFile(fullWalPath.c_str(), wal));
+    ASSERT_GT(wal.size(), 3u);
+    ASSERT_TRUE(
+        folly::writeFile(wal.substr(0, wal.size() - 3), fullWalPath.c_str()));
+  };
+  appendTornWal();
+
+  auto loaded = bundle.overlay->loadOverlayDir(parent);
+  EXPECT_NE(loaded.end(), loaded.find("kept"_pc));
+  EXPECT_EQ(loaded.end(), loaded.find("dropped"_pc));
+  EXPECT_FALSE(bundle.store->hasWal(parent));
+  EXPECT_TRUE(folly::fs::is_directory((root + "fsck"_pc).asString()));
+
+  // Simulate a crash after publishing the recovered base but before removing
+  // the old WAL. Replaying that stale delta must leave the recovery intact.
+  appendTornWal();
+  auto reloaded = bundle.overlay->loadOverlayDir(parent);
+  EXPECT_NE(reloaded.end(), reloaded.find("kept"_pc));
+  EXPECT_EQ(reloaded.end(), reloaded.find("dropped"_pc));
+  EXPECT_FALSE(bundle.store->hasWal(parent));
+
+  bundle.overlay->close();
+}
+
 // A WAL ADD the Overlay cannot represent, because its inode number was never
 // allocated or its mode has bits DirEntry cannot hold, is dropped from the
 // merged directory instead of aborting on the DirEntry or visitDirEntries
@@ -1862,6 +2536,11 @@ TEST_F(OverlayLoadCorruptWalTest, dropsAddWithInvalidMode) {
       "bogus"_pc,
       0x0f000000 | S_IFREG | 0644,
       bundle_.overlay->allocateInodeNumber().get());
+  expectOnlyBaseEntrySurvives();
+}
+
+TEST_F(OverlayLoadCorruptWalTest, dropsSelfReferencingAdd) {
+  appendAdd("bogus"_pc, S_IFREG | 0644, parent_.get());
   expectOnlyBaseEntrySurvives();
 }
 
@@ -2048,7 +2727,6 @@ TEST(WalAddRemoveChildTest, addChildFallsBackToFullSaveWhenWalDisabled) {
       dir,
       kPathMapDefaultCaseSensitive,
       kInodeCatalogType,
-      kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
@@ -2886,7 +3564,6 @@ TEST(WalRenameTest, missingDestinationGuardCanBeDisabledAfterReload) {
         dir,
         kPathMapDefaultCaseSensitive,
         kInodeCatalogType,
-        kInodeCatalogOptions,
         makeTestEdenFsEventsLogger(),
         errorLogger,
         makeRefPtr<EdenStats>(),
@@ -2942,7 +3619,7 @@ TEST(WalRenameTest, missingDestinationGuardCanBeDisabledAfterReload) {
   }
 }
 
-TEST(WalRenameTest, destinationCompactionWriteFailurePreservesSource) {
+TEST(WalRenameTest, destinationCompactionWriteFailureKeepsTheRename) {
   folly::test::TemporaryDirectory tmp("eden_wal_rename_compaction_failure");
   const auto dir = canonicalPath(tmp.path().string());
   auto bundle = makeWalLifecycleOverlay(dir);
@@ -2960,27 +3637,26 @@ TEST(WalRenameTest, destinationCompactionWriteFailurePreservesSource) {
   // A directory at the temporary file path makes only the destination's
   // compaction write fail, even when the test runs with elevated privileges.
   const auto blocker = overlayDirTempFilePath(tmp.path(), dst);
-  ASSERT_TRUE(boost::filesystem::create_directory(blocker));
+  ASSERT_TRUE(folly::fs::create_directory(blocker));
   OverlayTestHelper::setWalCompactionRng(*bundle.overlay, [] { return 0u; });
   srcContent.erase("source"_pc);
   EXPECT_THROW(
       bundle.overlay->renameChild(
           src, dst, "source"_pc, "target"_pc, srcContent, dstContent),
       std::system_error);
+  // Both appends are on disk by the time the compaction fails, so the WAL
+  // files hold the whole rename and nothing in the caller's directories is
+  // out of step with them.
   EXPECT_TRUE(bundle.store->hasWal(dst));
-  EXPECT_FALSE(bundle.store->hasWal(src));
+  EXPECT_TRUE(bundle.store->hasWal(src));
   bundle.overlay->close();
-  ASSERT_TRUE(boost::filesystem::remove(blocker));
+  ASSERT_TRUE(folly::fs::remove(blocker));
 
   auto reopened = makeWalLifecycleOverlay(dir);
   const auto loadedSrc = reopened.overlay->loadOverlayDir(src);
   const auto loadedDst = reopened.overlay->loadOverlayDir(dst);
-  ASSERT_EQ(1u, loadedSrc.size());
+  EXPECT_TRUE(loadedSrc.empty());
   ASSERT_EQ(1u, loadedDst.size());
-  const auto source = loadedSrc.find("source"_pc);
-  ASSERT_NE(loadedSrc.end(), source);
-  EXPECT_EQ(child, source->second.getInodeNumber());
-  EXPECT_EQ(id, source->second.getObjectId());
   const auto target = loadedDst.find("target"_pc);
   ASSERT_NE(loadedDst.end(), target);
   EXPECT_EQ(child, target->second.getInodeNumber());
@@ -3000,7 +3676,6 @@ TEST(WalRenameTest, fallsBackWhenWalDisabled) {
       dir,
       kPathMapDefaultCaseSensitive,
       kInodeCatalogType,
-      kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
@@ -3058,7 +3733,6 @@ TEST(WalMaterializeChildTest, fallsBackToFullSaveWhenWalDisabled) {
       dir,
       kPathMapDefaultCaseSensitive,
       kInodeCatalogType,
-      kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),

@@ -51,7 +51,6 @@ external_commands![
     cmdstatus,
     cmdversion,
     cmdwhereami,
-    #[cfg(feature = "eden")]
     cmdworktree,
     cmddebugargs,
     cmddebugconfigtree,
@@ -84,7 +83,7 @@ external_commands![
     cmddebugwait,
     cmddebugwalkdetector,
     // [[[end]]]
-    #[cfg(all(feature = "cas", fbcode_build))]
+    #[cfg(all(feature = "debugcas", fbcode_build))]
     cmddebugcas,
 ];
 

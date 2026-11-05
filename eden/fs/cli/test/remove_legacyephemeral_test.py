@@ -64,10 +64,10 @@ class RemoveLegacyEphemeralCheckoutsTest(unittest.TestCase):
         checkout3 = instance.create_test_mount("mount3")
 
         config1 = checkout1.get_config()
-        checkout1.save_config(config1._replace(inode_catalog_type="sqlite"))
+        checkout1.save_config(config1._replace(inode_catalog_type="legacy"))
 
         config2 = checkout2.get_config()
-        checkout2.save_config(config2._replace(inode_catalog_type="lmdb"))
+        checkout2.save_config(config2._replace(inode_catalog_type="legacy"))
 
         config3 = checkout3.get_config()
         checkout3.save_config(config3._replace(inode_catalog_type=None))
@@ -149,13 +149,13 @@ class RemoveLegacyEphemeralCheckoutsTest(unittest.TestCase):
         checkout1.save_config(config1._replace(inode_catalog_type="legacyephemeral"))
 
         config2 = checkout2.get_config()
-        checkout2.save_config(config2._replace(inode_catalog_type="sqlite"))
+        checkout2.save_config(config2._replace(inode_catalog_type="legacy"))
 
         config3 = checkout3.get_config()
         checkout3.save_config(config3._replace(inode_catalog_type="legacyephemeral"))
 
         config4 = checkout4.get_config()
-        checkout4.save_config(config4._replace(inode_catalog_type="lmdb"))
+        checkout4.save_config(config4._replace(inode_catalog_type="legacy"))
 
         unmount_calls, destroy_mount_calls = self._add_mock_methods(instance)
 

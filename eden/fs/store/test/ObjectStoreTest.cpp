@@ -5,11 +5,13 @@
  * GNU General Public License version 2.
  */
 
+#include <folly/executors/GlobalExecutor.h>
 #include <folly/test/TestUtils.h>
 #include <gtest/gtest.h>
 #include <re2/re2.h>
 
 #include <array>
+#include <stdexcept>
 
 #include <fb303/ServiceData.h>
 #include <folly/coro/GtestHelpers.h>
@@ -65,7 +67,8 @@ struct ObjectStoreTest : public ::testing::TestWithParam<CaseSensitivity> {
         std::make_shared<ProcessInfoCache>(),
         makeTestEdenFsEventsLogger(),
         std::make_shared<ReloadableConfig>(EdenConfig::createTestEdenConfig()),
-        GetParam());
+        GetParam(),
+        folly::getGlobalCPUExecutor());
 
     auto configWithBlake3Key = EdenConfig::createTestEdenConfig();
     configWithBlake3Key->blake3Key.setStringValue(
@@ -79,7 +82,8 @@ struct ObjectStoreTest : public ::testing::TestWithParam<CaseSensitivity> {
         std::make_shared<ProcessInfoCache>(),
         makeTestEdenFsEventsLogger(),
         std::make_shared<ReloadableConfig>(configWithBlake3Key),
-        GetParam());
+        GetParam(),
+        folly::getGlobalCPUExecutor());
 
     auto configWithTreeAuxPrefetching = EdenConfig::createTestEdenConfig();
     fakeBackingStoreWithTreeAuxPrefetching =
@@ -91,7 +95,8 @@ struct ObjectStoreTest : public ::testing::TestWithParam<CaseSensitivity> {
         std::make_shared<ProcessInfoCache>(),
         makeTestEdenFsEventsLogger(),
         std::make_shared<ReloadableConfig>(configWithTreeAuxPrefetching),
-        GetParam());
+        GetParam(),
+        folly::getGlobalCPUExecutor());
 
     readyBlobId = putReadyBlob("readyblob");
     readyTreeId = putReadyTree();
@@ -220,7 +225,68 @@ struct ObjectStoreTest : public ::testing::TestWithParam<CaseSensitivity> {
   ObjectId readyTreeId;
 };
 
+class ThrowingWalkDetector final : public WalkDetector {
+ public:
+  void witnessFileRead(
+      const ObjectId&,
+      ObjectFetchContext::Origin,
+      OptionalProcessId,
+      std::optional<ObjectFetchContext::DirEntryCounts>) override {
+    throw std::runtime_error("walk detector failure");
+  }
+  void witnessTreeRead(
+      const ObjectId&,
+      const Tree&,
+      ObjectFetchContext::Origin,
+      OptionalProcessId) override {
+    throw std::runtime_error("walk detector failure");
+  }
+  void witnessDirectorySize(
+      RelativePathPiece,
+      ObjectFetchContext::DirEntryCounts) override {}
+  void workingCopyParentHint(const RootId&) override {}
+};
+
 } // namespace
+
+TEST_P(ObjectStoreTest, fetches_survive_a_throwing_walk_detector) {
+  auto store = ObjectStore::create(
+      fakeBackingStore,
+      treeCache,
+      stats.copy(),
+      std::make_shared<ProcessInfoCache>(),
+      makeTestEdenFsEventsLogger(),
+      std::make_shared<ReloadableConfig>(EdenConfig::createTestEdenConfig()),
+      GetParam(),
+      folly::getGlobalCPUExecutor(),
+      std::make_shared<ThrowingWalkDetector>());
+  EXPECT_NE(store->getBlob(readyBlobId, context).get(0ms), nullptr);
+  EXPECT_NE(store->getTree(readyTreeId, context).get(0ms), nullptr);
+}
+
+TEST_P(ObjectStoreTest, inode_gc_fetches_are_not_witnessed) {
+  auto detector = std::make_shared<FakeWalkDetector>();
+  auto store = ObjectStore::create(
+      fakeBackingStore,
+      treeCache,
+      stats.copy(),
+      std::make_shared<ProcessInfoCache>(),
+      makeTestEdenFsEventsLogger(),
+      std::make_shared<ReloadableConfig>(EdenConfig::createTestEdenConfig()),
+      GetParam(),
+      folly::getGlobalCPUExecutor(),
+      detector);
+
+  auto gcContext = ObjectFetchContext::getNullInodeGcContext();
+  store->getTree(readyTreeId, gcContext).get(0ms);
+  store->getBlob(readyBlobId, gcContext).get(0ms);
+  EXPECT_TRUE(detector->treeReads().empty());
+  EXPECT_TRUE(detector->fileReads().empty());
+
+  store->getBlob(readyBlobId, ObjectFetchContext::getNullFsContext()).get(0ms);
+  EXPECT_EQ(std::vector<ObjectId>{readyBlobId}, detector->fileReads());
+}
+
 TEST_P(ObjectStoreTest, getBlob_tracks_backing_store_read) {
   objectStore->getBlob(readyBlobId, context).get(0ms);
   ASSERT_EQ(1, loggingContext->requests.size());
@@ -478,7 +544,8 @@ TEST_P(ObjectStoreTest, getTree_prefetchUsesTreeCacheWhenBypassDisabled) {
       std::make_shared<ProcessInfoCache>(),
       makeTestEdenFsEventsLogger(),
       std::make_shared<ReloadableConfig>(config),
-      GetParam());
+      GetParam(),
+      folly::getGlobalCPUExecutor());
   auto prefetchContext = ObjectFetchContext::getNullPrefetchContext();
 
   cachingObjectStore->getTree(readyTreeId, prefetchContext).get(0ms);
@@ -758,7 +825,8 @@ TEST_P(ObjectStoreTest, get_tree_with_different_sensitivities) {
       std::make_shared<ProcessInfoCache>(),
       makeTestEdenFsEventsLogger(),
       std::make_shared<ReloadableConfig>(EdenConfig::createTestEdenConfig()),
-      getOppositeCaseSensitivity());
+      getOppositeCaseSensitivity(),
+      folly::getGlobalCPUExecutor());
 
   auto blobOne = putReadyBlob("foo content");
   auto blobTwo = putReadyBlob("bar content");
@@ -917,7 +985,8 @@ struct ObjectStoreCheckPermissionTest : public ::testing::Test {
         std::make_shared<ProcessInfoCache>(),
         makeTestEdenFsEventsLogger(),
         edenConfig,
-        CaseSensitivity::Sensitive);
+        CaseSensitivity::Sensitive,
+        folly::getGlobalCPUExecutor());
   }
 
   void setTtlSeconds(uint64_t seconds) {

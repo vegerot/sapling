@@ -83,6 +83,13 @@ export const diffSummary = atomFamilyWeak((diffId: DiffId | undefined) =>
   }),
 );
 
+// A push merges into the existing map, so most diffs keep their summary object. Handing those the
+// same result object lets jotai stop there, instead of re-rendering every badge and re-asking for
+// every diff's signal count on each push.
+const NO_SUMMARY: Result<DiffSummary | undefined> = {value: undefined};
+const summaryResults = new WeakMap<DiffSummary, Result<DiffSummary | undefined>>();
+const errorResults = new WeakMap<Error, Result<DiffSummary | undefined>>();
+
 /** A diff's last known summary, or the fetch error if there is none to show. */
 function summaryOrFetchError(
   all: DiffSummariesState,
@@ -91,9 +98,26 @@ function summaryOrFetchError(
   const summary = all.value?.get(diffId);
   const error = diffFetchError(all, diffId);
   if (summary == null && error != null) {
-    return {error};
+    return memoizedResult(errorResults, error, () => ({error}));
   }
-  return {value: summary};
+  if (summary == null) {
+    return NO_SUMMARY;
+  }
+  return memoizedResult(summaryResults, summary, () => ({value: summary}));
+}
+
+function memoizedResult<K extends object>(
+  cache: WeakMap<K, Result<DiffSummary | undefined>>,
+  key: K,
+  make: () => Result<DiffSummary | undefined>,
+): Result<DiffSummary | undefined> {
+  const cached = cache.get(key);
+  if (cached != null) {
+    return cached;
+  }
+  const result = make();
+  cache.set(key, result);
+  return result;
 }
 
 /** The error that speaks for one diff: its own if failures are tracked per diff, else the fetch's. */
@@ -119,7 +143,7 @@ export function isSignalSummaryActionable(summary: DiffSignalSummary | undefined
 
 /**
  * Whether the diff for `diffId` has actionable signals, based on `diffSummary`.
- * Shared predicate for SmartActionsMenu, actionConfigs, and any other
+ * Shared predicate for smart action configs and any other
  * summary-based gating. Uses `readAtom` so it can be called outside React
  * (e.g. in `actionConfigs.shouldShow`).
  */
@@ -376,6 +400,10 @@ const handleVisibilityChange = () => {
   writeAtom(pageVisibility, oldValue => {
     if (oldValue !== newValue && newValue === 'hidden') {
       clearTrackedCache();
+    }
+    if (oldValue !== newValue && newValue === 'focused') {
+      serverAPI.postMessage({type: 'fetchDiffSummaries', force: true});
+      tracker.track('DiffFetchSource', {extras: {source: 'webview_focus'}});
     }
     return newValue;
   });

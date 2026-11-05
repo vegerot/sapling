@@ -8,6 +8,7 @@ edition = "2024"
 homepage = "https://sapling-scm.com/"
 repository = "https://github.com/facebook/sapling"
 license = "MIT"
+exclude = ["BUCK"]
 
 [lib]
 name = "udsipc"
@@ -15,7 +16,7 @@ name = "udsipc"
 [dependencies]
 anyhow = "1.0.104"
 fn-error-context = "0.2"
-fs-err = { version = "3.3.1", features = ["tokio"] }
+fs-err = "3.3.2"
 sapling-nodeipc = { version = "0.1.0", path = "../nodeipc" }
 
 [target.'cfg(target_os = "windows")'.dependencies]

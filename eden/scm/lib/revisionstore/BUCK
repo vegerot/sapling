@@ -17,14 +17,6 @@ sl_rust_library(
                 "fb": [],
                 "for-tests": [],
             },
-            "lib": {"name": "revisionstore"},
-            "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
-                "license": "MIT",
-                "name": "sapling-revisionstore",
-                "repository": "https://github.com/facebook/sapling",
-            },
         },
     },
     crate = "revisionstore",
@@ -97,6 +89,7 @@ sl_rust_library(
         "//eden/scm/lib/storemodel:storemodel",
         "//eden/scm/lib/types:types",
         "//eden/scm/lib/util:util",
+        "//eden/scm/lib/util/bytescan:bytescan",
         "//eden/scm/lib/util/format-util:format-util",
         "//eden/scm/lib/util/redacted:redacted",
         "//eden/scm/lib/util/try-once-lock:try-once-lock",
@@ -110,13 +103,8 @@ sl_rust_library(
     srcs = glob(["types/**/*.rs"]),
     autocargo = {
         "cargo_toml_config": {
-            "lib": {"name": "revisionstore_types"},
             "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
-                "license": "MIT",
                 "name": "sapling-revisionstore_types",
-                "repository": "https://github.com/facebook/sapling",
             },
         },
         "cargo_toml_dir": "types",

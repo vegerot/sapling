@@ -14,12 +14,15 @@
 #include <folly/logging/xlog.h>
 #include <folly/portability/OpenSSL.h>
 
+#include "eden/common/utils/FaultInjector.h"
 #include "eden/fs/digest/Blake3.h"
+#include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/FileInode.h"
 #include "eden/fs/inodes/InodeError.h"
 #include "eden/fs/inodes/InodePtr.h"
 #include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/inodes/OverlayFile.h"
+#include "eden/fs/inodes/ServerState.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/model/Blob.h"
 #include "eden/fs/telemetry/EdenErrorInfoBuilder.h"
@@ -165,7 +168,16 @@ FileOffset OverlayFileAccess::getFileSize(FileInode& inode) {
 }
 
 FileOffset OverlayFileAccess::getFileSize(InodeNumber ino, InodeBase* inode) {
-  auto entry = getEntryForInode(ino);
+  EntryPtr entry;
+  try {
+    entry = getEntryForInode(ino);
+  } catch (const std::system_error& ex) {
+    if (ex.code() != std::errc::no_such_file_or_directory) {
+      throw;
+    }
+    throw OverlayFileCorruption(
+        ENOENT, inode ? inode->inodePtrFromThis() : InodePtr{}, ex.what());
+  }
   uint64_t version;
   {
     auto info = entry->info.rlock();
@@ -198,7 +210,7 @@ FileOffset OverlayFileAccess::getFileSize(InodeNumber ino, InodeBase* inode) {
           ino,
           st.st_size);
     }
-    throw InodeError(
+    throw OverlayFileCorruption(
         EIO,
         inode ? inode->inodePtrFromThis() : InodePtr{},
         "corrupt overlay file");
@@ -299,17 +311,12 @@ std::string OverlayFileAccess::readAllContents(FileInode& inode) {
   // TODO: implement readFile with pread instead of lseek.
   auto info = entry->info.wlock();
 
-  // Both LegacyInodeCatalog and LegacyDev use header files
-  if (overlay_->getInodeCatalogType() == InodeCatalogType::Legacy ||
-      overlay_->getInodeCatalogType() == InodeCatalogType::LegacyDev ||
-      overlay_->getInodeCatalogType() == InodeCatalogType::LegacyEphemeral) {
-    auto rc = entry->file.lseek(FsFileContentStore::kHeaderLength, SEEK_SET);
-    if (rc.hasError()) {
-      throw InodeError(
-          rc.error(),
-          inode.inodePtrFromThis(),
-          "unable to seek in materialized FileInode");
-    }
+  auto rc = entry->file.lseek(FsFileContentStore::kHeaderLength, SEEK_SET);
+  if (rc.hasError()) {
+    throw InodeError(
+        rc.error(),
+        inode.inodePtrFromThis(),
+        "unable to seek in materialized FileInode");
   }
   auto result = entry->file.readFile();
 
@@ -345,6 +352,8 @@ size_t OverlayFileAccess::write(
     const struct iovec* iov,
     size_t iovcnt,
     FileOffset off) {
+  inode.getMount()->getServerState()->getFaultInjector().check(
+      "overlay-write", inode.getNodeId());
   auto entry = getEntryForInode(inode.getNodeId());
 
   auto xfer =

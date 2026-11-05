@@ -15,6 +15,7 @@
 #include <folly/logging/xlog.h>
 
 #include "eden/common/utils/Bug.h"
+#include "eden/common/utils/FaultInjector.h"
 #include "eden/common/utils/SystemError.h"
 #include "eden/common/utils/TimeUtil.h"
 #include "eden/fs/config/EdenConfig.h"
@@ -25,6 +26,7 @@
 #include "eden/fs/inodes/ParentInodeInfo.h"
 #include "eden/fs/inodes/ServerState.h"
 #include "eden/fs/inodes/TreeInode.h"
+#include "eden/fs/telemetry/EdenErrorInfo.h"
 #include "eden/fs/telemetry/EdenErrorInfoBuilder.h"
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
@@ -45,11 +47,11 @@ InodeMap::UnloadedInode::UnloadedInode(
     InodeNumber parentNum,
     PathComponentPiece entryName,
     mode_t mode,
-    EdenTimestamp lastFsRequestTime)
+    EdenTimestamp lastGcRefTime)
     : parent(parentNum),
       name(entryName),
       mode{mode},
-      lastFsRequestTime{lastFsRequestTime} {}
+      lastGcRefTime{lastGcRefTime} {}
 
 InodeMap::UnloadedInode::UnloadedInode(
     InodeNumber parentNum,
@@ -58,13 +60,13 @@ InodeMap::UnloadedInode::UnloadedInode(
     mode_t mode,
     std::optional<ObjectId> id,
     uint32_t fsRefcount,
-    EdenTimestamp lastFsRequestTime)
+    EdenTimestamp lastGcRefTime)
     : parent(parentNum),
       name(entryName),
       isUnlinked{isUnlinked},
       mode{mode},
       id{std::move(id)},
-      lastFsRequestTime{lastFsRequestTime},
+      lastGcRefTime{lastGcRefTime},
       numFsReferences{fsRefcount} {
   if (folly::kIsWindows) {
     XDCHECK_LE(numFsReferences, 1u);
@@ -82,7 +84,7 @@ InodeMap::UnloadedInode::UnloadedInode(
       isUnlinked{isUnlinked},
       mode{inode->getMode()},
       id{inode->getObjectId()},
-      lastFsRequestTime{inode->getLastFsRequestTime()},
+      lastGcRefTime{inode->getLastGcRefTime()},
       numFsReferences{fsRefcount} {
   if (folly::kIsWindows) {
     XDCHECK_LE(numFsReferences, 1u);
@@ -91,6 +93,14 @@ InodeMap::UnloadedInode::UnloadedInode(
 
 InodeType InodeMap::UnloadedInode::getInodeType() const {
   return S_ISDIR(mode) ? InodeType::TREE : InodeType::FILE;
+}
+
+bool InodeMap::UnloadedInode::matchesLinkedChild(
+    InodeNumber parentNumber,
+    PathComponentPiece entryName,
+    mode_t initialMode) const {
+  return parent == parentNumber && name == entryName && !isUnlinked &&
+      (mode & S_IFMT) == (initialMode & S_IFMT);
 }
 
 InodeMap::InodeMap(
@@ -124,7 +134,11 @@ inline void InodeMap::insertLoadedInode(
     const folly::Synchronized<Members>::LockedPtr& data,
     InodeBase* inode) {
   auto ret = data->loadedInodes_.emplace(inode->getNodeId(), inode);
-  XCHECK(ret.second);
+  XCHECK(ret.second) << fmt::format(
+      "inode {} is already loaded as {} while inserting {}",
+      inode->getNodeId(),
+      ret.first->second->getLogPath(),
+      inode->getLogPath());
   if (inode->getType() == dtype_t::Dir) {
     ++data->numTreeInodes_;
   } else {
@@ -300,7 +314,9 @@ void InodeMap::initializeFromOverlay(TreeInodePtr root, Overlay& overlay) {
       data->unloadedInodes_.size());
 }
 
-ImmediateFuture<InodePtr> InodeMap::lookupInode(InodeNumber number) {
+ImmediateFuture<InodePtr> InodeMap::lookupInode(
+    InodeNumber number,
+    const ObjectFetchContextPtr& context) {
   // Nearly every lookup is for an already loaded inode and mutates nothing, so
   // it must not serialize behind the write lock that starting a load needs.
   if (auto inode = lookupLoadedInode(number)) {
@@ -399,7 +415,8 @@ ImmediateFuture<InodePtr> InodeMap::lookupInode(InodeNumber number) {
           isUnlinked,
           childInodeNumber,
           optionalId,
-          mode);
+          mode,
+          context);
       return result;
     }
 
@@ -439,7 +456,8 @@ ImmediateFuture<InodePtr> InodeMap::lookupInode(InodeNumber number) {
         unloadedData->isUnlinked,
         childInodeNumber,
         unloadedData->id,
-        unloadedData->mode);
+        unloadedData->mode,
+        context);
 
     if (alreadyLoading) {
       // This parent is already being loaded.
@@ -463,15 +481,18 @@ void InodeMap::setupParentLookupPromise(
     bool isUnlinked,
     InodeNumber childInodeNumber,
     std::optional<ObjectId> id,
-    mode_t mode) {
+    mode_t mode,
+    const ObjectFetchContextPtr& context) {
   promise.getFuture()
       .thenValue([name = PathComponent(childName),
                   this,
                   isUnlinked,
                   childInodeNumber,
                   id,
-                  mode](const InodePtr& inode) {
-        startChildLookup(inode, name, isUnlinked, childInodeNumber, id, mode);
+                  mode,
+                  context = context.copy()](const InodePtr& inode) {
+        startChildLookup(
+            inode, name, isUnlinked, childInodeNumber, id, mode, context);
       })
       .thenError([this, childInodeNumber](const folly::exception_wrapper& ex) {
         // Fail all pending lookups on the child
@@ -485,7 +506,13 @@ void InodeMap::startChildLookup(
     bool isUnlinked,
     InodeNumber childInodeNumber,
     std::optional<ObjectId> id,
-    mode_t mode) {
+    mode_t mode,
+    const ObjectFetchContextPtr& context) {
+  auto fault = mount_->getServerState()->getFaultInjector().checkTry(
+      "inodemap-load", childInodeNumber);
+  if (fault.hasException()) {
+    return inodeLoadFailed(childInodeNumber, fault.exception());
+  }
   auto treeInode = parent.asTreePtrOrNull();
   if (!treeInode) {
     auto bug = EDEN_BUG_EXCEPTION()
@@ -505,7 +532,7 @@ void InodeMap::startChildLookup(
   // In that case getOrLoadChild() will call startLoadingChildIfNotLoading() to
   // tell if it should continue the load itself, or if the load was already in
   // progress.)
-  treeInode->loadChildInode(childName, childInodeNumber);
+  treeInode->loadChildInode(childName, childInodeNumber, context);
 }
 
 InodeMap::PromiseVector InodeMap::inodeLoadComplete(InodeBase* inode) {
@@ -527,7 +554,7 @@ InodeMap::PromiseVector InodeMap::inodeLoadComplete(InodeBase* inode) {
       swap(promises, it->second.promises);
 
       inode->setChannelRefcount(it->second.numFsReferences);
-      inode->restoreLastFsRequestTime(it->second.lastFsRequestTime);
+      inode->restoreLastGcRefTime(it->second.lastGcRefTime);
 
       // Insert the entry into loadedInodes_ and remove it from unloadedInodes_
       insertLoadedInode(data, inode);
@@ -576,7 +603,8 @@ InodeMap::PromiseVector InodeMap::inodeLoadComplete(InodeBase* inode) {
 
 void InodeMap::inodeLoadFailed(
     InodeNumber number,
-    const folly::exception_wrapper& ex) {
+    const folly::exception_wrapper& ex,
+    bool logAsError) {
   auto promises = extractPendingPromises(number);
   for (auto& promise : promises) {
     promise.setException(ex);
@@ -586,16 +614,19 @@ void InodeMap::inodeLoadFailed(
     mount_->publishInodeTraceEvent(std::move(optionalFailEvent.value()));
   }
 
-  auto outcome = ErrorLogOutcome::Disabled;
-  ex.with_exception([&](const std::exception& e) {
-    outcome = mount_->getServerState()->getErrorLogger().log(
-        EdenErrorInfo::objectStore(ErrorArg::fromExceptionWithoutTrace(e))
-            .withInode(number.getRawValue())
-            .withMountPoint(mount_->getPath().asString())
-            .withErrorType("inode_loading_failed"));
-  });
-  if (outcome != ErrorLogOutcome::RateLimited) {
-    XLOGF(ERR, "failed to load inode {}: {}", number, folly::exceptionStr(ex));
+  if (logAsError) {
+    auto outcome = ErrorLogOutcome::Disabled;
+    ex.with_exception([&](const std::exception& e) {
+      outcome = mount_->getServerState()->getErrorLogger().log(
+          EdenErrorInfo::objectStore(ErrorArg::fromExceptionWithoutTrace(e))
+              .withInode(number.getRawValue())
+              .withMountPoint(mount_->getPath().asString())
+              .withErrorType("inode_loading_failed"));
+    });
+    if (outcome != ErrorLogOutcome::RateLimited) {
+      XLOGF(
+          ERR, "failed to load inode {}: {}", number, folly::exceptionStr(ex));
+    }
   }
   stats_->increment(&InodeMapStats::lookupInodeError, promises.size());
 }
@@ -647,14 +678,20 @@ InodeMap::PromiseVector InodeMap::extractPendingPromises(InodeNumber number) {
   return promises;
 }
 
-ImmediateFuture<TreeInodePtr> InodeMap::lookupTreeInode(InodeNumber number) {
-  return lookupInode(number).thenValue(
-      [](const InodePtr& inode) { return inode.asTreePtr(); });
+ImmediateFuture<TreeInodePtr> InodeMap::lookupTreeInode(
+    InodeNumber number,
+    const ObjectFetchContextPtr& context) {
+  return lookupInode(number, context).thenValue([](const InodePtr& inode) {
+    return inode.asTreePtr();
+  });
 }
 
-ImmediateFuture<FileInodePtr> InodeMap::lookupFileInode(InodeNumber number) {
-  return lookupInode(number).thenValue(
-      [](const InodePtr& inode) { return inode.asFilePtr(); });
+ImmediateFuture<FileInodePtr> InodeMap::lookupFileInode(
+    InodeNumber number,
+    const ObjectFetchContextPtr& context) {
+  return lookupInode(number, context).thenValue([](const InodePtr& inode) {
+    return inode.asFilePtr();
+  });
 }
 
 InodePtr InodeMap::lookupLoadedInode(InodeNumber number) {
@@ -785,13 +822,30 @@ InodePtr InodeMap::decFsRefcountHelper(
   auto unloadedIter = data->unloadedInodes_.find(number);
   if (UNLIKELY(unloadedIter == data->unloadedInodes_.end())) {
     stats_->increment(&InodeMapStats::lookupInodeError);
+    if (mount_->throwEstaleIfInodeIsMissing()) {
+      // Userspace FS peers (NFS, FSKit) can send forgets that violate the
+      // reference contract in ways a kernel client cannot; a misbehaving
+      // peer must never be able to abort the daemon. There is no reply to
+      // a FORGET, so tolerating means ignoring it.
+      stats_->increment(&InodeMapStats::forgetUnknownInode);
+      XLOG_EVERY_MS(WARN, 60000) << fmt::format(
+          "ignoring FORGET for unknown inode {} from userspace FS peer",
+          number);
+      return nullptr;
+    }
     EDEN_BUG() << "InodeMap::decFsRefcount() called on unknown inode number "
                << number;
   }
 
-  // Decrement the reference count in the unloaded entry
+  // Decrement the reference count in the unloaded entry. Only FUSE counts
+  // references, and InodeBase::incFsRefcount counts them only on Linux, so
+  // the same test applies here. The PrjFS invalidation path arrives with the
+  // 0/1 flag that InodeBase::decFsRefcount keeps for loaded inodes, and NFS
+  // only ever clears through forgetStaleInodes(). An inode may be remembered
+  // without a reference, for example while a load is pending, so clear
+  // rather than subtract.
   auto& unloadedEntry = unloadedIter->second;
-  if (clearRefCount) {
+  if (clearRefCount || !folly::kIsLinux) {
     unloadedEntry.numFsReferences = 0;
   } else {
     XCHECK_GE(unloadedEntry.numFsReferences, count);
@@ -1052,7 +1106,7 @@ Future<SerializedInodeMap> InodeMap::shutdown(
       // If entry.id is empty, the inode is materialized.
       serializedEntry.mode() = entry.mode;
       serializedEntry.lastFsRequestTime() =
-          entry.lastFsRequestTime.toSerializedValue();
+          entry.lastGcRefTime.toSerializedValue();
 
       result.unloadedInodes()->emplace_back(std::move(serializedEntry));
     }
@@ -1291,7 +1345,7 @@ optional<InodeMap::UnloadedInode> InodeMap::updateOverlayForUnload(
           S_IFDIR | 0755,
           treeContents.treeId,
           fsCount,
-          asTree->getLastFsRequestTime());
+          asTree->getLastGcRefTime());
     };
 
     // If the fs refcount is non-zero we have to remember this inode.
@@ -1338,18 +1392,34 @@ optional<InodeMap::UnloadedInode> InodeMap::updateOverlayForUnload(
   }
 }
 
-bool InodeMap::startLoadingChildIfNotLoading(
-    const TreeInode* parent,
+InodeMap::ChildLoadResult InodeMap::startLoadingChildIfNotLoading(
+    TreeInode* parent,
     PathComponentPiece name,
     InodeNumber childInode,
     mode_t mode,
-    folly::Promise<InodePtr> promise) {
+    folly::Promise<InodePtr>& promise) {
   bool isFirstPromise;
   std::optional<InodeTraceEvent> startLoadEvent;
   {
     auto data = data_.wlock();
+    if (auto loaded = data->loadedInodes_.find(childInode);
+        loaded != data->loadedInodes_.end()) {
+      auto loadedAs = loaded->second->getLogPath();
+      data.unlock();
+      reportDuplicateEntry(parent, name, childInode, loadedAs);
+      return ChildLoadResult::Conflict;
+    }
     UnloadedInode* unloadedData{nullptr};
     auto iter = data->unloadedInodes_.find(childInode);
+    // The caller holds the parent's contents lock and its DirEntry has no
+    // inode pointer. A loaded inode therefore belongs to a different entry.
+    // Likewise, only the same linked entry may join an in-progress load.
+    // A torn rename can leave two disk entries referring to the same inode;
+    // do not attach the second entry to that inode or its load promises.
+    if (iter != data->unloadedInodes_.end() &&
+        !iter->second.matchesLinkedChild(parent->getNodeId(), name, mode)) {
+      return ChildLoadResult::Conflict;
+    }
     if (iter == data->unloadedInodes_.end()) {
       InodeNumber parentNumber = parent->getNodeId();
       // T127459236: not all attributes of the UnloadedInode are set here. For
@@ -1382,7 +1452,28 @@ bool InodeMap::startLoadingChildIfNotLoading(
   // If this is the very first promise then tell the caller they need
   // to start the load operation.  Otherwise someone else (whoever added the
   // first promise) has already started loading the inode.
-  return isFirstPromise;
+  return isFirstPromise ? ChildLoadResult::Started : ChildLoadResult::Pending;
+}
+
+void InodeMap::reportDuplicateEntry(
+    TreeInode* parent,
+    PathComponentPiece name,
+    InodeNumber childInode,
+    const std::string& loadedAs) {
+  auto message = fmt::format(
+      "inode {} is already loaded as {}; refusing to load it again as {}/{}",
+      childInode,
+      loadedAs,
+      parent->getLogPath(),
+      name.view());
+  auto outcome = mount_->getServerState()->getErrorLogger().log(
+      EdenErrorInfo::overlay(message, childInode.getRawValue())
+          .withMountPoint(mount_->getPath().asString())
+          .withErrorType("duplicate_inode_entry"));
+  if (outcome != ErrorLogOutcome::RateLimited) {
+    XLOGF(ERR, "{}", message);
+  }
+  stats_->increment(&InodeMapStats::lookupInodeError);
 }
 
 void InodeMap::inodeCreated(const InodePtr& inode) {
@@ -1458,7 +1549,7 @@ std::vector<InodeMap::UnloadedInodeGcEntry> InodeMap::getUnloadedChildrenForGc(
     result.push_back(
         UnloadedInodeGcEntry{
             PathComponent{inode.name},
-            inode.lastFsRequestTime,
+            inode.lastGcRefTime,
             inode.numFsReferences});
   }
   return result;

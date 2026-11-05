@@ -8,10 +8,11 @@ edition = "2024"
 homepage = "https://sapling-scm.com/"
 repository = "https://github.com/facebook/sapling"
 license = "MIT"
+exclude = ["BUCK"]
 
 [lib]
 name = "ministate"
 
 [dependencies]
 anyhow = "1.0.104"
-parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard", "serde"] }

@@ -15,6 +15,7 @@ use anyhow::Result;
 use anyhow::bail;
 use fs_err as fs;
 use identity::dotgit::follow_dotgit_path;
+use identity::dotgit::resolve_git_common_dir;
 pub use requirements::Requirements;
 
 /// RepoMinimalInfo contains:
@@ -24,6 +25,33 @@ pub use requirements::Requirements;
 ///
 /// It can be useful by the config loader to decide extra config
 /// per requirement.
+///
+/// Sapling repo example:
+///
+/// ```text
+/// /repos/wc/.sl/sharedpath: /repos/backing/.sl
+///
+/// path:               /repos/wc
+/// shared_path:        /repos/backing
+/// dot_hg_path:        /repos/wc/.sl
+/// shared_dot_hg_path: /repos/backing/.sl
+/// store_path:         /repos/backing/.sl/store
+/// ```
+///
+/// Git repo (worktree) example:
+///
+/// ```text
+/// /repos/topic/.git: gitdir: /repos/main/.git/worktrees/topic
+/// /repos/main/.git/worktrees/topic/commondir: ../..
+///
+/// path:               /repos/topic
+/// shared_path:        /repos/topic (no direct Git equivalent)
+/// GIT_DIR:            /repos/main/.git/worktrees/topic
+/// GIT_COMMON_DIR:     /repos/main/.git
+/// dot_hg_path:        /repos/main/.git/worktrees/topic/sl
+/// shared_dot_hg_path: /repos/main/.git/sl
+/// store_path:         /repos/main/.git/sl/store
+/// ```
 #[derive(Clone)]
 pub struct RepoMinimalInfo {
     pub path: PathBuf,
@@ -51,25 +79,22 @@ impl RepoMinimalInfo {
             None => bail!("repository {} not found!", path.display()),
         };
 
-        let (dot_git_path, dot_hg_path) = if ident.is_dot_git() {
+        let (dot_hg_path, git_common_dir) = if ident.is_dot_git() {
+            // follow_dotgit_path() returns the per-worktree GIT_DIR.
             let dot_git_path = follow_dotgit_path(path.join(".git"));
-            let dot_dir = "sl";
-            let dot_sl_path = dot_git_path.join(dot_dir);
-            (Some(dot_git_path), dot_sl_path)
-        } else if ident.is_dot_repo() {
-            let dot_git_path = path.join(".repo/manifests/.git");
-            let dot_sl_path = path.join(ident.dot_dir());
-            (Some(dot_git_path), dot_sl_path)
+            let git_common_dir = resolve_git_common_dir(&dot_git_path)?;
+            (dot_git_path.join("sl"), Some(git_common_dir))
         } else {
-            (None, path.join(ident.dot_dir()))
+            (path.join(ident.dot_dir()), None)
         };
 
-        let (shared_dot_hg_path, shared_path, shared_ident) =
-            match (read_sharedpath(&dot_hg_path)?, dot_git_path) {
-                (Some((path, ident)), _) => (path.join(ident.dot_dir()), path, ident),
-                (None, None) => (path.join(ident.dot_dir()), path.clone(), ident),
-                (None, Some(_dot_git_path)) => (dot_hg_path.clone(), path.clone(), ident),
-            };
+        let (shared_dot_hg_path, shared_path, shared_ident) = match git_common_dir {
+            Some(git_common_dir) => (git_common_dir.join("sl"), path.clone(), ident),
+            None => match read_sharedpath(&dot_hg_path)? {
+                Some((path, ident)) => (path.join(ident.dot_dir()), path, ident),
+                None => (dot_hg_path.clone(), path.clone(), ident),
+            },
+        };
         let store_path = shared_dot_hg_path.join("store");
 
         let requirements = Requirements::load_repo_requirements(&dot_hg_path)?;
@@ -88,6 +113,27 @@ impl RepoMinimalInfo {
         };
 
         Ok(info)
+    }
+}
+
+// Git-specific path helpers.
+impl RepoMinimalInfo {
+    /// Returns `$GIT_DIR` for git repos.
+    pub fn git_dir(&self) -> Option<&Path> {
+        if self.ident.is_dot_git() {
+            self.dot_hg_path.parent()
+        } else {
+            None
+        }
+    }
+
+    /// Returns `$GIT_COMMON_DIR` for git repos.
+    pub fn git_common_dir(&self) -> Option<&Path> {
+        if self.ident.is_dot_git() {
+            self.shared_dot_hg_path.parent()
+        } else {
+            None
+        }
     }
 }
 

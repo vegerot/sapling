@@ -20,11 +20,14 @@ nom = "8"
 pin-project = "1.1.13"
 qps = { version = "0.1.0", path = "../../servers/slapi/slapi_server/qps" }
 thiserror = "2.0.21"
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
-tokio-util = { version = "0.7.19", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
+tokio-util = { version = "0.7.20", features = ["full"] }
 
 [dev-dependencies]
 maplit = "1.0"
 mercurial_types-mocks = { version = "0.1.0", path = "../../mercurial/types/mocks" }
 mononoke_macros = { version = "0.1.0", path = "../mononoke_macros" }
 quickcheck = "1.1"
+
+[lints]
+workspace = true

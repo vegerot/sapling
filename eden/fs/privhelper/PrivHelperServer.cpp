@@ -108,6 +108,9 @@ constexpr int kRegisteredMountRootOpenFlags = O_PATH | O_DIRECTORY | O_CLOEXEC;
 #ifndef MOUNT_ATTR_RDONLY
 #define MOUNT_ATTR_RDONLY 0x00000001
 #endif
+#ifndef MOUNT_ATTR_NODEV
+#define MOUNT_ATTR_NODEV 0x00000004
+#endif
 #ifndef MOUNT_ATTR_NOSUID
 #define MOUNT_ATTR_NOSUID 0x00000002
 #endif
@@ -177,6 +180,9 @@ folly::File fsOpen(folly::StringPiece fsType) {
 
 folly::File fsMount(int fsFd, bool readOnly) {
   unsigned int mountAttrs = MOUNT_ATTR_NOSUID;
+  if (!disablePrivHelperHardening()) {
+    mountAttrs |= MOUNT_ATTR_NODEV;
+  }
   if (readOnly) {
     mountAttrs |= MOUNT_ATTR_RDONLY;
   }
@@ -275,31 +281,18 @@ void PrivHelperServer::unmountRegisteredMount(
   if (useModernMountApi()) {
     const auto procFdPath =
         fmt::format("/proc/self/fd/{}", registeredMount.rootFd.fd());
-    struct stat st{};
-    // This probes procfs support for an already-open fd before using that fd
-    // path for umount2().
-    //
-    // @lint-ignore CLANGTIDY facebook-hte-BadCall-stat
-    if (stat(procFdPath.c_str(), &st) == 0) {
-      XLOGF(
-          DBG2,
-          "Unmounting registered mount `{}` through `{}`",
-          mountPath,
-          procFdPath);
-      const auto rc =
-          umount2(procFdPath.c_str(), linuxUnmountFlags(options, false));
-      if (rc != 0) {
-        logUnmountError(mountPath.c_str(), errno);
-      }
-      return;
-    }
-
+    // Filesystem errors must not restore authority to the original pathname.
     XLOGF(
         DBG2,
-        "failed to stat {}; falling back to path-based unmount for {}: {}",
-        procFdPath,
+        "Unmounting registered mount `{}` through `{}`",
         mountPath,
-        folly::errnoStr(errno));
+        procFdPath);
+    const auto rc =
+        umount2(procFdPath.c_str(), linuxUnmountFlags(options, false));
+    if (rc != 0) {
+      logUnmountError(mountPath.c_str(), errno);
+    }
+    return;
   }
 #endif
   unmount(mountPath.c_str(), options);
@@ -394,6 +387,36 @@ bool spawnEdenFs(
   }
 }
 } // namespace
+
+PrivHelperOwner resolvePrivHelperOwner(
+    uid_t realUid,
+    gid_t realGid,
+    uid_t cliUid,
+    gid_t cliGid) {
+  if (realUid == 0) {
+    return {cliUid, cliGid};
+  }
+  if (disablePrivHelperHardening()) {
+    XLOGF(
+        WARN,
+        "Privhelper hardening disabled; using CLI owner {}/{} for caller {}/{}",
+        cliUid,
+        cliGid,
+        realUid,
+        realGid);
+    return {cliUid, cliGid};
+  }
+  if (cliUid != realUid || cliGid != realGid) {
+    XLOGF(
+        WARN,
+        "Ignoring CLI privhelper owner {}/{}; caller is {}/{}",
+        cliUid,
+        cliGid,
+        realUid,
+        realGid);
+  }
+  return {realUid, realGid};
+}
 
 PrivHelperServer::PrivHelperServer()
     : spawnEdenFs_{spawnEdenFs}, now_{currentEpochSeconds} {}
@@ -623,11 +646,11 @@ folly::File PrivHelperServer::fuseMount(
       gid_,
       fuseDev.fd());
 
-  // The mount flags.
-  // We do not use MS_NODEV.  MS_NODEV prevents mount points from being created
-  // inside our filesystem.  We currently use bind mounts to point the buck-out
-  // directory to an alternate location outside of eden.
+  // Bind redirections inherit their source flags independently of this mount.
   int mountFlags = MS_NOSUID;
+  if (!disablePrivHelperHardening()) {
+    mountFlags |= MS_NODEV;
+  }
   if (readOnly) {
     mountFlags |= MS_RDONLY;
   }
@@ -899,6 +922,9 @@ void PrivHelperServer::nfsMount(
   mattrFlags |= NFS_MATTR_MNTFLAGS;
   // These are non-NFS specific and will be also passed directly to mount(2)
   nfs_mattr_mntflags mountFlags = MNT_NOSUID;
+  if (!disablePrivHelperHardening()) {
+    mountFlags |= MNT_NODEV;
+  }
   if (options.readOnly) {
     mountFlags |= MNT_RDONLY;
   }
@@ -966,7 +992,8 @@ void PrivHelperServer::nfsMount(
    * guards the syscall: a setuid-root privhelper leaves an EXC_GUARD crash
    * report on every mount, and on macOS 27.2 a non-root privhelper gets EPERM.
    */
-  if (needsFstypeOverride(options)) {
+  if (nfsFstypeOverride_.load(std::memory_order_relaxed) &&
+      needsFstypeOverride(options)) {
     rc = fsctl(
         mountPath.c_str(), FSCTL_SET_FSTYPENAME_OVERRIDE, (void*)"edenfs:", 0);
     if (rc != 0) {
@@ -986,11 +1013,11 @@ void PrivHelperServer::nfsMount(
   }
   auto mountOpts = makeLinuxNfsMountOptions(options);
 
-  // The mount flags.
-  // We do not use MS_NODEV.  MS_NODEV prevents mount points from being created
-  // inside our filesystem.  We currently use bind mounts to point the buck-out
-  // directory to an alternate location outside of eden.
+  // Bind redirections inherit their source flags independently of this mount.
   int mountFlags = MS_NOSUID;
+  if (!disablePrivHelperHardening()) {
+    mountFlags |= MS_NODEV;
+  }
   if (options.readOnly) {
     mountFlags |= MS_RDONLY;
   }
@@ -1208,6 +1235,10 @@ UnixSocket::Message PrivHelperServer::processMountMsg(Cursor& cursor) {
   bool readOnly;
   string vfsType;
   PrivHelperConn::parseMountRequest(cursor, mountPath, readOnly, vfsType);
+  if (!disablePrivHelperHardening() && vfsType != "fuse" &&
+      vfsType != "fuse.edenfs") {
+    folly::throwSystemErrorExplicit(EINVAL, "unsupported FUSE filesystem type");
+  }
   XLOGF(DBG3, "mount \"{}\"", mountPath);
 
 #ifndef __APPLE__
@@ -1627,6 +1658,25 @@ UnixSocket::Message PrivHelperServer::processSetFuseReadAhead(
   return makeResponse();
 }
 
+UnixSocket::Message PrivHelperServer::processSetNfsFstypeOverride(
+    folly::io::Cursor& cursor) {
+  bool enabled = true;
+  PrivHelperConn::parseSetNfsFstypeOverrideRequest(cursor, enabled);
+  nfsFstypeOverride_.store(enabled, std::memory_order_relaxed);
+#ifdef __APPLE__
+  XLOGF(
+      INFO,
+      "NFS filesystem type override {}",
+      enabled ? "enabled" : "disabled");
+#else
+  XLOGF(
+      DBG2,
+      "NFS filesystem type override {} (no effect on this platform)",
+      enabled ? "enabled" : "disabled");
+#endif
+  return makeResponse();
+}
+
 void PrivHelperServer::setMemoryPriorityForProcess(pid_t pid, int priority) {
   auto processPriority = ProcessPriority{priority, uid_};
 
@@ -1702,21 +1752,6 @@ PrivHelperServer::BindUnmountResult PrivHelperServer::bindUnmountByFd(
   // umount2() still takes a path, but this procfs path refers to the already
   // open target fd. Do not pass UMOUNT_NOFOLLOW here: the procfd magic link is
   // the mechanism that converts the fd back to a kernel path for umount2().
-  struct stat st{};
-  // This probes procfs support for an already-open fd before deciding whether
-  // to use the explicit legacy fallback.
-  //
-  // @lint-ignore CLANGTIDY facebook-hte-BadCall-stat
-  if (stat(procFdPath.c_str(), &st) != 0) {
-    XLOGF(
-        DBG2,
-        "failed to stat {}; falling back to path-based unmount for {}: {}",
-        procFdPath,
-        mountPath,
-        folly::errnoStr(errno));
-    return BindUnmountResult::ProcFdUnavailable;
-  }
-
   XLOGF(DBG2, "Unmounting bind mount `{}` through `{}`", mountPath, procFdPath);
   const auto rc = umountBindMountByFd(procFdPath.c_str());
   if (rc != 0 && errno == EINVAL) {
@@ -1744,7 +1779,7 @@ void PrivHelperServer::insecureBindUnmount(const char* mountPath) {
 }
 
 void PrivHelperServer::bindUnmount(
-    const char* mountPath,
+    [[maybe_unused]] const char* mountPath,
     folly::StringPiece mountRoot) {
 #ifndef __APPLE__
   auto targetFd = openBindMountTarget(mountRoot, mountPath);
@@ -1762,8 +1797,9 @@ void PrivHelperServer::bindUnmount(
   }
 #else
   (void)mountRoot;
+  folly::throwSystemErrorExplicit(
+      ENOTSUP, "bind unmounts are not supported on macOS");
 #endif
-  insecureBindUnmount(mountPath);
 }
 
 UnixSocket::Message PrivHelperServer::processSetRestartArgsMsg(Cursor& cursor) {
@@ -2081,6 +2117,12 @@ UnixSocket::Message PrivHelperServer::processMessage(
     case PrivHelperConn::REQ_SET_LOG_FILE:
       return processSetLogFileMsg(cursor, request);
     case PrivHelperConn::REQ_UNMOUNT_BIND:
+#ifdef __APPLE__
+      if (!disablePrivHelperHardening()) {
+        folly::throwSystemErrorExplicit(
+            ENOTSUP, "bind unmounts are not supported on macOS");
+      }
+#endif
       return processBindUnMountMsg(cursor);
     case PrivHelperConn::REQ_SET_DAEMON_TIMEOUT:
     case PrivHelperConn::REQ_SET_USE_EDENFS:
@@ -2103,6 +2145,8 @@ UnixSocket::Message PrivHelperServer::processMessage(
       return processSetMemoryPriorityForProcess(cursor);
     case PrivHelperConn::REQ_SET_FUSE_READ_AHEAD:
       return processSetFuseReadAhead(cursor);
+    case PrivHelperConn::REQ_SET_NFS_FSTYPE_OVERRIDE:
+      return processSetNfsFstypeOverride(cursor);
     case PrivHelperConn::REQ_SET_RESTART_ARGS:
       return processSetRestartArgsMsg(cursor);
     case PrivHelperConn::REQ_NOTIFY_CLEAN_SHUTDOWN:

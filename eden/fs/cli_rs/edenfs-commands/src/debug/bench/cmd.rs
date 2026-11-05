@@ -17,6 +17,7 @@ use clap::Parser;
 use serde_json;
 
 use super::dbio;
+use super::facebook;
 use super::fsio;
 use super::r#gen;
 use super::traversal;
@@ -80,6 +81,12 @@ pub enum BenchCmd {
         /// Disable progress bars
         #[clap(long)]
         no_progress: bool,
+
+        /// Only read the files already under --test-dir: skip the write and
+        /// remove phases and leave the directory untouched. Kernel caches
+        /// default to mode 3 so lookups reach the filesystem.
+        #[clap(long)]
+        read_only: bool,
     },
 
     #[clap(about = "Run database I/O benchmarks")]
@@ -197,10 +204,23 @@ impl crate::Subcommand for BenchCmd {
                 json,
                 diff,
                 no_progress,
+                read_only,
             } => {
-                let drop_kernel_caches = fsio::resolve_kernel_cache_drop_mode(*drop_kernel_caches)?;
+                let drop_kernel_caches = fsio::resolve_kernel_cache_drop_mode(
+                    *drop_kernel_caches,
+                    if *read_only {
+                        fsio::KernelCacheDropMode::PageCacheDentriesInodes
+                    } else {
+                        fsio::KernelCacheDropMode::PageCache
+                    },
+                )?;
                 let baseline = diff.as_deref().map(fsio::load_result).transpose()?;
-                match r#gen::TestDir::validate(test_dir) {
+                let test_dir = if *read_only {
+                    r#gen::TestDir::existing(test_dir)
+                } else {
+                    r#gen::TestDir::validate(test_dir)
+                };
+                match test_dir {
                     Ok(test_dir) => {
                         let result = fsio::bench_fs_io(
                             &test_dir,
@@ -213,10 +233,15 @@ impl crate::Subcommand for BenchCmd {
                                 jobs: *jobs,
                                 drop_kernel_caches,
                                 show_progress: !*json && !*no_progress,
+                                read_only: *read_only,
                             },
                             baseline.as_ref(),
                         );
-                        let cleanup_result = test_dir.remove();
+                        let cleanup_result = if *read_only {
+                            Ok(())
+                        } else {
+                            test_dir.remove()
+                        };
                         let mut result = match result {
                             Ok(result) => result,
                             Err(error) => {
@@ -275,8 +300,7 @@ impl crate::Subcommand for BenchCmd {
                         random_data.chunk_size as f64 / types::BYTES_IN_KILOBYTE as f64,
                         random_data.total_size() as f64 / types::BYTES_IN_GIGABYTE as f64
                     );
-                    println!("{}", dbio::bench_lmdb_write_mfmd(&test_dir, &random_data)?);
-                    println!("{}", dbio::bench_lmdb_read_mfmd(&test_dir, &random_data)?);
+                    facebook::run_lmdb_benchmarks(&test_dir, &random_data)?;
                     println!(
                         "{}",
                         dbio::bench_sqlite_write_mfmd(&test_dir, &random_data)?
@@ -369,5 +393,23 @@ mod tests {
             panic!("expected fs-io command");
         };
         assert!(drop_kernel_caches.is_some());
+    }
+
+    #[test]
+    fn fs_io_read_only_flag_parses() {
+        let command =
+            BenchCmd::try_parse_from(["bench", "fs-io", "--read-only", "--test-dir", "/tmp"])
+                .expect("read-only flag should parse");
+
+        let BenchCmd::FsIo {
+            read_only,
+            test_dir,
+            ..
+        } = command
+        else {
+            panic!("expected fs-io command");
+        };
+        assert!(read_only);
+        assert_eq!(test_dir, "/tmp");
     }
 }

@@ -28,6 +28,7 @@
 #include <folly/SocketAddress.h>
 #include <folly/Synchronized.h>
 #include <folly/ThreadLocal.h>
+#include <folly/container/F14Map.h>
 #include <folly/coro/safe/NowTask.h>
 #include <folly/futures/SharedPromise.h>
 #include <folly/io/async/ScopedEventBaseThread.h>
@@ -49,11 +50,9 @@
 #include "eden/fs/takeover/TakeoverHandler.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/IActivityRecorder.h"
-#ifdef EDEN_HAVE_OBC
-#include "monitoring/obc/OBCAvg.h"
-#endif
 
 DECLARE_bool(takeover);
+DECLARE_bool(forceTakeover);
 
 namespace cpptoml {
 class table;
@@ -85,8 +84,8 @@ class EdenServiceHandler;
 class ErrorLogger;
 class HeartbeatManager;
 class SaplingBackingStore;
-class IScribeLogger;
 class Journal;
+class MountHealthProbeProgress;
 class MountInfo;
 class ObjectStore;
 class PrivHelper;
@@ -103,6 +102,7 @@ class XplatLogger;
 struct CheckoutResult;
 struct INodePopulationReport;
 struct SessionInfo;
+enum class CheckoutRecoveryTrigger : uint8_t;
 
 #ifndef _WIN32
 class TakeoverServer;
@@ -175,7 +175,6 @@ class EdenServer : private TakeoverHandler {
       std::shared_ptr<const EdenConfig> edenConfig,
       ActivityRecorderFactory activityRecorderFactory,
       BackingStoreFactory* backingStoreFactory,
-      std::shared_ptr<IScribeLogger> scribeLogger,
       std::shared_ptr<StartupStatusChannel> startupStatusChannel,
       std::string version = std::string{});
 
@@ -270,8 +269,35 @@ class EdenServer : private TakeoverHandler {
    * mounts.
    *
    * Returns a Future that will return a map of (mount path -> FUSE fd)
+   *
+   * A takeover that is not forced gives the Thrift requests in flight
+   * core:takeover-request-grace to finish and is refused, with an error, if
+   * they do not; the Thrift server could not stop until they finished. One
+   * that asks to proceed only if idle is also refused while an operation
+   * noted by noteActivity() ran within core:takeover-recent-activity-window.
+   * A forced takeover cancels every Thrift request instead. All of them end
+   * the open trace streams.
    */
-  folly::Future<TakeoverData> startTakeoverShutdown() override;
+  folly::Future<TakeoverData> startTakeoverShutdown(bool force, bool onlyIfIdle)
+      override;
+
+  /**
+   * Record that EdenFS served a Thrift request that marks it as in use: a
+   * checkout, a reset of the parent commits, a mount or an unmount. Mounts
+   * made at startup or during a takeover do not count. See
+   * startTakeoverShutdown().
+   */
+  void noteActivity(std::string_view what);
+
+  /**
+   * A checkout recovery calls this right before it mounts, and
+   * endRecoveryMount() once mount() completes. Returns false, and the
+   * recovery must not mount, once EdenFS has left RUNNING. A graceful restart
+   * waits for recovery mounts like for Thrift requests, then refuses: a mount
+   * whose channel has not started cannot be handed over.
+   */
+  bool beginRecoveryMount(const AbsolutePath& mountPath);
+  void endRecoveryMount(const AbsolutePath& mountPath);
 
   /**
    * Mount and return an EdenMount.
@@ -433,6 +459,30 @@ class EdenServer : private TakeoverHandler {
   void removeEdenHeartbeatFile() const;
   bool checkForPreviousHeartbeat(bool takeover);
 #endif
+
+  /**
+   * The part of startTakeoverShutdown() that commits to the restart, once an
+   * unforced takeover has waited for the requests in flight.
+   */
+  folly::Future<TakeoverData> startTakeoverShutdownNow(bool force);
+
+  /**
+   * Wait up to core:takeover-request-grace for the Thrift requests in flight
+   * to finish. Throws, after logging the requests, if some have not finished
+   * by then or if any has already been running for longer than that.
+   */
+  folly::coro::Task<void> co_waitForInFlightRequests();
+
+  /**
+   * The executor for the work a diff of the working copy entails: loading
+   * inodes from the overlay and hashing materialized files. Checkout runs on
+   * it, and status does when thrift:use-status-executor is on. A status is
+   * refused while a checkout is in progress, so the two overlap only when a
+   * checkout starts during a status, and then they share the pool's threads.
+   */
+  folly::Executor* getDiffWorkExecutor() const {
+    return diffWorkExecutor_.get();
+  }
 
   const std::shared_ptr<ServerState>& getServerState() const {
     return serverState_;
@@ -637,11 +687,6 @@ class EdenServer : private TakeoverHandler {
   void startPeriodicTasks();
   void updatePeriodicTaskIntervals(const EdenConfig& config);
 
-#ifdef EDEN_HAVE_OBC
-  // Calculates EdenFS RSS memory usage.
-  monitoring::OBCAvg memory_vm_rss_bytes_;
-#endif
-
   /**
    * Schedule a call to unloadInodes() to happen after timeout
    * has expired.
@@ -693,10 +738,13 @@ class EdenServer : private TakeoverHandler {
   bool createStorageEngine(cpptoml::table& config);
   void openStorageEngine(StartupLogger& logger);
 
-  // Called when a mount has been unmounted and has stopped.
+  // Called when a mount has been unmounted and has stopped. fsChannelCompleted
+  // is true when the mount's channel ran and then stopped, rather than the
+  // mount failing to start.
   void mountFinished(
       EdenMount* mountPoint,
-      std::optional<TakeoverData::MountInfo> takeover);
+      std::optional<TakeoverData::MountInfo> takeover,
+      bool fsChannelCompleted = false);
 
   [[nodiscard]] folly::SemiFuture<folly::Unit> performNormalShutdown();
   void shutdownPrivhelper();
@@ -730,9 +778,6 @@ class EdenServer : private TakeoverHandler {
   void registerInodePopulationReportsCallback();
   void unregisterInodePopulationReportsCallback();
 
-  // Report memory usage statistics to ServiceData.
-  void reportMemoryStats();
-
 #ifdef __linux__
   void scheduleCgroupFileCacheReclaim();
 #endif
@@ -742,15 +787,78 @@ class EdenServer : private TakeoverHandler {
   // while.
   void refreshBackingStore();
 
-  // Tree overlay needs periodically run checkpoint to flush its journal file.
-  void manageOverlay();
-
   // Run a garbage collection cycle over the inodes hierarchy.
   void garbageCollectAllMounts();
 
-  // Detects when a mount point accidentally gets unmounted, and
-  // attempts to recover it.
-  void accidentalUnmountRecovery();
+  // Returns the config of a checkout from config.json that the daemon is not
+  // serving and was not asked to stop serving, or nullptr. May throw.
+  std::unique_ptr<CheckoutConfig> loadCheckoutNotServed(
+      const AbsolutePath& mountPath,
+      const AbsolutePath& clientDirectory);
+
+  // Whether a checkout whose channel just stopped should be remounted now.
+  // `unexpectedStop` is FsStopReason::unexpected of the stop. Counts the
+  // reason when it should not.
+  bool shouldRecoverAfterChannelStop(
+      const EdenMount& edenMount,
+      bool unexpectedStop,
+      bool takeover);
+  void recoverCheckoutAfterChannelStop(
+      const AbsolutePath& mountPath,
+      const AbsolutePath& clientDirectory);
+
+  // The checkouts loadCheckoutNotServed() returns, with their configs.
+  // Empty unless the daemon is RUNNING. Also forgets the recovery state of
+  // checkouts no longer in config.json.
+  std::vector<std::pair<AbsolutePath, std::unique_ptr<CheckoutConfig>>>
+  findCheckoutsNotServed();
+  // Starts recovering the checkouts not served without waiting for the next
+  // health-check tick, which can be up to two intervals away after a start.
+  // Called when a takeover leaves the daemon RUNNING: a takeover only remounts
+  // the checkouts the other daemon handed over.
+  void recoverCheckoutsNotServedSoon();
+
+  // The last recorded stop reason of a checkout, or empty.
+  std::string getCheckoutStopReason(const AbsolutePath& mountPath);
+  // Whether recovery stopped retrying a checkout because it kept flapping.
+  bool isCheckoutFlapLimited(const AbsolutePath& mountPath) const;
+
+  // Remounts a checkout loadCheckoutNotServed() returned. A failed attempt is
+  // retried by a later call, up to kMaxCheckoutRecoveryAttempts. The success
+  // or final failure is logged as an eden_mount_health_issue.
+  // Returns false if the checkout must not be tried now.
+  bool startCheckoutRecovery(
+      const AbsolutePath& mountPath,
+      std::unique_ptr<CheckoutConfig> initialConfig,
+      CheckoutRecoveryTrigger trigger);
+
+  struct CheckoutRecoveryAttempt {
+    uint32_t number;
+    // Why the daemon stopped serving the checkout, and when; empty if it has
+    // not served it since it started.
+    std::string stopReason;
+    std::optional<std::chrono::steady_clock::time_point> stoppedAt;
+  };
+  // Returns nullopt if this checkout must not be tried now: an attempt is in
+  // progress, or recovery gave up.
+  std::optional<CheckoutRecoveryAttempt> beginCheckoutRecovery(
+      const AbsolutePath& mountPath);
+  // Returns true if this attempt failed and recovery gives up on the checkout.
+  bool endCheckoutRecovery(const AbsolutePath& mountPath, bool success);
+  // Ends an attempt that never mounted; it does not count as a failure.
+  void cancelCheckoutRecovery(const AbsolutePath& mountPath);
+  // Forgets recovery state once the checkout is mounted some other way. While
+  // an attempt is in flight, the reset is applied when the attempt ends.
+  void resetCheckoutRecovery(const AbsolutePath& mountPath);
+  // Forgets recovery state of checkouts that left config.json.
+  void pruneCheckoutRecoveries(
+      const std::unordered_set<AbsolutePath>& configuredPaths);
+  // Records why the checkout stopped being served. `channelStoppedAt` is when
+  // its channel was asked to stop; unset when the channel never started.
+  void recordCheckoutStop(
+      const AbsolutePath& mountPath,
+      std::string reason,
+      std::optional<std::chrono::steady_clock::time_point> channelStoppedAt);
 
   // Probes every mount the daemon believes it is serving and reports the ones
   // the kernel disagrees about.
@@ -759,10 +867,8 @@ class EdenServer : private TakeoverHandler {
   // Checks a running mount point without blocking the main EventBase.
   void scheduleRunningMountHealthCheck(
       const AbsolutePath& mountPath,
-      std::string repoSource);
-
-  // Detects when NFS backed repos are being crawled.
-  void detectNfsCrawl();
+      std::string repoSource,
+      std::weak_ptr<EdenMount> mount);
 
   // Rechecks restricted roots that omitted mode hides from their parent's
   // listing, so that a re-grant becomes visible without an explicit access.
@@ -778,7 +884,8 @@ class EdenServer : private TakeoverHandler {
    * each store
    */
   std::vector<size_t> collectSaplingBackingStoreCounters(
-      std::function<size_t(const SaplingBackingStore&)> getCounterFromStore);
+      const std::function<size_t(const SaplingBackingStore&)>&
+          getCounterFromStore);
 
   /*
    * Member variables.
@@ -797,6 +904,17 @@ class EdenServer : private TakeoverHandler {
   // This is used because at some point we have both edenfs daemon processes
   // running and we need to be able to tell which one is the old one.
   std::optional<std::string> oldDaemonPid_ = std::nullopt;
+
+  /**
+   * The thread that serves the NFS sockets: mountd and every mount's nfsd. NFS
+   * requests must not wait behind the main EventBase, whose periodic tasks can
+   * block it for tens of seconds (the backing store flush syncs the hgcache),
+   * and soft mounts turn such a stall into ETIMEDOUT for the application.
+   * Declared before mountPoints_ and serverState_: a mount's NFS channel and
+   * the NFS servers are destroyed on this thread, so it must outlive them.
+   */
+  folly::ScopedEventBaseThread nfsEventBaseThread_{"NfsEventBase"};
+
   std::shared_ptr<EdenServiceHandler> handler_;
   std::shared_ptr<apache::thrift::ThriftServer> server_;
   std::shared_ptr<ThriftServerEventHandler> serverEventHandler_;
@@ -806,17 +924,6 @@ class EdenServer : private TakeoverHandler {
 
   folly::Synchronized<BackingStoreMap> backingStores_;
   std::shared_ptr<ReloadableConfig> config_;
-
-  /**
-   * The thread that serves the NFS sockets: mountd, rpcbind and every
-   * mount's nfsd. NFS requests must not wait behind the main EventBase,
-   * whose periodic tasks can block it for tens of seconds (the backing
-   * store flush syncs the hgcache), and soft mounts turn such a stall into
-   * ETIMEDOUT for the application. Declared before mountPoints_ and
-   * serverState_: a mount's NFS channel and the servers are destroyed on
-   * this thread, so it must outlive them.
-   */
-  folly::ScopedEventBaseThread nfsEventBaseThread_{"NfsEventBase"};
 
   std::shared_ptr<folly::Synchronized<MountMap>> mountPoints_;
   std::shared_ptr<folly::Synchronized<
@@ -850,8 +957,34 @@ class EdenServer : private TakeoverHandler {
      */
     folly::Future<std::optional<TakeoverData>> shutdownFuture =
         folly::Future<std::optional<TakeoverData>>::makeEmpty();
+    // Checkout recoveries mounting now, and when each started. See
+    // beginRecoveryMount().
+    folly::F14FastMap<AbsolutePath, std::chrono::steady_clock::time_point>
+        recoveryMounts;
   };
   folly::Synchronized<RunStateData> runningState_;
+
+  // This daemon took its mounts over from another one. Set by prepareImpl().
+  bool startedByTakeover_{false};
+
+  // Logs and returns the refusal of a graceful restart while a checkout
+  // recovery is mounting, or nullopt if none is.
+  std::optional<std::string> refuseTakeoverForRecoveryMounts(
+      const RunStateData& state,
+      std::string_view why);
+
+  // Unforced takeovers waiting for the Thrift requests in flight. Only
+  // touched on the main event base thread: by startTakeoverShutdown(), by
+  // the wait's continuation, and by performCleanup(), which ends the waits
+  // still pending before anything is torn down.
+  size_t pendingTakeoverWaits_ = 0;
+  folly::CancellationSource takeoverWaitCancellation_;
+
+  struct RecentActivity {
+    std::string what;
+    std::chrono::steady_clock::time_point when;
+  };
+  folly::Synchronized<std::optional<RecentActivity>> recentActivity_;
 
   /**
    * Move the server into RunState::SHUTTING_DOWN and disarm the privhelper's
@@ -981,17 +1114,10 @@ class EdenServer : private TakeoverHandler {
   bool thriftUseSerialExecution_;
 
   /**
-   * If the Thrift Server created at startup is configured to use a dedicated
-   * executor for the checkoutRevision endpoint.
+   * Executor for the diff work of checkout and status; see
+   * getDiffWorkExecutor().
    */
-  bool thriftUseCheckoutExecutor_;
-
-  /**
-   * Dedicated executor for checkoutRevision Thrift endpoint. This will be null
-   * if the config to use a dedicated executor is not set at daemon startup, if
-   * thriftUseCheckoutExecutor_ is false.
-   */
-  std::shared_ptr<folly::Executor> checkoutRevisionExecutor_;
+  std::shared_ptr<folly::Executor> diffWorkExecutor_;
 
   /**
    * If the Thrift Server created at startup is configured to use a dedicated
@@ -1006,8 +1132,38 @@ class EdenServer : private TakeoverHandler {
    */
   std::shared_ptr<folly::Executor> prefetchFilesV2Executor_;
 
-  std::shared_ptr<folly::Synchronized<std::unordered_set<std::string>>>
+  // In-flight health check probes, by mount path.
+  std::shared_ptr<folly::Synchronized<std::unordered_map<
+      std::string,
+      std::shared_ptr<const MountHealthProbeProgress>>>>
       runningMountHealthChecks_;
+
+  static constexpr uint32_t kMaxCheckoutRecoveryAttempts = 3;
+  // A recovered checkout that stops again within kCheckoutFlapWindow flaps;
+  // after kMaxCheckoutFlaps flaps in a row it is no longer recovered.
+  static constexpr auto kCheckoutFlapWindow = std::chrono::minutes{10};
+  static constexpr uint32_t kMaxCheckoutFlaps = 3;
+  struct CheckoutRecoveryState {
+    bool inFlight{false};
+    uint32_t failedAttempts{0};
+    // Set after kMaxCheckoutRecoveryAttempts failures; no more attempts.
+    bool gaveUp{false};
+    // The checkout was mounted some other way while an attempt was in flight.
+    bool resetRequested{false};
+    std::string stopReason;
+    std::chrono::steady_clock::time_point stoppedAt;
+    // The channel of this attempt's mount started and then stopped before the
+    // attempt ended.
+    bool stoppedDuringRecovery{false};
+    std::optional<std::chrono::steady_clock::time_point> recoveredAt;
+    uint32_t flaps{0};
+  };
+  folly::Synchronized<folly::F14FastMap<AbsolutePath, CheckoutRecoveryState>>
+      checkoutRecoveryStates_;
+  // Counts a stop that came soon after a recovery of this checkout.
+  static void addCheckoutFlap(
+      const AbsolutePath& mountPath,
+      CheckoutRecoveryState& state);
 
   /**
    * Remounting progress state.
@@ -1085,19 +1241,12 @@ class EdenServer : private TakeoverHandler {
   PeriodicFnTask<&EdenServer::checkLockValidity> checkValidityTask_{
       this,
       "check_lock_validity"};
-  PeriodicFnTask<&EdenServer::reportMemoryStats> memoryStatsTask_{
-      this,
-      "mem_stats"};
   PeriodicFnTask<&EdenServer::refreshBackingStore> backingStoreTask_{
       this,
       "backing_store"};
-  PeriodicFnTask<&EdenServer::manageOverlay> overlayTask_{this, "overlay"};
   PeriodicFnTask<&EdenServer::garbageCollectAllMounts> gcTask_{
       this,
       "inode_gc"};
-  PeriodicFnTask<&EdenServer::detectNfsCrawl> detectNfsCrawlTask_{
-      this,
-      "detect_nfs_crawl"};
 #ifdef __linux__
   PeriodicFnTask<&EdenServer::scheduleCgroupFileCacheReclaim>
       cgroupFileCacheReclaimTask_{this, "cgroup_file_cache_reclaim"};
@@ -1109,8 +1258,6 @@ class EdenServer : private TakeoverHandler {
   // a walk that outlives this EdenServer clears its own copy, not a member.
   const std::shared_ptr<std::atomic<bool>> restrictedRootRefreshInFlight_{
       std::make_shared<std::atomic<bool>>(false)};
-  PeriodicFnTask<&EdenServer::accidentalUnmountRecovery>
-      accidentalUnmountRecoveryTask_{this, "accidental_unmount_recovery"};
   PeriodicFnTask<&EdenServer::checkMountHealth> mountHealthCheckTask_{
       this,
       "mount_health_check"};

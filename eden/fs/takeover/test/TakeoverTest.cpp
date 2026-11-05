@@ -6,9 +6,12 @@
  */
 
 #include <folly/Exception.h>
+#include <folly/Portability.h>
+#include <folly/ScopeGuard.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/Promise.h>
 #include <folly/io/IOBufQueue.h>
+#include <folly/portability/GFlags.h>
 #include <folly/test/TestUtils.h>
 #include <folly/testing/TestUtil.h>
 #include <gmock/gmock.h>
@@ -20,6 +23,8 @@
 #include "eden/fs/takeover/TakeoverData.h"
 #include "eden/fs/takeover/TakeoverHandler.h"
 #include "eden/fs/takeover/TakeoverServer.h"
+
+DECLARE_int64(maximumChunkSize);
 
 using namespace facebook::eden;
 using folly::EventBase;
@@ -33,6 +38,8 @@ using ::testing::ElementsAreArray;
 using namespace std::chrono_literals;
 
 namespace {
+constexpr int64_t kTestChunkSize = 64 * 1024;
+
 /**
  * A TakeoverHandler that returns the TakeoverData object passed to its
  * constructor.
@@ -41,14 +48,27 @@ class TestHandler : public TakeoverHandler {
  public:
   explicit TestHandler(TakeoverData&& data) : data_{std::move(data)} {}
 
-  Future<TakeoverData> startTakeoverShutdown() override {
+  Future<TakeoverData> startTakeoverShutdown(bool force, bool onlyIfIdle)
+      override {
+    force_ = force;
+    onlyIfIdle_ = onlyIfIdle;
     return makeFuture(std::move(data_));
   }
 
   void closeStorage() override {}
 
+  bool wasForced() const {
+    return force_;
+  }
+
+  bool wasOnlyIfIdle() const {
+    return onlyIfIdle_;
+  }
+
  private:
   TakeoverData data_;
+  bool force_ = false;
+  bool onlyIfIdle_ = false;
 };
 
 /**
@@ -56,7 +76,9 @@ class TestHandler : public TakeoverHandler {
  */
 class ErrorHandler : public TakeoverHandler {
  public:
-  Future<TakeoverData> startTakeoverShutdown() override {
+  Future<TakeoverData> startTakeoverShutdown(
+      bool /*force*/,
+      bool /*onlyIfIdle*/) override {
     return makeFuture<TakeoverData>(
         std::logic_error("purposely failing for testing"));
   }
@@ -73,7 +95,9 @@ Future<TakeoverData> takeoverViaEventBase(
     const std::set<int32_t>& supportedVersions,
     const uint64_t supportedCapabilities,
     bool shouldThrowDuringTakeover = false,
-    bool shouldPing = true) {
+    bool shouldPing = true,
+    bool force = false,
+    bool onlyIfIdle = false) {
   Promise<TakeoverData> promise;
   auto future = promise.getFuture();
   std::thread thread([path = AbsolutePath{socketPath},
@@ -81,11 +105,15 @@ Future<TakeoverData> takeoverViaEventBase(
                       supportedCapabilities = supportedCapabilities,
                       shouldThrowDuringTakeover = shouldThrowDuringTakeover,
                       shouldPing = shouldPing,
+                      force = force,
+                      onlyIfIdle = onlyIfIdle,
                       promise = std::move(promise)]() mutable {
     promise.setWith([&] {
       return takeoverMounts(
           path,
           /*takeoverReceiveTimeout*/ std::chrono::seconds(150),
+          force,
+          onlyIfIdle,
           shouldThrowDuringTakeover,
           shouldPing,
           supportedVersions,
@@ -137,7 +165,9 @@ folly::Try<TakeoverData> runTakeover(
     const std::set<int32_t>& serverSupportedVersions =
         kSupportedTakeoverVersions,
     const uint64_t clientSupportedCapabilities = kSupportedCapabilities,
-    const uint64_t serverSupportedCapabilities = kSupportedCapabilities) {
+    const uint64_t serverSupportedCapabilities = kSupportedCapabilities,
+    bool force = false,
+    bool onlyIfIdle = false) {
   // Ignore SIGPIPE so that sendmsg() will fail with an error code instead
   // of terminating the program if the remote side has closed the connection.
   signal(SIGPIPE, SIG_IGN);
@@ -159,7 +189,11 @@ folly::Try<TakeoverData> runTakeover(
                     &evb,
                     socketPath,
                     clientSupportedVersions,
-                    clientSupportedCapabilities)
+                    clientSupportedCapabilities,
+                    /*shouldThrowDuringTakeover=*/false,
+                    /*shouldPing=*/true,
+                    force,
+                    onlyIfIdle)
                     .ensure([&] { evb.terminateLoopSoon(); });
   loopWithTimeout(&evb);
   if (!future.isReady()) {
@@ -170,8 +204,8 @@ folly::Try<TakeoverData> runTakeover(
 }
 
 void checkExpectedFile(int fd, AbsolutePathPiece path) {
-  struct stat fdStat;
-  struct stat pathStat;
+  struct stat fdStat{};
+  struct stat pathStat{};
   auto rc = fstat(fd, &fdStat);
   folly::checkUnixError(rc, "fstat failed");
   rc = stat(path.asString().c_str(), &pathStat);
@@ -182,29 +216,15 @@ void checkExpectedFile(int fd, AbsolutePathPiece path) {
 }
 } // namespace
 
-TEST(Takeover, roundTripVersionCapabilities) {
-  for (auto& version : kSupportedTakeoverVersions) {
-    EXPECT_EQ(
-        TakeoverData::capabilitiesToVersion(
-            TakeoverData::versionToCapabilities(version)),
-        version);
-  }
-}
-
-TEST(Takeover, unsupportedVersionCapabilities) {
+TEST(Takeover, requiredCapabilities) {
   EXPECT_EQ(
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionNeverSupported),
-      0);
-
-  EXPECT_EQ(
-      TakeoverData::capabilitiesToVersion(0),
-      TakeoverData::kTakeoverProtocolVersionNeverSupported);
-}
-
-TEST(Takeover, invalidComboCapabilities) {
+      TakeoverData::computeCompatibleCapabilities(
+          kSupportedCapabilities, kSupportedCapabilities),
+      kSupportedCapabilities);
   EXPECT_THROW(
-      TakeoverData::capabilitiesToVersion(TakeoverCapabilities::FUSE),
+      TakeoverData::computeCompatibleCapabilities(
+          kSupportedCapabilities & ~TakeoverCapabilities::NFS,
+          kSupportedCapabilities),
       std::runtime_error);
 }
 
@@ -237,52 +257,7 @@ TEST(Takeover, rejectsLegacyFuseConnectionInfoSize) {
       "invalid FUSE connection info size");
 }
 
-TEST(Takeover, matchCapabilities) {
-  auto threeCapabilities = TakeoverData::versionToCapabilities(
-      TakeoverData::kTakeoverProtocolVersionThree);
-  auto fourCapabilities = TakeoverData::versionToCapabilities(
-      TakeoverData::kTakeoverProtocolVersionFour);
-  auto fiveCapabilities = TakeoverData::versionToCapabilities(
-      TakeoverData::kTakeoverProtocolVersionFive);
-  auto sixCapabilities = TakeoverData::versionToCapabilities(
-      TakeoverData::kTakeoverProtocolVersionSix);
-  auto sevenCapabilities = TakeoverData::versionToCapabilities(
-      TakeoverData::kTakeoverProtocolVersionSeven);
-
-  EXPECT_EQ(
-      TakeoverData::computeCompatibleCapabilities(
-          threeCapabilities, fourCapabilities),
-      threeCapabilities);
-  EXPECT_EQ(
-      TakeoverData::computeCompatibleCapabilities(
-          fiveCapabilities, sevenCapabilities),
-      fiveCapabilities);
-  EXPECT_EQ(
-      TakeoverData::computeCompatibleCapabilities(
-          sixCapabilities, sevenCapabilities),
-      sixCapabilities);
-  EXPECT_EQ(
-      TakeoverData::computeCompatibleCapabilities(
-          sevenCapabilities, sevenCapabilities),
-      sevenCapabilities);
-}
-
-/**
- * In older versions of the protocol, we did not know how to pass the mountd
- * socket, so there is no need to check that we correctly passed the mountd
- * socket in simpleTestImpl. This enum is used in simpleTestImpl to decide
- * wather we should check the mountd socket.
- */
-enum class CheckMountdSocket { YES = 0, NO = 1 };
-
-void simpleTestImpl(
-    CheckMountdSocket checkMountdSocket = CheckMountdSocket::NO,
-    const std::set<int32_t>& clientSupportedVersions =
-        kSupportedTakeoverVersions,
-    const std::set<int32_t>& serverSupportedVersions =
-        kSupportedTakeoverVersions,
-    uint64_t clientCapabilities = kSupportedCapabilities,
-    uint64_t serverCapabilities = kSupportedCapabilities) {
+TEST(Takeover, simple) {
   TemporaryDirectory tmpDir("eden_takeover_test");
   AbsolutePath tmpDirPath = canonicalPath(tmpDir.path().string());
 
@@ -325,13 +300,7 @@ void simpleTestImpl(
   // Perform the takeover
   auto serverSendFuture = serverData.takeoverComplete.getFuture();
   TestHandler handler{std::move(serverData)};
-  auto result = runTakeover(
-      tmpDir,
-      &handler,
-      clientSupportedVersions,
-      serverSupportedVersions,
-      clientCapabilities,
-      serverCapabilities);
+  auto result = runTakeover(tmpDir, &handler);
   ASSERT_TRUE(serverSendFuture.hasValue());
   EXPECT_TRUE(result.hasValue());
   const auto& clientData = result.value();
@@ -340,9 +309,7 @@ void simpleTestImpl(
   checkExpectedFile(clientData.lockFile.fd(), lockFilePath);
   // And the thrift socket FD
   checkExpectedFile(clientData.thriftSocket.fd(), thriftSocketPath);
-  if (checkMountdSocket == CheckMountdSocket::YES) {
-    checkExpectedFile(clientData.mountdServerSocket->fd(), mountdSocketPath);
-  }
+  checkExpectedFile(clientData.mountdServerSocket->fd(), mountdSocketPath);
 
   // Make sure the received mount information is correct
   ASSERT_EQ(2, clientData.mountPoints.size());
@@ -357,135 +324,6 @@ void simpleTestImpl(
   auto& fuseChannelData1 =
       std::get<FuseChannelData>(clientData.mountPoints.at(1).channelInfo);
   checkExpectedFile(fuseChannelData1.fd.fd(), mount2FusePath);
-}
-
-TEST(Takeover, simple) {
-  simpleTestImpl(CheckMountdSocket::YES);
-}
-
-TEST(Takeover, fourToSeven) {
-  // in both these tests we will settle on version 4 of the protocol
-  // which does not know how to transfer the mountd socket, so no need
-  // to check the mountd socket.
-  simpleTestImpl(
-      CheckMountdSocket::NO,
-      {TakeoverData::kTakeoverProtocolVersionFour},
-      {TakeoverData::kTakeoverProtocolVersionFour,
-       TakeoverData::kTakeoverProtocolVersionFive,
-       TakeoverData::kTakeoverProtocolVersionSix,
-       TakeoverData::kTakeoverProtocolVersionSeven},
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionFour),
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSeven));
-
-  simpleTestImpl(
-      CheckMountdSocket::NO,
-      {TakeoverData::kTakeoverProtocolVersionFour,
-       TakeoverData::kTakeoverProtocolVersionFive,
-       TakeoverData::kTakeoverProtocolVersionSix,
-       TakeoverData::kTakeoverProtocolVersionSeven},
-      {TakeoverData::kTakeoverProtocolVersionFour},
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSeven),
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionFour));
-}
-
-TEST(Takeover, fiveToSeven) {
-  simpleTestImpl(
-      CheckMountdSocket::YES,
-      {TakeoverData::kTakeoverProtocolVersionFour,
-       TakeoverData::kTakeoverProtocolVersionFive},
-      {TakeoverData::kTakeoverProtocolVersionFour,
-       TakeoverData::kTakeoverProtocolVersionFive,
-       TakeoverData::kTakeoverProtocolVersionSix,
-       TakeoverData::kTakeoverProtocolVersionSeven},
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionFive),
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSeven));
-
-  simpleTestImpl(
-      CheckMountdSocket::YES,
-      {TakeoverData::kTakeoverProtocolVersionFour,
-       TakeoverData::kTakeoverProtocolVersionFive,
-       TakeoverData::kTakeoverProtocolVersionSix,
-       TakeoverData::kTakeoverProtocolVersionSeven},
-      {TakeoverData::kTakeoverProtocolVersionFour,
-       TakeoverData::kTakeoverProtocolVersionFive},
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSeven),
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionFive));
-}
-
-TEST(Takeover, sixToSeven) {
-  simpleTestImpl(
-      CheckMountdSocket::YES,
-      {TakeoverData::kTakeoverProtocolVersionFour,
-       TakeoverData::kTakeoverProtocolVersionFive,
-       TakeoverData::kTakeoverProtocolVersionSix},
-      {TakeoverData::kTakeoverProtocolVersionFour,
-       TakeoverData::kTakeoverProtocolVersionFive,
-       TakeoverData::kTakeoverProtocolVersionSix,
-       TakeoverData::kTakeoverProtocolVersionSeven},
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSix),
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSeven));
-
-  simpleTestImpl(
-      CheckMountdSocket::YES,
-      {TakeoverData::kTakeoverProtocolVersionFour,
-       TakeoverData::kTakeoverProtocolVersionFive,
-       TakeoverData::kTakeoverProtocolVersionSix,
-       TakeoverData::kTakeoverProtocolVersionSeven},
-      {TakeoverData::kTakeoverProtocolVersionFour,
-       TakeoverData::kTakeoverProtocolVersionFive,
-       TakeoverData::kTakeoverProtocolVersionSix},
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSeven),
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSix));
-}
-
-TEST(Takeover, atypicalVersionCapability) {
-  simpleTestImpl(
-      CheckMountdSocket::YES,
-      kSupportedTakeoverVersions,
-      kSupportedTakeoverVersions,
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSix),
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSeven));
-
-  simpleTestImpl(
-      CheckMountdSocket::YES,
-      kSupportedTakeoverVersions,
-      kSupportedTakeoverVersions,
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSeven),
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSix));
-
-  simpleTestImpl(
-      CheckMountdSocket::YES,
-      kSupportedTakeoverVersions,
-      kSupportedTakeoverVersions,
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionFive),
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSeven));
-
-  simpleTestImpl(
-      CheckMountdSocket::YES,
-      kSupportedTakeoverVersions,
-      kSupportedTakeoverVersions,
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionSeven),
-      TakeoverData::versionToCapabilities(
-          TakeoverData::kTakeoverProtocolVersionFive));
 }
 
 TEST(Takeover, noMounts) {
@@ -519,6 +357,60 @@ TEST(Takeover, noMounts) {
 
   // Make sure the received mount information is empty
   EXPECT_EQ(0, clientData.mountPoints.size());
+  EXPECT_FALSE(handler.wasForced());
+}
+
+TEST(Takeover, forcedTakeoverReachesHandler) {
+  TemporaryDirectory tmpDir("eden_takeover_test");
+  AbsolutePath tmpDirPath = canonicalPath(tmpDir.path().string());
+
+  TakeoverData serverData;
+  serverData.lockFile =
+      folly::File{(tmpDirPath + "lock"_pc).view(), O_RDWR | O_CREAT};
+  serverData.thriftSocket =
+      folly::File{(tmpDirPath + "thrift"_pc).view(), O_RDWR | O_CREAT};
+  serverData.mountdServerSocket =
+      folly::File{(tmpDirPath + "mountd"_pc).view(), O_RDWR | O_CREAT};
+
+  TestHandler handler{std::move(serverData)};
+  auto result = runTakeover(
+      tmpDir,
+      &handler,
+      kSupportedTakeoverVersions,
+      kSupportedTakeoverVersions,
+      kSupportedCapabilities,
+      kSupportedCapabilities,
+      /*force=*/true);
+  EXPECT_TRUE(result.hasValue());
+  EXPECT_TRUE(handler.wasForced());
+  EXPECT_FALSE(handler.wasOnlyIfIdle());
+}
+
+TEST(Takeover, onlyIfIdleReachesHandler) {
+  TemporaryDirectory tmpDir("eden_takeover_test");
+  AbsolutePath tmpDirPath = canonicalPath(tmpDir.path().string());
+
+  TakeoverData serverData;
+  serverData.lockFile =
+      folly::File{(tmpDirPath + "lock"_pc).view(), O_RDWR | O_CREAT};
+  serverData.thriftSocket =
+      folly::File{(tmpDirPath + "thrift"_pc).view(), O_RDWR | O_CREAT};
+  serverData.mountdServerSocket =
+      folly::File{(tmpDirPath + "mountd"_pc).view(), O_RDWR | O_CREAT};
+
+  TestHandler handler{std::move(serverData)};
+  auto result = runTakeover(
+      tmpDir,
+      &handler,
+      kSupportedTakeoverVersions,
+      kSupportedTakeoverVersions,
+      kSupportedCapabilities,
+      kSupportedCapabilities,
+      /*force=*/false,
+      /*onlyIfIdle=*/true);
+  EXPECT_TRUE(result.hasValue());
+  EXPECT_FALSE(handler.wasForced());
+  EXPECT_TRUE(handler.wasOnlyIfIdle());
 }
 
 TEST(Takeover, manyMounts) {
@@ -591,7 +483,53 @@ TEST(Takeover, manyMounts) {
   }
 }
 
+TEST(Takeover, chunksSerializedInodeMap) {
+  const auto originalChunkSize = FLAGS_maximumChunkSize;
+  SCOPE_EXIT {
+    FLAGS_maximumChunkSize = originalChunkSize;
+  };
+  FLAGS_maximumChunkSize = kTestChunkSize;
+
+  SerializedInodeMap inodeMap;
+  constexpr int64_t numInodes = 1024;
+  for (int64_t i = 0; i < numInodes; ++i) {
+    SerializedInodeMapEntry entry;
+    entry.inodeNumber() = i;
+    entry.name() = folly::to<string>(
+        "example_inode_name______________choose_a_big_name______________", i);
+    entry.hash() = folly::to<string>(
+        "example_inode_hash______________choose_a_big_hash______________", i);
+    inodeMap.unloadedInodes()->emplace_back(std::move(entry));
+  }
+  TakeoverData data;
+  data.mountPoints.emplace_back(
+      canonicalPath("/mount"),
+      canonicalPath("/state"),
+      FuseChannelData{folly::File{}, fuse_init_out{}},
+      std::move(inodeMap));
+
+  UnixSocket::Message message;
+  data.serialize(kSupportedCapabilities, message);
+  EXPECT_GT(message.data.countChainElements(), 1);
+  EXPECT_GT(message.data.computeChainDataLength(), kTestChunkSize);
+  const auto* chunk = &message.data;
+  do {
+    EXPECT_LE(chunk->length(), kTestChunkSize);
+    chunk = chunk->next();
+  } while (chunk != &message.data);
+}
+
 TEST(Takeover, manyInodes) {
+  const auto originalChunkSize = FLAGS_maximumChunkSize;
+  SCOPE_EXIT {
+    if (folly::kIsSanitizeThread) {
+      FLAGS_maximumChunkSize = originalChunkSize;
+    }
+  };
+  if (folly::kIsSanitizeThread) {
+    FLAGS_maximumChunkSize = kTestChunkSize;
+  }
+
   TemporaryDirectory tmpDir("eden_takeover_test");
   AbsolutePath tmpDirPath = canonicalPath(tmpDir.path().string());
 
@@ -606,15 +544,9 @@ TEST(Takeover, manyInodes) {
   serverData.mountdServerSocket =
       folly::File{mountdSocketPath.view(), O_RDWR | O_CREAT};
 
-  // Build a TakeoverData which is a large message(length=1102721166).
-  // Here we create a mount with 7 million inodes. The size of this
-  // TakeoverData will be 1102721166 bytes.
-
-  // This size is larger than 1 GB (the maximum data length that we chose for
-  // transferring eden TakeoverData over UnixSocket). The TakeoverServer should
-  // split the data into multiple chunks and send them in sequence.
-
-  constexpr int64_t numInodes = 7000000;
+  // The non-TSan payload exceeds UnixSocket's 1GB message limit. TSan uses a
+  // smaller payload and chunk cap to cover the same multi-message handoff.
+  constexpr int64_t numInodes = folly::kIsSanitizeThread ? 4096 : 7000000;
 
   auto mountPath =
       tmpDirPath + RelativePathPiece{folly::to<string>("mounts/foo/test")};
@@ -627,8 +559,7 @@ TEST(Takeover, manyInodes) {
     SerializedInodeMapEntry entry;
     entry.inodeNumber() = i;
     entry.parentInode() = 0;
-    // The name and hash are chosen to be long enough to make the message
-    // larger than 1 GB.
+    // The long name and hash make the non-TSan message larger than 1 GB.
     entry.name() = folly::to<string>(
         "example_inode_name______________choose_a_big_name______________", i);
     entry.isUnlinked() = false;
@@ -650,7 +581,8 @@ TEST(Takeover, manyInodes) {
   TestHandler handler{std::move(serverData)};
   auto result = runTakeover(tmpDir, &handler);
   ASSERT_TRUE(serverSendFuture.hasValue());
-  EXPECT_TRUE(result.hasValue());
+  ASSERT_FALSE(serverSendFuture.value().has_value());
+  ASSERT_TRUE(result.hasValue());
   const auto& clientData = result.value();
 
   // Make sure the received lock file and thrift socket FDs are correct
@@ -674,7 +606,35 @@ TEST(Takeover, manyInodes) {
       tmpDirPath + PathComponentPiece{folly::to<string>("fuse")};
   auto& fuseChannelData = std::get<FuseChannelData>(mountInfo.channelInfo);
   checkExpectedFile(fuseChannelData.fd.fd(), expectedFusePath);
-  EXPECT_EQ(numInodes, mountInfo.inodeMap.unloadedInodes()->size());
+  const auto& unloadedInodes = *mountInfo.inodeMap.unloadedInodes();
+  ASSERT_EQ(numInodes, unloadedInodes.size());
+  const auto checkInode = [&](int64_t i) {
+    const auto& entry = unloadedInodes[i];
+    EXPECT_EQ(i, *entry.inodeNumber());
+    EXPECT_EQ(0, *entry.parentInode());
+    EXPECT_EQ(
+        folly::to<string>(
+            "example_inode_name______________choose_a_big_name______________",
+            i),
+        *entry.name());
+    EXPECT_FALSE(*entry.isUnlinked());
+    EXPECT_EQ(1, *entry.numFsReferences());
+    ASSERT_TRUE(entry.hash().has_value());
+    EXPECT_EQ(
+        folly::to<string>(
+            "example_inode_hash______________choose_a_big_hash______________",
+            i),
+        *entry.hash());
+    EXPECT_EQ(0644, *entry.mode());
+  };
+  if (folly::kIsSanitizeThread) {
+    for (int64_t i = 0; i < numInodes; ++i) {
+      checkInode(i);
+    }
+  } else {
+    checkInode(0);
+    checkInode(numInodes - 1);
+  }
 }
 
 TEST(Takeover, error) {

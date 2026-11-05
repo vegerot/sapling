@@ -387,6 +387,10 @@ class Window:
             self.scrollable_section_window_start + self.scrollable_section_window_size
         )
         self.scrollable = False
+        farthest_scroll = max(
+            0, (self.number_scrollable_lines - self.scrollable_section_window_size)
+        )
+        self.scrollable_offset = min(farthest_scroll, self.scrollable_offset)
 
     # first line number to be written in the scrollable section
     def get_scrollable_top_line(self) -> int:
@@ -1061,12 +1065,13 @@ class Process:
 
     def aggregate(self, other: "Process") -> None:
         self.increment_counts(other.access_counts)
+        self.fuseFetch += other.fuseFetch
         self.is_running |= other.is_running
 
         # Check if other is more relevant
         if other.is_running or other.last_access > self.last_access:
             self.pid = other.pid
-            self.last_access = other.last_access
+        self.last_access = max(self.last_access, other.last_access)
 
     def increment_counts(self, access_counts: AccessCounts) -> None:
         # Modern thrift-python types have immutable fields, so create a new object

@@ -39,6 +39,7 @@ use permission_checker::MononokeIdentitySet;
 use permission_checker::PermissionCheckerBuilder;
 use tokio::task::JoinHandle;
 
+use crate::DenyingRestriction;
 use crate::ManifestType;
 use crate::RestrictedManifestId;
 use crate::RestrictedPaths;
@@ -58,12 +59,10 @@ pub(crate) enum AccessEnforcementOutcome {
     /// No enforcement condition set matched the access, so it is allowed
     /// whatever the caller's authorization.
     NotEnforced,
-    /// An enforcement condition set matched the access. The permission request
-    /// group is present when the caller is unauthorized and the access must be
+    /// An enforcement condition set matched the access. The denying restriction
+    /// is present when the caller is unauthorized and the access must be
     /// denied, and absent when the caller is authorized.
-    Enforced {
-        denial_permission_request_group: Option<PermissionRequestGroup>,
-    },
+    Enforced { denial: Option<DenyingRestriction> },
     /// An enforcement condition set matched the access, but so did an
     /// enforcement exemption set, so the access is allowed whatever the
     /// caller's authorization.
@@ -81,14 +80,11 @@ impl AccessEnforcementOutcome {
         }
     }
 
-    /// The group a denied caller should request access to, if the access is
-    /// denied.
-    pub(crate) fn denial_permission_request_group(&self) -> Option<&PermissionRequestGroup> {
+    /// The denying restriction, if the access is denied.
+    pub(crate) fn denial(&self) -> Option<&DenyingRestriction> {
         match self {
             Self::NotEnforced | Self::Exempted => None,
-            Self::Enforced {
-                denial_permission_request_group,
-            } => denial_permission_request_group.as_ref(),
+            Self::Enforced { denial } => denial.as_ref(),
         }
     }
 }
@@ -152,12 +148,13 @@ pub(crate) enum PathRestrictionSource {
     AclManifest(ChangesetId),
 }
 
-/// Source to use for manifest-side restriction checks.
+/// Where a restriction is declared.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ManifestRestrictionSource {
-    /// Config-backed manifest-id store.
+pub(crate) enum RestrictionSource {
+    /// The repo config: `path_restriction_metadata`, plus the manifest-id
+    /// store for manifest accesses.
     Config,
-    /// AclManifest pointer attached to the manifest.
+    /// `.slacl` files, read through the AclManifest derived data.
     AclManifest,
 }
 
@@ -176,15 +173,49 @@ pub struct RestrictionCheckResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AuthorizationCheckResult {
     /// Whether the caller has direct read access to every matching path ACL.
-    has_acl_access: bool,
+    has_acl_access: FactorResult,
     /// Whether the caller is in the tooling allowlist group.
-    is_allowlisted_tooling: bool,
+    is_allowlisted_tooling: FactorResult,
     /// Whether the caller is in the rollout allowlist group.
-    is_rollout_allowlisted: bool,
+    is_rollout_allowlisted: FactorResult,
     /// Whether the caller is in the admin bypass group. Tracked separately from
     /// `has_acl_access` so a bypass grant is distinguishable from genuine ACL
     /// read access in the access logs.
-    is_admin_bypass: bool,
+    is_admin_bypass: FactorResult,
+}
+
+/// Result of evaluating one authorization factor.
+///
+/// `NotSet` represents absent policy, while `Unauthorized` represents a
+/// configured policy that the caller did not satisfy. Fetch and evaluation
+/// failures remain errors and never become factor observations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FactorResult {
+    NotSet,
+    Authorized,
+    Unauthorized,
+}
+
+impl FactorResult {
+    fn from_authorized(authorized: bool) -> Self {
+        if authorized {
+            Self::Authorized
+        } else {
+            Self::Unauthorized
+        }
+    }
+
+    fn is_authorized(self) -> bool {
+        self == Self::Authorized
+    }
+
+    fn from_optional_authorized(configured: bool, authorized: bool) -> Self {
+        if configured {
+            Self::from_authorized(authorized)
+        } else {
+            Self::NotSet
+        }
+    }
 }
 
 /// Repo-wide allowlist authorization, shared by every restriction in one source
@@ -192,15 +223,15 @@ pub(crate) struct AuthorizationCheckResult {
 /// tent, so it has to be evaluated per restriction rather than once per batch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AllowlistAuthorization {
-    is_allowlisted_tooling: bool,
-    is_admin_bypass: bool,
+    is_allowlisted_tooling: FactorResult,
+    is_admin_bypass: FactorResult,
 }
 
 impl AllowlistAuthorization {
     fn into_authorization_check_result(
         self,
-        has_acl_access: bool,
-        is_rollout_allowlisted: bool,
+        has_acl_access: FactorResult,
+        is_rollout_allowlisted: FactorResult,
     ) -> AuthorizationCheckResult {
         AuthorizationCheckResult {
             has_acl_access,
@@ -219,35 +250,51 @@ impl AuthorizationCheckResult {
         is_admin_bypass: bool,
     ) -> Self {
         Self {
-            has_acl_access,
-            is_allowlisted_tooling,
-            is_rollout_allowlisted,
-            is_admin_bypass,
+            has_acl_access: FactorResult::from_authorized(has_acl_access),
+            is_allowlisted_tooling: FactorResult::from_authorized(is_allowlisted_tooling),
+            is_rollout_allowlisted: FactorResult::from_authorized(is_rollout_allowlisted),
+            is_admin_bypass: FactorResult::from_authorized(is_admin_bypass),
         }
     }
 
     /// Whether the caller has read authorization through ACLs, allowlists, or
     /// the admin bypass group.
     pub(crate) fn has_authorization(&self) -> bool {
-        self.has_acl_access
-            || self.is_allowlisted_tooling
-            || self.is_rollout_allowlisted
-            || self.is_admin_bypass
+        self.has_acl_access.is_authorized()
+            || self.is_allowlisted_tooling.is_authorized()
+            || self.is_rollout_allowlisted.is_authorized()
+            || self.is_admin_bypass.is_authorized()
     }
 
     pub(crate) fn has_acl_access(&self) -> bool {
-        self.has_acl_access
+        self.has_acl_access.is_authorized()
     }
 
     pub(crate) fn is_allowlisted_tooling(&self) -> bool {
-        self.is_allowlisted_tooling
+        self.is_allowlisted_tooling.is_authorized()
     }
 
     pub(crate) fn is_rollout_allowlisted(&self) -> bool {
-        self.is_rollout_allowlisted
+        self.is_rollout_allowlisted.is_authorized()
     }
 
     pub(crate) fn is_admin_bypass(&self) -> bool {
+        self.is_admin_bypass.is_authorized()
+    }
+
+    fn acl_result(&self) -> FactorResult {
+        self.has_acl_access
+    }
+
+    fn rollout_result(&self) -> FactorResult {
+        self.is_rollout_allowlisted
+    }
+
+    fn tooling_result(&self) -> FactorResult {
+        self.is_allowlisted_tooling
+    }
+
+    fn admin_result(&self) -> FactorResult {
         self.is_admin_bypass
     }
 }
@@ -486,36 +533,9 @@ pub(crate) struct SourceRestrictionSummary {
     restriction_roots: Vec<NonRootMPath>,
 }
 
-/// Aggregate per-restriction rollout-allowlist flags for one request.
-///
-/// Every restriction must allowlist the caller: being allowlisted for one tent
-/// must not authorize reads of a different tent caught by the same request.
-///
-/// The emptiness guard is load-bearing. `all()` is vacuously true, and an empty
-/// batch means nothing was restricted — already authorized via `has_acl_access`,
-/// but not *rollout-allowlisted*. Without the guard every unrestricted access
-/// would be logged as rollout-allowlisted.
-fn all_rollout_allowlisted(flags: impl IntoIterator<Item = bool>) -> bool {
-    let mut flags = flags.into_iter().peekable();
-    flags.peek().is_some() && flags.all(|allowlisted| allowlisted)
-}
-
 impl SourceRestrictionSummary {
     pub(crate) fn from_checks(checks: &[impl SourceRestrictionCheck]) -> Self {
-        let has_acl_access = checks
-            .iter()
-            .all(|check| check.authorization().has_acl_access());
-        let is_allowlisted_tooling = checks
-            .iter()
-            .any(|check| check.authorization().is_allowlisted_tooling());
-        let is_rollout_allowlisted = all_rollout_allowlisted(
-            checks
-                .iter()
-                .map(|check| check.authorization().is_rollout_allowlisted()),
-        );
-        let is_admin_bypass = checks
-            .iter()
-            .any(|check| check.authorization().is_admin_bypass());
+        let authorization = aggregate_single_source_authorization(checks);
         let repo_region_acls = checks
             .iter()
             .map(|check| check.repo_region_identity().to_string())
@@ -527,12 +547,7 @@ impl SourceRestrictionSummary {
             .collect();
 
         Self {
-            authorization: AuthorizationCheckResult::new(
-                has_acl_access,
-                is_allowlisted_tooling,
-                is_rollout_allowlisted,
-                is_admin_bypass,
-            ),
+            authorization,
             repo_region_acls,
             restriction_roots,
         }
@@ -715,7 +730,7 @@ pub(crate) async fn has_read_access_to_repo_region(
 /// Check if the caller has maintainer access to every repo region ACL in `acls`
 /// (conjunctive evaluation), or is a member of `admin_bypass_group`.
 ///
-/// Mirrors [`has_read_access_to_repo_region`] but checks the `maintainers`
+/// Mirrors `has_read_access_to_repo_region` but checks the `maintainers`
 /// action instead of `read`. Used to gate `.slacl` ACL-file modifications while
 /// letting admins in `admin_bypass_group` through even when they do not maintain
 /// the affected ACL.
@@ -787,7 +802,7 @@ async fn has_repo_region_acls_for_action(
 /// Check whether the caller is a member of the given group identity, if one is
 /// configured. Returns `false` when no group is set — an absent group never
 /// grants access.
-async fn is_in_optional_group(
+pub(crate) async fn is_in_optional_group(
     ctx: &CoreContext,
     acl_provider: &Arc<dyn AclProvider>,
     group: Option<&MononokeIdentity>,
@@ -833,6 +848,7 @@ pub(crate) async fn check_authorization(
     tooling_allowlist_group: Option<&str>,
     admin_bypass_group: Option<&MononokeIdentity>,
 ) -> Result<AuthorizationCheckResult> {
+    let has_rollout_allowlist = restrictions.iter().any(|(_, group)| group.is_some());
     let acls = restrictions.iter().map(|(acl, _)| *acl).collect::<Vec<_>>();
     let allowlist_authorization = check_allowlist_authorization(
         ctx,
@@ -849,8 +865,11 @@ pub(crate) async fn check_authorization(
             .try_collect::<Vec<_>>(),
     )?;
     Ok(allowlist_authorization.into_authorization_check_result(
-        has_acl_access,
-        all_rollout_allowlisted(rollout_allowlisted),
+        FactorResult::from_authorized(has_acl_access),
+        FactorResult::from_optional_authorized(
+            has_rollout_allowlist,
+            all_rollout_allowlisted(rollout_allowlisted),
+        ),
     ))
 }
 
@@ -879,7 +898,10 @@ async fn check_allowlist_authorization(
     )?;
     Ok(AllowlistAuthorization {
         is_allowlisted_tooling,
-        is_admin_bypass,
+        is_admin_bypass: FactorResult::from_optional_authorized(
+            admin_bypass_group.is_some(),
+            is_admin_bypass,
+        ),
     })
 }
 
@@ -887,10 +909,12 @@ async fn check_optional_allowlist_group(
     ctx: &CoreContext,
     acl_provider: &Arc<dyn AclProvider>,
     group_name: Option<&str>,
-) -> Result<bool> {
+) -> Result<FactorResult> {
     match group_name {
-        Some(group_name) => is_part_of_group(ctx, acl_provider, group_name).await,
-        None => Ok(false),
+        Some(group_name) => is_part_of_group(ctx, acl_provider, group_name)
+            .await
+            .map(FactorResult::from_authorized),
+        None => Ok(FactorResult::NotSet),
     }
 }
 
@@ -912,6 +936,8 @@ pub(crate) async fn get_path_restriction_root_check(
     cs_id: Option<ChangesetId>,
     paths: &[NonRootMPath],
 ) -> Result<Vec<PathRestrictionCheckResult>> {
+    // TODO(T289977216): In Both mode, fetch both sources and reconcile their
+    // tri-state factors instead of selecting one source's metadata.
     let restriction_info =
         restriction_info::get_path_restriction_root_info(restricted_paths, ctx, cs_id, paths)
             .await?;
@@ -925,6 +951,8 @@ pub(crate) async fn get_path_restriction_check(
     cs_id: Option<ChangesetId>,
     paths: &[NonRootMPath],
 ) -> Result<Vec<PathRestrictionCheckResult>> {
+    // TODO(T289977216): In Both mode, fetch both sources and reconcile their
+    // tri-state factors instead of selecting one source's metadata.
     let restriction_info =
         restriction_info::get_path_restriction_info(restricted_paths, ctx, cs_id, paths).await?;
     check_path_restriction_infos(ctx, restricted_paths, restriction_info).await
@@ -936,20 +964,18 @@ pub(crate) async fn get_manifest_restriction_check(
     ctx: &CoreContext,
     manifest_id: &RestrictedManifestId,
     manifest_type: &ManifestType,
-    source: ManifestRestrictionSource,
+    source: RestrictionSource,
 ) -> Result<Vec<ManifestRestrictionCheckResult>> {
     let restriction_info = match source {
-        ManifestRestrictionSource::Config => {
-            restriction_info::get_manifest_restriction_info_from_config(
-                restricted_paths,
-                ctx,
-                manifest_id,
-                manifest_type,
-            )
-            .await
-            .context("find config restrictions for manifest-side check")?
-        }
-        ManifestRestrictionSource::AclManifest => {
+        RestrictionSource::Config => restriction_info::get_manifest_restriction_info_from_config(
+            restricted_paths,
+            ctx,
+            manifest_id,
+            manifest_type,
+        )
+        .await
+        .context("find config restrictions for manifest-side check")?,
+        RestrictionSource::AclManifest => {
             restriction_info::get_manifest_restriction_info_from_acl_manifest(
                 restricted_paths,
                 ctx,
@@ -970,6 +996,8 @@ pub(crate) async fn get_manifest_restriction_check_for_current_behavior(
     manifest_id: &RestrictedManifestId,
     manifest_type: &ManifestType,
 ) -> Result<Vec<ManifestRestrictionCheckResult>> {
+    // TODO(T289977216): In Both mode, fetch both sources and reconcile their
+    // tri-state factors instead of selecting one source's metadata.
     let restriction_info = restriction_info::get_manifest_restriction_info(
         restricted_paths,
         ctx,
@@ -1044,6 +1072,7 @@ fn pre_filter_condition_sets<'a>(
 struct RequestFacts<'a> {
     entry_point: Option<String>,
     server_side_tenting: bool,
+    client_partial_responses_flag: bool,
     machine_tier: Option<&'a str>,
     build_rule: Option<&'static str>,
     identities: &'a MononokeIdentitySet,
@@ -1063,6 +1092,8 @@ impl<'a> RequestFacts<'a> {
                 .client_request_info()
                 .map(|cri| cri.entry_point.to_string()),
             server_side_tenting: ctx.session().server_side_tenting(),
+            client_partial_responses_flag: metadata.partial_responses_opt_in()
+                || metadata.partial_responses_opt_out(),
             machine_tier: metadata.machine_tier(),
             build_rule: server_build_rule(),
             identities: metadata.identities(),
@@ -1112,7 +1143,9 @@ impl<'a> RequestFacts<'a> {
     /// `always_enabled` and `restriction_acls` are the caller's to evaluate.
     fn matches_condition_set(&self, set: &EnforcementConditionSet) -> bool {
         self.matches(&set.matchers)
-            && (!set.require_client_request_flag || self.server_side_tenting)
+            && (!set.require_client_request_flag
+                || self.server_side_tenting
+                || self.client_partial_responses_flag)
     }
 }
 
@@ -1169,35 +1202,11 @@ where
     T: SourceRestrictionCheck + Send + Sync + 'static,
 {
     let result = handle.await_result().await?;
-    let any_match = match pre_filter_variant {
-        PreFilterVariant::Definite => true,
-        PreFilterVariant::NeedsFetch => {
-            let restriction_acls = result
-                .as_ref()
-                .iter()
-                .map(SourceRestrictionCheck::repo_region_identity)
-                .collect::<Vec<_>>();
-            condition_sets_match_restriction_acls(candidates, &restriction_acls)
-        }
-    };
-
-    if !any_match {
-        return Ok(AccessEnforcementOutcome::NotEnforced);
-    }
-
-    let denial_permission_request_group = result
-        .as_ref()
-        .iter()
-        .filter(|check| !check.authorization().has_authorization())
-        // Multiple denied checks can be returned by one source. Pick a stable
-        // permission request group so error messages do not depend on source
-        // result ordering.
-        .min_by(|left, right| compare_denied_checks(*left, *right))
-        .map(|check| check.permission_request_group().clone());
-
-    Ok(AccessEnforcementOutcome::Enforced {
-        denial_permission_request_group,
-    })
+    Ok(completed_source_enforcement_outcome(
+        result.as_ref(),
+        candidates,
+        pre_filter_variant,
+    ))
 }
 
 /// Combine authoritative source enforcement outcomes.
@@ -1216,15 +1225,13 @@ pub(crate) fn authoritative_sources_enforcement_outcome(
 
     if let Some(denial) = outcomes
         .into_iter()
-        .find(|outcome| outcome.denial_permission_request_group().is_some())
+        .find(|outcome| outcome.denial().is_some())
     {
         return Ok(denial);
     }
     match errors.into_iter().next() {
         Some(error) => Err(error),
-        None if enforced => Ok(AccessEnforcementOutcome::Enforced {
-            denial_permission_request_group: None,
-        }),
+        None if enforced => Ok(AccessEnforcementOutcome::Enforced { denial: None }),
         None => Ok(AccessEnforcementOutcome::NotEnforced),
     }
 }
@@ -1300,7 +1307,7 @@ pub(crate) async fn check_manifest_restriction_from_source(
     restricted_paths: &RestrictedPaths,
     manifest_id: RestrictedManifestId,
     manifest_type: ManifestType,
-    source: ManifestRestrictionSource,
+    source: RestrictionSource,
 ) -> Result<Vec<ManifestRestrictionCheckResult>> {
     get_manifest_restriction_check(restricted_paths, ctx, &manifest_id, &manifest_type, source)
         .await
@@ -1311,7 +1318,7 @@ pub(crate) fn spawn_manifest_restriction_check(
     restricted_paths: Arc<RestrictedPaths>,
     manifest_id: RestrictedManifestId,
     manifest_type: ManifestType,
-    source: ManifestRestrictionSource,
+    source: RestrictionSource,
 ) -> SharedFetchHandle<ManifestRestrictionCheckResult> {
     let ctx = ctx.clone();
     let handle = mononoke::spawn_task(async move {
@@ -1473,6 +1480,94 @@ async fn check_restriction_authorization_with_acl(
         has_read_access_to_repo_region(ctx, acl_provider, &acls),
         is_in_optional_group(ctx, acl_provider, rollout_allowlist_group),
     )?;
-    Ok(allowlist_authorization
-        .into_authorization_check_result(has_acl_access, is_rollout_allowlisted))
+    Ok(allowlist_authorization.into_authorization_check_result(
+        FactorResult::from_authorized(has_acl_access),
+        FactorResult::from_optional_authorized(
+            rollout_allowlist_group.is_some(),
+            is_rollout_allowlisted,
+        ),
+    ))
+}
+
+/// Preserve the legacy single-source contract: ACL and rollout require every
+/// restriction, while repository-wide tooling and admin grants require any.
+fn aggregate_single_source_authorization(
+    checks: &[impl SourceRestrictionCheck],
+) -> AuthorizationCheckResult {
+    AuthorizationCheckResult::new(
+        checks
+            .iter()
+            .all(|check| check.authorization().acl_result().is_authorized()),
+        checks
+            .iter()
+            .any(|check| check.authorization().tooling_result().is_authorized()),
+        all_rollout_allowlisted(
+            checks
+                .iter()
+                .map(|check| check.authorization().rollout_result().is_authorized()),
+        ),
+        checks
+            .iter()
+            .any(|check| check.authorization().admin_result().is_authorized()),
+    )
+}
+
+/// Aggregate per-restriction rollout-allowlist flags for one request.
+///
+/// Every restriction must allowlist the caller: being allowlisted for one tent
+/// must not authorize reads of a different tent caught by the same request.
+///
+/// The emptiness guard is load-bearing. `all()` is vacuously true, and an empty
+/// batch means nothing was restricted — already authorized via `has_acl_access`,
+/// but not *rollout-allowlisted*. Without the guard every unrestricted access
+/// would be logged as rollout-allowlisted.
+fn all_rollout_allowlisted(flags: impl IntoIterator<Item = bool>) -> bool {
+    let mut flags = flags.into_iter().peekable();
+    flags.peek().is_some() && flags.all(|allowlisted| allowlisted)
+}
+
+/// Calculate enforcement after one source fetch has completed successfully.
+///
+/// `Definite` always produces `Enforced`; `NeedsFetch` produces `Enforced` only
+/// when a restriction ACL matches an active condition, and otherwise produces
+/// `NotEnforced`. An enforced result carries a denial group only when at least
+/// one fetched restriction is unauthorized. Fetch errors must be handled by
+/// the caller before invoking this helper.
+fn completed_source_enforcement_outcome<T>(
+    result: &[T],
+    candidates: &[&EnforcementConditionSet],
+    pre_filter_variant: &PreFilterVariant,
+) -> AccessEnforcementOutcome
+where
+    T: SourceRestrictionCheck,
+{
+    let any_match = match pre_filter_variant {
+        PreFilterVariant::Definite => true,
+        PreFilterVariant::NeedsFetch => {
+            let restriction_acls = result
+                .iter()
+                .map(SourceRestrictionCheck::repo_region_identity)
+                .collect::<Vec<_>>();
+            condition_sets_match_restriction_acls(candidates, &restriction_acls)
+        }
+    };
+
+    if !any_match {
+        return AccessEnforcementOutcome::NotEnforced;
+    }
+
+    let denial = result
+        .iter()
+        .filter(|check| !check.authorization().has_authorization())
+        // Multiple denied checks can be returned by one source. Pick a stable
+        // denying restriction so error messages do not depend on source
+        // result ordering.
+        .min_by(|left, right| compare_denied_checks(*left, *right))
+        .map(|check| DenyingRestriction {
+            restriction_root: check.restriction_root().cloned(),
+            repo_region_acl: check.repo_region_identity().clone(),
+            permission_request_group: check.permission_request_group().clone(),
+        });
+
+    AccessEnforcementOutcome::Enforced { denial }
 }

@@ -14,7 +14,6 @@
 //! but not exactly once i.e. the same request might be executed a few times.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -50,12 +49,12 @@ use mononoke_api::MononokeRepo;
 use mononoke_api::Repo;
 use mononoke_app::MononokeReposManager;
 use mononoke_macros::mononoke;
+use mononoke_repos::MononokeRepos;
 use mononoke_types::RepositoryId;
 use mononoke_types::Timestamp;
 use rand::RngExt as _;
 use stats::define_stats;
 use stats::prelude::*;
-use tokio::sync::OnceCell;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -69,13 +68,13 @@ use crate::scuba::log_start;
 use crate::stats::stats_loop;
 
 /// Decrement the refcount for an on-demand loaded repo. When the count drops
-/// to zero the repo is removed from memory via `repos_mgr.remove_repo()`.
+/// to zero the repo is removed from memory via `remove_repo`.
 /// This is a standalone function so it can be called both through `&self` and
 /// after `self` has been partially moved.
 fn release_ondemand_repo_impl(
     repo_id: Option<RepositoryId>,
     ondemand_repo_refs: &Mutex<HashMap<RepositoryId, OndemandRepoRef>>,
-    repos_mgr: &MononokeReposManager<Repo>,
+    remove_repo: impl FnOnce(&str),
 ) {
     let repo_id = match repo_id {
         Some(id) => id,
@@ -90,7 +89,7 @@ fn release_ondemand_repo_impl(
             // Keep the entry locked until the repo has been removed. Otherwise,
             // a concurrent request can mistake the still-present repo for a
             // pre-configured repo and use it without taking a reference.
-            repos_mgr.remove_repo(&name);
+            remove_repo(&name);
             refs.remove(&repo_id);
         } else {
             repo_ref.count -= 1;
@@ -98,50 +97,80 @@ fn release_ondemand_repo_impl(
     }
 }
 
-type RepoLoadResult = Result<(), Arc<Error>>;
-
 struct OndemandRepoRef {
     name: String,
     count: usize,
-    /// Resolves only after `add_repo()` has finished. All concurrent requests
-    /// for this repo await the same cell before trying to access the repo.
-    loaded: Arc<OnceCell<RepoLoadResult>>,
 }
 
-async fn wait_for_repo_load<F, Fut>(loaded: &OnceCell<RepoLoadResult>, load: F) -> RepoLoadResult
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<(), Error>>,
-{
-    loaded
-        .get_or_init(|| async { load().await.map_err(Arc::new) })
-        .await
-        .clone()
-}
-
-/// Release the reference registered by a request whose shared repo load
-/// failed. The failed generation stays in the map until all of its waiters
-/// have observed the error, then the next request can start a fresh load.
-fn release_failed_repo_load(
-    repo_id: RepositoryId,
-    loaded: &Arc<OnceCell<RepoLoadResult>>,
+/// Ensure the repo for a request is loaded. Returns true if this is an
+/// on-demand repo that must be released after processing.
+///
+/// `repo_name` resolves an unloaded repo's name; `remove_repo` unloads it if
+/// the load fails and this was its last request.
+async fn ensure_ondemand_repo_loaded<R>(
+    repos: &MononokeRepos<R>,
     ondemand_repo_refs: &Mutex<HashMap<RepositoryId, OndemandRepoRef>>,
-) {
-    let mut refs = ondemand_repo_refs.lock().expect("poisoned mutex");
-    let remove = match refs.get_mut(&repo_id) {
-        Some(repo_ref) if Arc::ptr_eq(&repo_ref.loaded, loaded) => {
-            if repo_ref.count == 1 {
-                true
-            } else {
-                repo_ref.count -= 1;
-                false
-            }
-        }
-        _ => false,
+    repo_id: Option<RepositoryId>,
+    repo_name: impl FnOnce(RepositoryId) -> Result<String>,
+    remove_repo: impl FnOnce(&str),
+) -> Result<bool, Arc<Error>>
+where
+    R: Send + Sync + 'static,
+{
+    let repo_id = match repo_id {
+        Some(id) => id,
+        None => return Ok(false),
     };
-    if remove {
-        refs.remove(&repo_id);
+
+    let repo_name = {
+        let mut refs = ondemand_repo_refs.lock().expect("poisoned mutex");
+        if let Some(repo_ref) = refs.get_mut(&repo_id) {
+            repo_ref.count += 1;
+            repo_ref.name.clone()
+        } else {
+            // Pre-configured repo — no on-demand management needed. The
+            // worker's `Mononoke` is built over this same repo set, so this is
+            // the lookup `Mononoke::raw_repo_by_id` does.
+            if repos.get_by_id(repo_id.id()).is_some() {
+                return Ok(false);
+            }
+            let repo_name = repo_name(repo_id).map_err(|e| {
+                Arc::new(Error::msg(format!(
+                    "No config found for repo_id {repo_id}: {e}"
+                )))
+            })?;
+            // Registered under the refs lock so a concurrent release cannot
+            // remove the repo before this request holds its reference.
+            info!("Loading repo {} (id={}) on-demand", repo_name, repo_id);
+            repos.add_placeholder(&repo_name, repo_id.id());
+            refs.insert(
+                repo_id,
+                OndemandRepoRef {
+                    name: repo_name.clone(),
+                    count: 1,
+                },
+            );
+            repo_name
+        }
+    };
+
+    // Concurrent requests for the same repo share one detached build.
+    let load_result = match repos.get(&repo_name).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(Error::msg(format!(
+            "On-demand repo {repo_name} (id={repo_id}) was removed while loading"
+        ))),
+        Err(error) => Err(error),
+    };
+
+    // A failed load is released like a finished request: the last waiter
+    // removes the repo, so the next request starts a fresh build.
+    if let Err(error) = load_result {
+        release_ondemand_repo_impl(Some(repo_id), ondemand_repo_refs, remove_repo);
+        return Err(Arc::new(error));
     }
+
+    Ok(true)
 }
 
 const DEQUEUE_STREAM_SLEEP_TIME: u64 = 1000;
@@ -236,8 +265,7 @@ impl RepoShardedProcessExecutor for AsyncMethodRequestWorker {
         // Start the stats logger loop
         let (stats, stats_abort_handle) = abortable({
             cloned!(self.ctx, self.queue);
-            let repo_ids = self.mononoke.known_repo_ids().clone();
-            async move { stats_loop(&ctx, repo_ids, &queue).await }
+            async move { stats_loop(&ctx, &queue).await }
         });
         let _stats = mononoke::spawn_task(stats);
 
@@ -401,62 +429,28 @@ impl AsyncMethodRequestWorker {
     /// an on-demand repo that should be released after processing via
     /// `release_ondemand_repo`.
     async fn ensure_repo_loaded(&self, repo_id: Option<RepositoryId>) -> Result<bool, Arc<Error>> {
-        let repo_id = match repo_id {
-            Some(id) => id,
-            None => return Ok(false),
-        };
-
-        // Register this request and get the readiness cell shared by every
-        // concurrent request for the same on-demand repo.
-        let (repo_name, loaded) = {
-            let mut refs = self.ondemand_repo_refs.lock().expect("poisoned mutex");
-            if let Some(repo_ref) = refs.get_mut(&repo_id) {
-                repo_ref.count += 1;
-                (repo_ref.name.clone(), repo_ref.loaded.clone())
-            } else {
-                // Pre-configured repo — no on-demand management needed.
-                if self.mononoke.raw_repo_by_id(repo_id.id()).is_some() {
-                    return Ok(false);
-                }
-                let configs = self.repos_mgr.configs();
-                let (repo_name, _) = configs
-                    .get_or_load_repo_config_by_id(repo_id.id())
-                    .map_err(|e| {
-                        Arc::new(Error::msg(format!(
-                            "No config found for repo_id {repo_id}: {e}"
-                        )))
-                    })?;
-                let loaded = Arc::new(OnceCell::new());
-                refs.insert(
-                    repo_id,
-                    OndemandRepoRef {
-                        name: repo_name.clone(),
-                        count: 1,
-                        loaded: loaded.clone(),
-                    },
-                );
-                (repo_name, loaded)
-            }
-        };
-
-        let load_result = wait_for_repo_load(&loaded, || async {
-            info!("Loading repo {} (id={}) on-demand", repo_name, repo_id);
-            self.repos_mgr.add_repo(&repo_name).await.map(|_| ())
-        })
-        .await;
-
-        if let Err(error) = load_result {
-            release_failed_repo_load(repo_id, &loaded, &self.ondemand_repo_refs);
-            return Err(error);
-        }
-
-        Ok(true)
+        let repos_mgr = &self.repos_mgr;
+        ensure_ondemand_repo_loaded(
+            repos_mgr.repos(),
+            &self.ondemand_repo_refs,
+            repo_id,
+            |repo_id| {
+                let (repo_name, _) = repos_mgr
+                    .configs()
+                    .get_or_load_repo_config_by_id(repo_id.id())?;
+                Ok(repo_name)
+            },
+            |repo_name| repos_mgr.remove_repo(repo_name),
+        )
+        .await
     }
 
     /// Decrement the refcount for an on-demand repo. When it reaches zero,
     /// remove the repo from memory.
     fn release_ondemand_repo(&self, repo_id: Option<RepositoryId>) {
-        release_ondemand_repo_impl(repo_id, &self.ondemand_repo_refs, &self.repos_mgr);
+        release_ondemand_repo_impl(repo_id, &self.ondemand_repo_refs, |repo_name| {
+            self.repos_mgr.remove_repo(repo_name)
+        });
     }
 
     fn concurrency_limit_backoff() -> Duration {
@@ -658,7 +652,9 @@ impl AsyncMethodRequestWorker {
         }
 
         // Release on-demand repo (decrement refcount, remove when zero).
-        release_ondemand_repo_impl(cleanup_repo_id, &ondemand_repo_refs, &repos_mgr_for_cleanup);
+        release_ondemand_repo_impl(cleanup_repo_id, &ondemand_repo_refs, |repo_name| {
+            repos_mgr_for_cleanup.remove_repo(repo_name)
+        });
     }
 
     async fn keep_alive_loop(
@@ -707,8 +703,11 @@ mod test {
 
     use anyhow::Error;
     use fbinit::FacebookInit;
+    use futures::FutureExt;
+    use futures::future::BoxFuture;
     use mononoke_api::RepositoryId;
     use mononoke_macros::mononoke;
+    use mononoke_repos::RepoLoader;
     use requests_table::RequestType;
     use source_control as thrift;
 
@@ -717,93 +716,291 @@ mod test {
     // A representative threshold for exercising `request_stream_inner` directly.
     const ABANDONED_REQUEST_THRESHOLD_SECS: i64 = 5 * 60;
 
-    #[mononoke::fbinit_test]
-    async fn test_concurrent_repo_loads_wait_for_first_loader(_fb: FacebookInit) -> Result<()> {
-        let loaded = Arc::new(OnceCell::new());
-        let load_started = Arc::new(tokio::sync::Notify::new());
-        let finish_load = Arc::new(tokio::sync::Notify::new());
-        let load_count = Arc::new(AtomicUsize::new(0));
+    const ONDEMAND_REPO: &str = "repo";
 
-        let first = mononoke::spawn_task({
-            cloned!(loaded, load_started, finish_load, load_count);
-            async move {
-                wait_for_repo_load(&loaded, || async {
-                    load_count.fetch_add(1, Ordering::Relaxed);
-                    load_started.notify_one();
-                    finish_load.notified().await;
-                    Ok(())
-                })
+    fn ondemand_repo_id() -> RepositoryId {
+        RepositoryId::new(1)
+    }
+
+    struct TestRepo;
+
+    /// Counts loads, fails the first `fail_first` of them, and holds each one
+    /// until the test lets it finish.
+    struct Gate {
+        calls: AtomicUsize,
+        fail_first: usize,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Gate {
+        fn held(fail_first: usize) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                fail_first,
+                started: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn open(fail_first: usize) -> Arc<Self> {
+            let gate = Self::held(fail_first);
+            gate.let_through();
+            gate
+        }
+
+        fn let_through(&self) {
+            self.release
+                .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        async fn load(&self) -> Result<TestRepo> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release
+                .acquire()
                 .await
+                .expect("the gate is never closed")
+                .forget();
+            if call < self.fail_first {
+                Err(Error::msg("repo load failed"))
+            } else {
+                Ok(TestRepo)
             }
-        });
-        load_started.notified().await;
+        }
+    }
 
-        let second = wait_for_repo_load(&loaded, || async {
-            load_count.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        });
-        pin_mut!(second);
-        assert!(futures::poll!(second.as_mut()).is_pending());
-        assert_eq!(load_count.load(Ordering::Relaxed), 1);
+    struct GatedLoader(Arc<Gate>);
 
-        finish_load.notify_one();
-        first.await?.expect("first repo load should succeed");
-        second.await.expect("second repo load should succeed");
+    impl RepoLoader<TestRepo> for GatedLoader {
+        fn load(&self, _repo_name: String) -> BoxFuture<'static, Result<TestRepo>> {
+            let gate = self.0.clone();
+            async move { gate.load().await }.boxed()
+        }
+    }
+
+    /// A real `MononokeRepos` whose repo is built by a `Gate`, plus the
+    /// worker's refcounts.
+    struct Ondemand {
+        repos: MononokeRepos<TestRepo>,
+        refs: Mutex<HashMap<RepositoryId, OndemandRepoRef>>,
+    }
+
+    impl Ondemand {
+        fn new(gate: &Arc<Gate>) -> Arc<Self> {
+            Arc::new(Self {
+                repos: MononokeRepos::new_lazy(Arc::new(GatedLoader(gate.clone()))),
+                refs: Mutex::new(HashMap::new()),
+            })
+        }
+    }
+
+    impl Ondemand {
+        fn request(self: &Arc<Self>) -> tokio::task::JoinHandle<Result<bool, Arc<Error>>> {
+            let ondemand = self.clone();
+            mononoke::spawn_task(async move {
+                ensure_ondemand_repo_loaded(
+                    &ondemand.repos,
+                    &ondemand.refs,
+                    Some(ondemand_repo_id()),
+                    |_| Ok(ONDEMAND_REPO.to_string()),
+                    |repo_name| ondemand.repos.remove(repo_name),
+                )
+                .await
+            })
+        }
+
+        fn release(&self) {
+            release_ondemand_repo_impl(Some(ondemand_repo_id()), &self.refs, |repo_name| {
+                self.repos.remove(repo_name)
+            });
+        }
+
+        fn is_loaded(&self) -> bool {
+            self.repos.get_by_name(ONDEMAND_REPO).is_some()
+        }
+
+        fn is_registered(&self) -> bool {
+            self.repos.iter_names().any(|name| name == ONDEMAND_REPO)
+        }
+
+        fn refcount(&self) -> Option<usize> {
+            self.refs
+                .lock()
+                .expect("poisoned mutex")
+                .get(&ondemand_repo_id())
+                .map(|repo_ref| repo_ref.count)
+        }
+    }
+
+    /// Lets every other task on the test's single-threaded runtime run until
+    /// it blocks.
+    async fn settle() {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[mononoke::test]
+    async fn test_ondemand_requests_share_one_inflight_load() -> Result<()> {
+        let gate = Gate::held(0);
+        let ondemand = Ondemand::new(&gate);
+
+        let first = ondemand.request();
+        gate.started.notified().await;
+        let second = ondemand.request();
+        settle().await;
+
+        assert!(
+            !second.is_finished(),
+            "a request must wait for the in-flight load, neither skipping nor finishing it"
+        );
+        assert!(
+            !ondemand.is_loaded(),
+            "the repo must not be served mid-load"
+        );
+        assert_eq!(
+            ondemand.refcount(),
+            Some(2),
+            "both requests hold a reference"
+        );
+
+        gate.let_through();
+        assert!(
+            first
+                .await?
+                .expect("the first request should load the repo")
+        );
+        assert!(
+            second
+                .await?
+                .expect("the second request should share the load")
+        );
+        assert!(ondemand.is_loaded());
+        assert_eq!(gate.calls(), 1, "two concurrent requests must load once");
         Ok(())
     }
 
-    #[mononoke::fbinit_test]
-    async fn test_failed_repo_load_releases_each_waiter(_fb: FacebookInit) -> Result<()> {
-        let repo_id = RepositoryId::new(1);
-        let loaded = Arc::new(OnceCell::new());
-        let finish_load = Arc::new(tokio::sync::Notify::new());
-        let load_count = AtomicUsize::new(0);
-        let ondemand_repo_refs = Mutex::new(HashMap::from([(
-            repo_id,
-            OndemandRepoRef {
-                name: "test_repo".to_string(),
-                count: 2,
-                loaded: loaded.clone(),
-            },
-        )]));
+    #[mononoke::test]
+    async fn test_ondemand_failed_load_reaches_every_waiter_then_is_retried() -> Result<()> {
+        let gate = Gate::held(1);
+        let ondemand = Ondemand::new(&gate);
 
-        let first = wait_for_repo_load(&loaded, || async {
-            load_count.fetch_add(1, Ordering::Relaxed);
-            finish_load.notified().await;
-            Err(Error::msg("repo load failed"))
-        });
-        pin_mut!(first);
-        assert!(futures::poll!(first.as_mut()).is_pending());
-
-        let second = wait_for_repo_load(&loaded, || async {
-            load_count.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        });
-        pin_mut!(second);
-        assert!(futures::poll!(second.as_mut()).is_pending());
-        assert_eq!(load_count.load(Ordering::Relaxed), 1);
-
-        finish_load.notify_one();
-        let first_error = first.await.expect_err("repo load should fail");
-        let second_error = second.await.expect_err("waiter should see load failure");
-        assert!(Arc::ptr_eq(&first_error, &second_error));
-
-        release_failed_repo_load(repo_id, &loaded, &ondemand_repo_refs);
-        assert_eq!(
-            ondemand_repo_refs
-                .lock()
-                .expect("poisoned mutex")
-                .get(&repo_id)
-                .expect("entry should remain for the second waiter")
-                .count,
-            1,
-        );
-        release_failed_repo_load(repo_id, &loaded, &ondemand_repo_refs);
+        let first = ondemand.request();
+        gate.started.notified().await;
+        let second = ondemand.request();
+        settle().await;
         assert!(
-            !ondemand_repo_refs
-                .lock()
-                .expect("poisoned mutex")
-                .contains_key(&repo_id)
+            !second.is_finished(),
+            "the second request waits on the first load"
+        );
+
+        gate.let_through();
+        let errors = [
+            first
+                .await?
+                .expect_err("the first request should see the failure"),
+            second
+                .await?
+                .expect_err("the second request should see the same failure"),
+        ];
+        for error in &errors {
+            assert!(
+                format!("{error:#}").contains("repo load failed"),
+                "every waiter should get the load's own error, got: {error:#}"
+            );
+        }
+        assert_eq!(
+            gate.calls(),
+            1,
+            "both waiters must share the one failed load"
+        );
+        assert_eq!(
+            ondemand.refcount(),
+            None,
+            "every waiter must drop its reference"
+        );
+        assert!(
+            !ondemand.is_registered(),
+            "a failed load must not leave the repo behind"
+        );
+
+        assert!(
+            ondemand
+                .request()
+                .await?
+                .expect("the next request should load afresh and succeed")
+        );
+        assert_eq!(
+            gate.calls(),
+            2,
+            "the failure must not be cached past its waiters"
+        );
+        Ok(())
+    }
+
+    #[mononoke::test]
+    async fn test_ondemand_repo_is_unloaded_by_last_release_and_reloaded_after() -> Result<()> {
+        let gate = Gate::open(0);
+        let ondemand = Ondemand::new(&gate);
+
+        assert!(ondemand.request().await?.expect("load should succeed"));
+        assert!(
+            ondemand
+                .request()
+                .await?
+                .expect("loaded repo should be shared")
+        );
+        assert_eq!(ondemand.refcount(), Some(2));
+        assert_eq!(gate.calls(), 1, "a loaded repo must not be loaded again");
+
+        ondemand.release();
+        assert!(ondemand.is_loaded(), "a repo still in use must stay loaded");
+
+        ondemand.release();
+        assert!(
+            !ondemand.is_registered(),
+            "the last release should unload the repo"
+        );
+        assert_eq!(ondemand.refcount(), None);
+        assert_eq!(gate.calls(), 1, "releasing must not load anything");
+
+        assert!(ondemand.request().await?.expect("reload should succeed"));
+        assert_eq!(
+            gate.calls(),
+            2,
+            "a request after the unload must load again"
+        );
+        Ok(())
+    }
+
+    #[mononoke::test]
+    async fn test_ondemand_load_survives_its_first_request_being_dropped() -> Result<()> {
+        let gate = Gate::held(0);
+        let ondemand = Ondemand::new(&gate);
+
+        let first = ondemand.request();
+        gate.started.notified().await;
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("the request was aborted")
+                .is_cancelled()
+        );
+
+        let second = ondemand.request();
+        settle().await;
+        gate.let_through();
+        assert!(second.await?.expect("the next request should get the repo"));
+        assert_eq!(
+            gate.calls(),
+            1,
+            "a dropped request's load must finish rather than restart"
         );
         Ok(())
     }

@@ -1,0 +1,28 @@
+load("//eden/scm:targets.bzl", "sl_rust_library")
+
+oncall("sapling")
+
+sl_rust_library(
+    name = "small_set",
+    srcs = glob(["src/**/*.rs"]),
+    autocargo = {
+        "cargo_toml_config": {
+            "features": {
+                "default": [],
+                "serialize": ["serde"],
+            },
+            "package": {
+                "description": "Compact bitset of small non-negative integers.",
+            },
+        },
+    },
+    crate_root = "src/lib.rs",
+    features = ["serialize"],
+    test_deps = [
+        "fbsource//third-party/rust:quickcheck",
+        "fbsource//third-party/rust:serde_json",
+    ],
+    deps = [
+        "fbsource//third-party/rust:serde",
+    ],
+)

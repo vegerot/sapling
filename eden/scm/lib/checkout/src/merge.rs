@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use manifest::FileType;
@@ -66,7 +67,10 @@ impl Merge {
                 (None, Some(_a)) => continue, // Already in destination
                 (Some(a), None) => ActionOrConflict::Action(*a),
                 (Some(s), Some(d)) => {
-                    if let Some(ac) = self.resolve_conflict(*s, *d) {
+                    if let Some(ac) = self
+                        .resolve_conflict(*s, *d)
+                        .with_context(|| format!("Failed to merge {file}"))?
+                    {
                         ac
                     } else {
                         continue;
@@ -80,9 +84,9 @@ impl Merge {
         Ok(result)
     }
 
-    fn resolve_conflict(&self, src: Action, dest: Action) -> Option<ActionOrConflict> {
-        Some(match (src, dest) {
-            (Action::Remove, Action::Remove) => return None,
+    fn resolve_conflict(&self, src: Action, dest: Action) -> Result<Option<ActionOrConflict>> {
+        Ok(Some(match (src, dest) {
+            (Action::Remove, Action::Remove) => return Ok(None),
             (Action::Update(s), Action::Update(d)) => both_changed(s, d),
             (Action::UpdateExec(s), Action::UpdateExec(d)) => {
                 assert!(s == d); // Can not be otherwise
@@ -96,7 +100,7 @@ impl Merge {
 
             // mercurial handles this differently - it actually raise it as a conflict since file has "changed" and removed
             // but more logical is probably to just remove the file and ignore flag update on the other side
-            (Action::UpdateExec(_), Action::Remove) => return None,
+            (Action::UpdateExec(_), Action::Remove) => return Ok(None),
 
             // exists only in src / remote / m2
             (Action::Remove, Action::Update(up)) => {
@@ -105,11 +109,47 @@ impl Merge {
             // same as mirror case above, for mercurial this is a conflict
             (Action::Remove, Action::UpdateExec(_)) => ActionOrConflict::Action(Action::Remove),
 
-            // flag conflicts - todo - implement
-            (Action::Update(_), Action::UpdateExec(_)) => unimplemented!(),
-            (Action::UpdateExec(_), Action::Update(_)) => unimplemented!(),
-        })
+            (Action::Update(mut update), Action::UpdateExec(exec))
+            | (Action::UpdateExec(exec), Action::Update(mut update)) => {
+                let update_is_src = matches!(src, Action::Update(_));
+                match update.to.file_type {
+                    FileType::Regular | FileType::Executable => {
+                        if update_is_src {
+                            update.to.file_type = if exec {
+                                FileType::Executable
+                            } else {
+                                FileType::Regular
+                            };
+                            ActionOrConflict::Action(Action::Update(update))
+                        } else {
+                            ActionOrConflict::Action(Action::UpdateExec(exec))
+                        }
+                    }
+                    FileType::Symlink | FileType::GitSubmodule => {
+                        let exec = exec_update(update, exec)?;
+                        if update_is_src {
+                            both_changed(update, exec)
+                        } else {
+                            both_changed(exec, update)
+                        }
+                    }
+                }
+            }
+        }))
     }
+}
+
+fn exec_update(update: UpdateAction, exec: bool) -> Result<UpdateAction> {
+    let from = update
+        .from
+        .context("an executable-bit change requires a file in the common ancestor")?;
+    let mut to = from;
+    to.file_type = if exec {
+        FileType::Executable
+    } else {
+        FileType::Regular
+    };
+    Ok(UpdateAction::new(Some(from), to))
 }
 
 fn both_changed(src: UpdateAction, dest: UpdateAction) -> ActionOrConflict {
@@ -213,5 +253,106 @@ impl<M: Manifest> MergeResult<M> {
 impl<T: Manifest> fmt::Display for MergeResult<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}\n{}", self.actions, self.conflicts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use manifest::FileMetadata;
+    use manifest_tree::testutil::TestStore;
+    use manifest_tree::testutil::make_tree_manifest_from_meta;
+    use types::HgId;
+
+    use super::*;
+
+    #[test]
+    fn test_merge_content_with_exec() -> Result<()> {
+        check_content_and_exec(false)
+    }
+
+    #[test]
+    fn test_merge_exec_with_content() -> Result<()> {
+        check_content_and_exec(true)
+    }
+
+    fn check_content_and_exec(swap_sides: bool) -> Result<()> {
+        for base_type in [FileType::Regular, FileType::Executable] {
+            let exec_type = if base_type == FileType::Regular {
+                FileType::Executable
+            } else {
+                FileType::Regular
+            };
+            for content_type in [FileType::Regular, FileType::Executable] {
+                let store = Arc::new(TestStore::new());
+                let path = RepoPathBuf::from_string("file".to_owned())?;
+                let base_meta = FileMetadata::new(HgId::from_byte_array([1; 20]), base_type);
+                let content_meta = FileMetadata::new(HgId::from_byte_array([2; 20]), content_type);
+                let exec_meta = FileMetadata::new(base_meta.hgid, exec_type);
+                let base =
+                    make_tree_manifest_from_meta(store.clone(), vec![(path.clone(), base_meta)]);
+                let content =
+                    make_tree_manifest_from_meta(store.clone(), vec![(path.clone(), content_meta)]);
+                let exec = make_tree_manifest_from_meta(store, vec![(path.clone(), exec_meta)]);
+                let (src, dest) = if swap_sides {
+                    (&exec, &content)
+                } else {
+                    (&content, &exec)
+                };
+
+                let merged = Merge {}
+                    .merge(src, dest, &base)?
+                    .try_into_manifest()?
+                    .expect("content and executable changes should merge without conflict");
+                assert_eq!(
+                    merged.get_file(&path)?,
+                    Some(FileMetadata::new(content_meta.hgid, exec_type)),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_symlink_with_exec() -> Result<()> {
+        check_symlink_and_exec(false)
+    }
+
+    #[test]
+    fn test_merge_exec_with_symlink() -> Result<()> {
+        check_symlink_and_exec(true)
+    }
+
+    fn check_symlink_and_exec(swap_sides: bool) -> Result<()> {
+        let store = Arc::new(TestStore::new());
+        let path = RepoPathBuf::from_string("file".to_owned())?;
+        let base_meta = FileMetadata::regular(HgId::from_byte_array([1; 20]));
+        let link_meta = FileMetadata::new(HgId::from_byte_array([2; 20]), FileType::Symlink);
+        let exec_meta = FileMetadata::new(base_meta.hgid, FileType::Executable);
+        let base = make_tree_manifest_from_meta(store.clone(), vec![(path.clone(), base_meta)]);
+        let link = make_tree_manifest_from_meta(store.clone(), vec![(path.clone(), link_meta)]);
+        let exec = make_tree_manifest_from_meta(store, vec![(path.clone(), exec_meta)]);
+        let (src, dest, src_meta, dest_meta) = if swap_sides {
+            (&exec, &link, exec_meta, link_meta)
+        } else {
+            (&link, &exec, link_meta, exec_meta)
+        };
+
+        let merged = Merge {}.merge(src, dest, &base)?;
+        match &merged.conflicts()[&path] {
+            Conflict::BothChanged {
+                ancestor,
+                src,
+                dest,
+            } => {
+                assert_eq!(*ancestor, Some(base_meta));
+                assert_eq!(*src, src_meta);
+                assert_eq!(*dest, dest_meta);
+            }
+            _ => panic!("a symlink and executable change should remain a type conflict"),
+        }
+        assert!(merged.try_into_manifest()?.is_none());
+        Ok(())
     }
 }

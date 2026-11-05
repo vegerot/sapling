@@ -460,6 +460,17 @@ class PrivHelperClientSession
   void handleSocketError(
       folly::StringPiece reason,
       const folly::exception_wrapper& ew) {
+    // The owner can drop its last reference when the status leaves RUNNING.
+    // The socket keeps raw pointers to this session until its callbacks
+    // unwind. Keep the session alive until the current loop iteration ends.
+    auto self = weak_from_this().lock();
+    if (!self) {
+      // This is a guard. Only the session destructor can call this without a
+      // live reference. The session releases conn_ before its destructor runs.
+      return;
+    }
+    EventBase* eventBase{nullptr};
+    UnixSocket::UniquePtr conn;
     // If we are RUNNING, move to the DISCONNECTED state and then close the
     // socket and fail all pending requests.
     //
@@ -476,30 +487,29 @@ class PrivHelperClientSession
       if (state->status != Status::RUNNING) {
         return;
       }
+      eventBase = state->eventBase;
       state->status = Status::DISCONNECTED;
       state->eventBase = nullptr;
+      // Claim the socket together with the status change. Otherwise
+      // shutdown() can claim it and destroy it off the EventBase thread.
+      conn = std::move(state->conn_);
     }
     XLOG(ERR) << "lost connection to privhelper process (" << reason
               << "): " << folly::exceptionStr(ew);
     if (edenFsEventsLogger_) {
       edenFsEventsLogger_->logEvent(PrivHelperExit{reason.str()});
     }
-    closeSocket(ew);
+    closeClaimedSocket(std::move(conn), ew);
     // The EventBase is no longer in use; without this, destroying the
     // client later fails OnDestructionCallback's must-be-canceled check.
     cancel();
+    eventBase->runInLoop([self = std::move(self)] {});
   }
 
   /**
-   * Tear down the connection and fail all pending requests.
-   *
-   * Safe to call from inside the socket's own callbacks:
-   * UnixSocket::destroy() defers its teardown until the callback stack
-   * unwinds.
+   * Claim the socket from state_, then tear down the connection.
    */
   void closeSocket(const folly::exception_wrapper& ew) {
-    PendingRequestMap pending;
-    pending.swap(pendingRequests_);
     // Move the socket out of state_ and destroy it only after releasing the
     // lock: if a receive callback is still registered (the EOF and error
     // paths), destroying the socket synchronously invokes socketClosed(),
@@ -512,6 +522,27 @@ class PrivHelperClientSession
       auto state = state_.wlock();
       conn = std::move(state->conn_);
     }
+    closeClaimedSocket(std::move(conn), ew);
+  }
+
+  /**
+   * Destroy a socket claimed from state_ and fail all pending requests.
+   *
+   * Does nothing when conn is null. Then another caller claimed the socket.
+   * Only that caller can access pendingRequests_.
+   *
+   * Safe to call from inside the socket's own callbacks:
+   * UnixSocket::destroy() defers its teardown until the callback stack
+   * unwinds.
+   */
+  void closeClaimedSocket(
+      UnixSocket::UniquePtr conn,
+      const folly::exception_wrapper& ew) {
+    if (!conn) {
+      return;
+    }
+    PendingRequestMap pending;
+    pending.swap(pendingRequests_);
     conn.reset();
 
     for (auto& entry : pending) {
@@ -621,6 +652,7 @@ class PrivHelperClientImpl : public PrivHelper {
   Future<folly::Unit> setFuseReadAhead(
       StringPiece mountPath,
       uint32_t readAheadKb) override;
+  Future<folly::Unit> setNfsFstypeOverride(bool enabled) override;
   Future<Unit> setRestartArgs(const EdenFsRestartArgs& args) override;
   void notifyCleanShutdown(StringPiece reason) noexcept override;
   void setEdenFsEventsLogger(
@@ -945,6 +977,17 @@ Future<Unit> PrivHelperClientImpl::setFuseReadAhead(
       .thenValue([](UnixSocket::Message&& response) {
         PrivHelperConn::parseEmptyResponse(
             PrivHelperConn::REQ_SET_FUSE_READ_AHEAD, response);
+      });
+}
+
+Future<Unit> PrivHelperClientImpl::setNfsFstypeOverride(bool enabled) {
+  auto xid = getNextXid();
+  auto request =
+      PrivHelperConn::serializeSetNfsFstypeOverrideRequest(xid, enabled);
+  return sendAndRecv(xid, "set_nfs_fstype_override", std::move(request))
+      .thenValue([](UnixSocket::Message&& response) {
+        PrivHelperConn::parseEmptyResponse(
+            PrivHelperConn::REQ_SET_NFS_FSTYPE_OVERRIDE, response);
       });
 }
 
@@ -1367,6 +1410,11 @@ class StubPrivHelper final : public PrivHelper {
       uint32_t readAheadKb) override {
     (void)mountPath;
     (void)readAheadKb;
+    NOT_IMPLEMENTED();
+  }
+
+  folly::Future<folly::Unit> setNfsFstypeOverride(bool enabled) override {
+    (void)enabled;
     NOT_IMPLEMENTED();
   }
 

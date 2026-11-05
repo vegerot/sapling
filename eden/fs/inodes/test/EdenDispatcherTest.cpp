@@ -10,22 +10,33 @@
 #include "eden/fs/fuse/FuseDispatcher.h"
 
 #include <fmt/format.h>
+#include <array>
 #include <atomic>
 #include <limits>
+#include <optional>
+#include <stdexcept>
+#include <string_view>
 #include <thread>
 
 #include <folly/test/TestUtils.h>
 #include <folly/testing/TestUtil.h>
 #include <gtest/gtest.h>
+#include "eden/common/utils/FaultInjector.h"
+#include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/inodes/EdenMount.h"
+#include "eden/fs/inodes/FileInode.h"
 #include "eden/fs/inodes/InodeMap.h"
+#include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/model/Blob.h"
+#include "eden/fs/model/Tree.h"
 #include "eden/fs/store/ObjectFetchContext.h"
+#include "eden/fs/testharness/FakeBackingStore.h"
 #include "eden/fs/testharness/FakeFuse.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
 #include "eden/fs/testharness/StoredObject.h"
 #include "eden/fs/testharness/TestMount.h"
+#include "eden/fs/utils/LinuxKernelVersion.h"
 
 using namespace facebook::eden;
 using namespace std::chrono_literals;
@@ -45,6 +56,55 @@ constexpr auto kTooLongPiece = folly::StringPiece{
 static_assert(256 == kTooLongPiece.size(), "256 is one larger than the max!");
 
 static const auto kTooLong = PathComponentPiece{kTooLongPiece};
+
+// Mirrors the INVAL_ENTRY mitigation in
+// FuseDispatcherImpl::computeNegativeEntryTtl().
+uint64_t expectedNegativeTtl(uint64_t configured) {
+#ifdef __linux__
+  auto version = getRunningLinuxKernelVersion();
+  if (version.major > 6 || (version.major == 6 && version.minor >= 19)) {
+    return 0;
+  }
+#endif
+  return configured;
+}
+
+constexpr std::array<std::string_view, 5> kFuseDispatcherFaultPoints{
+    "FuseDispatcherImpl::lookup",
+    "FuseDispatcherImpl::negativeLookup",
+    "FuseDispatcherImpl::getattr",
+    "FuseDispatcherImpl::read",
+    "FuseDispatcherImpl::write",
+};
+
+template <typename Trigger>
+void expectFaultPointReachable(
+    TestMount& mount,
+    std::string_view faultPoint,
+    Trigger&& trigger) {
+  auto& injector = mount.getServerState()->getFaultInjector();
+  injector.injectBlock(faultPoint, ".*", 1);
+
+  std::optional<std::string> error;
+  std::thread request([future = trigger(), &error]() mutable {
+    try {
+      std::move(future).get();
+    } catch (const std::exception& ex) {
+      error = ex.what();
+    }
+  });
+
+  const auto reached = injector.waitUntilBlocked(faultPoint, 5s);
+  injector.removeFault(faultPoint, ".*");
+  const auto unblocked = injector.unblockWithError(
+      faultPoint, ".*", std::runtime_error("checkpoint reached"));
+  request.join();
+
+  ASSERT_TRUE(reached) << faultPoint;
+  EXPECT_EQ(1, unblocked);
+  ASSERT_TRUE(error.has_value());
+  EXPECT_EQ("checkpoint reached", *error);
+}
 } // namespace
 
 TEST_F(EdenDispatcherTest, mknodReturnsNameTooLong) {
@@ -177,6 +237,62 @@ TEST(RawEdenDispatcherTest, lookup_returns_valid_inode_for_good_file) {
   EXPECT_EQ(entry.nodeid, entry.attr.ino);
 }
 
+TEST(RawEdenDispatcherTest, fuseDispatcherFaultPointsAreReachable) {
+  FakeTreeBuilder builder;
+  builder.setFile("file", "contents");
+  TestMount mount{builder};
+  auto* dispatcher = mount.getDispatcher();
+  const auto entry =
+      dispatcher
+          ->lookup(
+              0, kRootNodeId, "file"_pc, ObjectFetchContext::getNullContext())
+          .get(0ms);
+  const auto ino = InodeNumber{entry.nodeid};
+
+  expectFaultPointReachable(mount, kFuseDispatcherFaultPoints[0], [&] {
+    return dispatcher->lookup(
+        0, kRootNodeId, "file"_pc, ObjectFetchContext::getNullContext());
+  });
+  expectFaultPointReachable(mount, kFuseDispatcherFaultPoints[1], [&] {
+    return dispatcher->lookup(
+        0, kRootNodeId, "missing"_pc, ObjectFetchContext::getNullContext());
+  });
+  expectFaultPointReachable(mount, kFuseDispatcherFaultPoints[2], [&] {
+    return dispatcher->getattr(ino, ObjectFetchContext::getNullContext());
+  });
+  expectFaultPointReachable(mount, kFuseDispatcherFaultPoints[3], [&] {
+    return dispatcher->read(ino, 1, 0, ObjectFetchContext::getNullContext());
+  });
+  expectFaultPointReachable(mount, kFuseDispatcherFaultPoints[4], [&] {
+    return dispatcher->write(ino, "x", 0, ObjectFetchContext::getNullContext());
+  });
+}
+
+TEST(RawEdenDispatcherTest, negativeLookupFaultPointIsReachableOnEnoentPath) {
+  FakeTreeBuilder builder;
+  builder.setFile("restricted/file", "contents");
+  builder.setDirIsRestricted("restricted");
+  TestMount mount{builder};
+  auto restricted = mount.getTreeInode("restricted"_relpath);
+  ASSERT_TRUE(restricted->isRestricted());
+
+  // getOrLoadChildIfExists() hands restricted directories to getOrLoadChild().
+  // Once the permission recheck grants access, that path reports the missing
+  // name as ENOENT instead of returning a null inode.
+  auto restrictedTreeId =
+      builder.getRoot()->get().find("restricted"_pc)->second.getObjectId();
+  mount.getBackingStore()->setCheckPermissionResult(restrictedTreeId, true);
+
+  expectFaultPointReachable(mount, kFuseDispatcherFaultPoints[1], [&] {
+    return mount.getDispatcher()->lookup(
+        0,
+        restricted->getNodeId(),
+        "missing"_pc,
+        ObjectFetchContext::getNullContext());
+  });
+  EXPECT_FALSE(restricted->isRestricted());
+}
+
 TEST(RawEdenDispatcherTest, lookup_updates_last_used_time) {
   FakeTreeBuilder builder;
   builder.setFile("hello", "world");
@@ -189,17 +305,20 @@ TEST(RawEdenDispatcherTest, lookup_updates_last_used_time) {
               0, kRootNodeId, "hello"_pc, ObjectFetchContext::getNullContext())
           .get(0ms);
   auto ino = InodeNumber{entry.nodeid};
-  auto inode = mount.getEdenMount()->getInodeMap()->lookupInode(ino).get(0ms);
-  auto timeAfterLookup = inode->getLastFsRequestTime();
+  auto inode = mount.getEdenMount()
+                   ->getInodeMap()
+                   ->lookupInode(ino, ObjectFetchContext::getNullContext())
+                   .get(0ms);
+  auto timeAfterLookup = inode->getLastGcRefTime();
 
   // Advance the clock
   mount.getClock().advance(60s);
 
-  // Another lookup should update lastFsRequestTime
+  // Another lookup should update lastGcRefTime
   mount.getDispatcher()
       ->lookup(0, kRootNodeId, "hello"_pc, ObjectFetchContext::getNullContext())
       .get(0ms);
-  auto timeAfterSecondLookup = inode->getLastFsRequestTime();
+  auto timeAfterSecondLookup = inode->getLastGcRefTime();
   EXPECT_GT(
       timeAfterSecondLookup.toTimespec().tv_sec,
       timeAfterLookup.toTimespec().tv_sec);
@@ -217,18 +336,62 @@ TEST(RawEdenDispatcherTest, getattr_updates_last_used_time) {
               0, kRootNodeId, "hello"_pc, ObjectFetchContext::getNullContext())
           .get(0ms);
   auto ino = InodeNumber{entry.nodeid};
-  auto inode = mount.getEdenMount()->getInodeMap()->lookupInode(ino).get(0ms);
+  auto inode = mount.getEdenMount()
+                   ->getInodeMap()
+                   ->lookupInode(ino, ObjectFetchContext::getNullContext())
+                   .get(0ms);
 
   // Advance the clock
   mount.getClock().advance(60s);
 
-  // getattr should update lastFsRequestTime
-  auto timeBefore = inode->getLastFsRequestTime();
+  // getattr should update lastGcRefTime
+  auto timeBefore = inode->getLastGcRefTime();
   mount.getDispatcher()
       ->getattr(ino, ObjectFetchContext::getNullContext())
       .get(0ms);
-  auto timeAfter = inode->getLastFsRequestTime();
+  auto timeAfter = inode->getLastGcRefTime();
   EXPECT_GT(timeAfter.toTimespec().tv_sec, timeBefore.toTimespec().tv_sec);
+}
+
+TEST(
+    RawEdenDispatcherTest,
+    getattr_propagates_backing_error_after_materialize) {
+  FakeTreeBuilder builder;
+  builder.setFile("file", "contents");
+  TestMount mount{
+      builder,
+      /*startReady=*/false,
+      /*enableActivityBuffer=*/true,
+      kPathMapDefaultCaseSensitive,
+      nullptr,
+      [](EdenConfig& config) {
+        config.overlayOnlineFsck.setValue(true, ConfigSourceType::CommandLine);
+      }};
+  ASSERT_TRUE(mount.getEdenMount()->getOverlay()->usesOnlineFsck());
+  auto inode = mount.getFileInode("file");
+  auto context = ObjectFetchContext::getNullContext();
+  auto attrFuture = mount.getDispatcher()
+                        ->getattr(inode->getNodeId(), context)
+                        .semi()
+                        .via(mount.getServerExecutor().get());
+  mount.drainServerExecutor();
+  ASSERT_FALSE(attrFuture.isReady());
+
+  // O_TRUNC can materialize the inode while its backing-store stat is pending.
+  DesiredMetadata desired;
+  desired.size = 0;
+  inode->setattr(desired, context).get(0ms);
+  ASSERT_TRUE(inode->isMaterialized());
+  builder.getStoredBlob("file"_relpath)
+      ->triggerError(std::system_error(EIO, std::generic_category()));
+  mount.drainServerExecutor();
+  EXPECT_THROW(std::move(attrFuture).get(0ms), std::system_error);
+  EXPECT_EQ(
+      0,
+      mount.getDispatcher()
+          ->getattr(inode->getNodeId(), context)
+          .get(0ms)
+          .st.st_size);
 }
 
 TEST(RawEdenDispatcherTest, lookup_returns_infinite_ttl_without_pressure_gc) {
@@ -262,8 +425,8 @@ TEST(RawEdenDispatcherTest, lookup_returns_default_negative_dcache_ttl) {
                    .get(0ms);
 
   EXPECT_EQ(0u, entry.nodeid);
-  EXPECT_EQ(60u, entry.entry_valid);
-  EXPECT_EQ(60u, entry.attr_valid);
+  EXPECT_EQ(expectedNegativeTtl(60), entry.entry_valid);
+  EXPECT_EQ(expectedNegativeTtl(60), entry.attr_valid);
 }
 
 TEST(RawEdenDispatcherTest, lookup_returns_configured_negative_dcache_ttl) {
@@ -282,8 +445,8 @@ TEST(RawEdenDispatcherTest, lookup_returns_configured_negative_dcache_ttl) {
                    .get(0ms);
 
   EXPECT_EQ(0u, entry.nodeid);
-  EXPECT_EQ(7u, entry.entry_valid);
-  EXPECT_EQ(7u, entry.attr_valid);
+  EXPECT_EQ(expectedNegativeTtl(7), entry.entry_valid);
+  EXPECT_EQ(expectedNegativeTtl(7), entry.attr_valid);
 }
 
 TEST(RawEdenDispatcherTest, lookup_returns_dynamic_ttl_with_pressure_gc) {

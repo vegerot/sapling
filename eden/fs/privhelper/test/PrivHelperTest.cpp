@@ -5,7 +5,7 @@
  * GNU General Public License version 2.
  */
 
-#include <boost/filesystem.hpp>
+#include <folly/Conv.h>
 #include <folly/Exception.h>
 #include <folly/File.h>
 #include <folly/FileUtil.h>
@@ -13,9 +13,11 @@
 #include <folly/Range.h>
 #include <folly/ScopeGuard.h>
 #include <folly/SocketAddress.h>
+#include <folly/String.h>
 #include <folly/Synchronized.h>
 #include <folly/futures/Future.h>
 #include <folly/io/Cursor.h>
+#include <folly/io/FsUtil.h>
 #include <folly/io/IOBuf.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/EventBaseThread.h>
@@ -28,6 +30,7 @@
 #include <gtest/gtest.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -46,14 +49,16 @@
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/statvfs.h>
 #include "eden/fs/privhelper/priority/LinuxMemoryPriority.h"
+#include "eden/fs/utils/MountInfoTable.h"
 #include "eden/fs/utils/Statmount.h"
 #endif
 
 #include "eden/common/telemetry/DynamicEvent.h"
+#include "eden/common/testharness/ScopedEnvVar.h"
 #include "eden/common/testharness/TempFile.h"
 #include "eden/common/utils/UserInfo.h"
-#include "eden/common/utils/test/ScopedEnvVar.h"
 #include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/privhelper/PrivHelperConn.h"
 #include "eden/fs/privhelper/PrivHelperImpl.h"
@@ -126,7 +131,7 @@ void runInMountNamespace(
 }
 void installPrivHelperRollbackMarker() {
   checkUnixError(mount("tmpfs", "/etc", "tmpfs", 0, "size=1m"));
-  boost::filesystem::create_directory("/etc/eden");
+  folly::fs::create_directory("/etc/eden");
   File marker(
       kDisablePrivHelperHardeningPath,
       O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
@@ -134,6 +139,29 @@ void installPrivHelperRollbackMarker() {
   ASSERT_TRUE(disablePrivHelperHardening());
 }
 } // namespace
+#endif
+
+TEST(PrivHelperOwnerTest, onlyRealRootCanChooseAnOwner) {
+  if (disablePrivHelperHardening()) {
+    GTEST_SKIP() << "requires hardening to be enabled";
+  }
+  const auto user = resolvePrivHelperOwner(123, 456, 0, 0);
+  EXPECT_EQ(123, user.uid);
+  EXPECT_EQ(456, user.gid);
+  const auto root = resolvePrivHelperOwner(0, 0, 123, 456);
+  EXPECT_EQ(123, root.uid);
+  EXPECT_EQ(456, root.gid);
+}
+
+#ifdef __linux__
+TEST(PrivHelperOwnerTest, rollbackRestoresTheCliOwner) {
+  runInMountNamespace([] {
+    installPrivHelperRollbackMarker();
+    const auto owner = resolvePrivHelperOwner(123, 456, 0, 0);
+    EXPECT_EQ(0, owner.uid);
+    EXPECT_EQ(0, owner.gid);
+  });
+}
 #endif
 
 TEST(TccDisclaimKillswitch, presentWhenFileExists) {
@@ -365,6 +393,14 @@ class PrivHelperFdUnmountTestServer : public PrivHelperServer {
     return insecureBindUnmountCalled_.load();
   }
 
+  void setUnmountError(int error) {
+    unmountError_.store(error);
+  }
+
+  size_t fdUnmountCalls() const {
+    return fdUnmountCalls_.load();
+  }
+
  private:
   void unmount(const char* /* mountPath */, UnmountOptions /* options */)
       override {}
@@ -376,12 +412,15 @@ class PrivHelperFdUnmountTestServer : public PrivHelperServer {
 
 #ifndef __APPLE__
   int umountBindMountByFd(const char* /* procFdPath */) override {
-    errno = EINVAL;
+    ++fdUnmountCalls_;
+    errno = unmountError_.load();
     return -1;
   }
 #endif
 
   std::atomic<bool> insecureBindUnmountCalled_{false};
+  std::atomic<int> unmountError_{EINVAL};
+  std::atomic<size_t> fdUnmountCalls_{0};
 };
 
 namespace {
@@ -996,6 +1035,148 @@ TEST_F(PrivHelperRawProtocolTest, legacyMacFuseConfigRequestsAreNoOps) {
 }
 
 #ifdef __linux__
+TEST(PrivHelperMountFlagsTest, initialFuseMountHasAnExplicitNodevFlag) {
+  if (access("/dev/fuse", R_OK | W_OK) != 0) {
+    GTEST_SKIP() << "/dev/fuse is unavailable";
+  }
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    File clientConn;
+    File serverConn;
+    PrivHelperConn::createConnPair(clientConn, serverConn);
+    PrivHelperServer server;
+    std::thread thread([&server, conn = std::move(serverConn)]() mutable {
+      server.initPartial(std::move(conn), getuid(), getgid());
+      server.run();
+    });
+    SCOPE_EXIT {
+      thread.join();
+    };
+    RawPrivHelperClient client(std::move(clientConn));
+    auto response = client.sendAndRecv(
+        PrivHelperConn::serializeMountRequest(
+            1, dir.path().string(), false, "fuse.edenfs"));
+    PrivHelperConn::parseEmptyResponse(
+        PrivHelperConn::REQ_MOUNT_FUSE, response);
+    const auto mounts = getMountInfoForPath(
+        dir.path().c_str(),
+        {.includeMountOptions = true, .includeMountId = true});
+    ASSERT_TRUE(mounts.hasValue());
+    ASSERT_TRUE(mounts->has_value());
+    std::string mountinfo;
+    ASSERT_TRUE(folly::readFile("/proc/self/mountinfo", mountinfo));
+    std::vector<StringPiece> lines;
+    folly::split('\n', mountinfo, lines);
+    const auto row =
+        std::find_if(lines.begin(), lines.end(), [&](StringPiece line) {
+          return line.startsWith(fmt::format("{} ", mounts->value().mountId));
+        });
+    ASSERT_NE(lines.end(), row);
+    std::vector<StringPiece> fields;
+    folly::split(' ', *row, fields);
+    ASSERT_GT(fields.size(), 5);
+    std::vector<StringPiece> flags;
+    folly::split(',', fields[5], flags);
+    EXPECT_NE(flags.end(), std::find(flags.begin(), flags.end(), "nodev"));
+    EXPECT_NE(flags.end(), std::find(flags.begin(), flags.end(), "nosuid"));
+    response = client.sendAndRecv(
+        PrivHelperConn::serializeUnmountRequest(2, dir.path().string(), {}));
+    PrivHelperConn::parseEmptyResponse(
+        PrivHelperConn::REQ_UNMOUNT_FUSE, response);
+  });
+}
+
+TEST(PrivHelperRollbackTest, legacyFuseMountOmitsNodevAndForwardsTheType) {
+  if (access("/dev/fuse", R_OK | W_OK) != 0) {
+    GTEST_SKIP() << "/dev/fuse is unavailable";
+  }
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    installPrivHelperRollbackMarker();
+    File clientConn;
+    File serverConn;
+    PrivHelperConn::createConnPair(clientConn, serverConn);
+    PrivHelperServer server;
+    std::thread thread([&server, conn = std::move(serverConn)]() mutable {
+      server.initPartial(std::move(conn), getuid(), getgid());
+      server.run();
+    });
+    SCOPE_EXIT {
+      thread.join();
+    };
+    RawPrivHelperClient client(std::move(clientConn));
+    auto response = client.sendAndRecv(
+        PrivHelperConn::serializeMountRequest(
+            1, dir.path().string(), false, "ramfs"));
+    PrivHelperConn::parseEmptyResponse(
+        PrivHelperConn::REQ_MOUNT_FUSE, response);
+    struct statvfs flags{};
+    checkUnixError(statvfs(dir.path().c_str(), &flags));
+    EXPECT_NE(0, flags.f_flag & ST_NOSUID);
+    EXPECT_EQ(0, flags.f_flag & ST_NODEV);
+    response = client.sendAndRecv(
+        PrivHelperConn::serializeUnmountRequest(2, dir.path().string(), {}));
+    PrivHelperConn::parseEmptyResponse(
+        PrivHelperConn::REQ_UNMOUNT_FUSE, response);
+  });
+}
+#endif
+
+#ifdef __APPLE__
+TEST_F(PrivHelperTest, bindUnmountIsUnsupportedEvenForRegisteredPaths) {
+  auto dir = makeTempDir();
+  const auto path = dir.path().string();
+  client_->takeoverStartup(path, {}).get(1s);
+  server_.setFuseUnmountResult(path).setValue();
+
+  for (const auto& suffix : {"/buck-out", "/../victim"}) {
+    auto rejected = client_->bindUnMount(path + suffix);
+    auto nextRequest = client_->getServerPid();
+    EXPECT_THROW_RE(
+        std::move(rejected).get(1s),
+        std::system_error,
+        "bind unmounts are not supported on macOS");
+    EXPECT_EQ(getpid(), std::move(nextRequest).get(1s));
+  }
+  EXPECT_TRUE(xplatLogger_->getEvents().empty());
+}
+#endif
+
+TEST_F(PrivHelperTest, fuseRequestRejectsOtherFilesystemTypes) {
+  auto dir = makeTempDir();
+  for (const auto& type :
+       {std::string{"ramfs"},
+        std::string{"fuse.other"},
+        std::string{"fuse\0ramfs", 10}}) {
+    auto rejected = client_->fuseMount(dir.path().string(), false, type);
+    auto nextRequest = client_->getServerPid();
+    EXPECT_THROW_RE(
+        std::move(rejected).get(1s),
+        std::system_error,
+        "unsupported FUSE filesystem type");
+    EXPECT_EQ(getpid(), std::move(nextRequest).get(1s));
+  }
+  EXPECT_TRUE(server_.getRequestedVfsTypes().empty());
+  TemporaryFile mountedFile;
+  for (const auto& type : {"fuse", "fuse.edenfs"}) {
+    const auto path = (dir.path() / type).string();
+    folly::fs::create_directory(path);
+    server_.setFuseMountResult(path).setValue(File(mountedFile.fd(), false));
+    server_.setFuseUnmountResult(path).setValue();
+    auto mounted = client_->fuseMount(path, false, type).get(1s);
+    EXPECT_GE(mounted.fd(), 0);
+    EXPECT_EQ(std::vector<std::string>{type}, server_.getRequestedVfsTypes());
+  }
+  EXPECT_TRUE(xplatLogger_->getEvents().empty());
+}
+
+TEST_F(PrivHelperTest, nfsFstypeOverrideCanBeTurnedOff) {
+  EXPECT_TRUE(server_.nfsFstypeOverrideEnabled());
+  client_->setNfsFstypeOverride(false).get(1s);
+  EXPECT_FALSE(server_.nfsFstypeOverrideEnabled());
+}
+
+#ifdef __linux__
 TEST_F(PrivHelperTest, fuseReadAheadRequiresARegisteredMount) {
   auto dir = makeTempDir();
   const auto path = dir.path().string();
@@ -1235,8 +1416,8 @@ TEST(PrivHelperSanityTest, readAheadRollbackBypassesRegistration) {
 TEST(PrivHelperSanityTest, userPathResolutionFollowsOrdinarySymlinks) {
   TemporaryDirectory dir;
   const auto real = dir.path() / "real";
-  boost::filesystem::create_directory(real);
-  boost::filesystem::create_directory(real / "leaf");
+  folly::fs::create_directory(real);
+  folly::fs::create_directory(real / "leaf");
   checkUnixError(symlink("real", (dir.path() / "link").c_str()));
   PrivHelperSanityTestServer server(getuid());
   auto fd = server.openPathAsUser(
@@ -1256,8 +1437,8 @@ TEST(PrivHelperSanityTest, userPathResolutionRejectsAnInaccessibleAncestor) {
   }
   TemporaryDirectory dir;
   const auto blocked = dir.path() / "blocked";
-  boost::filesystem::create_directory(blocked);
-  boost::filesystem::create_directory(blocked / "leaf");
+  folly::fs::create_directory(blocked);
+  folly::fs::create_directory(blocked / "leaf");
   checkUnixError(chmod(blocked.c_str(), 0000));
   SCOPE_EXIT {
     checkUnixError(chmod(blocked.c_str(), 0700));
@@ -1276,8 +1457,11 @@ TEST(PrivHelperSanityTest, bindMountClonesAnOPathSourceDescriptor) {
     const auto source = dir.path() / "source";
     const auto root = dir.path() / "checkout";
     const auto target = root / "redirect";
-    boost::filesystem::create_directory(source);
-    boost::filesystem::create_directories(target);
+    folly::fs::create_directory(source);
+    folly::fs::create_directories(target);
+    checkUnixError(
+        mount("tmpfs", root.c_str(), "tmpfs", MS_NOSUID | MS_NODEV, "size=1m"));
+    folly::fs::create_directory(target);
     ASSERT_TRUE(
         folly::writeFile(StringPiece{"content"}, (source / "file").c_str()));
 
@@ -1293,6 +1477,307 @@ TEST(PrivHelperSanityTest, bindMountClonesAnOPathSourceDescriptor) {
     checkUnixError(stat(target.c_str(), &targetStat));
     EXPECT_EQ(sourceStat.st_ino, targetStat.st_ino);
     EXPECT_EQ(sourceStat.st_dev, targetStat.st_dev);
+    struct statvfs sourceFlags{}, targetFlags{}, checkoutFlags{};
+    checkUnixError(statvfs(source.c_str(), &sourceFlags));
+    checkUnixError(statvfs(target.c_str(), &targetFlags));
+    checkUnixError(statvfs(root.c_str(), &checkoutFlags));
+    EXPECT_NE(0, checkoutFlags.f_flag & ST_NOSUID);
+    EXPECT_EQ(sourceFlags.f_flag & ST_NOSUID, targetFlags.f_flag & ST_NOSUID);
+    EXPECT_EQ(0, targetFlags.f_flag & ST_NOSUID);
+  });
+}
+
+class PrivHelperCleanupTestServer : public PrivHelperServer {
+ public:
+  mutable size_t snapshots{0};
+  std::function<void(size_t)> afterSnapshot;
+
+  SanityCheckResult cleanup(const std::string& path) {
+    File root(path.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+    return cleanupStaleBindMounts(path, root.fd());
+  }
+
+  SanityCheckResult cleanupWithoutDescriptor(const std::string& path) {
+    return cleanupStaleBindMounts(path, -1);
+  }
+
+ private:
+  std::vector<MountTableEntry> mountsForCleanup() const override {
+    auto mounts = PrivHelperServer::mountsForCleanup();
+    const auto snapshot = ++snapshots;
+    if (afterSnapshot) {
+      afterSnapshot(snapshot);
+    }
+    return mounts;
+  }
+};
+
+TEST(PrivHelperCleanupTest, cleansNestedMountsWithoutChangingTheCheckoutMount) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+    const auto child = dir.path() / "child";
+    folly::fs::create_directory(child);
+    checkUnixError(mount("tmpfs", child.c_str(), "tmpfs", 0, "size=1m"));
+    const auto nested = child / "nested";
+    folly::fs::create_directory(nested);
+    checkUnixError(mount("tmpfs", nested.c_str(), "tmpfs", 0, "size=1m"));
+    ASSERT_TRUE(
+        folly::writeFile(StringPiece{"root"}, (dir.path() / "marker").c_str()));
+    ASSERT_TRUE(
+        folly::writeFile(StringPiece{"child"}, (child / "marker").c_str()));
+
+    PrivHelperCleanupTestServer server;
+    const auto result = server.cleanup(dir.path().string());
+
+    EXPECT_EQ(2, result.staleRedirectionMountsFound);
+    EXPECT_EQ(2, result.staleRedirectionMountsSucceeded);
+    EXPECT_EQ(0, result.staleRedirectionMountsFailed);
+    EXPECT_EQ(2, server.snapshots);
+    EXPECT_TRUE(folly::fs::exists(dir.path() / "marker"));
+    EXPECT_FALSE(folly::fs::exists(child / "marker"));
+  });
+}
+
+TEST(PrivHelperCleanupTest, siblingMountsUseBoundedValidationBatches) {
+  for (const int count : {16, 65}) {
+    TemporaryDirectory dir;
+    runInMountNamespace([&] {
+      checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+      for (int i = 0; i < count; ++i) {
+        const auto child = dir.path() / fmt::format("child-{}", i);
+        folly::fs::create_directory(child);
+        checkUnixError(mount("tmpfs", child.c_str(), "tmpfs", 0, "size=1m"));
+      }
+      PrivHelperCleanupTestServer server;
+
+      const auto result = server.cleanup(dir.path().string());
+
+      EXPECT_EQ(count, result.staleRedirectionMountsSucceeded);
+      EXPECT_EQ(0, result.staleRedirectionMountsFailed);
+      EXPECT_EQ(count == 16 ? 2 : 3, server.snapshots);
+    });
+  }
+}
+
+TEST(PrivHelperCleanupTest, stackedChildrenArePeeledBeforeTheirParent) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+    const auto parent = dir.path() / "parent";
+    folly::fs::create_directory(parent);
+    checkUnixError(mount("tmpfs", parent.c_str(), "tmpfs", 0, "size=1m"));
+    const auto child = parent / "child";
+    folly::fs::create_directory(child);
+    for (int i = 0; i < 2; ++i) {
+      checkUnixError(mount("tmpfs", child.c_str(), "tmpfs", 0, "size=1m"));
+    }
+    PrivHelperCleanupTestServer server;
+
+    const auto result = server.cleanup(dir.path().string());
+
+    EXPECT_EQ(3, result.staleRedirectionMountsSucceeded);
+    EXPECT_EQ(0, result.staleRedirectionMountsFailed);
+    EXPECT_EQ(3, server.snapshots);
+  });
+}
+
+TEST(
+    PrivHelperCleanupTest,
+    rollbackUsesLegacyCleanupWithoutDescriptorMetadata) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+    const auto child = dir.path() / "child";
+    folly::fs::create_directory(child);
+    checkUnixError(mount("tmpfs", child.c_str(), "tmpfs", 0, "size=1m"));
+    ASSERT_TRUE(
+        folly::writeFile(StringPiece{"mounted"}, (child / "marker").c_str()));
+    installPrivHelperRollbackMarker();
+    PrivHelperCleanupTestServer server;
+    server.afterSnapshot = [](size_t) {
+      ADD_FAILURE() << "hardened cleanup should not enumerate mounts";
+    };
+
+    const auto result = server.cleanupWithoutDescriptor(dir.path().string());
+
+    EXPECT_EQ(1, result.staleRedirectionMountsFound);
+    EXPECT_EQ(1, result.staleRedirectionMountsSucceeded);
+    EXPECT_EQ(0, result.staleRedirectionMountsFailed);
+    EXPECT_EQ(0, server.snapshots);
+    EXPECT_FALSE(folly::fs::exists(child / "marker"));
+  });
+}
+
+TEST(PrivHelperCleanupTest, enumerationErrorsAreContainedAndRetryable) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+    const auto child = dir.path() / "child";
+    folly::fs::create_directory(child);
+    for (const size_t failingSnapshot : {1, 2}) {
+      checkUnixError(mount("tmpfs", child.c_str(), "tmpfs", 0, "size=1m"));
+      ASSERT_TRUE(
+          folly::writeFile(StringPiece{"mounted"}, (child / "marker").c_str()));
+      PrivHelperCleanupTestServer server;
+      server.afterSnapshot = [failingSnapshot](size_t snapshot) {
+        if (snapshot == failingSnapshot) {
+          folly::throwSystemErrorExplicit(EIO, "injected mount-table failure");
+        }
+      };
+
+      const auto failed = server.cleanup(dir.path().string());
+
+      EXPECT_EQ(0, failed.staleRedirectionMountsSucceeded);
+      EXPECT_TRUE(folly::fs::exists(child / "marker"));
+      server.afterSnapshot = {};
+      const auto retried = server.cleanup(dir.path().string());
+      EXPECT_EQ(1, retried.staleRedirectionMountsSucceeded);
+      EXPECT_EQ(0, retried.staleRedirectionMountsFailed);
+      EXPECT_FALSE(folly::fs::exists(child / "marker"));
+    }
+  });
+}
+
+TEST(PrivHelperCleanupTest, peelsStackedMountsAtTheSamePath) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+    const auto child = dir.path() / "child";
+    folly::fs::create_directory(child);
+    for (int i = 0; i < 2; ++i) {
+      checkUnixError(mount("tmpfs", child.c_str(), "tmpfs", 0, "size=1m"));
+      ASSERT_TRUE(
+          folly::writeFile(StringPiece{"mounted"}, (child / "marker").c_str()));
+    }
+
+    PrivHelperCleanupTestServer server;
+    const auto result = server.cleanup(dir.path().string());
+
+    EXPECT_EQ(2, result.staleRedirectionMountsSucceeded);
+    EXPECT_EQ(0, result.staleRedirectionMountsFailed);
+    EXPECT_FALSE(folly::fs::exists(child / "marker"));
+  });
+}
+
+TEST(PrivHelperCleanupTest, detachedFuseDoesNotRequireFilesystemAttributes) {
+  if (access("/dev/fuse", R_OK | W_OK) != 0) {
+    GTEST_SKIP() << "/dev/fuse is unavailable";
+  }
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+    const auto child = dir.path() / "child";
+    folly::fs::create_directory(child);
+    File fuse("/dev/fuse", O_RDWR | O_CLOEXEC);
+    const auto options = fmt::format(
+        "fd={},rootmode=40755,user_id={},group_id={}",
+        fuse.fd(),
+        getuid(),
+        getgid());
+    checkUnixError(mount(
+        "edenfs:",
+        child.c_str(),
+        "fuse",
+        MS_NOSUID | MS_NODEV,
+        options.c_str()));
+    fuse.close();
+    struct stat st{};
+    ASSERT_EQ(-1, stat(child.c_str(), &st));
+    ASSERT_EQ(ENOTCONN, errno);
+
+    PrivHelperCleanupTestServer server;
+    const auto result = server.cleanup(dir.path().string());
+
+    EXPECT_EQ(1, result.staleRedirectionMountsSucceeded);
+    EXPECT_EQ(0, result.staleRedirectionMountsFailed);
+    EXPECT_EQ(0, stat(child.c_str(), &st));
+  });
+}
+
+TEST(PrivHelperCleanupTest, removedCandidateDoesNotSelectTheEnclosingMount) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+    const auto child = dir.path() / "child";
+    folly::fs::create_directory(child);
+    checkUnixError(mount("tmpfs", child.c_str(), "tmpfs", 0, "size=1m"));
+    ASSERT_TRUE(
+        folly::writeFile(StringPiece{"root"}, (dir.path() / "marker").c_str()));
+    PrivHelperCleanupTestServer server;
+    server.afterSnapshot = [&](size_t snapshot) {
+      if (snapshot == 1) {
+        checkUnixError(umount2(child.c_str(), MNT_DETACH));
+      }
+    };
+
+    const auto result = server.cleanup(dir.path().string());
+
+    EXPECT_EQ(0, result.staleRedirectionMountsSucceeded);
+    EXPECT_EQ(1, result.staleRedirectionMountsFailed);
+    EXPECT_TRUE(folly::fs::exists(dir.path() / "marker"));
+  });
+}
+
+TEST(PrivHelperCleanupTest, ancestorSwapAfterPinningCannotRedirectCleanup) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+    const auto original = dir.path() / "original";
+    const auto moved = dir.path() / "moved";
+    const auto victim = dir.path() / "victim";
+    for (const auto& root : {original, victim}) {
+      folly::fs::create_directories(root / "child");
+      checkUnixError(
+          mount("tmpfs", (root / "child").c_str(), "tmpfs", 0, "size=1m"));
+      ASSERT_TRUE(
+          folly::writeFile(
+              StringPiece{"mounted"}, (root / "child" / "marker").c_str()));
+    }
+    PrivHelperCleanupTestServer server;
+    server.afterSnapshot = [&](size_t snapshot) {
+      if (snapshot == 2) {
+        folly::fs::rename(original, moved);
+        folly::fs::create_directory_symlink(victim, original);
+      }
+    };
+
+    const auto result = server.cleanup(original.string());
+
+    EXPECT_EQ(1, result.staleRedirectionMountsSucceeded);
+    EXPECT_TRUE(folly::fs::exists(victim / "child" / "marker"));
+    EXPECT_FALSE(folly::fs::exists(moved / "child" / "marker"));
+  });
+}
+
+TEST(PrivHelperCleanupTest, descendantSymlinkCannotSelectAnOutsideMount) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+    const auto checkout = dir.path() / "checkout";
+    const auto inside = checkout / "inside";
+    const auto victim = dir.path() / "victim";
+    for (const auto& root : {inside, victim}) {
+      folly::fs::create_directories(root / "child");
+      checkUnixError(
+          mount("tmpfs", (root / "child").c_str(), "tmpfs", 0, "size=1m"));
+      ASSERT_TRUE(
+          folly::writeFile(
+              StringPiece{"mounted"}, (root / "child" / "marker").c_str()));
+    }
+    PrivHelperCleanupTestServer server;
+    server.afterSnapshot = [&](size_t snapshot) {
+      if (snapshot == 1) {
+        folly::fs::rename(inside, checkout / "moved");
+        folly::fs::create_directory_symlink(victim, inside);
+      }
+    };
+
+    const auto result = server.cleanup(checkout.string());
+
+    EXPECT_EQ(0, result.staleRedirectionMountsSucceeded);
+    EXPECT_EQ(1, result.staleRedirectionMountsFailed);
+    EXPECT_TRUE(folly::fs::exists(victim / "child" / "marker"));
   });
 }
 
@@ -1306,7 +1791,7 @@ TEST(PrivHelperSanityTest, userPathResolutionDisablesDacOverrides) {
         checkUnixError(prctl(PR_SET_SECUREBITS, SECBIT_NO_SETUID_FIXUP));
         const auto blocked = dir.path() / "blocked";
         const auto leaf = blocked / "leaf";
-        boost::filesystem::create_directories(leaf);
+        folly::fs::create_directories(leaf);
         checkUnixError(chmod(blocked.c_str(), 0000));
         EXPECT_NO_THROW(File(leaf.c_str(), O_PATH | O_DIRECTORY));
 
@@ -1388,8 +1873,8 @@ TEST(PrivHelperStaleMountTest, ancestorReplacementCannotRedirectUnmount) {
     const auto original = dir.path() / "original";
     const auto moved = dir.path() / "moved";
     const auto victim = dir.path() / "victim";
-    boost::filesystem::create_directories(original / "mount");
-    boost::filesystem::create_directories(victim / "mount");
+    folly::fs::create_directories(original / "mount");
+    folly::fs::create_directories(victim / "mount");
     checkUnixError(
         mount("edenfs:", (original / "mount").c_str(), "tmpfs", 0, "size=1m"));
     checkUnixError(
@@ -1403,14 +1888,14 @@ TEST(PrivHelperStaleMountTest, ancestorReplacementCannotRedirectUnmount) {
 
     PrivHelperStaleMountTestServer server;
     server.beforeChildProbe = [&] {
-      boost::filesystem::rename(original, moved);
-      boost::filesystem::create_directory_symlink(victim, original);
+      folly::fs::rename(original, moved);
+      folly::fs::create_directory_symlink(victim, original);
     };
     EXPECT_TRUE(server.detectAndUnmountStaleMount(
         (original / "mount").string(), false, false));
     EXPECT_FALSE(server.unmounted);
-    EXPECT_FALSE(boost::filesystem::exists(moved / "mount" / "marker"));
-    EXPECT_TRUE(boost::filesystem::exists(victim / "mount" / "marker"));
+    EXPECT_FALSE(folly::fs::exists(moved / "mount" / "marker"));
+    EXPECT_TRUE(folly::fs::exists(victim / "mount" / "marker"));
   });
 }
 
@@ -1682,13 +2167,11 @@ TEST_F(PrivHelperTest, bindMounts) {
   auto abcPath = abcMountPoint.path().string();
   TemporaryFile tempFile;
 
-  boost::filesystem::create_directory(abcMountPoint.path() / "foo");
-  boost::filesystem::create_directory(abcMountPoint.path() / "bar");
-  boost::filesystem::create_directory(abcMountPoint.path() / "buck-out");
-  boost::filesystem::create_directory(
-      abcMountPoint.path() / "foo" / "buck-out");
-  boost::filesystem::create_directory(
-      abcMountPoint.path() / "bar" / "buck-out");
+  folly::fs::create_directory(abcMountPoint.path() / "foo");
+  folly::fs::create_directory(abcMountPoint.path() / "bar");
+  folly::fs::create_directory(abcMountPoint.path() / "buck-out");
+  folly::fs::create_directory(abcMountPoint.path() / "foo" / "buck-out");
+  folly::fs::create_directory(abcMountPoint.path() / "bar" / "buck-out");
 
   // Prepare promises for the mount calls
   server_.setFuseMountResult(abcPath).setValue(File(tempFile.fd(), false));
@@ -1699,15 +2182,14 @@ TEST_F(PrivHelperTest, bindMounts) {
   auto userMountPoint = makeTempDir("user");
   auto userPath = userMountPoint.path().string();
 
-  boost::filesystem::create_directory(userMountPoint.path() / "somerepo");
-  boost::filesystem::create_directory(
-      userMountPoint.path() / "somerepo" / "buck-out");
+  folly::fs::create_directory(userMountPoint.path() / "somerepo");
+  folly::fs::create_directory(userMountPoint.path() / "somerepo" / "buck-out");
 
   server_.setFuseMountResult(userPath + "/somerepo")
       .setValue(File(tempFile.fd(), false));
   server_.setBindMountResult(userPath + "/somerepo/buck-out").setValue();
 
-  boost::filesystem::create_directory(userMountPoint.path() / "somerepo2");
+  folly::fs::create_directory(userMountPoint.path() / "somerepo2");
   server_.setFuseMountResult(userPath + "/somerepo2")
       .setValue(File(tempFile.fd(), false));
 
@@ -1768,8 +2250,8 @@ TEST_F(PrivHelperTest, bindMountRejectsEscapedMountPath) {
 #else
   auto mountRoot = makeTempDir("mount-root");
   auto source = makeTempDir("source");
-  boost::filesystem::create_directory(mountRoot.path() / "registered");
-  boost::filesystem::create_directory(mountRoot.path() / "target");
+  folly::fs::create_directory(mountRoot.path() / "registered");
+  folly::fs::create_directory(mountRoot.path() / "target");
 
   const auto registeredPath = (mountRoot.path() / "registered").string();
   const auto escapedPath = registeredPath + "/../target";
@@ -1830,9 +2312,9 @@ TEST_F(PrivHelperTest, bindMountRejectsSymlinkComponent) {
   auto mountRoot = makeTempDir("mount-root");
   auto source = makeTempDir("source");
   auto outside = makeTempDir("outside");
-  boost::filesystem::create_directory(mountRoot.path() / "registered");
-  boost::filesystem::create_directories(outside.path() / "target");
-  boost::filesystem::create_directory_symlink(
+  folly::fs::create_directory(mountRoot.path() / "registered");
+  folly::fs::create_directories(outside.path() / "target");
+  folly::fs::create_directory_symlink(
       outside.path(), mountRoot.path() / "registered" / "link");
 
   const auto registeredPath = (mountRoot.path() / "registered").string();
@@ -1863,12 +2345,11 @@ TEST_F(PrivHelperTest, bindMountRejectsSymlinkHiddenByDotDot) {
   auto mountRoot = makeTempDir("mount-root");
   auto source = makeTempDir("source");
   auto outside = makeTempDir("outside");
-  boost::filesystem::create_directory(mountRoot.path() / "registered");
-  boost::filesystem::create_directory(
-      mountRoot.path() / "registered" / "target");
-  boost::filesystem::create_directories(outside.path() / "child");
-  boost::filesystem::create_directory(outside.path() / "target");
-  boost::filesystem::create_directory_symlink(
+  folly::fs::create_directory(mountRoot.path() / "registered");
+  folly::fs::create_directory(mountRoot.path() / "registered" / "target");
+  folly::fs::create_directories(outside.path() / "child");
+  folly::fs::create_directory(outside.path() / "target");
+  folly::fs::create_directory_symlink(
       outside.path() / "child", mountRoot.path() / "registered" / "link");
 
   const auto registeredPath = (mountRoot.path() / "registered").string();
@@ -1899,10 +2380,9 @@ TEST_F(PrivHelperTest, bindMountAllowsSymlinkAncestorOfRegisteredMount) {
   auto realRoot = makeTempDir("real-root");
   auto linkRoot = makeTempDir("link-root");
   auto source = makeTempDir("source");
-  boost::filesystem::create_directories(realRoot.path() / "registered");
-  boost::filesystem::create_directories(
-      realRoot.path() / "registered" / "redirected");
-  boost::filesystem::create_directory_symlink(
+  folly::fs::create_directories(realRoot.path() / "registered");
+  folly::fs::create_directories(realRoot.path() / "registered" / "redirected");
+  folly::fs::create_directory_symlink(
       realRoot.path(), linkRoot.path() / "link");
 
   const auto registeredPath =
@@ -1927,10 +2407,10 @@ TEST_F(
   auto alternateRoot = makeTempDir("alternate-root");
   auto linkRoot = makeTempDir("link-root");
   auto source = makeTempDir("source");
-  boost::filesystem::create_directories(realRoot.path() / "registered");
-  boost::filesystem::create_directories(
+  folly::fs::create_directories(realRoot.path() / "registered");
+  folly::fs::create_directories(
       alternateRoot.path() / "registered" / "redirected");
-  boost::filesystem::create_directory_symlink(
+  folly::fs::create_directory_symlink(
       realRoot.path(), linkRoot.path() / "link");
 
   const auto registeredPath =
@@ -1940,8 +2420,8 @@ TEST_F(
   client_->takeoverStartup(registeredPath, {}).get(1s);
   server_.setFuseUnmountResult(registeredPath).setValue();
 
-  boost::filesystem::remove(linkRoot.path() / "link");
-  boost::filesystem::create_directory_symlink(
+  folly::fs::remove(linkRoot.path() / "link");
+  folly::fs::create_directory_symlink(
       alternateRoot.path(), linkRoot.path() / "link");
 
   server_.setBindMountResult(bindPath).setValue();
@@ -1964,15 +2444,14 @@ TEST_F(PrivHelperTest, takeoverKeepsValidatedRootWhenAncestorIsReplaced) {
   const auto ancestor = root.path() / "ancestor";
   const auto moved = root.path() / "moved";
   const auto replacement = root.path() / "replacement";
-  boost::filesystem::create_directories(
-      ancestor / "registered" / "original-only");
-  boost::filesystem::create_directories(
+  folly::fs::create_directories(ancestor / "registered" / "original-only");
+  folly::fs::create_directories(
       replacement / "registered" / "replacement-only");
 
   const auto registeredPath = (ancestor / "registered").string();
   server_.setAfterSanityCheck([ancestor, moved, replacement] {
-    boost::filesystem::rename(ancestor, moved);
-    boost::filesystem::create_directory_symlink(replacement, ancestor);
+    folly::fs::rename(ancestor, moved);
+    folly::fs::create_directory_symlink(replacement, ancestor);
   });
   client_->takeoverStartup(registeredPath, {}).get(1s);
   server_.setFuseUnmountResult(registeredPath).setValue();
@@ -1996,9 +2475,8 @@ TEST_F(PrivHelperFdUnmountTest, bindUnmountAllowsAlreadyUnmountedTarget) {
   GTEST_SKIP() << "Linux-specific procfd bind unmount validation";
 #else
   auto mountRoot = makeTempDir("mount-root");
-  boost::filesystem::create_directory(mountRoot.path() / "registered");
-  boost::filesystem::create_directory(
-      mountRoot.path() / "registered" / "not-mounted");
+  folly::fs::create_directory(mountRoot.path() / "registered");
+  folly::fs::create_directory(mountRoot.path() / "registered" / "not-mounted");
 
   const auto registeredPath = (mountRoot.path() / "registered").string();
   const auto notMountedPath = registeredPath + "/not-mounted";
@@ -2010,18 +2488,107 @@ TEST_F(PrivHelperFdUnmountTest, bindUnmountAllowsAlreadyUnmountedTarget) {
 #endif
 }
 
+TEST_F(PrivHelperFdUnmountTest, bindUnmountErrorsDoNotRestorePathAuthority) {
+#ifdef __APPLE__
+  GTEST_SKIP() << "Linux-specific procfd bind unmount validation";
+#else
+  auto root = makeTempDir();
+  folly::fs::create_directory(root.path() / "child");
+  const auto path = root.path().string();
+  client_->takeoverStartup(path, {}).get(1s);
+
+  for (const auto error : {EIO, ENOENT, ENOTCONN}) {
+    server_.setUnmountError(error);
+    auto rejected = client_->bindUnMount(path + "/child");
+    auto nextRequest = client_->getServerPid();
+    EXPECT_THROW(std::move(rejected).get(1s), std::system_error);
+    EXPECT_EQ(getpid(), std::move(nextRequest).get(1s));
+  }
+  EXPECT_EQ(3, server_.fdUnmountCalls());
+  server_.setUnmountError(EINVAL);
+  EXPECT_NO_THROW(client_->bindUnMount(path + "/child").get(1s));
+  EXPECT_EQ(4, server_.fdUnmountCalls());
+  EXPECT_FALSE(server_.insecureBindUnmountCalled());
+#endif
+}
+
+#ifdef __linux__
+class PrivHelperRegisteredUnmountTestServer : public PrivHelperServer {
+ public:
+  void registerMount(const std::string& path) {
+    registerMountPoint(path);
+  }
+};
+
+TEST(PrivHelperUnmountTest, disconnectedMountKeepsAuthorityAfterAncestorSwap) {
+  if (access("/dev/fuse", R_OK | W_OK) != 0) {
+    GTEST_SKIP() << "/dev/fuse is unavailable";
+  }
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+    const auto original = dir.path() / "original";
+    const auto moved = dir.path() / "moved";
+    const auto victim = dir.path() / "victim";
+    folly::fs::create_directories(original / "mount");
+    folly::fs::create_directories(victim / "mount");
+    checkUnixError(
+        mount("victim", (victim / "mount").c_str(), "tmpfs", 0, "size=1m"));
+    ASSERT_TRUE(
+        folly::writeFile(
+            StringPiece{"victim"}, (victim / "mount" / "marker").c_str()));
+    File fuse("/dev/fuse", O_RDWR | O_CLOEXEC);
+    const auto options = fmt::format(
+        "fd={},rootmode=40755,user_id={},group_id={}",
+        fuse.fd(),
+        getuid(),
+        getgid());
+    checkUnixError(mount(
+        "edenfs:",
+        (original / "mount").c_str(),
+        "fuse",
+        MS_NOSUID | MS_NODEV,
+        options.c_str()));
+
+    File clientConn;
+    File serverConn;
+    PrivHelperConn::createConnPair(clientConn, serverConn);
+    PrivHelperRegisteredUnmountTestServer server;
+    const auto path = (original / "mount").string();
+    server.registerMount(path);
+    std::thread thread([&server, conn = std::move(serverConn)]() mutable {
+      server.initPartial(std::move(conn), getuid(), getgid());
+      server.run();
+    });
+    SCOPE_EXIT {
+      thread.join();
+    };
+    RawPrivHelperClient client(std::move(clientConn));
+    fuse.close();
+    folly::fs::rename(original, moved);
+    folly::fs::create_directory_symlink(victim, original);
+
+    auto response = client.sendAndRecv(
+        PrivHelperConn::serializeUnmountRequest(2, path, {}));
+    PrivHelperConn::parseEmptyResponse(
+        PrivHelperConn::REQ_UNMOUNT_FUSE, response);
+    EXPECT_TRUE(folly::fs::exists(victim / "mount" / "marker"));
+    struct stat st{};
+    EXPECT_EQ(0, stat((moved / "mount").c_str(), &st));
+  });
+}
+#endif
+
 TEST_F(PrivHelperTest, takeoverShutdown) {
   auto abcMountPoint = makeTempDir("abc");
   auto abcPath = abcMountPoint.path().string();
   TemporaryFile tempFile;
 
-  boost::filesystem::create_directory(abcMountPoint.path() / "foo");
-  boost::filesystem::create_directory(abcMountPoint.path() / "bar");
-  boost::filesystem::create_directory(abcMountPoint.path() / "buck-out");
-  boost::filesystem::create_directory(
-      abcMountPoint.path() / "foo" / "buck-out");
-  boost::filesystem::create_directory(
-      abcMountPoint.path() / "bar" / "buck-out");
+  folly::fs::create_directory(abcMountPoint.path() / "foo");
+  folly::fs::create_directory(abcMountPoint.path() / "bar");
+  folly::fs::create_directory(abcMountPoint.path() / "buck-out");
+  folly::fs::create_directory(abcMountPoint.path() / "foo" / "buck-out");
+  folly::fs::create_directory(abcMountPoint.path() / "bar" / "buck-out");
 
   // Prepare promises for the mount calls
   server_.setFuseMountResult(abcPath).setValue(File(tempFile.fd(), false));
@@ -2032,14 +2599,13 @@ TEST_F(PrivHelperTest, takeoverShutdown) {
   auto userMountPoint = makeTempDir("user");
   auto userPath = userMountPoint.path().string();
 
-  boost::filesystem::create_directory(userMountPoint.path() / "somerepo");
+  folly::fs::create_directory(userMountPoint.path() / "somerepo");
 
   server_.setFuseMountResult(userPath + "/somerepo")
       .setValue(File(tempFile.fd(), false));
 
-  boost::filesystem::create_directory(userMountPoint.path() / "somerepo2");
-  boost::filesystem::create_directory(
-      userMountPoint.path() / "somerepo2" / "buck-out");
+  folly::fs::create_directory(userMountPoint.path() / "somerepo2");
+  folly::fs::create_directory(userMountPoint.path() / "somerepo2" / "buck-out");
   server_.setFuseMountResult(userPath + "/somerepo2")
       .setValue(File(tempFile.fd(), false));
   server_.setBindMountResult(userPath + "/somerepo2/buck-out").setValue();
@@ -2088,9 +2654,8 @@ TEST_F(PrivHelperTest, takeoverStartup) {
   auto abcPath = abcMountPoint.path().string();
   TemporaryFile tempFile;
 
-  boost::filesystem::create_directories(
-      abcMountPoint.path() / "foo" / "buck-out");
-  boost::filesystem::create_directories(
+  folly::fs::create_directories(abcMountPoint.path() / "foo" / "buck-out");
+  folly::fs::create_directories(
       abcMountPoint.path() / "xyz" / "test" / "buck-out");
 
   // Indicate that we are taking over some mount points.
@@ -2110,7 +2675,7 @@ TEST_F(PrivHelperTest, takeoverStartup) {
   // Manually mount one other mount point.
   auto xyzMountPoint = makeTempDir("xyz");
   auto xyzPath = xyzMountPoint.path().string();
-  boost::filesystem::create_directory(xyzMountPoint.path() / "buck-out");
+  folly::fs::create_directory(xyzMountPoint.path() / "buck-out");
   server_.setFuseMountResult(xyzPath).setValue(File(tempFile.fd(), false));
   server_.setBindMountResult(xyzPath + "/buck-out").setValue();
   client_->fuseMount(xyzPath, false, "fuse").get(1s);
@@ -2354,12 +2919,6 @@ TEST(PrivHelperConnectionLossTest, sendFailureFailsRequestsWithoutDeadlock) {
   // Same failure family as above, but through the other entry point: the
   // send itself fails synchronously while the connection still looks open,
   // which invokes the error callbacks from inside send().
-#ifdef __APPLE__
-  // On macOS, shutting down the peer's receive side does not make sends
-  // fail with EPIPE (they are silently accepted until the socket is fully
-  // closed), so this test cannot trigger the send-failure path there.
-  GTEST_SKIP() << "shutdown(SHUT_RD) does not fail peer sends on macOS";
-#else
   EventBaseThread ioThread;
   File clientConn;
   File serverConn;
@@ -2368,10 +2927,10 @@ TEST(PrivHelperConnectionLossTest, sendFailureFailsRequestsWithoutDeadlock) {
   ioThread.getEventBase()->runInEventBaseThreadAndWait(
       [&] { client->attachEventBase(ioThread.getEventBase()); });
 
-  // Shut down only the server's receiving side: the client never sees EOF,
+  // Shut down only the client's sending side: the client never sees EOF,
   // but its next send fails with EPIPE.
   folly::checkUnixError(
-      ::shutdown(serverConn.fd(), SHUT_RD), "shutdown failed");
+      ::shutdown(client->getRawClientFd(), SHUT_WR), "shutdown failed");
 
   auto pending = client->fuseUnmount("/never/answered", {});
   EXPECT_THROW(std::move(pending).get(5s), std::runtime_error);
@@ -2381,7 +2940,6 @@ TEST(PrivHelperConnectionLossTest, sendFailureFailsRequestsWithoutDeadlock) {
   folly::Baton<> alive;
   ioThread.getEventBase()->runInEventBaseThread([&] { alive.post(); });
   EXPECT_TRUE(alive.try_wait_for(5s));
-#endif // !__APPLE__
 }
 
 TEST(PrivHelperConnectionLossTest, unexpectedExitLogsOneEvent) {
@@ -2436,6 +2994,86 @@ TEST(PrivHelperConnectionLossTest, cleanShutdownLogsNoEvent) {
 
   // Locally-initiated teardown is not an unexpected privhelper exit.
   EXPECT_EQ(0ul, recorder->getEvents().size());
+}
+
+/**
+ * An IXplatLogger that holds the caller in logEvent() until the test releases
+ * it. The client logs the privhelper exit after its status leaves RUNNING. The
+ * test can then act on the client at a known point in that window.
+ */
+class BlockingXplatLogger : public IXplatLogger {
+ public:
+  void logEvent(std::string_view /*category*/, const DynamicEvent& /*event*/)
+      override {
+    entered_.post();
+    released_.wait();
+  }
+
+  bool waitUntilEntered(std::chrono::milliseconds timeout) {
+    return entered_.try_wait_for(timeout);
+  }
+
+  void release() {
+    released_.post();
+  }
+
+ private:
+  folly::SaturatingSemaphore<true /* MayBlock */> entered_;
+  folly::SaturatingSemaphore<true /* MayBlock */> released_;
+};
+
+class PrivHelperExitRaceTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    File clientConn;
+    PrivHelperConn::createConnPair(clientConn, serverConn_);
+    client_ = createTestPrivHelper(std::move(clientConn));
+    client_->setEdenFsEventsLogger(
+        std::make_shared<EdenFsEventsLogger>(logger_));
+    ioThread_.getEventBase()->runInEventBaseThreadAndWait(
+        [&] { client_->attachEventBase(ioThread_.getEventBase()); });
+  }
+
+  /**
+   * Close the server end of the connection. Then destroy the client while its
+   * EventBase thread is in the privhelper-exit handling. The EventBase stays
+   * alive.
+   */
+  void destroyClientDuringPrivhelperExit() {
+    serverConn_.close();
+    ASSERT_TRUE(logger_->waitUntilEntered(30s))
+        << "the client did not start to handle the privhelper exit";
+    client_.reset();
+    logger_->release();
+
+    folly::Baton<> alive;
+    ioThread_.getEventBase()->runInEventBaseThread([&] { alive.post(); });
+    EXPECT_TRUE(alive.try_wait_for(30s));
+  }
+
+  // Declared before client_, so that the EventBase outlives the client.
+  EventBaseThread ioThread_;
+  File serverConn_;
+  std::shared_ptr<BlockingXplatLogger> logger_{
+      std::make_shared<BlockingXplatLogger>()};
+  std::unique_ptr<PrivHelper> client_;
+};
+
+TEST_F(PrivHelperExitRaceTest, clientDestroyedDuringPrivhelperExit) {
+  destroyClientDuringPrivhelperExit();
+}
+
+TEST_F(PrivHelperExitRaceTest, requestInFlightFailsWithTheExitError) {
+  // The request is larger than the socket buffer. The server does not read.
+  // Part of the request thus stays in the client's send queue.
+  auto pending =
+      client_->fuseUnmount(std::string(8 * 1024 * 1024, 'x'), UnmountOptions{});
+  ioThread_.getEventBase()->runInEventBaseThreadAndWait([] {});
+
+  destroyClientDuringPrivhelperExit();
+
+  EXPECT_THROW_RE(
+      std::move(pending).get(30s), std::runtime_error, "privhelper process");
 }
 
 /**

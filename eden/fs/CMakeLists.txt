@@ -9,7 +9,13 @@ add_executable(
   notifications/edenfs.exe.manifest
 )
 
-install(TARGETS edenfs RUNTIME DESTINATION bin)
+# Where edenfsctl looks for the daemon: <prefix>/libexec/eden, or <prefix>/libexec
+# on Windows.
+if(WIN32)
+  install(TARGETS edenfs RUNTIME DESTINATION libexec)
+else()
+  install(TARGETS edenfs RUNTIME DESTINATION libexec/eden)
+endif()
 target_include_directories(
   edenfs
   PUBLIC
@@ -27,7 +33,9 @@ if(NOT WIN32)
     edenfs_privhelper
     service/PrivHelperMain.cpp
   )
-  install(TARGETS edenfs_privhelper RUNTIME DESTINATION bin)
+  # edenfsctl starts edenfs with /usr/local/libexec/eden/edenfs_privhelper, or
+  # $EDENFS_PRIVHELPER_PATH, and runs it under sudo unless that's setuid root.
+  install(TARGETS edenfs_privhelper RUNTIME DESTINATION libexec/eden)
   target_include_directories(
     edenfs_privhelper
     PUBLIC
@@ -58,16 +66,22 @@ add_subdirectory(fuse)
 add_subdirectory(privhelper)
 add_subdirectory(inodes)
 add_subdirectory(journal)
-add_subdirectory(lmdb)
 add_subdirectory(model)
 add_subdirectory(nfs)
 add_subdirectory(notifications)
 add_subdirectory(prjfs)
-add_subdirectory(py)
+add_subdirectory(rust/backtrace_ffi)
+add_subdirectory(rust/edenfs-staticlib)
+add_subdirectory(rust/manifold_ffi)
+add_subdirectory(rust/redirect_ffi)
+if(EDEN_HAVE_THRIFT_PYTHON)
+  add_subdirectory(py)
+endif()
 add_subdirectory(service)
-add_subdirectory(sqlite)
 add_subdirectory(store)
 add_subdirectory(takeover)
 add_subdirectory(telemetry)
-add_subdirectory(testharness)
+if(BUILD_TESTS)
+  add_subdirectory(testharness)
+endif()
 add_subdirectory(utils)

@@ -8,10 +8,11 @@ edition = "2024"
 homepage = "https://sapling-scm.com/"
 repository = "https://github.com/facebook/sapling"
 license = "MIT"
+exclude = ["BUCK"]
 
 [lib]
 name = "submodule"
 
 [dependencies]
-sapling-configmodel = { version = "0.1.0", path = "../config/model" }
+sapling-configmodel = { version = "0.2.0", path = "../config/model" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }

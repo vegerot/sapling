@@ -19,6 +19,8 @@ use edenfs_client::daemon_info::DaemonHealthy;
 use edenfs_client::instance::EdenFsInstance;
 use edenfs_client::types::DaemonInfo;
 use edenfs_client::types::Fb303Status;
+#[cfg(target_os = "linux")]
+use edenfs_utils::trace_env;
 use futures::stream::StreamExt;
 use tokio::time;
 use tracing::Level;
@@ -105,15 +107,7 @@ impl StatusCmd {
     async fn get_status(&self, instance: &EdenFsInstance) -> edenfs_error::Result<DaemonInfo> {
         #[cfg(fbcode_build)]
         if self.wait {
-            let waited_status = self.get_status_blocking_on_startup(instance).await;
-            if let Err(edenfs_error::EdenFsError::UnknownMethod(_)) = waited_status {
-                println!(
-                    "The version of EdenFS you are running does not yet support streaming status. Falling back to regular status ..."
-                );
-                return self.get_status_simple(instance).await;
-            } else {
-                return waited_status;
-            }
+            return self.get_status_blocking_on_startup(instance).await;
         }
         self.get_status_simple(instance).await
     }
@@ -188,6 +182,7 @@ fn print_systemd_status_full(instance: &EdenFsInstance) {
     };
 
     let mut command = Command::new("systemctl");
+    command.envs(trace_env("systemctl"));
     command.args(["--user", "status", "--no-pager", &unit]);
 
     // Point `systemctl --user` at the current user's D-Bus session bus rather

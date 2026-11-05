@@ -22,6 +22,7 @@
 #include <fb303/ServiceData.h>
 #include <fb303/ThreadCachedServiceData.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <folly/Conv.h>
 #include <folly/Exception.h>
 #include <folly/File.h>
@@ -52,6 +53,7 @@
 #include "eden/common/utils/ProcessInfoCache.h"
 #include "eden/common/utils/StatTimes.h"
 #include "eden/common/utils/String.h"
+#include "eden/common/utils/TimeUtil.h"
 #include "eden/common/utils/UnboundedQueueExecutor.h"
 #include "eden/fs/config/CheckoutConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
@@ -532,12 +534,17 @@ class ThriftRequestScope {
     if (auto handler = handler_.lock()) {
       if (enableCancellation) {
         folly::CancellationSource cancellationSource;
+        auto token = cancellationSource.getToken();
+        thriftFetchContext_->setCancellationToken(token);
+        prefetchFetchContext_->setCancellationToken(std::move(token));
         handler->insertCancellationSource(
             requestId_,
             std::move(cancellationSource),
-            std::string(sourceLocation_.function_name()));
+            sourceLocation_.function_name(),
+            pid);
       } else {
-        handler->insertUncancelableRequest(requestId_);
+        handler->insertUncancelableRequest(
+            requestId_, sourceLocation_.function_name(), pid);
       }
     }
 
@@ -609,6 +616,17 @@ class ThriftRequestScope {
 
   uint64_t getRequestId() const {
     return requestId_;
+  }
+
+  /**
+   * Record that this request's work continues after its response was sent,
+   * so that a graceful restart does not wait for it and a stop deadline does
+   * not blame it.
+   */
+  void markBackground() {
+    if (auto handler = handler_.lock()) {
+      handler->markRequestAsBackground(requestId_);
+    }
   }
 
  private:
@@ -820,6 +838,18 @@ facebook::eden::InodePtr inodeFromUserPath(
       ObjectFetchContext::Cause::Thrift,                                    \
       __VA_ARGS__)
 
+#define INSTRUMENT_THRIFT_CALL_WITH_PREFETCH_STATS_AND_CANCELLATION( \
+    level, enableStats, requestContext, ...)                         \
+  INSTRUMENT_THRIFT_CALL_IMPL(                                       \
+      level,                                                         \
+      nullptr,                                                       \
+      nullptr,                                                       \
+      requestContext,                                                \
+      true,                                                          \
+      enableStats,                                                   \
+      ObjectFetchContext::Cause::Thrift,                             \
+      __VA_ARGS__)
+
 ThriftRequestTraceEvent ThriftRequestTraceEvent::start(
     uint64_t requestId,
     folly::StringPiece method,
@@ -893,7 +923,13 @@ EdenServiceHandler::EdenServiceHandler(
       });
 }
 
-EdenServiceHandler::~EdenServiceHandler() = default;
+EdenServiceHandler::~EdenServiceHandler() {
+  disarmDelayedCancellation();
+}
+
+std::shared_ptr<folly::Executor> EdenServiceHandler::getTraceStreamExecutor() {
+  return server_->getServerState()->getThreadPool();
+}
 
 EdenMountHandle EdenServiceHandler::lookupMount(const MountId& mountId) {
   return lookupMount(mountId.mountPoint());
@@ -934,6 +970,7 @@ EdenServiceHandler::getProcessor() {
 folly::SemiFuture<folly::Unit> EdenServiceHandler::semifuture_mount(
     std::unique_ptr<MountArgument> argument) {
   auto helper = INSTRUMENT_THRIFT_CALL(INFO, (*argument->mountPoint()));
+  server_->noteActivity("mount");
   return wrapImmediateFuture(
              std::move(helper),
              makeImmediateFutureWith([&] {
@@ -964,43 +1001,93 @@ folly::SemiFuture<folly::Unit> EdenServiceHandler::semifuture_mount(
 
 folly::SemiFuture<folly::Unit> EdenServiceHandler::semifuture_unmount(
     std::unique_ptr<std::string> mountPoint) {
-  auto helper = INSTRUMENT_THRIFT_CALL(INFO, *mountPoint);
+  auto requestContext = getRequestContext();
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
+      INFO, true, requestContext, *mountPoint);
+  server_->noteActivity("unmount");
+  auto requestId = helper->getRequestId();
   return wrapImmediateFuture(
              std::move(helper),
-             makeImmediateFutureWith([&]() mutable {
-               auto mountPath = absolutePathFromThrift(*mountPoint);
-               return server_->unmount(mountPath, UnmountOptions{});
-             }).thenError([this](const folly::exception_wrapper& ex) {
-               ex.with_exception([&](const std::exception& e) {
-                 server_->getServerState()->getErrorLogger().log(
-                     EdenErrorInfo::thrift(
-                         ErrorArg::fromExceptionWithoutTrace(e), "unmount"));
-               });
-               throw newEdenError(ex);
-             }))
+             unmountUnlessCancelled(
+                 requestId,
+                 absolutePathFromThrift(*mountPoint),
+                 UnmountOptions{}))
       .semi();
 }
 
 folly::SemiFuture<folly::Unit> EdenServiceHandler::semifuture_unmountV2(
     std::unique_ptr<UnmountArgument> unmountArg) {
-  auto helper =
-      INSTRUMENT_THRIFT_CALL(INFO, *unmountArg->mountId()->mountPoint());
+  auto requestContext = getRequestContext();
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
+      INFO, true, requestContext, *unmountArg->mountId()->mountPoint());
+  server_->noteActivity("unmount");
+  auto requestId = helper->getRequestId();
   return wrapImmediateFuture(
              std::move(helper),
-             makeImmediateFutureWith([&]() mutable {
-               auto mountPath =
-                   absolutePathFromThrift(*unmountArg->mountId()->mountPoint());
-               return server_->unmount(
-                   mountPath, UnmountOptions{.force = *unmountArg->useForce()});
-             }).thenError([this](const folly::exception_wrapper& ex) {
-               ex.with_exception([&](const std::exception& e) {
-                 server_->getServerState()->getErrorLogger().log(
-                     EdenErrorInfo::thrift(
-                         ErrorArg::fromExceptionWithoutTrace(e), "unmount"));
-               });
-               throw newEdenError(ex);
-             }))
+             unmountUnlessCancelled(
+                 requestId,
+                 absolutePathFromThrift(*unmountArg->mountId()->mountPoint()),
+                 UnmountOptions{.force = *unmountArg->useForce()}))
       .semi();
+}
+
+ImmediateFuture<folly::Unit> EdenServiceHandler::unmountUnlessCancelled(
+    uint64_t requestId,
+    AbsolutePath mountPath,
+    UnmountOptions options) {
+  // The unmount answers once the mount has shut down, and that shutdown
+  // finishes on the main event base. EdenServer::stop() cancels every active
+  // request and then waits for Thrift to drain them while the main event
+  // base is not running, so an unmount that waited through the stop would
+  // hold the drain until Thrift aborts the daemon. Cancellation answers the
+  // request instead; the mount's shutdown carries on without it, and
+  // unmountAll() waits for it during cleanup.
+  struct Wait {
+    folly::Promise<folly::Unit> promise;
+    std::atomic<bool> answered{false};
+    void answer(folly::Try<folly::Unit>&& result) {
+      if (!answered.exchange(true)) {
+        promise.setTry(std::move(result));
+      }
+    }
+  };
+  auto wait = std::make_shared<Wait>();
+  auto answer = wait->promise.getSemiFuture();
+
+  std::shared_ptr<folly::CancellationCallback> onCancel;
+  if (auto token = getCancellationToken(requestId)) {
+    onCancel = std::make_shared<
+        folly::CancellationCallback>(std::move(*token), [wait, mountPath] {
+      wait->answer(
+          folly::Try<folly::Unit>{newEdenError(
+              EdenErrorType::GENERIC_ERROR,
+              fmt::format(
+                  "EdenFS is stopping; the unmount of {} completes as part of "
+                  "the shutdown",
+                  mountPath))});
+    });
+  }
+
+  folly::futures::detachOn(
+      server_->getServerState()->getThreadPool().get(),
+      makeImmediateFutureWith([this, mountPath, options] {
+        return server_->unmount(mountPath, options);
+      })
+          .semi()
+          .defer([wait](folly::Try<folly::Unit>&& result) {
+            wait->answer(std::move(result));
+          }));
+
+  return ImmediateFuture<folly::Unit>{std::move(answer)}
+      .thenError([this](const folly::exception_wrapper& ex) {
+        ex.with_exception([&](const std::exception& e) {
+          server_->getServerState()->getErrorLogger().log(
+              EdenErrorInfo::thrift(
+                  ErrorArg::fromExceptionWithoutTrace(e), "unmount"));
+        });
+        throw newEdenError(ex);
+      })
+      .ensure([onCancel = std::move(onCancel)] {});
 }
 
 void EdenServiceHandler::listMounts(std::vector<MountInfo>& results) {
@@ -1045,6 +1132,10 @@ EdenServiceHandler::semifuture_checkOutRevision(
     std::unique_ptr<std::string> hash,
     CheckoutMode checkoutMode,
     std::unique_ptr<CheckOutRevisionParams> params) {
+  // Noted when the checkout starts and again when it ends, so that a
+  // graceful restart asked to wait for an idle daemon stays away from it.
+  server_->noteActivity("checkOutRevision");
+  auto noteEnd = [this] { server_->noteActivity("checkOutRevision"); };
   auto config = server_->getServerState()->getEdenConfig();
   bool useCoroutines = config->enableCoroutines.getValue() &&
       config->enableCoroutinesPhase7.getValue();
@@ -1068,10 +1159,15 @@ EdenServiceHandler::semifuture_checkOutRevision(
                std::move(hash),
                checkoutMode,
                std::move(params))
-        .semi();
+        .semi()
+        .deferEnsure(noteEnd);
   }
   return semifuture_checkOutRevisionImpl(
-      std::move(mountPoint), std::move(hash), checkoutMode, std::move(params));
+             std::move(mountPoint),
+             std::move(hash),
+             checkoutMode,
+             std::move(params))
+      .deferEnsure(noteEnd);
 }
 
 folly::coro::now_task<std::unique_ptr<std::vector<CheckoutConflict>>>
@@ -1097,10 +1193,6 @@ EdenServiceHandler::co_checkOutRevisionImpl(
                                            : "(unspecified hg root manifest)",
       rootIdOptions.fid().has_value() ? folly::hexlify(*rootIdOptions.fid())
                                       : "no fid provided");
-  auto cancellationToken = getCancellationToken(helper->getRequestId());
-  if (cancellationToken.has_value()) {
-    helper->getThriftFetchContext().setCancellationToken(*cancellationToken);
-  }
   helper->getThriftFetchContext().fillClientRequestInfo(params->cri());
   auto& fetchContext = helper->getFetchContext();
 
@@ -1143,10 +1235,6 @@ EdenServiceHandler::semifuture_checkOutRevisionImpl(
                                            : "(unspecified hg root manifest)",
       rootIdOptions.fid().has_value() ? folly::hexlify(*rootIdOptions.fid())
                                       : "no fid provided");
-  auto cancellationToken = getCancellationToken(helper->getRequestId());
-  if (cancellationToken.has_value()) {
-    helper->getThriftFetchContext().setCancellationToken(*cancellationToken);
-  }
   helper->getThriftFetchContext().fillClientRequestInfo(params->cri());
   auto& fetchContext = helper->getFetchContext();
 
@@ -1181,6 +1269,7 @@ EdenServiceHandler::semifuture_resetParentCommits(
     std::unique_ptr<std::string> mountPoint,
     std::unique_ptr<WorkingDirectoryParents> parents,
     std::unique_ptr<ResetParentCommitsParams> params) {
+  server_->noteActivity("resetParentCommits");
   auto rootIdOptions = params->rootIdOptions().ensure();
   auto helper = INSTRUMENT_THRIFT_CALL(
       DBG1,
@@ -1767,6 +1856,87 @@ class ThriftStreamPublisherOwner {
   apache::thrift::ServerStreamPublisher<T> publisher;
 };
 
+/**
+ * What keeps a trace stream open: the request scope, so the stream counts as
+ * an outstanding Thrift request for as long as it is open, and the TraceBus
+ * subscription whose subscriber owns the stream publisher.
+ *
+ * The stream ends when the subscription is dropped: the bus thread destroys
+ * the subscriber, and the ThriftStreamPublisherOwner it holds completes the
+ * publisher. That happens when the client disconnects, which destroys this
+ * object, and when the request is cancelled, which EdenServiceHandler does for
+ * every stream when EdenFS stops.
+ */
+template <typename Subscription>
+class TraceStreamSubscription {
+ public:
+  TraceStreamSubscription(
+      std::unique_ptr<ThriftRequestScope> helper,
+      std::optional<folly::CancellationToken> cancellationToken,
+      std::shared_ptr<folly::Executor> executor)
+      : helper_{std::move(helper)}, executor_{std::move(executor)} {
+    if (cancellationToken) {
+      onCancel_.emplace(std::move(*cancellationToken), [this] { close(); });
+    }
+  }
+
+  TraceStreamSubscription(const TraceStreamSubscription&) = delete;
+  TraceStreamSubscription(TraceStreamSubscription&&) = delete;
+  TraceStreamSubscription& operator=(const TraceStreamSubscription&) = delete;
+  TraceStreamSubscription& operator=(TraceStreamSubscription&&) = delete;
+
+  ~TraceStreamSubscription() {
+    // Completing the publisher can run the stream's completion callback, and
+    // with it this destructor, on the TraceBus thread. The request scope's
+    // destructor publishes to the Thrift request bus, which may be that very
+    // bus, so it must not run there.
+    executor_->add([helper = std::move(helper_)]() mutable { helper.reset(); });
+  }
+
+  /**
+   * Store the subscription that feeds the stream. A subscription that arrives
+   * after the request was cancelled is dropped right away, which ends the
+   * stream before the client sees an event.
+   */
+  void subscribe(Subscription subscription) {
+    auto state = state_.wlock();
+    if (!state->closed) {
+      state->subscription.emplace(std::move(subscription));
+    }
+  }
+
+ private:
+  void close() {
+    auto state = state_.wlock();
+    state->closed = true;
+    state->subscription.reset();
+  }
+
+  struct State {
+    bool closed = false;
+    std::optional<Subscription> subscription;
+  };
+
+  std::unique_ptr<ThriftRequestScope> helper_;
+  // Owned rather than kept alive: the pool does not hand out a keep-alive.
+  std::shared_ptr<folly::Executor> executor_;
+  folly::Synchronized<State> state_;
+  std::optional<folly::CancellationCallback> onCancel_;
+};
+
+template <typename Subscription>
+std::shared_ptr<TraceStreamSubscription<Subscription>>
+makeTraceStreamSubscription(
+    EdenServiceHandler& handler,
+    std::shared_ptr<folly::Executor> executor,
+    std::unique_ptr<ThriftRequestScope> helper) {
+  auto requestId = helper->getRequestId();
+  handler.markRequestAsStream(requestId);
+  auto cancellationToken = handler.getCancellationToken(requestId);
+  return std::make_shared<TraceStreamSubscription<Subscription>>(
+      std::move(helper), std::move(cancellationToken), std::move(executor));
+}
+
 } // namespace
 
 #ifndef _WIN32
@@ -1881,58 +2051,61 @@ void convertThriftRequestTraceEventToThriftRequestEvent(
 
 apache::thrift::ServerStream<ThriftRequestEvent>
 EdenServiceHandler::traceThriftRequestEvents() {
-  auto helper = INSTRUMENT_THRIFT_CALL(DBG3);
+  auto requestContext = getRequestContext();
+  auto helper =
+      INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(DBG3, true, requestContext);
 
-  struct SubscriptionHandleOwner {
-    TraceBus<ThriftRequestTraceEvent>::SubscriptionHandle handle;
-  };
-
-  auto h = std::make_shared<SubscriptionHandleOwner>();
+  auto stream = makeTraceStreamSubscription<
+      TraceBus<ThriftRequestTraceEvent>::SubscriptionHandle>(
+      *this, getTraceStreamExecutor(), std::move(helper));
 
   auto [serverStream, publisher] =
-      apache::thrift::ServerStream<ThriftRequestEvent>::createPublisher([h] {
-        // on disconnect, release subscription handle
-      });
+      apache::thrift::ServerStream<ThriftRequestEvent>::createPublisher(
+          [stream] {
+            // on disconnect, release the subscription and the request scope
+          });
 
-  h->handle = thriftRequestTraceBus_->subscribeFunction(
+  stream->subscribe(thriftRequestTraceBus_->subscribeFunction(
       "Live Thrift request tracing",
       [publisher_2 = ThriftStreamPublisherOwner{std::move(publisher)}](
           const ThriftRequestTraceEvent& event) mutable {
         ThriftRequestEvent thriftEvent;
         convertThriftRequestTraceEventToThriftRequestEvent(event, thriftEvent);
         publisher_2.next(thriftEvent);
-      });
+      }));
 
   return std::move(serverStream);
 }
 
 apache::thrift::ServerStream<TaskEvent> EdenServiceHandler::traceTaskEvents(
     std::unique_ptr<::facebook::eden::TraceTaskEventsRequest> /* request */) {
-  auto helper = INSTRUMENT_THRIFT_CALL(DBG3);
-  struct SubscriptionHandleOwner {
-    TraceBus<TaskTraceEvent>::SubscriptionHandle handle;
-  };
+  auto requestContext = getRequestContext();
+  auto helper =
+      INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(DBG3, true, requestContext);
 
-  auto h = std::make_shared<SubscriptionHandleOwner>();
+  auto stream =
+      makeTraceStreamSubscription<TraceBus<TaskTraceEvent>::SubscriptionHandle>(
+          *this, getTraceStreamExecutor(), std::move(helper));
 
   auto [serverStream, publisher] =
-      apache::thrift::ServerStream<TaskEvent>::createPublisher([h] {
-        // on disconnect, release subscription handle
+      apache::thrift::ServerStream<TaskEvent>::createPublisher([stream] {
+        // on disconnect, release the subscription and the request scope
       });
 
-  h->handle = TaskTraceEvent::getTraceBus()->subscribeFunction(
-      "Live Thrift request tracing",
-      [publisher_2 = ThriftStreamPublisherOwner{std::move(publisher)}](
-          const TaskTraceEvent& event) mutable {
-        TaskEvent taskEvent;
-        taskEvent.times() = thriftTraceEventTimes(event);
-        taskEvent.name() = event.name;
-        taskEvent.threadName() = event.threadName;
-        taskEvent.threadId() = event.threadId;
-        taskEvent.duration() = event.duration.count();
-        taskEvent.start() = event.start.count();
-        publisher_2.next(taskEvent);
-      });
+  stream->subscribe(
+      TaskTraceEvent::getTraceBus()->subscribeFunction(
+          "Live Thrift request tracing",
+          [publisher_2 = ThriftStreamPublisherOwner{std::move(publisher)}](
+              const TaskTraceEvent& event) mutable {
+            TaskEvent taskEvent;
+            taskEvent.times() = thriftTraceEventTimes(event);
+            taskEvent.name() = event.name;
+            taskEvent.threadName() = event.threadName;
+            taskEvent.threadId() = event.threadId;
+            taskEvent.duration() = event.duration.count();
+            taskEvent.start() = event.start.count();
+            publisher_2.next(taskEvent);
+          }));
 
   return std::move(serverStream);
 }
@@ -1940,7 +2113,9 @@ apache::thrift::ServerStream<TaskEvent> EdenServiceHandler::traceTaskEvents(
 apache::thrift::ServerStream<FsEvent> EdenServiceHandler::traceFsEvents(
     std::unique_ptr<std::string> mountPoint,
     int64_t eventCategoryMask) {
-  auto helper = INSTRUMENT_THRIFT_CALL(DBG3, *mountPoint);
+  auto requestContext = getRequestContext();
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
+      DBG3, true, requestContext, *mountPoint);
   auto mountHandle = lookupMount(mountPoint);
   auto& edenMount = mountHandle.getEdenMount();
 
@@ -1951,7 +2126,7 @@ apache::thrift::ServerStream<FsEvent> EdenServiceHandler::traceFsEvents(
     eventCategoryMask = ~0;
   }
 
-  struct Context {
+  struct FsTraceSubscription {
     // While subscribed to FuseChannel's TraceBus, request detailed argument
     // strings.
     TraceDetailedArgumentsHandle argHandle;
@@ -1965,11 +2140,11 @@ apache::thrift::ServerStream<FsEvent> EdenServiceHandler::traceFsEvents(
 #endif // _WIN32
   };
 
-  auto context = std::make_shared<Context>();
+  FsTraceSubscription subscription;
 #ifdef _WIN32
   auto prjfsChannel = edenMount.getPrjfsChannel()->getInner();
   if (prjfsChannel) {
-    context->argHandle = prjfsChannel->traceDetailedArguments();
+    subscription.argHandle = prjfsChannel->traceDetailedArguments();
   } else {
     EDEN_BUG() << "tracing isn't supported yet for the "
                << fmt::underlying(
@@ -1980,9 +2155,9 @@ apache::thrift::ServerStream<FsEvent> EdenServiceHandler::traceFsEvents(
   auto* fuseChannel = edenMount.getFuseChannel();
   auto* nfsdChannel = edenMount.getNfsdChannel();
   if (fuseChannel) {
-    context->argHandle = fuseChannel->traceDetailedArguments();
+    subscription.argHandle = fuseChannel->traceDetailedArguments();
   } else if (nfsdChannel) {
-    context->argHandle = nfsdChannel->traceDetailedArguments();
+    subscription.argHandle = nfsdChannel->traceDetailedArguments();
   } else {
     EDEN_BUG() << "tracing isn't supported yet for the "
                << fmt::underlying(
@@ -1991,14 +2166,17 @@ apache::thrift::ServerStream<FsEvent> EdenServiceHandler::traceFsEvents(
   }
 #endif // _WIN32
 
+  auto stream = makeTraceStreamSubscription<FsTraceSubscription>(
+      *this, getTraceStreamExecutor(), std::move(helper));
+
   auto [serverStream, publisher] =
-      apache::thrift::ServerStream<FsEvent>::createPublisher([context] {
-        // on disconnect, release context and the TraceSubscriptionHandle
+      apache::thrift::ServerStream<FsEvent>::createPublisher([stream] {
+        // on disconnect, release the subscription and the request scope
       });
 
 #ifdef _WIN32
   if (prjfsChannel) {
-    context->subHandle = prjfsChannel->getTraceBusPtr()->subscribeFunction(
+    subscription.subHandle = prjfsChannel->getTraceBusPtr()->subscribeFunction(
         fmt::format("strace-{}", edenMount.getPath().basename()),
         [publisher = ThriftStreamPublisherOwner{std::move(publisher)}](
             const PrjfsTraceEvent& event) {
@@ -2035,7 +2213,7 @@ apache::thrift::ServerStream<FsEvent> EdenServiceHandler::traceFsEvents(
   }
 #else
   if (fuseChannel) {
-    context->subHandle = fuseChannel->getTraceBus().subscribeFunction(
+    subscription.subHandle = fuseChannel->getTraceBus().subscribeFunction(
         fmt::format("strace-{}", edenMount.getPath().basename()),
         [publisher_2 = ThriftStreamPublisherOwner{std::move(publisher)},
          serverState = server_->getServerState(),
@@ -2076,7 +2254,7 @@ apache::thrift::ServerStream<FsEvent> EdenServiceHandler::traceFsEvents(
           publisher_2.next(te);
         });
   } else if (nfsdChannel) {
-    context->subHandle = nfsdChannel->getTraceBus().subscribeFunction(
+    subscription.subHandle = nfsdChannel->getTraceBus().subscribeFunction(
         fmt::format("strace-{}", edenMount.getPath().basename()),
         [publisher_2 = ThriftStreamPublisherOwner{std::move(publisher)},
          eventCategoryMask](const NfsTraceEvent& event) {
@@ -2112,6 +2290,7 @@ apache::thrift::ServerStream<FsEvent> EdenServiceHandler::traceFsEvents(
         });
   }
 #endif // _WIN32
+  stream->subscribe(std::move(subscription));
   return std::move(serverStream);
 }
 
@@ -2220,6 +2399,7 @@ void convertHgImportTraceEventToHgEvent(
 
   switch (event.importCause) {
     case ObjectFetchContext::Cause::Unknown:
+    case ObjectFetchContext::Cause::InodeGc:
       te.importCause() = HgImportCause::UNKNOWN;
       break;
     case ObjectFetchContext::Cause::Fs:
@@ -2264,25 +2444,25 @@ void convertHgImportTraceEventToHgEvent(
 
 apache::thrift::ServerStream<HgEvent> EdenServiceHandler::traceHgEvents(
     std::unique_ptr<std::string> mountPoint) {
-  auto helper = INSTRUMENT_THRIFT_CALL(DBG3, *mountPoint);
+  auto requestContext = getRequestContext();
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
+      DBG3, true, requestContext, *mountPoint);
   auto mountHandle = lookupMount(mountPoint);
   auto backingStore = mountHandle.getObjectStore().getBackingStore();
   std::shared_ptr<SaplingBackingStore> saplingBackingStore =
       castToSaplingBackingStore(
           backingStore, mountHandle.getEdenMount().getPath());
 
-  struct Context {
-    TraceSubscriptionHandle<HgImportTraceEvent> subHandle;
-  };
-
-  auto context = std::make_shared<Context>();
+  auto stream =
+      makeTraceStreamSubscription<TraceSubscriptionHandle<HgImportTraceEvent>>(
+          *this, getTraceStreamExecutor(), std::move(helper));
 
   auto [serverStream, publisher] =
-      apache::thrift::ServerStream<HgEvent>::createPublisher([context] {
-        // on disconnect, release context and the TraceSubscriptionHandle
+      apache::thrift::ServerStream<HgEvent>::createPublisher([stream] {
+        // on disconnect, release the subscription and the request scope
       });
 
-  context->subHandle = saplingBackingStore->getTraceBus().subscribeFunction(
+  stream->subscribe(saplingBackingStore->getTraceBus().subscribeFunction(
       fmt::format(
           "hgtrace-{}", mountHandle.getEdenMount().getPath().basename()),
       [publisher_2 = ThriftStreamPublisherOwner{std::move(publisher)},
@@ -2293,7 +2473,7 @@ apache::thrift::ServerStream<HgEvent> EdenServiceHandler::traceHgEvents(
         convertHgImportTraceEventToHgEvent(
             event, *processInfoCache, thriftEvent);
         publisher_2.next(thriftEvent);
-      });
+      }));
 
   return std::move(serverStream);
 }
@@ -2321,22 +2501,22 @@ void ConvertInodeTraceEventToThriftInodeEvent(
 
 apache::thrift::ServerStream<InodeEvent> EdenServiceHandler::traceInodeEvents(
     std::unique_ptr<std::string> mountPoint) {
-  auto helper = INSTRUMENT_THRIFT_CALL(DBG3, *mountPoint);
+  auto requestContext = getRequestContext();
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
+      DBG3, true, requestContext, *mountPoint);
   auto mountHandle = lookupMount(mountPoint);
   auto inodeMap = mountHandle.getEdenMount().getInodeMap();
 
-  struct Context {
-    TraceSubscriptionHandle<InodeTraceEvent> subHandle;
-  };
-
-  auto context = std::make_shared<Context>();
+  auto stream =
+      makeTraceStreamSubscription<TraceSubscriptionHandle<InodeTraceEvent>>(
+          *this, getTraceStreamExecutor(), std::move(helper));
 
   auto [serverStream, publisher] =
-      apache::thrift::ServerStream<InodeEvent>::createPublisher([context] {
-        // on disconnect, release context and the TraceSubscriptionHandle
+      apache::thrift::ServerStream<InodeEvent>::createPublisher([stream] {
+        // on disconnect, release the subscription and the request scope
       });
 
-  context->subHandle =
+  stream->subscribe(
       mountHandle.getEdenMount().getInodeTraceBus().subscribeFunction(
           fmt::format(
               "inodetrace-{}", mountHandle.getEdenMount().getPath().basename()),
@@ -2355,7 +2535,7 @@ apache::thrift::ServerStream<InodeEvent> EdenServiceHandler::traceInodeEvents(
               thriftEvent.path() = event.getPath();
             }
             publisher_2.next(thriftEvent);
-          });
+          }));
 
   return std::move(serverStream);
 }
@@ -2507,8 +2687,13 @@ ImmediateFuture<folly::Unit> diffBetweenRoots(
 apache::thrift::ResponseAndServerStream<ChangesSinceResult, ChangedFileResult>
 EdenServiceHandler::streamChangesSince(
     std::unique_ptr<StreamChangesSinceParams> params) {
-  auto helper = INSTRUMENT_THRIFT_CALL_WITH_STAT(
-      DBG3, &ThriftStats::streamChangesSince, *params->mountPoint());
+  auto requestContext = getRequestContext();
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_STAT_AND_CANCELLATION(
+      DBG3,
+      &ThriftStats::streamChangesSince,
+      true,
+      requestContext,
+      *params->mountPoint());
   auto mountHandle = lookupMount(params->mountPoint());
   const auto& fromPosition = *params->fromPosition();
   auto& fetchContext = helper->getFetchContext();
@@ -2552,6 +2737,14 @@ EdenServiceHandler::streamChangesSince(
   }
 
   auto cancellationSource = std::make_shared<folly::CancellationSource>();
+  // Cancelling the request, which EdenFS does for a forced restart, stops the
+  // diffs the same way a client disconnect does.
+  std::shared_ptr<folly::CancellationCallback> onRequestCancel;
+  if (auto requestToken = getCancellationToken(helper->getRequestId())) {
+    onRequestCancel = std::make_shared<folly::CancellationCallback>(
+        std::move(*requestToken),
+        [cancellationSource] { cancellationSource->requestCancellation(); });
+  }
   auto [serverStream, publisher] =
       apache::thrift::ServerStream<ChangedFileResult>::createPublisher(
           [cancellationSource] { cancellationSource->requestCancellation(); });
@@ -2615,6 +2808,7 @@ EdenServiceHandler::streamChangesSince(
                  sharedPublisherLock,
                  callback = std::move(callback),
                  helper = std::move(helper),
+                 onRequestCancel = std::move(onRequestCancel),
                  cancellationSource](
                     folly::Try<std::vector<folly::Unit>>&& result) mutable {
                   if (result.hasException()) {
@@ -2622,6 +2816,16 @@ EdenServiceHandler::streamChangesSince(
                         std::move(*sharedPublisherLock->wlock());
                     std::move(sharedPublisher)
                         .next(newEdenError(std::move(result).exception()));
+                  } else if (cancellationSource->getToken()
+                                 .isCancellationRequested()) {
+                    // A cancelled diff stops early. A client that is still
+                    // connected must not take the stream for complete.
+                    auto sharedPublisher =
+                        std::move(*sharedPublisherLock->wlock());
+                    std::move(sharedPublisher)
+                        .next(newEdenError(
+                            folly::make_exception_wrapper<
+                                folly::OperationCancelled>()));
                   }
                 })
             .semi());
@@ -3296,9 +3500,12 @@ void EdenServiceHandler::sendNotification(
 apache::thrift::ResponseAndServerStream<ChangesSinceResult, ChangedFileResult>
 EdenServiceHandler::streamSelectedChangesSince(
     std::unique_ptr<StreamSelectedChangesSinceParams> params) {
-  auto helper = INSTRUMENT_THRIFT_CALL_WITH_STAT(
+  auto requestContext = getRequestContext();
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_STAT_AND_CANCELLATION(
       DBG3,
       &ThriftStats::streamSelectedChangesSince,
+      true,
+      requestContext,
       *params->changesParams()->mountPoint());
   auto mountHandle = lookupMount(params->changesParams()->mountPoint().value());
   const auto& fromPosition = *params->changesParams()->fromPosition();
@@ -3328,6 +3535,14 @@ EdenServiceHandler::streamSelectedChangesSince(
   }
 
   auto cancellationSource = std::make_shared<folly::CancellationSource>();
+  // Cancelling the request, which EdenFS does for a forced restart, stops the
+  // diffs the same way a client disconnect does.
+  std::shared_ptr<folly::CancellationCallback> onRequestCancel;
+  if (auto requestToken = getCancellationToken(helper->getRequestId())) {
+    onRequestCancel = std::make_shared<folly::CancellationCallback>(
+        std::move(*requestToken),
+        [cancellationSource] { cancellationSource->requestCancellation(); });
+  }
   auto [serverStream, publisher] =
       apache::thrift::ServerStream<ChangedFileResult>::createPublisher(
           [cancellationSource] { cancellationSource->requestCancellation(); });
@@ -3368,7 +3583,9 @@ EdenServiceHandler::streamSelectedChangesSince(
         server_->getServerState()->getProcessInfoCache(),
         server_->getServerState()->getEdenFsEventsLogger(),
         server_->getServerState()->getReloadableConfig(),
-        caseSensitivity);
+        caseSensitivity,
+        folly::getKeepAliveToken(
+            server_->getServerState()->getThreadPool().get()));
     auto callback =
         std::make_shared<StreamingDiffCallback>(sharedPublisherLock);
 
@@ -3411,6 +3628,7 @@ EdenServiceHandler::streamSelectedChangesSince(
                  sharedPublisherLock,
                  callback = std::move(callback),
                  helper = std::move(helper),
+                 onRequestCancel = std::move(onRequestCancel),
                  cancellationSource](
                     folly::Try<std::vector<folly::Unit>>&& result) mutable {
                   if (result.hasException()) {
@@ -3418,6 +3636,16 @@ EdenServiceHandler::streamSelectedChangesSince(
                         std::move(*sharedPublisherLock->wlock());
                     std::move(sharedPublisher)
                         .next(newEdenError(std::move(result).exception()));
+                  } else if (cancellationSource->getToken()
+                                 .isCancellationRequested()) {
+                    // A cancelled diff stops early. A client that is still
+                    // connected must not take the stream for complete.
+                    auto sharedPublisher =
+                        std::move(*sharedPublisherLock->wlock());
+                    std::move(sharedPublisher)
+                        .next(newEdenError(
+                            folly::make_exception_wrapper<
+                                folly::OperationCancelled>()));
                   }
                 })
             .semi());
@@ -3539,57 +3767,11 @@ void EdenServiceHandler::debugGetRawJournal(
       mountHandle.getObjectStore());
 }
 
-folly::SemiFuture<std::unique_ptr<std::vector<EntryInformationOrError>>>
-EdenServiceHandler::semifuture_getEntryInformationImpl(
-    std::unique_ptr<std::string> mountPoint,
-    std::unique_ptr<std::vector<std::string>> paths,
-    std::unique_ptr<SyncBehavior> sync) {
-  auto helper = INSTRUMENT_THRIFT_CALL(
-      DBG3, *mountPoint, getSyncTimeout(*sync), toLogArg(*paths));
-  auto mountHandle = lookupMount(mountPoint);
-  auto& fetchContext = helper->getFetchContext();
-
-  return wrapImmediateFuture(
-             std::move(helper),
-             waitForPendingWrites(mountHandle.getEdenMount(), *sync)
-                 .thenValue([mountHandle,
-                             paths = std::move(paths),
-                             fetchContext = fetchContext.copy()](auto&&) {
-                   return applyToVirtualInode(
-                       mountHandle.getRootInode(),
-                       *paths,
-                       [](const VirtualInode& inode, const RelativePath&) {
-                         return inode.getDtype();
-                       },
-                       mountHandle.getObjectStorePtr(),
-                       fetchContext);
-                 })
-                 .thenValue([](vector<Try<dtype_t>> done) {
-                   auto out =
-                       std::make_unique<vector<EntryInformationOrError>>();
-                   out->reserve(done.size());
-                   for (auto& item : done) {
-                     EntryInformationOrError result;
-                     if (item.hasException()) {
-                       result.error() = newEdenError(item.exception());
-                     } else {
-                       EntryInformation info;
-                       info.dtype() = static_cast<Dtype>(item.value());
-                       result.info() = info;
-                     }
-                     out->emplace_back(std::move(result));
-                   }
-                   return out;
-                 }))
-      .semi();
-}
-
 folly::coro::now_task<std::unique_ptr<std::vector<EntryInformationOrError>>>
-EdenServiceHandler::co_getEntryInformationImpl(
+EdenServiceHandler::getEntryInformationImpl(
     std::unique_ptr<std::string> mountPoint,
     std::unique_ptr<std::vector<std::string>> paths,
     std::unique_ptr<SyncBehavior> sync) {
-  XLOG(DBG6, "Using coroutine path for getEntryInformation");
   auto helper = INSTRUMENT_THRIFT_CALL(
       DBG3, *mountPoint, getSyncTimeout(*sync), toLogArg(*paths));
   auto& fetchContext = helper->getFetchContext();
@@ -3624,31 +3806,12 @@ EdenServiceHandler::co_getEntryInformationImpl(
   co_return out;
 }
 
-folly::SemiFuture<std::unique_ptr<std::vector<EntryInformationOrError>>>
-EdenServiceHandler::semifuture_getEntryInformation(
+folly::coro::Task<std::unique_ptr<std::vector<EntryInformationOrError>>>
+EdenServiceHandler::co_getEntryInformation(
     std::unique_ptr<std::string> mountPoint,
     std::unique_ptr<std::vector<std::string>> paths,
     std::unique_ptr<SyncBehavior> sync) {
-  if (server_->getServerState()
-          ->getEdenConfig()
-          ->enableCoroutinesPhase8.getValue()) {
-    // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-    return folly::coro::co_invoke(
-               [self = shared_from_this()](
-                   std::unique_ptr<std::string> mountPoint,
-                   std::unique_ptr<std::vector<std::string>> paths,
-                   std::unique_ptr<SyncBehavior> sync)
-                   -> folly::coro::Task<
-                       std::unique_ptr<std::vector<EntryInformationOrError>>> {
-                 co_return co_await self->co_getEntryInformationImpl(
-                     std::move(mountPoint), std::move(paths), std::move(sync));
-               },
-               std::move(mountPoint),
-               std::move(paths),
-               std::move(sync))
-        .semi();
-  }
-  return semifuture_getEntryInformationImpl(
+  co_return co_await getEntryInformationImpl(
       std::move(mountPoint), std::move(paths), std::move(sync));
 }
 
@@ -4003,6 +4166,7 @@ folly::coro::now_task<DirListAttributeDataOrError> co_getAllEntryAttributes(
     const EdenMount& edenMount,
     std::string path,
     const ObjectFetchContextPtr& fetchContext) {
+  fetchContext->throwIfCanceled();
   // Capture lastCheckoutTime before any co_await so synthetic tree mtimes
   // are stable across concurrent checkout.
   auto lastCheckoutTime = edenMount.getLastCheckoutTime().toTimespec();
@@ -4065,8 +4229,11 @@ folly::coro::Task<std::unique_ptr<ReaddirResult>>
 EdenServiceHandler::co_readdir(std::unique_ptr<ReaddirParams> params) {
   auto mountHandle = lookupMount(params->mountPoint());
   auto paths = *params->directoryPaths();
-  auto helper = INSTRUMENT_THRIFT_CALL(
+  auto requestContext = getRequestContext();
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
       DBG3,
+      true,
+      requestContext,
       *params->mountPoint(),
       getSyncTimeout(*params->sync()),
       toLogArg(paths));
@@ -4098,6 +4265,9 @@ EdenServiceHandler::co_readdir(std::unique_ptr<ReaddirParams> params) {
   }
 
   auto results = co_await folly::coro::collectAllRange(std::move(tasks));
+  // A cancellation that lands while the directories are being read shows up
+  // as per-entry errors; fail the request instead of returning them.
+  fetchContext->throwIfCanceled();
 
   auto res = std::make_unique<ReaddirResult>();
   res->dirLists() = std::move(results);
@@ -4184,6 +4354,10 @@ EdenServiceHandler::co_getEntryAttributes(
   }
 
   auto allRes = co_await folly::coro::collectAllTryRange(std::move(tasks));
+  // Each path that was cancelled holds an error in its slot. The request as a
+  // whole must fail rather than hand back a response that looks like per-path
+  // failures.
+  fetchContext->throwIfCanceled();
 
   if (!reqBitmask.containsAnyOf(kAclPathAttributes)) {
     co_return allRes;
@@ -4238,6 +4412,9 @@ EdenServiceHandler::getEntryAttributesImpl(
                     std::vector<folly::Try<EntryAttributes>> allRes) mutable
                     -> ImmediateFuture<
                         std::vector<folly::Try<EntryAttributes>>> {
+                  // A cancelled request fails as a whole; see
+                  // co_getEntryAttributes.
+                  fetchContext->throwIfCanceled();
                   if (!reqBitmask.containsAnyOf(kAclPathAttributes)) {
                     return allRes;
                   }
@@ -4316,6 +4493,7 @@ EdenServiceHandler::co_getEntryAttributesForPath(
     AttributesRequestScope reqScope,
     std::string_view path,
     const ObjectFetchContextPtr& fetchContext) {
+  fetchContext->throwIfCanceled();
   if (path.empty()) {
     co_yield folly::coro::co_error(newEdenError(
         EINVAL,
@@ -4424,8 +4602,11 @@ EdenServiceHandler::co_getAttributesFromFilesV2Impl(
       static_cast<std::underlying_type_t<FileAttributes>>(
           *params->requestedAttributes()));
   std::vector<std::string>& paths = params->paths().value();
-  auto helper = INSTRUMENT_THRIFT_CALL(
+  auto requestContext = getRequestContext();
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
       DBG3,
+      true,
+      requestContext,
       *params->mountPoint(),
       getSyncTimeout(*params->sync()),
       toLogArg(paths));
@@ -4463,8 +4644,11 @@ EdenServiceHandler::semifuture_getAttributesFromFilesV2Impl(
       static_cast<std::underlying_type_t<FileAttributes>>(
           *params->requestedAttributes()));
   std::vector<std::string>& paths = params->paths().value();
-  auto helper = INSTRUMENT_THRIFT_CALL(
+  auto requestContext = getRequestContext();
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
       DBG3,
+      true,
+      requestContext,
       *params->mountPoint(),
       getSyncTimeout(*params->sync()),
       toLogArg(paths));
@@ -4510,14 +4694,19 @@ EdenServiceHandler::semifuture_setPathObjectId(
   std::vector<SetPathObjectIdObjectAndPath> objects;
   std::vector<std::string> object_strings;
   auto objectSize =
-      params->objects().is_set() ? params->objects()->size() + 1 : 1;
+      apache::thrift::is_non_optional_field_set_manually_or_by_serializer(
+          params->objects())
+      ? params->objects()->size() + 1
+      : 1;
   objects.reserve(objectSize);
   object_strings.reserve(objectSize);
 
   // TODO deprecate non-batch fields once all clients moves to the batch
   // fields. Rust clients might set to default and is_set() would return false
   // negative
-  if (params->objectId().is_set() && !params->objectId()->empty()) {
+  if (apache::thrift::is_non_optional_field_set_manually_or_by_serializer(
+          params->objectId()) &&
+      !params->objectId()->empty()) {
     SetPathObjectIdObjectAndPath objectAndPath;
     objectAndPath.path = RelativePath{*params->path()};
     objectAndPath.id =
@@ -4716,6 +4905,9 @@ EdenServiceHandler::semifuture_ensureMaterialized(
   // cache exchange by materializing smaller random reads, and not prevent
   // execution starting by read large files on the background.
   bool background = *params->background();
+  if (background) {
+    helper->markBackground();
+  }
 
   auto waitForPendingWritesFuture =
       waitForPendingWrites(mountHandle.getEdenMount(), *params->sync());
@@ -4745,14 +4937,6 @@ EdenServiceHandler::semifuture_ensureMaterialized(
   (void)params;
   NOT_IMPLEMENTED();
 #endif
-}
-
-folly::SemiFuture<std::unique_ptr<Glob>>
-EdenServiceHandler::semifuture_predictiveGlobFiles(
-    std::unique_ptr<GlobParams> params) {
-  auto helper = INSTRUMENT_THRIFT_CALL(DBG3, *params->mountPoint());
-  XLOG(WARN, "predictiveGlobFiles is deprecated and no longer prefetches");
-  return folly::makeSemiFuture(std::make_unique<Glob>());
 }
 
 folly::SemiFuture<std::unique_ptr<Glob>>
@@ -4797,11 +4981,14 @@ EdenServiceHandler::co_globFilesImpl(std::unique_ptr<GlobParams> params) {
   auto requestContext = getRequestContext();
   auto helper = INSTRUMENT_THRIFT_GLOB_CALL_WITH_CANCELLATION(
       DBG3,
-      false,
+      true,
       requestContext,
       *params->mountPoint(),
       toLogArg(*params->globs()),
       globber.logString());
+  if (*params->background()) {
+    helper->markBackground();
+  }
   auto& context = helper->getFetchContext();
 
   co_await folly::coro::co_reschedule_on_current_executor;
@@ -4821,88 +5008,6 @@ EdenServiceHandler::co_globFilesImpl(std::unique_ptr<GlobParams> params) {
       server_->getServerState(),
       std::move(*params->globs()),
       context.copy());
-}
-folly::coro::Task<void> EdenServiceHandler::co_prefetchFiles(
-    std::unique_ptr<PrefetchParams> params) {
-  auto isBackground = *params->background();
-
-  // Resolve mount and revisions before any detach so invalid ones surface as an
-  // EdenError to the caller rather than a lost failure in a detached task.
-  auto mountHandle = lookupMount(params->mountPoint());
-  if (!params->revisions().value().empty()) {
-    params->revisions() =
-        resolveRootsWithLastFilter(params->revisions().value(), mountHandle);
-  }
-
-  auto serverState = server_->getServerState();
-  ThriftGlobImpl globber{*params};
-  auto helper = INSTRUMENT_THRIFT_CALL(
-      DBG2,
-      *params->mountPoint(),
-      toLogArg(*params->globs()),
-      globber.logString());
-
-  // Capture everything the work needs as guards; the detached task must not
-  // touch the raw server_, which EdenServer can destroy during shutdown.
-  // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-  auto task = folly::coro::co_invoke(
-      [mountHandle,
-       serverState,
-       globber = std::move(globber),
-       helper = std::move(helper)](std::unique_ptr<PrefetchParams> p) mutable
-          -> folly::coro::Task<void> {
-        TaskTraceBlock block{"EdenServiceHandler::prefetchFiles"};
-        auto& context = helper->getFetchContext();
-
-        co_await folly::coro::co_reschedule_on_current_executor;
-
-        maybeLogExpensiveGlob(
-            *p->globs(), *p->searchRoot(), globber, context, serverState);
-
-        co_await globber.glob(
-            mountHandle.getEdenMountPtr(),
-            serverState,
-            std::move(*p->globs()),
-            helper->getPrefetchFetchContext().copy());
-      },
-      std::move(params));
-
-  if (server_->usingPrefetchExecutor()) {
-    folly::Executor::KeepAlive<> exec =
-        folly::getKeepAliveToken(server_->getPrefetchFilesV2Executor().get());
-    auto pinned = folly::coro::co_withExecutor(exec, std::move(task));
-    if (isBackground) {
-      folly::futures::detachOn(exec, std::move(pinned).start());
-      co_return;
-    }
-    co_await std::move(pinned);
-    co_return;
-  }
-
-  // The glob code has a very large fan-out that can easily overload the
-  // Thrift CPU worker pool. To combat with that, we limit the execution to a
-  // single thread by using `folly::SerialExecutor` so the glob queries will
-  // not overload the executor.
-  if (server_->usingThriftSerialExecution()) {
-    if (isBackground) {
-      folly::futures::detachOn(
-          server_->getServerState()->getThreadPool().get(),
-          std::move(task).semi());
-      co_return;
-    }
-    co_await std::move(task);
-    co_return;
-  }
-
-  folly::Executor::KeepAlive<> serial = folly::SerialExecutor::create(
-      server_->getServer()->getThreadManager().get());
-  auto pinned = folly::coro::co_withExecutor(serial, std::move(task));
-  if (isBackground) {
-    folly::futures::detachOn(serial, std::move(pinned).start());
-    co_return;
-  }
-  co_await std::move(pinned);
-  co_return;
 }
 
 namespace {
@@ -5002,7 +5107,7 @@ PrefetchStats populatePrefetchStats(
 
 } // namespace
 
-// The following three functions are deliberately given external linkage
+// The following functions are deliberately given external linkage
 // (not left in the anonymous namespace above) so they can be exercised
 // directly from EdenServiceHandlerTest.cpp - visible for testing.
 
@@ -5053,6 +5158,16 @@ int64_t toThriftByteLimit(uint64_t value) {
     return -1;
   }
   return toThriftByteCount(value);
+}
+
+void validateInjectFaultDefinition(const FaultDefinition& fault) {
+  if (fault.unblockKeyClass().has_value() !=
+      fault.unblockKeyValueRegex().has_value()) {
+    throw newEdenError(
+        EINVAL,
+        EdenErrorType::ARGUMENT_ERROR,
+        "unblockKeyClass and unblockKeyValueRegex must be set together");
+  }
 }
 
 namespace {
@@ -5111,12 +5226,17 @@ EdenServiceHandler::prefetchFilesV2Impl(
         resolveRootsWithLastFilter(params->revisions().value(), mountHandle);
   }
   ThriftGlobImpl globber{*params};
-  auto helper = INSTRUMENT_THRIFT_CALL_WITH_PREFETCH_STATS(
+  auto requestContext = getRequestContext();
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_PREFETCH_STATS_AND_CANCELLATION(
       DBG2,
       params->returnStats().value(),
+      requestContext,
       *params->mountPoint(),
       toLogArg(*params->globs()),
       globber.logString());
+  if (*params->background()) {
+    helper->markBackground();
+  }
   auto& context = helper->getFetchContext();
   auto returnPrefetchedFiles = *params->returnPrefetchedFiles();
 
@@ -5235,29 +5355,24 @@ EdenServiceHandler::co_prefetchFilesV2(std::unique_ptr<PrefetchParams> params) {
   co_return co_await std::move(pinned);
 }
 
-folly::SemiFuture<struct folly::Unit> EdenServiceHandler::semifuture_chown(
-    [[maybe_unused]] std::unique_ptr<std::string> mountPoint,
-    [[maybe_unused]] int32_t uid,
-    [[maybe_unused]] int32_t gid) {
-#ifndef _WIN32
-  auto handle = lookupMount(mountPoint);
-  return handle.getEdenMount().chown(uid, gid).ensure([handle] {}).semi();
-#else
-  NOT_IMPLEMENTED();
-#endif // !_WIN32
-}
-
 folly::SemiFuture<std::unique_ptr<ChangeOwnershipResponse>>
 EdenServiceHandler::semifuture_changeOwnership(
     unique_ptr<ChangeOwnershipRequest> request) {
 #ifndef _WIN32
+  auto helper = INSTRUMENT_THRIFT_CALL(DBG2, *request->mountPoint());
+  auto& fetchContext = helper->getFetchContext();
   auto handle = lookupMount(*request->mountPoint());
-  return handle.getEdenMount()
-      .chown(*request->uid(), *request->gid())
-      .ensure([handle] {})
-      .thenValue([](folly::Unit&&) {
-        return std::make_unique<ChangeOwnershipResponse>();
-      })
+  return wrapImmediateFuture(
+             std::move(helper),
+             handle.getEdenMount()
+                 .chown(
+                     static_cast<uid_t>(*request->uid()),
+                     static_cast<gid_t>(*request->gid()),
+                     fetchContext)
+                 .ensure([handle] {})
+                 .thenValue([](folly::Unit&&) {
+                   return std::make_unique<ChangeOwnershipResponse>();
+                 }))
       .semi();
 #else
   NOT_IMPLEMENTED();
@@ -5273,7 +5388,7 @@ EdenServiceHandler::co_getScmStatusV2(
   static const std::string kNoFidSentinel = "(none)";
   auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
       DBG3,
-      false,
+      true,
       context,
       *scmParams->mountPoint(),
       folly::to<string>("commitHash=", logHash(*scmParams->commit())),
@@ -5285,6 +5400,8 @@ EdenServiceHandler::co_getScmStatusV2(
   helper->getThriftFetchContext().fillClientRequestInfo(scmParams->cri());
 
   auto& fetchContext = helper->getFetchContext();
+  auto edenConfig =
+      server_->getServerState()->getReloadableConfig()->getEdenConfig();
 
   auto mountHandle = lookupMount(scmParams->mountPoint());
 
@@ -5294,18 +5411,55 @@ EdenServiceHandler::co_getScmStatusV2(
       std::move(*scmParams->commit()), rootIdOptions, mountHandle);
   auto rootId = mountHandle.getObjectStore().parseRootId(parsedCommit);
 
-  const auto& enforceParents = server_->getServerState()
-                                   ->getReloadableConfig()
-                                   ->getEdenConfig()
-                                   ->enforceParents.getValue();
+  const auto& enforceParents = edenConfig->enforceParents.getValue();
 
-  auto status = co_await mountHandle.getEdenMount().co_diff(
-      mountHandle.getRootInode(),
-      rootId,
-      context->getConnectionContext()->getCancellationToken(),
-      fetchContext,
-      *scmParams->listIgnored(),
-      enforceParents);
+  // The connection token fires when the client goes away, the request token
+  // when EdenFS cancels the request, for example for a forced restart.
+  auto requestToken = fetchContext->getCancellationToken();
+
+  // Owns its arguments, so the Task can run on another executor.
+  auto diffBody = [mountHandle,
+                   rootId,
+                   cancellation = folly::cancellation_token_merge(
+                       context->getConnectionContext()->getCancellationToken(),
+                       requestToken),
+                   fetchContext = fetchContext.copy(),
+                   listIgnored = *scmParams->listIgnored(),
+                   enforceParents = enforceParents]() mutable
+      -> folly::coro::Task<std::unique_ptr<ScmStatus>> {
+    co_return co_await mountHandle.getEdenMount().co_diff(
+        mountHandle.getRootInode(),
+        rootId,
+        cancellation,
+        fetchContext,
+        listIgnored,
+        enforceParents);
+  };
+
+  std::unique_ptr<ScmStatus> status;
+  folly::Executor* executor = edenConfig->thriftUseStatusExecutor.getValue()
+      ? server_->getDiffWorkExecutor()
+      : nullptr;
+  if (executor) {
+    // The diff's coroutines run inline until they suspend, and with the
+    // default inline detached executor nothing in the walk suspends: the
+    // overlay reads of materialized directories complete before the children
+    // are visited and hashing is synchronous, so the whole diff runs on one
+    // thread. The detached executor makes each directory load asynchronous
+    // work on the diff work executor, so a child suspends on its load and
+    // resumes on that pool; that is what spreads the walk, and the hashing in
+    // it, across the pool. The pin puts those resumptions on the pool rather
+    // than on this Thrift worker.
+    fetchContext->setDetachedExecutor(executor);
+    status = co_await folly::coro::co_withExecutor(executor, diffBody());
+  } else {
+    status = co_await diffBody();
+  }
+  // A cancelled diff returns what it had walked so far. A client that is
+  // still connected must not take that for the full status.
+  if (requestToken.isCancellationRequested()) {
+    throw folly::OperationCancelled{};
+  }
 
   auto result = std::make_unique<GetScmStatusResult>();
   result->status() = std::move(*status);
@@ -5319,8 +5473,10 @@ EdenServiceHandler::semifuture_getScmStatusBetweenRevisions(
     unique_ptr<string> oldHash,
     unique_ptr<string> newHash) {
   auto* context = getRequestContext();
-  auto helper = INSTRUMENT_THRIFT_CALL(
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
       DBG2,
+      true,
+      context,
       *mountPoint,
       folly::to<string>("oldHash=", logHash(*oldHash)),
       folly::to<string>("newHash=", logHash(*newHash)));
@@ -5337,18 +5493,26 @@ EdenServiceHandler::semifuture_getScmStatusBetweenRevisions(
       resolveRootIdWithLastFilter(std::move(*newHash), mountHandle);
 
   auto callback = std::make_unique<ScmStatusDiffCallback>();
+  auto requestToken = fetchContext->getCancellationToken();
   auto diffFuture = diffBetweenRoots(
       mountHandle.getObjectStore().parseRootId(resolvedOldId),
       mountHandle.getObjectStore().parseRootId(resolvedNewId),
       *mountHandle.getEdenMount().getCheckoutConfig(),
       mountHandle.getObjectStorePtr(),
-      context->getConnectionContext()->getCancellationToken(),
+      folly::cancellation_token_merge(
+          context->getConnectionContext()->getCancellationToken(),
+          requestToken),
       fetchContext,
       callback.get());
   return wrapImmediateFuture(
              std::move(helper),
              std::move(diffFuture)
-                 .thenValue([callback = std::move(callback)](auto&&) {
+                 .thenValue([callback = std::move(callback),
+                             requestToken = std::move(requestToken)](auto&&) {
+                   // A cancelled diff holds a partial status.
+                   if (requestToken.isCancellationRequested()) {
+                     throw folly::OperationCancelled{};
+                   }
                    return std::make_unique<ScmStatus>(
                        callback->extractStatus());
                  }))
@@ -5399,37 +5563,6 @@ EdenServiceHandler::semifuture_matchFilesystem(
       EdenErrorType::POSIX_ERROR,
       "matchFilesystemStat only supported for PrjFs repos which {} is not",
       *params->mountPoint());
-}
-
-void EdenServiceHandler::debugGetScmTree(
-    vector<ScmTreeEntry>& entries,
-    unique_ptr<string> mountPoint,
-    unique_ptr<string> idStr,
-    [[maybe_unused]] bool localStoreOnly) {
-  auto helper = INSTRUMENT_THRIFT_CALL(DBG2, *mountPoint, logHash(*idStr));
-  auto mountHandle = lookupMount(mountPoint);
-  auto& store = mountHandle.getObjectStore();
-  auto id = store.parseObjectId(*idStr);
-
-  std::shared_ptr<const Tree> tree =
-      store.getTree(id, helper->getFetchContext()).get();
-
-  if (!tree) {
-    throw newEdenError(
-        ENOENT,
-        EdenErrorType::POSIX_ERROR,
-        "no tree found for id ",
-        store.renderObjectId(id));
-  }
-
-  for (const auto& entry : *tree) {
-    const auto& [name, treeEntry] = entry;
-    entries.emplace_back();
-    auto& out = entries.back();
-    out.name() = name.asString();
-    out.mode() = modeFromTreeEntryType(treeEntry.getType());
-    out.id() = store.renderObjectId(treeEntry.getObjectId());
-  }
 }
 
 folly::SemiFuture<std::unique_ptr<DebugGetScmBlobResponse>>
@@ -6096,20 +6229,6 @@ void EdenServiceHandler::debugOutstandingPrjfsCalls(
 #endif // _WIN32
 }
 
-bool EdenServiceHandler::debugLogError() {
-  auto helper = INSTRUMENT_THRIFT_CALL(DBG2);
-  auto& logger = server_->getServerState()->getErrorLogger();
-  if (!logger.isEnabled()) {
-    return false;
-  }
-  try {
-    throw std::runtime_error("debugLogError: test error for e2e validation");
-  } catch (const std::exception& ex) {
-    logger.log(EdenErrorInfo::thrift(ex, "debugLogError"));
-  }
-  return true;
-}
-
 void EdenServiceHandler::debugOutstandingThriftRequests(
     std::vector<ThriftRequestMetadata>& outstandingRequests) {
   auto helper = INSTRUMENT_THRIFT_CALL(DBG2);
@@ -6317,18 +6436,6 @@ void EdenServiceHandler::getAccessCounts(
   }
 }
 
-void EdenServiceHandler::clearAndCompactLocalStore() {
-  auto helper = INSTRUMENT_THRIFT_CALL(DBG1);
-}
-
-void EdenServiceHandler::debugClearLocalStoreCaches() {
-  auto helper = INSTRUMENT_THRIFT_CALL(DBG1);
-}
-
-void EdenServiceHandler::debugCompactLocalStorage() {
-  auto helper = INSTRUMENT_THRIFT_CALL(DBG1);
-}
-
 // TODO(T119221752): add more BackingStore subclasses to this command. We
 // currently only support SaplingBackingStores
 int64_t EdenServiceHandler::debugDropAllPendingRequests() {
@@ -6382,6 +6489,7 @@ EdenServiceHandler::semifuture_debugInvalidateNonMaterialized(
 
   ImmediateFuture<folly::Unit> backgroundFuture{std::in_place};
   if (*params->background()) {
+    helper->markBackground();
     backgroundFuture = makeNotReadyImmediateFuture();
   }
 
@@ -6397,19 +6505,17 @@ EdenServiceHandler::semifuture_debugInvalidateNonMaterialized(
                        mountHandle.getEdenMount(), path, fetchContext)
                 .asTreePtr();
           })
-          .thenValue(
-              [this, mountHandle, cutoff, fetchContext = fetchContext.copy()](
-                  TreeInodePtr inode) mutable {
-                auto pressureBased = mountHandle.getEdenMount()
-                                         .getEdenConfig()
-                                         ->enablePressureBasedGc.getValue();
-                return server_->garbageCollectInodes(
-                    mountHandle.getEdenMount(),
-                    inode,
-                    cutoff,
-                    fetchContext,
-                    pressureBased);
-              })
+          .thenValue([this, mountHandle, cutoff](TreeInodePtr inode) {
+            auto pressureBased = mountHandle.getEdenMount()
+                                     .getEdenConfig()
+                                     ->enablePressureBasedGc.getValue();
+            return server_->garbageCollectInodes(
+                mountHandle.getEdenMount(),
+                inode,
+                cutoff,
+                ObjectFetchContext::getNullInodeGcContext(),
+                pressureBased);
+          })
           .thenValue([](uint64_t numInvalidated) {
             auto ret = std::make_unique<DebugInvalidateResponse>();
             ret->numInvalidated() = numInvalidated;
@@ -6980,6 +7086,7 @@ std::optional<folly::exception_wrapper> getFaultError(
 
 void EdenServiceHandler::injectFault(unique_ptr<FaultDefinition> fault) {
   auto helper = INSTRUMENT_THRIFT_CALL(DBG2);
+  validateInjectFaultDefinition(*fault);
   auto& injector = server_->getServerState()->getFaultInjector();
   if (*fault->block()) {
     injector.injectBlock(
@@ -7003,6 +7110,16 @@ void EdenServiceHandler::injectFault(unique_ptr<FaultDefinition> fault) {
   if (*fault->kill()) {
     injector.injectKill(
         *fault->keyClass(), *fault->keyValueRegex(), *fault->count());
+    return;
+  }
+  if (fault->unblockKeyClass().has_value() &&
+      fault->unblockKeyValueRegex().has_value()) {
+    injector.injectUnblock(
+        *fault->keyClass(),
+        *fault->keyValueRegex(),
+        *fault->unblockKeyClass(),
+        *fault->unblockKeyValueRegex(),
+        *fault->count());
     return;
   }
 
@@ -7224,12 +7341,13 @@ OptionalProcessId EdenServiceHandler::getAndRegisterClientPid(
 void EdenServiceHandler::insertCancellationSource(
     uint64_t requestId,
     folly::CancellationSource cancellationSource,
-    std::string endpoint) {
+    std::string_view endpoint,
+    OptionalProcessId clientPid) {
   auto lockedStore = requestCancellationStore_.wlock();
   lockedStore->emplace(
       requestId,
       RequestCancellationInfo(
-          std::move(cancellationSource), std::move(endpoint)));
+          std::move(cancellationSource), endpoint, clientPid));
   XLOGF(
       DBG6,
       "Inserted cancellation source for request ID: {}. Total active: {}",
@@ -7285,7 +7403,7 @@ bool EdenServiceHandler::removeCancellationSource(uint64_t requestId) {
 
       server_->getServerState()->getEdenFsEventsLogger()->logEvent(
           ThriftCancellation{
-              it->second.endpoint,
+              std::string{it->second.endpoint},
               success,
               static_cast<double>(elapsed.count())});
     }
@@ -7323,15 +7441,74 @@ size_t EdenServiceHandler::getActiveCancellationSourceCount() const {
   return lockedStore->size();
 }
 
-void EdenServiceHandler::insertUncancelableRequest(uint64_t requestId) {
+void EdenServiceHandler::insertUncancelableRequest(
+    uint64_t requestId,
+    std::string_view endpoint,
+    OptionalProcessId clientPid) {
   auto lockedStore = requestCancellationStore_.wlock();
   lockedStore->emplace(
-      requestId, RequestCancellationInfo::createUncancelable());
+      requestId,
+      RequestCancellationInfo::createUncancelable(endpoint, clientPid));
   XLOGF(
       DBG6,
       "Inserted uncancelable request for request ID: {}. Total active: {}",
       requestId,
       lockedStore->size());
+}
+
+void EdenServiceHandler::markRequestAsStream(uint64_t requestId) {
+  auto lockedStore = requestCancellationStore_.wlock();
+  auto it = lockedStore->find(requestId);
+  if (it != lockedStore->end()) {
+    it->second.stream = true;
+  }
+}
+
+void EdenServiceHandler::markRequestAsBackground(uint64_t requestId) {
+  auto lockedStore = requestCancellationStore_.wlock();
+  auto it = lockedStore->find(requestId);
+  if (it != lockedStore->end()) {
+    it->second.background = true;
+  }
+}
+
+void EdenServiceHandler::closeTraceStreams() {
+  size_t closed = 0;
+  {
+    auto lockedStore = requestCancellationStore_.wlock();
+    for (auto& [requestId, cancellationInfo] : *lockedStore) {
+      if (cancellationInfo.stream && cancellationInfo.requestCancellation()) {
+        ++closed;
+      }
+    }
+  }
+  XLOGF(DBG3, "Closed {} trace streams", closed);
+}
+
+std::vector<EdenServiceHandler::LongRunningRequest>
+EdenServiceHandler::getRequestsRunningLongerThan(
+    std::chrono::steady_clock::duration minAge) const {
+  std::vector<LongRunningRequest> requests;
+  const auto now = std::chrono::steady_clock::now();
+  {
+    auto lockedStore = requestCancellationStore_.rlock();
+    for (const auto& [requestId, cancellationInfo] : *lockedStore) {
+      auto age = now - cancellationInfo.startedAt;
+      if (!cancellationInfo.stream && !cancellationInfo.background &&
+          age >= minAge) {
+        requests.push_back(
+            {requestId,
+             std::string{cancellationInfo.endpoint},
+             cancellationInfo.clientPid,
+             age,
+             cancellationInfo.isCancelable()});
+      }
+    }
+  }
+  std::sort(requests.begin(), requests.end(), [](auto& a, auto& b) {
+    return a.age > b.age;
+  });
+  return requests;
 }
 
 std::optional<RequestStatus> EdenServiceHandler::getRequestStatus(
@@ -7352,6 +7529,49 @@ EdenServiceHandler::getCancellationToken(uint64_t requestId) {
     return it->second.cancellationSource->getToken();
   }
   return std::nullopt;
+}
+
+void EdenServiceHandler::cancelActiveRequestsAfter(
+    std::chrono::nanoseconds delay,
+    std::string reason) {
+  auto pending = delayedCancellation_.wlock();
+  if (pending->timer) {
+    pending->timer->cancel();
+  }
+  const auto generation = ++pending->generation;
+  // Runs on the timekeeper thread; cancelling the requests only takes the
+  // cancellation store lock and runs their cancellation callbacks. It holds
+  // the delayed cancellation lock meanwhile, so once a disarm has returned no
+  // cancellation from this timer can still be running.
+  pending->timer =
+      folly::futures::sleep(
+          std::chrono::duration_cast<folly::HighResDuration>(delay))
+          .toUnsafeFuture()
+          .thenTry(
+              [weak = weak_from_this(), generation, reason = std::move(reason)](
+                  folly::Try<folly::Unit>&& slept) {
+                if (!slept.hasValue()) {
+                  return;
+                }
+                auto self = weak.lock();
+                if (!self) {
+                  return;
+                }
+                auto pending = self->delayedCancellation_.wlock();
+                if (pending->generation != generation) {
+                  return;
+                }
+                self->cancelAllActiveRequests(reason);
+              });
+}
+
+void EdenServiceHandler::disarmDelayedCancellation() {
+  auto pending = delayedCancellation_.wlock();
+  ++pending->generation;
+  if (pending->timer) {
+    pending->timer->cancel();
+    pending->timer.reset();
+  }
 }
 
 void EdenServiceHandler::cancelAllActiveRequests(std::string_view reason) {
@@ -7376,6 +7596,47 @@ void EdenServiceHandler::cancelAllActiveRequests(std::string_view reason) {
       "Requested cancellation for {} of {} active Thrift requests",
       cancelledCount,
       requestCount);
+}
+
+void EdenServiceHandler::logOutstandingThriftRequests(std::string_view reason) {
+  // Nothing new is accepted after a stop, so a request that later holds up
+  // the Thrift server's drain is one of these. Name them now while the
+  // daemon can still write a log.
+  constexpr size_t kMaxLogged = 50;
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<std::string> lines;
+  size_t total = 0;
+  {
+    const auto requests = outstandingThriftRequests_.rlock();
+    total = requests->size();
+    const auto cancellable = requestCancellationStore_.rlock();
+    for (const auto& [requestId, event] : *requests) {
+      if (lines.size() >= kMaxLogged) {
+        break;
+      }
+      lines.push_back(
+          fmt::format(
+              "{}: {} ({}, {}cancellable){}",
+              requestId,
+              event.method,
+              durationStr(now - event.monotonicTime),
+              cancellable->contains(requestId) ? "" : "not ",
+              event.clientPid
+                  ? fmt::format(" from pid {}", event.clientPid.value().get())
+                  : ""));
+    }
+  }
+  if (total == 0) {
+    XLOGF(INFO, "{}: no Thrift requests in flight", reason);
+    return;
+  }
+  XLOGF(
+      INFO,
+      "{}: {} Thrift request(s) in flight{}:\n  {}",
+      reason,
+      total,
+      total > lines.size() ? fmt::format(" (first {})", lines.size()) : "",
+      fmt::join(lines, "\n  "));
 }
 
 } // namespace facebook::eden

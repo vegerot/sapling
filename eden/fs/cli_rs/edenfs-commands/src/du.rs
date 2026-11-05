@@ -13,6 +13,7 @@ use std::fmt;
 use std::fs;
 #[cfg(target_os = "macos")]
 use std::io::IsTerminal;
+use std::path::Path;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::Command;
@@ -43,6 +44,8 @@ use edenfs_utils::get_buck_command;
 use edenfs_utils::get_env_with_buck_version;
 use edenfs_utils::get_environment_suitable_for_subprocess;
 use edenfs_utils::path_from_bytes;
+use edenfs_utils::trace_env;
+use hg_util::no_follow::NoFollowRoot;
 use serde::Serialize;
 use subprocess::Exec;
 use subprocess::Redirection as SubprocessRedirection;
@@ -372,6 +375,7 @@ fn get_hg_cache_path() -> Result<PathBuf> {
         .stderr(SubprocessRedirection::Pipe)
         .env_clear()
         .env_extend(&get_environment_suitable_for_subprocess())
+        .env_extend(&trace_env("hg"))
         .capture()?;
 
     if output.success() {
@@ -583,6 +587,7 @@ fn clean_buck_redirections(buck_redirections: HashSet<PathBuf>) -> Result<()> {
                 .cwd(basename)
                 .env_clear()
                 .env_extend(&get_env_with_buck_version(basename)?)
+                .env_extend(&trace_env("buck"))
                 .capture()
                 .with_context(|| format!("Failed to run buck {}", get_buck_command()))?;
 
@@ -606,6 +611,17 @@ fn clean_buck_redirections(buck_redirections: HashSet<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Delete an orphaned redirection the same way `sl worktree remove` deletes
+/// redirection backing storage.
+fn remove_orphaned_redirection(redir: &Path) -> Result<()> {
+    let (Some(parent), Some(name)) = (redir.parent(), redir.file_name()) else {
+        return Err(anyhow!("Found invalid redirection: {}", redir.display()));
+    };
+    NoFollowRoot::new(parent)
+        .and_then(|parent| parent.remove_dir_all(Path::new(name)))
+        .with_context(|| format!("Failed to recursively remove {}", redir.display()))
+}
+
 #[cfg(target_os = "macos")]
 fn get_purgeable_size() -> Result<u64> {
     let instance = get_edenfs_instance();
@@ -616,6 +632,7 @@ fn get_purgeable_size() -> Result<u64> {
     let args = &[PURGEABLE_DATA_UTIL, "-G", home_dir];
 
     let output = Command::new("sudo")
+        .envs(trace_env("sudo"))
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
@@ -664,6 +681,7 @@ fn clear_purgeable_space(purgeable_space: String) -> Result<()> {
     ];
 
     let output = Command::new("sudo")
+        .envs(trace_env("sudo"))
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
@@ -728,9 +746,19 @@ impl crate::Subcommand for DiskUsageCmd {
             get_redirections(&checkouts).context("Failed to get EdenFS redirections")?;
         let (_redirect_sources, redirect_targets): (BTreeSet<PathBuf>, BTreeSet<PathBuf>) =
             redirections.iter().cloned().unzip();
-        let orphaned_redirections =
-            redirect::scratch::get_orphaned_redirection_targets(&redirect_targets)
-                .unwrap_or_else(|_| Vec::new());
+        // `--clean`/`--deep-clean` still run their other cleanups and report the
+        // scan failure at the end.
+        let (orphaned_redirections, orphan_scan_error) =
+            match redirect::scratch::get_orphaned_redirection_targets(&redirect_targets) {
+                Ok(orphaned) => (orphaned, None),
+                Err(error) if self.clean_orphaned => {
+                    return Err(error.context("Failed to find orphaned redirections for cleanup"));
+                }
+                Err(error) => {
+                    eprintln!("Warning: failed to scan for orphaned redirections: {error:#}");
+                    (Vec::new(), Some(error))
+                }
+            };
         let fsck_dirs = get_fsck_dirs(&checkouts);
 
         let mut aggregated_usage_counts = AggregatedUsageCounts::new();
@@ -874,7 +902,9 @@ impl crate::Subcommand for DiskUsageCmd {
                 }
 
                 write_title("Orphaned redirections");
-                if orphaned_redirections.is_empty() {
+                if orphan_scan_error.is_some() {
+                    println!("Failed to scan for orphaned redirections");
+                } else if orphaned_redirections.is_empty() {
                     println!("No orphaned redirections");
                 } else {
                     for redir in orphaned_redirections.iter() {
@@ -886,9 +916,7 @@ impl crate::Subcommand for DiskUsageCmd {
                 if !orphaned_redirections.is_empty() {
                     if self.clean_orphaned || self.should_clean() {
                         for redir in orphaned_redirections.iter() {
-                            fs::remove_dir_all(redir).with_context(|| {
-                                format!("Failed to recursively remove {}", redir.display())
-                            })?;
+                            remove_orphaned_redirection(redir)?;
                         }
                     }
                 }
@@ -936,6 +964,7 @@ impl crate::Subcommand for DiskUsageCmd {
                         "Cleaning shared space used by the storage engine...".blue()
                     );
                     let output = Exec::cmd("eden")
+                        .env_extend(&trace_env("eden"))
                         .arg("gc")
                         .stdout(SubprocessRedirection::Pipe)
                         .stderr(SubprocessRedirection::Pipe)
@@ -1000,7 +1029,12 @@ impl crate::Subcommand for DiskUsageCmd {
                 }
             }
         }
-        Ok(0)
+        match orphan_scan_error {
+            Some(error) if self.should_clean() => {
+                Err(error.context("Failed to find orphaned redirections for cleanup"))
+            }
+            _ => Ok(0),
+        }
     }
 }
 
@@ -1203,6 +1237,25 @@ mod tests {
         assert!(
             output.contains("Not cleaned. Directories listed above. Check and remove manually")
         );
+    }
+
+    #[test]
+    fn remove_orphaned_redirection_deletes_read_only_directories() {
+        let scratch = tempdir().expect("temporary scratch root should be created");
+        let orphan = scratch.path().join("edenfsZredirectionsZbuck-out");
+        let action_out = orphan.join("v2/gen/action-out");
+        fs::create_dir_all(&action_out).expect("orphaned redirection should be created");
+        fs::write(action_out.join("file"), "data").expect("action output should be created");
+        let mut permissions = fs::metadata(&action_out)
+            .expect("action output directory metadata should be readable")
+            .permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&action_out, permissions)
+            .expect("action output directory should become read-only");
+
+        remove_orphaned_redirection(&orphan).expect("orphaned redirection should be deleted");
+
+        assert!(!orphan.exists(), "orphaned redirection should be gone");
     }
 
     #[test]

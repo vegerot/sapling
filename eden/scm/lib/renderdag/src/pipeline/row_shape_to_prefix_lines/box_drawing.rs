@@ -7,6 +7,8 @@
 
 use std::marker::PhantomData;
 
+use super::ancestry_lines;
+use crate::pipeline::types::DashStyle;
 use crate::pipeline::types::GraphRowShape;
 use crate::pipeline::types::LinkLine;
 use crate::pipeline::types::NodeLine;
@@ -31,15 +33,16 @@ mod glyph {
     pub(super) const JOIN_RIGHT: usize = 11;
     pub(super) const JOIN_BOTH: usize = 12;
     pub(super) const TERMINATION: usize = 13;
-    pub(super) const COUNT: usize = 14;
+    pub(super) const ANCESTOR_ONCE: usize = 14;
+    pub(super) const COUNT: usize = 15;
 }
 
 const SQUARE_GLYPHS: [&str; glyph::COUNT] = [
-    "  ", "──", "│ ", "· ", "┘ ", "└─", "┴─", "┐ ", "┌─", "┬─", "┤ ", "├─", "┼─", "~ ",
+    "  ", "──", "│ ", "· ", "┘ ", "└─", "┴─", "┐ ", "┌─", "┬─", "┤ ", "├─", "┼─", "~ ", "┆ ",
 ];
 
 const CURVED_GLYPHS: [&str; glyph::COUNT] = [
-    "  ", "──", "│ ", "╷ ", "╯ ", "╰─", "┴─", "╮ ", "╭─", "┬─", "┤ ", "├─", "┼─", "~ ",
+    "  ", "──", "│ ", "╷ ", "╯ ", "╰─", "┴─", "╮ ", "╭─", "┬─", "┤ ", "├─", "┼─", "~ ", "┆ ",
 ];
 
 const DEC_GLYPHS: [&str; glyph::COUNT] = [
@@ -57,11 +60,15 @@ const DEC_GLYPHS: [&str; glyph::COUNT] = [
     "\x1B(0tq\x1B(B",
     "\x1B(0nq\x1B(B",
     "~ ",
+    ": ",
 ];
 
 /// Glyph table used by box-drawing prefix line renderers.
 pub trait BoxDrawingGlyphSet {
     /// The glyph table for this box-drawing style.
+    /// Each entry contains a column glyph followed by a space or horizontal
+    /// glyph, optionally wrapped in DEC special graphics escape sequences.
+    /// The last entry draws vertical ancestor lines for `DashStyle::Once`.
     const GLYPHS: &'static [&'static str; glyph::COUNT];
 }
 
@@ -88,6 +95,8 @@ impl BoxDrawingGlyphSet for DecGraphics {
 
 /// Converts abstract row shapes into box-drawing graph prefix lines.
 pub struct BoxDrawingPrefixLineRenderer<G = Curved> {
+    column_spacing: usize,
+    spaced_glyphs: Option<Box<[String; glyph::COUNT]>>,
     _glyphs: PhantomData<G>,
 }
 
@@ -98,8 +107,40 @@ where
     /// Create a renderer that uses the glyph set from `G`.
     pub fn new() -> Self {
         Self {
+            column_spacing: 1,
+            spaced_glyphs: None,
             _glyphs: PhantomData,
         }
+    }
+
+    fn set_column_spacing(&mut self, column_spacing: usize) {
+        if self.column_spacing == column_spacing {
+            return;
+        }
+        self.column_spacing = column_spacing;
+        self.spaced_glyphs = (column_spacing != 1).then(|| {
+            Box::new(G::GLYPHS.map(|glyph| {
+                let (prefix, glyph, suffix) = match glyph
+                    .strip_prefix("\x1B(0")
+                    .and_then(|glyph| glyph.strip_suffix("\x1B(B"))
+                {
+                    Some(glyph) => ("\x1B(0", glyph, "\x1B(B"),
+                    None => ("", glyph, ""),
+                };
+                let split = glyph.char_indices().nth(1).unwrap().0;
+                let (column, spacing) = glyph.split_at(split);
+                let mut out = String::with_capacity(
+                    prefix.len() + column.len() + spacing.len() * column_spacing + suffix.len(),
+                );
+                out.push_str(prefix);
+                out.push_str(column);
+                for _ in 0..column_spacing {
+                    out.push_str(spacing);
+                }
+                out.push_str(suffix);
+                out
+            }))
+        });
     }
 
     /// Use square box-drawing glyphs.
@@ -116,8 +157,24 @@ where
 impl<G: BoxDrawingGlyphSet, N> PrefixLineRenderer<N> for BoxDrawingPrefixLineRenderer<G> {
     /// Convert the next graph row shape into prefix lines.
     fn next_prefix_lines(&mut self, line: &GraphRowShape<N>) -> Vec<PrefixLine> {
-        let glyphs = G::GLYPHS;
+        self.set_column_spacing(line.style.column_spacing);
+        let spaced_glyphs = self
+            .spaced_glyphs
+            .as_deref()
+            .map(|glyphs| glyphs.each_ref().map(String::as_str));
+        let glyphs = spaced_glyphs.as_ref().unwrap_or(G::GLYPHS);
+        let ancestor = match line.style.dash_style {
+            DashStyle::Persistent => glyph::ANCESTOR,
+            DashStyle::Once => glyph::ANCESTOR_ONCE,
+        };
         let mut lines = Vec::new();
+
+        lines.push(render_pad_line(
+            glyphs,
+            ancestor,
+            line.pre_node_line(),
+            PrefixLineKind::PreNode,
+        ));
 
         // Render the nodeline
         let mut node_line = PrefixLine {
@@ -130,14 +187,21 @@ impl<G: BoxDrawingGlyphSet, N> PrefixLineRenderer<N> for BoxDrawingPrefixLineRen
                     node_line.parts.push(PrefixLinePart::NodeGlyph);
                     node_line
                         .parts
-                        .push(PrefixLinePart::Text(String::from(" ")));
+                        .push(PrefixLinePart::Text(" ".repeat(line.style.column_spacing)));
                 }
                 NodeLine::Parent => push_text(&mut node_line, glyphs[glyph::PARENT]),
-                NodeLine::Ancestor => push_text(&mut node_line, glyphs[glyph::ANCESTOR]),
+                NodeLine::Ancestor => push_text(&mut node_line, glyphs[ancestor]),
                 NodeLine::Blank => push_text(&mut node_line, glyphs[glyph::SPACE]),
             }
         }
         lines.push(node_line);
+
+        lines.push(render_pad_line(
+            glyphs,
+            ancestor,
+            line.post_node_line(),
+            PrefixLineKind::PostNode,
+        ));
 
         // Render the link line
         #[allow(clippy::if_same_then_else)]
@@ -183,7 +247,7 @@ impl<G: BoxDrawingGlyphSet, N> PrefixLineRenderer<N> for BoxDrawingPrefixLineRen
                         (false, true) => link_line.push_str(glyphs[glyph::JOIN_RIGHT]),
                         (false, false) => {
                             if cur.intersects(LinkLine::VERT_ANCESTOR) {
-                                link_line.push_str(glyphs[glyph::ANCESTOR]);
+                                link_line.push_str(glyphs[ancestor]);
                             } else {
                                 link_line.push_str(glyphs[glyph::PARENT]);
                             }
@@ -232,7 +296,8 @@ impl<G: BoxDrawingGlyphSet, N> PrefixLineRenderer<N> for BoxDrawingPrefixLineRen
                     if *term {
                         term_line.push_str(term_str);
                     } else {
-                        term_line.push_str(glyphs[pad_line_to_glyph(line.pad_lines[i])]);
+                        term_line
+                            .push_str(glyphs[pad_line_to_glyph(line.ancestry_line[i], ancestor)]);
                     }
                 }
                 lines.push(PrefixLine {
@@ -242,14 +307,9 @@ impl<G: BoxDrawingGlyphSet, N> PrefixLineRenderer<N> for BoxDrawingPrefixLineRen
             }
         }
 
-        let mut base_pad_line = String::new();
-        for entry in line.pad_lines.iter() {
-            base_pad_line.push_str(glyphs[pad_line_to_glyph(*entry)]);
+        for (kind, columns) in ancestry_lines(line) {
+            lines.push(render_pad_line(glyphs, ancestor, columns, kind));
         }
-        lines.push(PrefixLine {
-            parts: vec![PrefixLinePart::Text(base_pad_line)],
-            kind: PrefixLineKind::PostAncestry,
-        });
 
         lines
     }
@@ -268,10 +328,36 @@ fn push_text(line: &mut PrefixLine, text: &str) {
     line.parts.push(PrefixLinePart::Text(text.to_owned()));
 }
 
-fn pad_line_to_glyph(line: PadLine) -> usize {
+fn render_pad_line(
+    glyphs: &[&str; glyph::COUNT],
+    ancestor: usize,
+    line: impl IntoIterator<Item = PadLine>,
+    kind: PrefixLineKind,
+) -> PrefixLine {
+    PrefixLine {
+        parts: vec![PrefixLinePart::Text(render_pad_text(
+            glyphs, ancestor, line,
+        ))],
+        kind,
+    }
+}
+
+fn render_pad_text(
+    glyphs: &[&str; glyph::COUNT],
+    ancestor: usize,
+    line: impl IntoIterator<Item = PadLine>,
+) -> String {
+    let mut out = String::new();
+    for entry in line {
+        out.push_str(glyphs[pad_line_to_glyph(entry, ancestor)]);
+    }
+    out
+}
+
+fn pad_line_to_glyph(line: PadLine, ancestor: usize) -> usize {
     match line {
         PadLine::Parent => glyph::PARENT,
-        PadLine::Ancestor => glyph::ANCESTOR,
+        PadLine::Ancestor => ancestor,
         PadLine::Blank => glyph::SPACE,
     }
 }

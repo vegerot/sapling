@@ -37,7 +37,6 @@ use repo_identity::RepoIdentityRef;
 use scuba_ext::FutureStatsScubaExt;
 use sharding_observability::WeightTracker;
 use tracing::info;
-use weight_observer::WeightGuard;
 use weight_observer::WeightObserver;
 
 use crate::command::Command;
@@ -150,18 +149,19 @@ async fn push(
                 request_context.ctx.fb,
                 repo_name.clone(),
                 main_client_id.as_deref(),
+                request_context.ctx.metadata().identities(),
             ))
         } else {
             None
         };
 
         // Parse the packfile provided as part of the push and verify that its valid
-        let (parsed_objects, tracked_weight) = parse_pack(
+        let (parsed_objects, _weight_guard) = parse_pack(
             pack_file.split().1,
             ctx,
             blobstore.clone(),
             concurrency,
-            weight_observer.clone(),
+            weight_observer,
         )
         .try_timed()
         .await?
@@ -171,13 +171,6 @@ async fn push(
             "Push".to_string(),
         );
         drop(pack_file);
-
-        // Keep weight on estimated_memory_bytes for the full push duration.
-        // The guard removes the weight when dropped (end of push or on error).
-        let _weight_guard = WeightGuard {
-            observer: weight_observer,
-            weight: tracked_weight,
-        };
 
         // Generate the GitObjectStore using the parsed objects
         let object_store = Arc::new(GitObjectStore::new(parsed_objects, ctx, blobstore.clone()));
@@ -384,6 +377,10 @@ async fn refs_update(
     // Share the entries across the concurrent per-ref set_ref calls.
     let tag_mapping_entries = tag_mapping_entries.map(Arc::new);
 
+    #[cfg_attr(
+        not(fbcode_build),
+        expect(unused_variables, reason = "Only internal builds divert pushes")
+    )]
     let diversion_mode = PushDiversionMode::resolve(&request_context, &acl_provider).await?;
 
     // Diversion: one synchronous submit_manifest_land to Multi-Repo Land.
@@ -400,6 +397,7 @@ async fn refs_update(
             git_bonsai_mapping_store.clone(),
             object_store.clone(),
             _multi_repo_land_service_address,
+            atomic_update,
         )
         .await?;
 

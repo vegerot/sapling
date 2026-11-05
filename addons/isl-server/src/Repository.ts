@@ -100,6 +100,7 @@ import {
   parseShelvedCommitsOutput,
 } from './templates';
 import {
+  canonicalizePath,
   findPublicAncestor,
   handleAbortSignalOnProcess,
   isEjecaError,
@@ -107,7 +108,7 @@ import {
 } from './utils';
 
 const SMARTLOG_TOO_MANY_COMMITS_WARNING =
-  /^smartlog: too many \(\d+\) commits, not rendering all of them$/m;
+  /^smartlog: too many \((\d+)\) commits, not rendering all of them$/m;
 
 /**
  * This class is responsible for providing information about the working copy
@@ -167,6 +168,8 @@ export class Repository {
   private configRateLimiter = new RateLimiter(1);
 
   private currentVisibleCommitRangeIndex = 0;
+  /** Used to log `SmartlogTooManyCommits` once per occurrence, rather than on every refetch. */
+  private isShowingTooManyCommits = false;
   private visibleCommitRanges: Array<number | undefined> = [
     DEFAULT_DAYS_OF_COMMITS_TO_LOAD,
     60,
@@ -644,14 +647,14 @@ export class Repository {
     }
 
     const [realCwd, realRoot] = await Promise.all([
-      fs.promises.realpath(ctx.cwd),
-      fs.promises.realpath(root),
+      canonicalizePath(ctx.cwd),
+      canonicalizePath(root),
     ]);
     // Since we found `root` for this particular `cwd`, we expect realpath(root) is a prefix of realpath(cwd).
     // That is, the relative path does not contain any ".." components.
     const repoRelativeCwd = path.relative(realRoot, realCwd);
     return {
-      cwd: ctx.cwd,
+      cwd: realCwd,
       repoRoot: realRoot,
       repoRelativeCwdLabel: path.normalize(path.join(path.basename(realRoot), repoRelativeCwd)),
     };
@@ -697,7 +700,6 @@ export class Repository {
   ): {args: Array<string>; stdin?: string | undefined} {
     const {cwd} = ctx;
     const repoRoot = nullthrows(this.info.repoRoot);
-    const illegalArgs = new Set(['--cwd', '--config', '--insecure', '--repository', '-R']);
     let stdin = operation.stdin;
     const args = [];
     for (const arg of operation.args) {
@@ -738,11 +740,12 @@ export class Repository {
             continue;
         }
       }
-      if (illegalArgs.has(arg)) {
+      if (!isFreeTextValue(args) && isIllegalOperationFlag(arg)) {
         throw new Error(`argument '${arg}' is not allowed`);
       }
       args.push(arg);
     }
+    validateMergeToolArgs(args, ctx.knownConfigs?.get('ui.merge'));
     return {args, stdin};
   }
 
@@ -831,9 +834,16 @@ export class Repository {
       },
     );
 
-    ctx.logger.log('run operation: ', command, fullArgs.join(' '));
+    ctx.logger.info('run operation: ', command, fullArgs.join(' '));
 
-    const commandBlocklist = new Set(['debugshell', 'dbsh', 'debugsh']);
+    const commandBlocklist = new Set([
+      'debugshell',
+      'dbsh',
+      'debugsh',
+      'debugpython',
+      'debugpy',
+      'debugrunshell',
+    ]);
     if (args.some(arg => commandBlocklist.has(arg))) {
       throw new Error(`command "${args.join(' ')}" is not allowed`);
     }
@@ -850,7 +860,7 @@ export class Repository {
       onProgress('stderr', data.toString());
     });
     signal.addEventListener('abort', () => {
-      ctx.logger.log('kill operation: ', command, fullArgs.join(' '));
+      ctx.logger.info('kill operation: ', command, fullArgs.join(' '));
     });
     handleAbortSignalOnProcess(execution, signal);
     try {
@@ -890,7 +900,7 @@ export class Repository {
   ref() {
     this.refcount++;
     if (this.refcount === 1) {
-      this.watchForChanges.setupSubscriptions(this.initialConnectionContext);
+      this.watchForChanges.setupSubscriptions();
     }
   }
   unref() {
@@ -996,10 +1006,6 @@ export class Repository {
   refreshWorktreeInfo = serializeAsyncCall(async () => {
     try {
       const ctx = this.initialConnectionContext;
-      const gkEnabled = await Internal.fetchFeatureFlag?.(ctx, 'isl_worktrees');
-      if (gkEnabled === false) {
-        return;
-      }
       const [sharedRoot, worktrees] = await Promise.all([findSharedRoot(ctx), listWorktrees(ctx)]);
       const repoRoot = this.info.repoRoot;
       const worktreeEntries =
@@ -1020,6 +1026,7 @@ export class Repository {
           ? {
               sharedRoot,
               worktrees: worktreeEntriesWithNodes,
+              supportsMutation: this.info.isEdenFs,
             }
           : undefined;
       this.worktreeInfo = worktreeInfo;
@@ -1109,9 +1116,20 @@ export class Repository {
         'LogCommand',
         this.initialConnectionContext,
       );
-      if (SMARTLOG_TOO_MANY_COMMITS_WARNING.test(proc.stderr)) {
+      const tooManyCommitsMatch = SMARTLOG_TOO_MANY_COMMITS_WARNING.exec(proc.stderr);
+      if (tooManyCommitsMatch != null) {
+        if (!this.isShowingTooManyCommits) {
+          this.isShowingTooManyCommits = true;
+          this.initialConnectionContext.tracker.track('SmartlogTooManyCommits', {
+            extras: {
+              numCommits: parseInt(tooManyCommitsMatch[1], 10),
+              visibleCommitDayRange: visibleCommitDayRange ?? null,
+            },
+          });
+        }
         throw new Error(ErrorShortMessages.TooManyCommits);
       }
+      this.isShowingTooManyCommits = false;
       const commits = parseCommitInfoOutput(
         this.initialConnectionContext.logger,
         proc.stdout.trim(),
@@ -1943,6 +1961,61 @@ export function absolutePathForFileInRepo(
 
 function isUnhealthyEdenFs(cwd: string): Promise<boolean> {
   return exists(path.join(cwd, 'README_EDEN.txt'));
+}
+
+/**
+ * Global `sl` flags that change which config or repository a command uses.
+ * Client-supplied operations must use structured `config` args instead.
+ */
+const ILLEGAL_LONG_FLAGS = ['--config', '--configfile', '--cwd', '--insecure', '--repository'];
+
+/**
+ * Whether an operation arg sets one of {@link ILLEGAL_LONG_FLAGS} or `-R`.
+ * `sl` accepts `--flag=value`, unique prefixes of some long flags (`--repo`),
+ * and short flags with attached values (`-R/path`), so exact matching is not enough.
+ */
+export function isIllegalOperationFlag(arg: string): boolean {
+  if (arg.startsWith('--')) {
+    const name = arg.split('=', 1)[0];
+    return name.length > 2 && ILLEGAL_LONG_FLAGS.some(flag => flag.startsWith(name));
+  }
+  return /^-[a-zA-Z]*R/.test(arg);
+}
+
+/** Flags whose value is free text, such as a commit message that may start with `-`. */
+const FREE_TEXT_FLAGS = new Set(['--message', '-m', '--user', '-u']);
+
+/** Whether the next arg is the value of a {@link FREE_TEXT_FLAGS} flag, which `sl` never parses as a flag. */
+function isFreeTextValue(precedingArgs: ReadonlyArray<string>): boolean {
+  const prev = precedingArgs[precedingArgs.length - 1];
+  return prev != null && FREE_TEXT_FLAGS.has(prev);
+}
+
+/**
+ * `--tool` (`-t`) names an external program to run for merges, which is as powerful as `--config`.
+ * Allow only built-in tools and the merge tool the user configured in `ui.merge`.
+ */
+export function validateMergeToolArgs(args: ReadonlyArray<string>, configuredTool?: string) {
+  const isAllowedTool = (tool: string | undefined) =>
+    tool != null && (/^(internal)?:[a-z0-9-]+$/i.test(tool) || tool === configuredTool);
+  args.forEach((arg, i) => {
+    let tool: string | undefined;
+    if (isFreeTextValue(args.slice(0, i))) {
+      return;
+    } else if (arg === '--tool') {
+      tool = args[i + 1];
+    } else if (arg.startsWith('--tool=')) {
+      tool = arg.slice('--tool='.length);
+    } else if (/^-[a-zA-Z]*t/.test(arg)) {
+      // ISL operations always use `--tool`; `-t` would also hide the value from this check.
+      throw new Error(`argument '${arg}' is not allowed`);
+    } else {
+      return;
+    }
+    if (!isAllowedTool(tool)) {
+      throw new Error(`merge tool '${tool}' is not allowed`);
+    }
+  });
 }
 
 async function isEdenFsRepo(repoRoot: AbsolutePath): Promise<boolean> {

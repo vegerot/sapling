@@ -143,6 +143,35 @@ def callcatch(ui, req, func):
     return func() if no exception happens. otherwise do some error handling
     and return an exit code accordingly. does not handle all exceptions.
     """
+    trace = []
+    category = None
+    try:
+        ret = _callcatch(ui, req, func, trace)
+        if trace:
+            category = _errorcategory(trace[0][1])
+        return ret
+    except BaseException as ex:
+        category = _errorcategory(ex)
+        raise
+    finally:
+        if trace:
+            traceui, ex, formatted = trace[0]
+            try:
+                if category:
+                    traceui.log("command_info", error_category=category)
+                if category not in (error.USAGE_ERROR, error.CERTIFICATE_ERROR):
+                    _uploadtraceback(traceui, str(ex), formatted)
+            except Exception as ex:
+                ui.warn(_("warning: could not log command traceback: %s\n") % ex)
+
+
+def _errorcategory(ex):
+    if isinstance(ex, error.CertificateError):
+        return error.CERTIFICATE_ERROR
+    return getattr(ex, "error_category", None)
+
+
+def _callcatch(ui, req, func, trace):
     try:
         try:
             try:
@@ -154,8 +183,7 @@ def callcatch(ui, req, func):
 
                 ui.traceback()
 
-                # Log error info for all non-zero exits.
-                _uploadtraceback(ui, str(ex), util.smartformatexc())
+                trace.append((ui, ex, util.smartformatexc()))
 
                 raise
             finally:
@@ -195,6 +223,8 @@ def callcatch(ui, req, func):
                     ui.warn("\n{}\n".format(problem[0]), label="doctor.treatment")
                     ui.note("  {}\n".format(problem[1]))
                     ui.debug("\nOriginal error:\n{}\n".format(inst))
+                    if problem[2]:
+                        inst.error_category = error.CERTIFICATE_ERROR
                     return 1
 
             raise
@@ -251,6 +281,9 @@ def callcatch(ui, req, func):
         ui.warn("%s\n" % msg, error=_("abort"))
         if req:
             req._permission_denied_handled = True
+    except error.RepoAccessDeniedError as inst:
+        ui.warn(_("permission denied: %s\n") % inst, error=_("abort"))
+        ui.warn(_("(%s)\n") % repoaccesshint(ui), label="ui.hint")
     except error.CensoredNodeError as inst:
         ui.warn(_("file censored %s!\n") % inst, error=_("abort"))
     except error.CommitLookupError as inst:
@@ -337,7 +370,9 @@ def callcatch(ui, req, func):
             # Let's only eat the error if it explicitly mentions "pipe".
             and "pipe" in inst.args[1]
         ):
-            pass
+            # Exit like a process killed by SIGPIPE, so callers can tell a
+            # closed pipe from a real error (255).
+            return 128 + 13
         elif getattr(inst, "strerror", None):
             filename = getattr(inst, "filename", None)
             if filename:
@@ -392,6 +427,13 @@ def callcatch(ui, req, func):
             raise
 
     return -1
+
+
+def repoaccesshint(ui) -> str:
+    """Hint for a user whose access to the repo was denied by the server."""
+    return ui.config("help", "repo-access-help") or _(
+        "check that you have access to this repository"
+    )
 
 
 def _uploadtraceback(ui, message, trace):

@@ -9,6 +9,7 @@
 Default config file for testing
 """
 
+import sys
 from typing import Optional
 
 
@@ -30,6 +31,7 @@ ignore.test=$RUNTESTDIR/gitignore
 
 [agent]
 ignore-quiet=False
+hide-hint-ack=False
 
 [devel]
 all-warnings=True
@@ -106,7 +108,9 @@ buffer-commit-count = 5
         content += """
 [extensions]
 fsmonitor=
-
+"""
+        if sys.platform != "darwin":
+            content += """
 [fsmonitor]
 fallback-on-watchman-exception=false
 """

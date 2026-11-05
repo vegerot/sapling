@@ -6,9 +6,12 @@
  */
 
 use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 
 use encoding::shell_output_bytes_to_path;
+use spawn_ext::CommandExt;
+use types::HgId;
 
 use crate::GitCmd;
 use crate::RepoGit;
@@ -23,6 +26,39 @@ pub struct GitWorktree {
 }
 
 impl RepoGit {
+    /// Create a detached checkout of `target` at `dest`. Git copies this
+    /// checkout's sparse patterns and worktree config into it.
+    pub fn add_worktree(&self, dest: &Path, target: HgId) -> io::Result<()> {
+        self.git_cmd("worktree", &["add", "--detach", "--quiet", "--"])
+            .arg(dest)
+            .arg(target.to_hex())
+            .checked_output()?;
+        Ok(())
+    }
+
+    /// Remove a linked checkout. Unless `force` is set, Git refuses if it has
+    /// local changes. Git refuses a locked checkout either way.
+    pub fn remove_worktree(&self, path: &Path, force: bool) -> io::Result<()> {
+        let args: &[&str] = if force {
+            &["remove", "--force", "--"]
+        } else {
+            &["remove", "--"]
+        };
+        self.git_cmd("worktree", args).arg(path).checked_output()?;
+        Ok(())
+    }
+
+    /// Whether the checkout at `path` has modified or untracked files.
+    pub fn worktree_has_changes(&self, path: &Path) -> io::Result<bool> {
+        let output = self
+            .parent
+            .parent
+            .git_cmd("status", &["--porcelain"])
+            .current_dir(path)
+            .checked_output()?;
+        Ok(!output.stdout.is_empty())
+    }
+
     /// List the worktrees registered with Git.
     pub fn list_worktrees(&self) -> io::Result<Vec<GitWorktree>> {
         let output = self.call("worktree", &["list", "--porcelain", "-z"])?;

@@ -82,12 +82,20 @@ python_binary(
 )
 
 python_library(
+    name = "agent_tracing",
+    srcs = ["agent_tracing.py"],
+    deps = ["//artillery/artillery2/api/cpp/cli_lite/python:art_cli_lite"],
+)
+
+python_library(
     name = "main_lib",
     srcs = [
         "main.py",
     ],
     deps = [
+        ":agent_tracing",
         ":constants",
+        ":error_report",
         ":lib",
         ":telemetry",
         ":trace",
@@ -101,6 +109,13 @@ python_library(
         "//fb303/thrift:fb303_core-python-types",
         "//thrift/lib/python:types",
         "//thrift/lib/python:types/exceptions",
+    ],
+)
+
+python_library(
+    name = "error_report",
+    srcs = [
+        "error_report.py",
     ],
 )
 
@@ -184,6 +199,7 @@ python_library(
         "fbsource//third-party/pypi/filelock:filelock",
         "fbsource//third-party/pypi/psutil:psutil",
         "fbsource//third-party/pypi/toml:toml",
+        ":error_report",
         ":hostname",
         ":mp",
         ":proc_utils",
@@ -216,7 +232,10 @@ python_library(
         "proc_utils_win.py",
     ],
     deps = [
+        "//eden/fs/config:config_thrift-python-types",
         "//eden/fs/py/eden/thrift:client",
+        "//eden/fs/service:thrift-python-types",
+        "//fb303/thrift:fb303_core-python-types",
     ] + select({
         "DEFAULT": [],
         "ovr_config//os:linux": [

@@ -7,6 +7,7 @@
 # pyre-strict
 
 import argparse
+import errno
 import json
 import os
 import unittest
@@ -226,6 +227,7 @@ class RestartTest(unittest.TestCase):
             daemon_binary=None,
             force_restart=False,
             migrate_to=None,
+            only_if_idle=False,
             preserved_vars=None,
             prompt=False,
         )
@@ -285,6 +287,69 @@ class RestartTest(unittest.TestCase):
             "devfuse_to_io_uring",
             telemetry_sample.strings["transport_name"],
         )
+
+    def test_graceful_restart_reports_a_refused_takeover(self) -> None:
+        restart_cmd = self.make_restart_cmd()
+        telemetry_logger = self.make_telemetry_logger()
+        instance = MagicMock()
+        instance.state_dir = Path("/home/test/.eden")
+        instance.get_telemetry_logger.return_value = telemetry_logger
+        instance.check_health.return_value = MagicMock(pid=1234)
+
+        with (
+            patch.object(config_mod, "get_transport_mismatches", return_value=[]),
+            patch.object(main_mod, "remove_legacyephemeral_checkouts"),
+            patch.object(
+                main_mod.daemon, "gracefully_restart_edenfs_service", return_value=1
+            ),
+            patch.object(main_mod.daemon, "takeover_was_refused", return_value=True),
+            patch.object(main_mod, "wait_for_instance_healthy"),
+        ):
+            self.assertEqual(
+                main_mod.daemon.TAKEOVER_REFUSED_EXIT_CODE,
+                restart_cmd._graceful_restart(instance),
+            )
+
+        self.assertEqual(1, len(telemetry_logger.samples))
+
+    def test_graceful_restart_logs_the_old_daemon_error(self) -> None:
+        restart_cmd = self.make_restart_cmd()
+        telemetry_logger = self.make_telemetry_logger()
+        instance = MagicMock()
+        instance.state_dir = Path("/home/test/.eden")
+        instance.get_telemetry_logger.return_value = telemetry_logger
+        instance.check_health.return_value = MagicMock(pid=1234)
+        # This refusal does not carry the refusal marker, so the restart is
+        # reported as failed with the old daemon resumed.
+        daemon_error = (
+            "Installed SIGBUS retry handler with a process-wide budget of 5\n"
+            "Requesting existing edenfs process to gracefully transfer its "
+            "mount points...\n"
+            "error starting EdenFS: std::runtime_error: std::runtime_error: "
+            "can only perform graceful restart when all mount points are "
+            "initialized"
+        )
+
+        with (
+            patch.object(config_mod, "get_transport_mismatches", return_value=[]),
+            patch.object(main_mod, "remove_legacyephemeral_checkouts"),
+            patch.object(
+                main_mod.daemon, "gracefully_restart_edenfs_service", return_value=1
+            ),
+            patch.object(main_mod.daemon, "_last_daemon_error", daemon_error),
+            patch.object(main_mod, "wait_for_instance_healthy"),
+        ):
+            self.assertEqual(1, restart_cmd._graceful_restart(instance))
+
+        self.assertEqual(1, len(telemetry_logger.samples))
+        telemetry_sample = telemetry_logger.samples[0]
+        self.assertEqual(
+            "Graceful restart failed, and old EdenFS process resumed",
+            telemetry_sample.strings["error"],
+        )
+        # FIXME: The sample should carry the old daemon's refusal, with
+        # strings["daemon_error"] equal to daemon_error.
+        self.assertNotIn("daemon_error", telemetry_sample.strings)
 
     def test_graceful_restart_falls_back_on_nfs_transport_mismatch(self) -> None:
         restart_cmd = self.make_restart_cmd()
@@ -485,7 +550,6 @@ class ListTest(unittest.TestCase):
                 redirections={},
                 redirection_targets={},
                 active_prefetch_profiles=[],
-                enable_sqlite_overlay=False,
                 use_write_back_cache=False,
                 re_use_case="buck2-default",
                 inode_catalog_type=None,
@@ -510,7 +574,6 @@ class ListTest(unittest.TestCase):
                 redirections={},
                 redirection_targets={},
                 active_prefetch_profiles=[],
-                enable_sqlite_overlay=False,
                 use_write_back_cache=False,
                 re_use_case="buck2-default",
                 inode_catalog_type=None,
@@ -535,7 +598,6 @@ class ListTest(unittest.TestCase):
                 redirections={},
                 redirection_targets={},
                 active_prefetch_profiles=[],
-                enable_sqlite_overlay=False,
                 use_write_back_cache=False,
                 re_use_case="buck2-default",
                 inode_catalog_type=None,
@@ -560,7 +622,6 @@ class ListTest(unittest.TestCase):
                 redirections={},
                 redirection_targets={},
                 active_prefetch_profiles=[],
-                enable_sqlite_overlay=False,
                 use_write_back_cache=False,
                 re_use_case="buck2-default",
                 inode_catalog_type=None,
@@ -585,7 +646,6 @@ class ListTest(unittest.TestCase):
                 redirections={},
                 redirection_targets={},
                 active_prefetch_profiles=[],
-                enable_sqlite_overlay=False,
                 use_write_back_cache=False,
                 re_use_case="buck2-default",
                 inode_catalog_type=None,
@@ -727,7 +787,6 @@ class ListTest(unittest.TestCase):
                 redirections={},
                 redirection_targets={},
                 active_prefetch_profiles=[],
-                enable_sqlite_overlay=False,
                 use_write_back_cache=False,
                 re_use_case="buck2-default",
                 inode_catalog_type=None,
@@ -752,7 +811,6 @@ class ListTest(unittest.TestCase):
                 redirections={},
                 redirection_targets={},
                 active_prefetch_profiles=[],
-                enable_sqlite_overlay=False,
                 use_write_back_cache=False,
                 re_use_case="buck2-default",
                 inode_catalog_type=None,
@@ -812,3 +870,131 @@ class ListTest(unittest.TestCase):
 """,
             json_out.getvalue(),
         )
+
+
+class PathIsMissingTest(unittest.TestCase, TemporaryDirectoryMixin):
+    def test_only_a_missing_path_is_missing(self) -> None:
+        tmp = Path(self.make_temporary_directory())
+        (tmp / "file").write_text("")
+        self.assertTrue(main_mod._path_is_missing(str(tmp / "missing")))
+        self.assertTrue(main_mod._path_is_missing(str(tmp / "file" / "subdir")))
+        self.assertFalse(main_mod._path_is_missing(str(tmp)))
+        self.assertFalse(main_mod._path_is_missing(str(tmp / "file")))
+        with patch(
+            "eden.fs.cli.main.os.stat", side_effect=OSError(errno.ENOTCONN, "stale")
+        ):
+            self.assertFalse(main_mod._path_is_missing(str(tmp / "stale-mount")))
+
+
+class RemoveCallerErrorTest(unittest.TestCase, TemporaryDirectoryMixin):
+    """`eden rm` on something that is not a checkout exits EX_NOINPUT and
+    records a `user_error` failure, so the DSU pipeline can tell it from an
+    EdenFS failure."""
+
+    def run_remove(self, path: str) -> tuple[int, telemetry.TestTelemetryLogger]:
+        tmp = Path(self.make_temporary_directory())
+        state_dir = tmp / ".eden"
+        state_dir.mkdir()
+        (state_dir / "config.json").write_text(json.dumps({}))
+        instance = config_mod.EdenInstance(state_dir, tmp / "etc", tmp / "home")
+        telemetry_logger = telemetry.TestTelemetryLogger()
+        telemetry_logger.samples = []
+        instance._telemetry_logger = telemetry_logger
+        args = main_mod.create_parser().parse_args(["rm", "-y", path])
+        with patch.object(main_mod, "get_eden_instance", return_value=instance):
+            exit_code = main_mod.RemoveCmd(argparse.ArgumentParser()).run(args)
+        return exit_code, telemetry_logger
+
+    def test_missing_path(self) -> None:
+        tmp = Path(self.make_temporary_directory())
+        exit_code, telemetry_logger = self.run_remove(str(tmp / "missing"))
+
+        self.assertEqual(main_mod.EX_NOINPUT, exit_code)
+        self.assertEqual(1, len(telemetry_logger.samples))
+        sample = telemetry_logger.samples[0]
+        self.assertEqual(0, sample.ints["success"])
+        self.assertEqual(main_mod.EX_NOINPUT, sample.ints["exit_code"])
+        self.assertEqual(
+            main_mod.FAILURE_KIND_USER_ERROR, sample.strings["failure_kind"]
+        )
+        self.assertIn("neither an EdenFS mount", sample.strings["error"])
+
+    def test_directory_with_content(self) -> None:
+        tmp = Path(self.make_temporary_directory())
+        (tmp / "notes.txt").write_text("keep me")
+        exit_code, telemetry_logger = self.run_remove(str(tmp))
+
+        self.assertEqual(main_mod.EX_NOINPUT, exit_code)
+        self.assertTrue((tmp / "notes.txt").exists())
+        sample = telemetry_logger.samples[0]
+        self.assertEqual(0, sample.ints["success"])
+        self.assertEqual(main_mod.EX_NOINPUT, sample.ints["exit_code"])
+        self.assertEqual(
+            main_mod.FAILURE_KIND_USER_ERROR, sample.strings["failure_kind"]
+        )
+
+    def test_plain_file(self) -> None:
+        tmp = Path(self.make_temporary_directory())
+        (tmp / "file").write_text("")
+        exit_code, telemetry_logger = self.run_remove(str(tmp / "file"))
+
+        self.assertEqual(main_mod.EX_NOINPUT, exit_code)
+        self.assertTrue((tmp / "file").exists())
+        self.assertEqual(
+            main_mod.FAILURE_KIND_USER_ERROR,
+            telemetry_logger.samples[0].strings["failure_kind"],
+        )
+
+    def test_path_under_a_plain_file(self) -> None:
+        tmp = Path(self.make_temporary_directory())
+        (tmp / "file").write_text("")
+        exit_code, telemetry_logger = self.run_remove(str(tmp / "file" / "subdir"))
+
+        self.assertEqual(main_mod.EX_NOINPUT, exit_code)
+        self.assertTrue((tmp / "file").exists())
+        sample = telemetry_logger.samples[0]
+        self.assertEqual(
+            main_mod.FAILURE_KIND_USER_ERROR, sample.strings["failure_kind"]
+        )
+        self.assertIn("neither an EdenFS mount", sample.strings["error"])
+
+
+class ClonePrecheckTest(unittest.TestCase, TemporaryDirectoryMixin):
+    def test_clone_into_configured_mount_path(self) -> None:
+        tmp_dir = Path(self.make_temporary_directory())
+        instance = config_mod.EdenInstance(
+            config_dir=tmp_dir / "state",
+            etc_eden_dir=tmp_dir / "etc",
+            home_dir=tmp_dir / "home",
+        )
+        mount_path = str(tmp_dir / "mounts" / "repo")
+        with patch.object(
+            instance,
+            "_get_directory_map",
+            return_value={Path(mount_path): "repo"},
+        ):
+            with patch.object(
+                instance,
+                "_create_mount_point_dir",
+                side_effect=RuntimeError("mount point created"),
+            ):
+                with self.assertRaisesRegex(Exception, "already configured"):
+                    instance.clone(MagicMock(), mount_path, "0" * 40)
+
+
+class FsckThreadCountTest(unittest.TestCase):
+    def test_error_discovery_threads_from_config(self) -> None:
+        cmd = main_mod.FsckCmd(argparse.ArgumentParser())
+        args = argparse.Namespace(
+            num_error_discovery_threads=4, check_only=True, force=False
+        )
+        instance = MagicMock()
+        instance.get_config_int.return_value = 16
+        with patch.object(main_mod, "get_fsck_command", return_value="eden_fsck"):
+            with patch.object(main_mod.subprocess, "call", return_value=0) as call:
+                cmd.check_one(args, instance, Path("/checkout"), Path("/state"))
+        argv = call.call_args[0][0]
+        instance.get_config_int.assert_called_once_with(
+            "fsck.num-error-discovery-threads", 4
+        )
+        self.assertIn("--num_error_discovery_threads=16", argv)

@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -31,7 +30,6 @@ use edenapi::configmodel::config::ContentHash;
 use log::warn;
 #[cfg(fbcode_build)]
 use metrics_fb::install as install_metrics_sink;
-use parking_lot::RwLock;
 use repo::RepoMinimalInfo;
 use repo::repo::Repo;
 use revisionstore::scmstore::KeyFetchError;
@@ -54,8 +52,8 @@ use types::errors::KeyedError;
 
 use crate::ffi::ffi::BackingStoreErrorKind;
 use crate::ffi_errors::classify_backingstore_error;
-use crate::prefetch;
-use crate::prefetch::prefetch_manager;
+use crate::walk::WalkConfig;
+use crate::walk::WalkDetector;
 
 /// Statistics about the hgcache (Sapling disk cache). Named `HgCacheStats`
 /// (not `CacheStats`) to avoid colliding with the unrelated in-memory
@@ -84,16 +82,12 @@ pub struct HgCacheStats {
 pub struct BackingStore {
     // ArcSwap is similar to RwLock, but has lower overhead for read operations.
     inner: ArcSwap<Inner>,
-
-    parent_hint: Arc<RwLock<Option<String>>>,
 }
 
-struct Inner {
-    filestore: Arc<dyn FileStore>,
+pub(crate) struct Inner {
+    pub(crate) filestore: Arc<dyn FileStore>,
     treestore: Arc<dyn TreeStore>,
-    repo: Arc<Repo>,
-    mount_path: PathBuf,
-    eden_client_dir: Option<PathBuf>,
+    pub(crate) repo: Arc<Repo>,
 
     // We store these so we can maintain them when reloading ourself.
     extra_configs: Vec<PinnedConfig>,
@@ -116,32 +110,12 @@ struct Inner {
     // Sets the maximum time since last reload until we force a reload (defaults to 5m).
     reload_interval: Duration,
 
-    prefetch_send: flume::Sender<()>,
-    walk_mode: WalkMode,
+    /// Counts the full reloads of the store, starting at 1. Walk detectors compare it with the
+    /// generation they built their state from, so they follow configuration changes.
+    pub(crate) generation: u64,
+
+    pub(crate) walk: WalkConfig,
     restricted_tree_mode: RestrictedTreeMode,
-    walk_detector: walkdetector::Detector,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum WalkMode {
-    // Don't observe walks.
-    Off,
-    // Watch for walks, but don't take any action.
-    Monitor,
-    // Prefetch files/trees based on observed walks.
-    Prefetch,
-}
-
-impl FromStr for WalkMode {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "monitor" => Ok(Self::Monitor),
-            "prefetch" => Ok(Self::Prefetch),
-            _ => Ok(Self::Off),
-        }
-    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -166,8 +140,16 @@ impl RestrictedTreeMode {
 
 impl BackingStore {
     /// Initialize `BackingStore`.
-    pub fn new<P: AsRef<Path>>(root: P, mount: P) -> Result<Self> {
-        Self::new_with_config(root.as_ref(), mount.as_ref(), &[])
+    pub fn new<P: AsRef<Path>>(root: P) -> Result<Self> {
+        Self::new_with_config(root.as_ref(), &[])
+    }
+
+    /// Walk detection for the checkout at `mount`. The detector follows this store's
+    /// configuration, including the walk mode, on each call that passes the store.
+    pub fn walk_detector(&self, mount: &Path) -> WalkDetector {
+        let detector = WalkDetector::new(mount);
+        detector.sync(self);
+        detector
     }
 
     pub fn name(&self) -> Result<String> {
@@ -179,63 +161,27 @@ impl BackingStore {
 
     /// Initialize `BackingStore` with extra configs.
     /// This is used by benches/ to set cache path to control warm/code test cases.
-    pub fn new_with_config(
-        root: impl AsRef<Path>,
-        mount: impl AsRef<Path>,
-        extra_configs: &[String],
-    ) -> Result<Self> {
-        Self::new_with_config_inner(root.as_ref(), mount.as_ref(), None, extra_configs)
-    }
-
-    pub fn new_with_config_and_client_dir(
-        root: impl AsRef<Path>,
-        mount: impl AsRef<Path>,
-        eden_client_dir: impl AsRef<Path>,
-        extra_configs: &[String],
-    ) -> Result<Self> {
-        Self::new_with_config_inner(
-            root.as_ref(),
-            mount.as_ref(),
-            Some(eden_client_dir.as_ref()),
-            extra_configs,
-        )
-    }
-
-    fn new_with_config_inner(
-        root: &Path,
-        mount: &Path,
-        eden_client_dir: Option<&Path>,
-        extra_configs: &[String],
-    ) -> Result<Self> {
+    pub fn new_with_config(root: impl AsRef<Path>, extra_configs: &[String]) -> Result<Self> {
         let extra_configs = extra_configs
             .iter()
             .map(|c| PinnedConfig::Raw(c.to_string().into(), "backingstore".into()))
             .collect::<Vec<_>>();
 
-        let parent_hint = Arc::new(RwLock::default());
-
         Ok(Self {
             inner: ArcSwap::new(Arc::new(Self::new_inner(
-                root,
-                mount,
-                eden_client_dir,
+                root.as_ref(),
                 &extra_configs,
                 touch_file_mtime(),
-                parent_hint.clone(),
-                walkdetector::Detector::new(),
+                1,
             )?)),
-            parent_hint,
         })
     }
 
     fn new_inner(
         root: &Path,
-        mount: &Path,
-        eden_client_dir: Option<&Path>,
         extra_configs: &[PinnedConfig],
         touch_file_mtime: Option<SystemTime>,
-        parent_hint: Arc<RwLock<Option<String>>>,
-        mut walk_detector: walkdetector::Detector,
+        generation: u64,
     ) -> Result<Inner> {
         constructors::init();
 
@@ -273,7 +219,7 @@ impl BackingStore {
         );
 
         // Apply indexed log configs, which can affect edenfs behavior.
-        indexedlog::config::configure(&config)?;
+        indexedlog_config::configure(&config)?;
 
         let repo = Repo::load_with_config(root, config)?;
         let filestore = repo.file_store()?;
@@ -289,124 +235,15 @@ impl BackingStore {
             }
         }
 
-        let walk_mode = WalkMode::from_str(
-            config
-                .get("backingstore", "walk-mode")
-                .unwrap_or_default()
-                .as_ref(),
-        )?;
+        let walk = WalkConfig::from_config(config.as_ref())?;
         let restricted_tree_mode = RestrictedTreeMode::from_config(config.as_ref());
 
         let repo = Arc::new(repo);
-
-        // First reset to default config values to handle the case when a config item was specified
-        // in the sl config, but is no longer present (i.e. need to revert to the in-code default).
-        walk_detector.reset_config();
-
-        if let Some(threshold) = config.get_opt("backingstore", "walk-threshold")? {
-            walk_detector.set_walk_threshold(threshold);
-        }
-
-        if let Some(depth) = config.get_opt("backingstore", "walk-lax-depth")? {
-            walk_detector.set_lax_depth(depth);
-        }
-
-        if let Some(depth) = config.get_opt("backingstore", "walk-strict-multiplier")? {
-            walk_detector.set_strict_multiplier(depth);
-        }
-
-        if let Some(threshold) = config.get_opt("backingstore", "walk-ratio")? {
-            walk_detector.set_walk_ratio(threshold);
-        }
-
-        if let Some(threshold) = config.get_opt("backingstore", "walk-gc-interval")? {
-            walk_detector.set_gc_interval(threshold);
-        }
-
-        if let Some(timeout) = config.get_opt("backingstore", "walk-gc-timeout")? {
-            walk_detector.set_gc_timeout(timeout);
-        }
-
-        walk_detector.set_root(Some(mount.to_path_buf()));
-        if config.get_or("backingstore", "walk-metadata-persistence", || true)? {
-            if let Some(eden_client_dir) = eden_client_dir {
-                walk_detector.set_persistence_path(walk_metadata_persistence_path(eden_client_dir));
-                walk_detector.load_persisted_metadata();
-            } else {
-                walk_detector.clear_persistence_path();
-            }
-        } else {
-            walk_detector.clear_persistence_path();
-        }
-
-        let prefetch_send = if walk_mode == WalkMode::Prefetch {
-            let prefetch_config = prefetch::Config {
-                // Pause prefetch if ratio of cache hits to prefetches is below min_ratio AND
-                // prefetches - cache hits is greater than max_initial_lag.
-                min_ratio: config.get_or("backingstore", "walk-prefetch-min-ratio", || 0.1)?,
-                max_initial_lag: config.get_or(
-                    "backingstore",
-                    "walk-prefetch-max-initial-lag",
-                    || 50_000,
-                )?,
-                min_interval: config.get_or(
-                    "backingstore",
-                    "walk-prefetch-min-interval",
-                    || Duration::from_millis(10),
-                )?,
-                file_batch_size: config.get_or(
-                    "backingstore",
-                    "walk-prefetch-file-batch-size",
-                    || 4_096,
-                )?,
-                max_concurrent_file_fetches: config
-                    .get_or(
-                        "backingstore",
-                        "walk-prefetch-max-concurrent-file-fetches",
-                        || 4,
-                    )?
-                    .max(1),
-                max_concurrent_manifest_walks: config
-                    .get_or(
-                        "backingstore",
-                        "walk-prefetch-max-concurrent-manifest-walks",
-                        || 4,
-                    )?
-                    .max(1),
-                max_concurrent_prefetches: config
-                    .get_or(
-                        "backingstore",
-                        "walk-prefetch-max-concurrent-prefetches",
-                        || 4,
-                    )?
-                    .max(1),
-                skip_lfs: config.get_or("backingstore", "walk-prefetch-skip-lfs", || true)?,
-            };
-
-            prefetch_manager(
-                prefetch_config,
-                repo.tree_resolver()?,
-                filestore.clone(),
-                parent_hint,
-                walk_detector.clone(),
-                root.into(),
-                |root: PathBuf| {
-                    let repo = Repo::load(root, &Vec::new())?;
-                    let wc = repo.working_copy()?;
-                    wc.read().sparse_matcher()
-                },
-            )
-        } else {
-            // Stick a dummy channel in so we don't need to fuss with Option.
-            flume::bounded(0).0
-        };
 
         Ok(Inner {
             treestore,
             filestore,
             repo,
-            mount_path: mount.to_path_buf(),
-            eden_client_dir: eden_client_dir.map(Path::to_path_buf),
             extra_configs: extra_configs.to_vec(),
             create_time: Instant::now(),
             touch_file_mtime,
@@ -418,10 +255,9 @@ impl BackingStore {
             reload_interval: config
                 .get_opt("backingstore", "reload-interval-secs")?
                 .unwrap_or(Duration::from_mins(5)),
-            prefetch_send,
-            walk_mode,
+            generation,
+            walk,
             restricted_tree_mode,
-            walk_detector,
         })
     }
 
@@ -582,65 +418,6 @@ impl BackingStore {
             .check_path_permissions(hg_cs_id, path_bufs)
     }
 
-    #[instrument(level = "trace", skip(self))]
-    pub fn witness_file_read(&self, path: &RepoPath, local: bool, pid: u32) {
-        let inner = self.inner.load();
-
-        if inner.walk_mode == WalkMode::Off {
-            return;
-        }
-
-        let walk_changed = if local {
-            inner.walk_detector.file_read(path, pid);
-            false
-        } else {
-            inner.walk_detector.file_loaded(path, pid)
-        };
-        if !walk_changed {
-            return;
-        }
-
-        inner.notify_prefetch();
-    }
-
-    #[instrument(level = "trace", skip(self))]
-    pub fn witness_dir_read(
-        &self,
-        path: &RepoPath,
-        local: bool,
-        num_files: usize,
-        num_dirs: usize,
-        pid: u32,
-    ) {
-        let inner = self.inner.load();
-
-        if inner.walk_mode == WalkMode::Off {
-            return;
-        }
-
-        let walk_changed = if local {
-            inner.walk_detector.dir_read(path, num_files, num_dirs, pid);
-            false
-        } else {
-            inner
-                .walk_detector
-                .dir_loaded(path, num_files, num_dirs, pid)
-        };
-        if !walk_changed {
-            return;
-        }
-
-        inner.notify_prefetch();
-    }
-
-    pub fn set_parent_hint(&self, parent_id: &str) {
-        tracing::info!(parent_id, "setting parent hint");
-
-        *self.parent_hint.write() = Some(parent_id.to_string());
-
-        self.maybe_reload().notify_prefetch();
-    }
-
     /// Get cache statistics for the hgcache (Sapling disk cache).
     ///
     /// Uses the store's indexedlog `disk_usage()` / `max_bytes()` APIs, which
@@ -696,7 +473,7 @@ impl BackingStore {
     //
     // We return an arc_swap::Guard so we only call inner.load() once normally.
     #[instrument(level = "trace", skip(self))]
-    fn maybe_reload(&self) -> arc_swap::Guard<Arc<Inner>> {
+    pub(crate) fn maybe_reload(&self) -> arc_swap::Guard<Arc<Inner>> {
         let inner = self.inner.load();
 
         if inner.create_time.elapsed() < inner.reload_check_interval {
@@ -754,12 +531,9 @@ impl BackingStore {
 
             match Self::new_inner(
                 inner.repo.path(),
-                &inner.mount_path,
-                inner.eden_client_dir.as_deref(),
                 &inner.extra_configs,
                 new_mtime,
-                self.parent_hint.clone(),
-                inner.walk_detector.clone(),
+                inner.generation + 1,
             ) {
                 Ok(mut new_inner) => {
                     new_inner.last_reload = Instant::now();
@@ -825,8 +599,6 @@ impl Inner {
             filestore: self.filestore.clone(),
             treestore: self.treestore.clone(),
             repo: self.repo.clone(),
-            mount_path: self.mount_path.clone(),
-            eden_client_dir: self.eden_client_dir.clone(),
             extra_configs: self.extra_configs.clone(),
 
             touch_file_mtime,
@@ -835,11 +607,10 @@ impl Inner {
             already_reloading: AtomicBool::new(false),
             reload_check_interval: self.reload_check_interval,
             reload_interval: self.reload_interval,
+            generation: self.generation,
 
-            prefetch_send: self.prefetch_send.clone(),
-            walk_mode: self.walk_mode,
+            walk: self.walk.clone(),
             restricted_tree_mode: self.restricted_tree_mode,
-            walk_detector: self.walk_detector.clone(),
         }
     }
 
@@ -850,18 +621,6 @@ impl Inner {
         // Sync pending counters to ODS/OBC.
         metrics::Registry::global().sync();
     }
-
-    fn notify_prefetch(&self) {
-        if self.walk_mode != WalkMode::Prefetch {
-            return;
-        }
-
-        let _ = self.prefetch_send.try_send(());
-    }
-}
-
-fn walk_metadata_persistence_path(eden_client_dir: &Path) -> PathBuf {
-    eden_client_dir.join("walk_detector_metadata.jsonl")
 }
 
 fn touch_file_mtime() -> Option<SystemTime> {
@@ -1219,17 +978,6 @@ mod tests {
     use types::fetch_mode::FetchMode;
 
     use super::*;
-
-    #[test]
-    fn test_walk_metadata_persistence_path_uses_eden_client_dir() {
-        let mount = Path::new("/eden/mount/repo");
-        let eden_client_dir = Path::new("/home/user/.eden/clients/repo");
-
-        let path = walk_metadata_persistence_path(eden_client_dir);
-
-        assert_eq!(path, eden_client_dir.join("walk_detector_metadata.jsonl"));
-        assert!(!path.starts_with(mount));
-    }
 
     #[test]
     fn test_get_cache_path_for_stats_joins_reponame_and_cachepath() {

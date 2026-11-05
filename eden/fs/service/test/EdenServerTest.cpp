@@ -22,25 +22,41 @@
 #include <memory>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 #include <folly/CancellationToken.h>
 #include <folly/ExceptionWrapper.h>
+#include <folly/Executor.h>
 #include <folly/ScopeGuard.h>
 #include <folly/io/IOBufQueue.h>
+#include <folly/io/async/AsyncSocket.h>
+#include <folly/io/async/EventBase.h>
+#include <folly/test/TestUtils.h>
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
+#include <thrift/lib/cpp/transport/TTransportException.h>
+#include <thrift/lib/cpp2/async/HeaderClientChannel.h>
 
 #include "eden/common/utils/FaultInjector.h"
+#include "eden/common/utils/FileUtils.h"
 #include "eden/common/utils/UnboundedQueueExecutor.h"
+#include "eden/fs/config/CheckoutConfig.h"
+#include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/ServerState.h"
+#include "eden/fs/model/RootId.h"
 #include "eden/fs/nfs/MountdRpc.h"
 #include "eden/fs/nfs/NfsServer.h"
 #include "eden/fs/service/EdenServiceHandler.h"
 #include "eden/fs/service/EdenStateDir.h"
+#include "eden/fs/service/gen-cpp2/EdenServiceAsyncClient.h"
 #include "eden/fs/takeover/TakeoverClient.h"
 #ifdef __linux__
+#include "eden/fs/privhelper/PrivHelper.h"
+#include "eden/fs/store/BackingStore.h"
 #include "eden/fs/store/ObjectFetchContext.h"
+#include "eden/fs/testharness/FakeBackingStore.h"
 #include "eden/fs/testharness/FakeFuse.h"
+#include "eden/fs/testharness/FakePrivHelper.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
 #include "eden/fs/testharness/TestMount.h"
 #endif
@@ -99,13 +115,20 @@ class ScopedServerThread {
 
 std::future<TakeoverData> takeoverViaThread(
     AbsolutePathPiece socketPath,
-    bool shouldThrowDuringTakeover) {
+    bool shouldThrowDuringTakeover,
+    bool force = false,
+    bool onlyIfIdle = false) {
   return std::async(
       std::launch::async,
-      [path = AbsolutePath{socketPath}, shouldThrowDuringTakeover] {
+      [path = AbsolutePath{socketPath},
+       shouldThrowDuringTakeover,
+       force,
+       onlyIfIdle] {
         return takeoverMounts(
             path,
             /*takeoverReceiveTimeout=*/std::chrono::seconds{150},
+            force,
+            onlyIfIdle,
             shouldThrowDuringTakeover);
       });
 }
@@ -440,6 +463,439 @@ TEST_F(EdenServerTest, TakeoverSendFailureRecoveryReinitializesMountd) {
   }
 }
 
+TEST(EdenServerTakeoverTest, RefusedWhileALongRequestRunsUnlessForced) {
+  GFLAGS_NAMESPACE::SetCommandLineOptionWithMode(
+      "enable_fault_injection", "true", GFLAGS_NAMESPACE::SET_FLAGS_VALUE);
+  TestServer::Options options;
+  // No grace: any request in flight has already outlived it.
+  options.takeoverRequestGrace = std::chrono::seconds{0};
+  TestServer testServer{options};
+  auto& server = testServer.getServer();
+  auto handler = server.getHandler();
+  auto socketPath = EdenStateDir{server.getEdenDir()}.getTakeoverSocketPath();
+
+  ScopedServerThread serverThread{server};
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return server.getStatus() == EdenServer::RunState::RUNNING;
+  }));
+
+  // Simulate a Thrift request that has been running for a while.
+  folly::CancellationSource source;
+  auto token = source.getToken();
+  handler->insertCancellationSource(
+      /*requestId=*/4242, std::move(source), "globFiles");
+
+  {
+    auto clientFuture = takeoverViaThread(
+        socketPath, /*shouldThrowDuringTakeover=*/false, /*force=*/false);
+    ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+      return clientFuture.wait_for(0ms) == std::future_status::ready;
+    }));
+    EXPECT_THROW_RE(
+        (void)clientFuture.get(), std::runtime_error, "refused.*globFiles");
+    EXPECT_FALSE(token.isCancellationRequested());
+    EXPECT_EQ(server.getStatus(), EdenServer::RunState::RUNNING);
+  }
+
+  {
+    auto clientFuture = takeoverViaThread(
+        socketPath, /*shouldThrowDuringTakeover=*/false, /*force=*/true);
+    ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+      return clientFuture.wait_for(0ms) == std::future_status::ready;
+    }));
+    EXPECT_NO_THROW((void)clientFuture.get());
+    EXPECT_TRUE(token.isCancellationRequested());
+  }
+
+  ASSERT_TRUE(serverThread.waitForExit(5s));
+  serverThread.join();
+  ASSERT_NO_THROW(serverThread.throwIfServeFailed());
+  EXPECT_TRUE(server.performCleanup());
+}
+
+TEST(EdenServerTakeoverTest, RefusedAfterRecentActivityOnlyWhenAsked) {
+  GFLAGS_NAMESPACE::SetCommandLineOptionWithMode(
+      "enable_fault_injection", "true", GFLAGS_NAMESPACE::SET_FLAGS_VALUE);
+  TestServer::Options options;
+  options.takeoverRecentActivityWindow = std::chrono::minutes{10};
+  TestServer testServer{options};
+  auto& server = testServer.getServer();
+  auto socketPath = EdenStateDir{server.getEdenDir()}.getTakeoverSocketPath();
+
+  ScopedServerThread serverThread{server};
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return server.getStatus() == EdenServer::RunState::RUNNING;
+  }));
+
+  // A checkout just ran; nothing is in flight.
+  server.noteActivity("checkOutRevision");
+
+  {
+    // A restart that asks for an idle daemon, as the restarter does, is
+    // refused and names the operation.
+    auto clientFuture = takeoverViaThread(
+        socketPath,
+        /*shouldThrowDuringTakeover=*/false,
+        /*force=*/false,
+        /*onlyIfIdle=*/true);
+    ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+      return clientFuture.wait_for(0ms) == std::future_status::ready;
+    }));
+    EXPECT_THROW_RE(
+        (void)clientFuture.get(),
+        std::runtime_error,
+        "in use recently.*checkOutRevision");
+    EXPECT_EQ(server.getStatus(), EdenServer::RunState::RUNNING);
+  }
+
+  {
+    // A plain graceful restart, as a person runs it, only cares about the
+    // requests in flight and proceeds.
+    auto clientFuture = takeoverViaThread(
+        socketPath, /*shouldThrowDuringTakeover=*/false, /*force=*/false);
+    ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+      return clientFuture.wait_for(0ms) == std::future_status::ready;
+    }));
+    EXPECT_NO_THROW((void)clientFuture.get());
+  }
+
+  ASSERT_TRUE(serverThread.waitForExit(5s));
+  serverThread.join();
+  ASSERT_NO_THROW(serverThread.throwIfServeFailed());
+  EXPECT_TRUE(server.performCleanup());
+}
+
+namespace {
+
+// Starts a takeover with one request in flight, and once the takeover has
+// looked at the requests in flight, finishes that request and starts another
+// one, which counts as arriving during the grace period. With `laterFinishes`
+// the later request finishes once the takeover has polled again; otherwise it
+// keeps running.
+struct TakeoverWithALaterRequest {
+  TakeoverWithALaterRequest(TestServer& testServer, bool laterFinishes)
+      : server{testServer.getServer()},
+        handler{server.getHandler()},
+        socketPath{EdenStateDir{server.getEdenDir()}.getTakeoverSocketPath()},
+        serverThread{server} {
+    EXPECT_TRUE(driveMainEventBaseUntil(server, [&] {
+      return server.getStatus() == EdenServer::RunState::RUNNING;
+    }));
+    handler->insertCancellationSource(
+        /*requestId=*/1, std::move(earlier), "getScmStatusV2");
+
+    auto& faultInjector = server.getServerState()->getFaultInjector();
+    faultInjector.injectBlock("takeover", "wait_for_requests");
+    if (laterFinishes) {
+      faultInjector.injectBlock("takeover_wait", "poll");
+    }
+    blockedWaiter = std::thread([this, &faultInjector, laterFinishes] {
+      takeoverBlocked = faultInjector.waitUntilBlocked("takeover", 5s);
+      handler->insertCancellationSource(
+          /*requestId=*/2, std::move(later), "globFiles");
+      handler->removeCancellationSource(/*requestId=*/1);
+      faultInjector.unblock("takeover", "wait_for_requests");
+      if (laterFinishes) {
+        // The takeover is about to poll again with the later request in
+        // flight; let it finish first.
+        pollBlocked = faultInjector.waitUntilBlocked("takeover_wait", 5s);
+        handler->removeCancellationSource(/*requestId=*/2);
+        faultInjector.unblock("takeover_wait", "poll");
+      }
+    });
+    clientFuture = takeoverViaThread(
+        socketPath, /*shouldThrowDuringTakeover=*/false, /*force=*/false);
+    EXPECT_TRUE(driveMainEventBaseUntil(
+        server,
+        [&] { return clientFuture.wait_for(0ms) == std::future_status::ready; },
+        10s));
+    blockedWaiter.join();
+    EXPECT_TRUE(takeoverBlocked);
+  }
+
+  EdenServer& server;
+  std::shared_ptr<EdenServiceHandler> handler;
+  AbsolutePath socketPath;
+  ScopedServerThread serverThread;
+  folly::CancellationSource earlier;
+  folly::CancellationToken earlierToken{earlier.getToken()};
+  folly::CancellationSource later;
+  folly::CancellationToken laterToken{later.getToken()};
+  std::thread blockedWaiter;
+  bool takeoverBlocked{false};
+  bool pollBlocked{false};
+  std::future<TakeoverData> clientFuture;
+};
+
+} // namespace
+
+TEST(EdenServerTakeoverTest, WaitsForRequestsThatArriveDuringTheGrace) {
+  GFLAGS_NAMESPACE::SetCommandLineOptionWithMode(
+      "enable_fault_injection", "true", GFLAGS_NAMESPACE::SET_FLAGS_VALUE);
+  TestServer::Options options;
+  options.takeoverRequestGrace = std::chrono::seconds{3};
+  TestServer testServer{options};
+  TakeoverWithALaterRequest takeover{testServer, /*laterFinishes=*/true};
+
+  // The later request finished on its own, so the takeover went ahead and
+  // cancelled nothing.
+  EXPECT_TRUE(takeover.pollBlocked);
+  EXPECT_NO_THROW((void)takeover.clientFuture.get());
+  EXPECT_FALSE(takeover.earlierToken.isCancellationRequested());
+  EXPECT_FALSE(takeover.laterToken.isCancellationRequested());
+
+  ASSERT_TRUE(takeover.serverThread.waitForExit(5s));
+  takeover.serverThread.join();
+  ASSERT_NO_THROW(takeover.serverThread.throwIfServeFailed());
+  EXPECT_TRUE(takeover.server.performCleanup());
+}
+
+TEST(
+    EdenServerTakeoverTest,
+    RefusedWhenARequestArrivingDuringTheGraceOutlivesIt) {
+  GFLAGS_NAMESPACE::SetCommandLineOptionWithMode(
+      "enable_fault_injection", "true", GFLAGS_NAMESPACE::SET_FLAGS_VALUE);
+  TestServer::Options options;
+  options.takeoverRequestGrace = std::chrono::seconds{1};
+  TestServer testServer{options};
+  TakeoverWithALaterRequest takeover{testServer, /*laterFinishes=*/false};
+
+  EXPECT_THROW_RE(
+      (void)takeover.clientFuture.get(),
+      std::runtime_error,
+      "refused.*globFiles");
+  EXPECT_FALSE(takeover.laterToken.isCancellationRequested());
+  EXPECT_EQ(takeover.server.getStatus(), EdenServer::RunState::RUNNING);
+
+  // A forced takeover cancels the request and ends the server.
+  auto forced = takeoverViaThread(
+      takeover.socketPath,
+      /*shouldThrowDuringTakeover=*/false,
+      /*force=*/true);
+  ASSERT_TRUE(driveMainEventBaseUntil(takeover.server, [&] {
+    return forced.wait_for(0ms) == std::future_status::ready;
+  }));
+  EXPECT_NO_THROW((void)forced.get());
+  EXPECT_TRUE(takeover.laterToken.isCancellationRequested());
+
+  ASSERT_TRUE(takeover.serverThread.waitForExit(5s));
+  takeover.serverThread.join();
+  ASSERT_NO_THROW(takeover.serverThread.throwIfServeFailed());
+  EXPECT_TRUE(takeover.server.performCleanup());
+}
+
+TEST(EdenServerTakeoverTest, CancelsRequestsThatArriveAfterTheGrace) {
+  GFLAGS_NAMESPACE::SetCommandLineOptionWithMode(
+      "enable_fault_injection", "true", GFLAGS_NAMESPACE::SET_FLAGS_VALUE);
+  TestServer::Options options;
+  options.takeoverRequestGrace = std::chrono::seconds{1};
+  TestServer testServer{options};
+  auto& server = testServer.getServer();
+  auto handler = server.getHandler();
+  auto socketPath = EdenStateDir{server.getEdenDir()}.getTakeoverSocketPath();
+
+  ScopedServerThread serverThread{server};
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return server.getStatus() == EdenServer::RunState::RUNNING;
+  }));
+
+  // Nothing is in flight, so the takeover does not wait. Pause it once the
+  // wait is over and start a request in that window.
+  auto& faultInjector = server.getServerState()->getFaultInjector();
+  faultInjector.injectBlock("takeover", "after_wait");
+  folly::CancellationSource late;
+  auto lateToken = late.getToken();
+  bool takeoverBlocked = false;
+  std::thread blockedWaiter([&] {
+    takeoverBlocked = faultInjector.waitUntilBlocked("takeover", 5s);
+    handler->insertCancellationSource(
+        /*requestId=*/3, std::move(late), "globFiles");
+    faultInjector.unblock("takeover", "after_wait");
+  });
+
+  auto clientFuture = takeoverViaThread(
+      socketPath, /*shouldThrowDuringTakeover=*/false, /*force=*/false);
+  ASSERT_TRUE(driveMainEventBaseUntil(
+      server,
+      [&] { return clientFuture.wait_for(0ms) == std::future_status::ready; },
+      10s));
+  blockedWaiter.join();
+  EXPECT_TRUE(takeoverBlocked);
+  EXPECT_NO_THROW((void)clientFuture.get());
+
+  // Once the Thrift server has stopped and the grace period has passed again,
+  // the request is cancelled rather than left to hold the stop to its
+  // deadline.
+  ASSERT_TRUE(driveMainEventBaseUntil(
+      server, [&] { return lateToken.isCancellationRequested(); }, 10s));
+
+  ASSERT_TRUE(serverThread.waitForExit(5s));
+  serverThread.join();
+  ASSERT_NO_THROW(serverThread.throwIfServeFailed());
+  EXPECT_TRUE(server.performCleanup());
+}
+
+TEST(EdenServerTakeoverTest, DoesNotWaitWhenTheGracePeriodIsOff) {
+  GFLAGS_NAMESPACE::SetCommandLineOptionWithMode(
+      "enable_fault_injection", "true", GFLAGS_NAMESPACE::SET_FLAGS_VALUE);
+  TestServer::Options options;
+  options.takeoverRequestGrace = std::chrono::seconds{0};
+  options.takeoverWaitsForRequests = false;
+  TestServer testServer{options};
+  auto& server = testServer.getServer();
+  auto handler = server.getHandler();
+  auto socketPath = EdenStateDir{server.getEdenDir()}.getTakeoverSocketPath();
+
+  ScopedServerThread serverThread{server};
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return server.getStatus() == EdenServer::RunState::RUNNING;
+  }));
+
+  folly::CancellationSource source;
+  auto token = source.getToken();
+  handler->insertCancellationSource(
+      /*requestId=*/4242, std::move(source), "globFiles");
+
+  // With the kill switch off the takeover neither refuses nor cancels.
+  auto clientFuture = takeoverViaThread(
+      socketPath, /*shouldThrowDuringTakeover=*/false, /*force=*/false);
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return clientFuture.wait_for(0ms) == std::future_status::ready;
+  }));
+  EXPECT_NO_THROW((void)clientFuture.get());
+  EXPECT_FALSE(token.isCancellationRequested());
+
+  ASSERT_TRUE(serverThread.waitForExit(5s));
+  serverThread.join();
+  ASSERT_NO_THROW(serverThread.throwIfServeFailed());
+  EXPECT_TRUE(server.performCleanup());
+}
+
+TEST(EdenServerTakeoverTest, WaitsForARecoveryMount) {
+  GFLAGS_NAMESPACE::SetCommandLineOptionWithMode(
+      "enable_fault_injection", "true", GFLAGS_NAMESPACE::SET_FLAGS_VALUE);
+  TestServer::Options options;
+  options.takeoverRequestGrace = std::chrono::seconds{5};
+  TestServer testServer{options};
+  auto& server = testServer.getServer();
+  auto socketPath = EdenStateDir{server.getEdenDir()}.getTakeoverSocketPath();
+
+  ScopedServerThread serverThread{server};
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return server.getStatus() == EdenServer::RunState::RUNNING;
+  }));
+
+  const auto mountPath = canonicalPath("/recovering");
+  ASSERT_TRUE(server.beginRecoveryMount(mountPath));
+  // The recovery mount finishes while the takeover waits for it.
+  auto& faultInjector = server.getServerState()->getFaultInjector();
+  faultInjector.injectBlock("takeover_wait", "poll");
+  bool pollBlocked = false;
+  std::thread blockedWaiter([&] {
+    pollBlocked = faultInjector.waitUntilBlocked("takeover_wait", 5s);
+    server.endRecoveryMount(mountPath);
+    faultInjector.unblock("takeover_wait", "poll");
+  });
+
+  auto clientFuture = takeoverViaThread(
+      socketPath, /*shouldThrowDuringTakeover=*/false, /*force=*/false);
+  ASSERT_TRUE(driveMainEventBaseUntil(
+      server,
+      [&] { return clientFuture.wait_for(0ms) == std::future_status::ready; },
+      10s));
+  blockedWaiter.join();
+  EXPECT_TRUE(pollBlocked);
+  EXPECT_NO_THROW((void)clientFuture.get());
+
+  ASSERT_TRUE(serverThread.waitForExit(5s));
+  serverThread.join();
+  ASSERT_NO_THROW(serverThread.throwIfServeFailed());
+  EXPECT_TRUE(server.performCleanup());
+}
+
+TEST(EdenServerTakeoverTest, RefusedWhileARecoveryMountOutlivesTheGrace) {
+  GFLAGS_NAMESPACE::SetCommandLineOptionWithMode(
+      "enable_fault_injection", "true", GFLAGS_NAMESPACE::SET_FLAGS_VALUE);
+  TestServer::Options options;
+  options.takeoverRequestGrace = std::chrono::seconds{1};
+  TestServer testServer{options};
+  auto& server = testServer.getServer();
+  auto socketPath = EdenStateDir{server.getEdenDir()}.getTakeoverSocketPath();
+
+  ScopedServerThread serverThread{server};
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return server.getStatus() == EdenServer::RunState::RUNNING;
+  }));
+
+  const auto mountPath = canonicalPath("/recovering");
+  ASSERT_TRUE(server.beginRecoveryMount(mountPath));
+  // Forcing does not help: a mount cannot be cancelled.
+  for (const bool force : {false, true}) {
+    auto clientFuture = takeoverViaThread(
+        socketPath, /*shouldThrowDuringTakeover=*/false, force);
+    ASSERT_TRUE(driveMainEventBaseUntil(
+        server,
+        [&] { return clientFuture.wait_for(0ms) == std::future_status::ready; },
+        10s));
+    EXPECT_THROW_RE(
+        (void)clientFuture.get(),
+        std::runtime_error,
+        "refused the graceful restart.*remounting /recovering");
+    EXPECT_EQ(server.getStatus(), EdenServer::RunState::RUNNING);
+  }
+
+  // Once the recovery has mounted, a takeover goes ahead, and no recovery
+  // mount can start after it.
+  server.endRecoveryMount(mountPath);
+  auto clientFuture = takeoverViaThread(
+      socketPath, /*shouldThrowDuringTakeover=*/false, /*force=*/false);
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return clientFuture.wait_for(0ms) == std::future_status::ready;
+  }));
+  EXPECT_NO_THROW((void)clientFuture.get());
+  EXPECT_FALSE(server.beginRecoveryMount(mountPath));
+
+  ASSERT_TRUE(serverThread.waitForExit(5s));
+  serverThread.join();
+  ASSERT_NO_THROW(serverThread.throwIfServeFailed());
+  EXPECT_TRUE(server.performCleanup());
+}
+
+TEST(EdenServerShutdownTest, StopsCleanlyWithAnIdleClientConnected) {
+  TestServer::Options options;
+  options.enableNfsServer = true;
+  auto testServer = std::make_unique<TestServer>(options);
+  auto& server = testServer->getServer();
+  auto serverThread = std::make_unique<ScopedServerThread>(server);
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return server.getStatus() == EdenServer::RunState::RUNNING;
+  }));
+
+  // A header connection, as the Sapling clients open. The stop drains rocket
+  // connections before serve() returns, but an idle header connection is left
+  // alone until the server object is destroyed, so this one is still open
+  // when the EdenServer goes away.
+  folly::EventBase clientEventBase;
+  auto socketPath = EdenStateDir{server.getEdenDir()}.getThriftSocketPath();
+  apache::thrift::Client<EdenService> client{
+      apache::thrift::HeaderClientChannel::newChannel(
+          apache::thrift::HeaderClientChannel::WithoutRocketUpgrade{},
+          folly::AsyncSocket::newSocket(
+              &clientEventBase,
+              folly::SocketAddress::makeFromPath(socketPath.view())))};
+  EXPECT_EQ(client.sync_getPid(), getpid());
+
+  server.stop();
+  ASSERT_TRUE(serverThread->waitForExit(5s));
+  ASSERT_NO_THROW(serverThread->throwIfServeFailed());
+  serverThread.reset();
+  ASSERT_TRUE(server.performCleanup());
+  testServer.reset();
+
+  EXPECT_THROW(
+      client.sync_getPid(), apache::thrift::transport::TTransportException);
+}
+
 TEST_F(EdenServerTest, RepeatedTakeoverFailuresDoNotBreakShutdownFuture) {
   auto& server = testServer().getServer();
   auto& faultInjector = server.getServerState()->getFaultInjector();
@@ -600,6 +1056,208 @@ TEST_F(
   ASSERT_EQ(std::future_status::ready, stopResult.wait_for(5s));
   EXPECT_TRUE(stopResult.get());
 }
+
+#ifdef __linux__
+namespace {
+
+class SingleBackingStoreFactory : public BackingStoreFactory {
+ public:
+  explicit SingleBackingStoreFactory(std::shared_ptr<BackingStore> store)
+      : store_{std::move(store)} {}
+
+  std::shared_ptr<BackingStore> createBackingStore(
+      BackingStoreType,
+      const CreateParams&) override {
+    return store_;
+  }
+
+ private:
+  std::shared_ptr<BackingStore> store_;
+};
+
+} // namespace
+
+// A server that can mount a checkout over a FakeFuse through EdenServer::mount,
+// so the mount runs the production shutdown path from the FsChannel through
+// mountFinished() to performCleanup().
+class EdenServerMountTest : public ::testing::Test {
+ protected:
+  EdenServerMountTest() {
+    GFLAGS_NAMESPACE::SetCommandLineOptionWithMode(
+        "enable_fault_injection", "true", GFLAGS_NAMESPACE::SET_FLAGS_VALUE);
+    FakeTreeBuilder builder;
+    builder.setFile("hello", "world\n");
+    backingStore_->putCommit(kCommit, builder.finalize(backingStore_, true))
+        ->setReady();
+    TestServer::Options options;
+    options.backingStoreFactory = &factory_;
+    testServer_ = std::make_unique<TestServer>(options);
+  }
+
+  TestServer& testServer() {
+    return *testServer_;
+  }
+
+  std::shared_ptr<EdenMount> mountCheckout() {
+    auto& server = testServer_->getServer();
+    auto clientDir = testServer_->getTmpDir() + "client"_pc;
+    ensureDirectoryExists(clientDir + "local"_pc);
+    mountPath_ = testServer_->getTmpDir() + "mount"_pc;
+    ensureDirectoryExists(mountPath_);
+    writeFile(
+        clientDir + "config.toml"_pc,
+        folly::ByteRange{folly::StringPiece{
+            "[repository]\npath = \"/repo\"\ntype = \"hg\"\n"}})
+        .value();
+    auto config =
+        CheckoutConfig::loadFromClientDirectory(mountPath_, clientDir);
+    config->setCheckedOutCommit(kCommit);
+
+    auto* privHelper =
+        dynamic_cast<FakePrivHelper*>(server.getServerState()->getPrivHelper());
+    privHelper->registerMount(mountPath_, fuse_);
+
+    // The mount's ImmediateFuture defers its work until it is driven; run it
+    // on the server's pool so the FUSE handshake below can happen meanwhile.
+    auto mountFuture = server.mount(std::move(config), /*readOnly=*/false)
+                           .semi()
+                           .via(server.getServerState()->getThreadPool().get());
+    // The mount opens the FUSE device partway through its start; answer the
+    // FUSE_INIT it then sends, as the kernel would.
+    auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (!fuse_->isStarted()) {
+      if (std::chrono::steady_clock::now() > deadline) {
+        throw std::runtime_error("the mount never opened its FUSE device");
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    fuse_->sendInitRequest();
+    fuse_->recvResponse();
+    return std::move(mountFuture).get(10s);
+  }
+
+  const AbsolutePath& mountPath() const {
+    return mountPath_;
+  }
+
+ private:
+  static inline const RootId kCommit{"1"};
+
+  std::shared_ptr<FakeBackingStore> backingStore_{
+      std::make_shared<FakeBackingStore>()};
+  SingleBackingStoreFactory factory_{backingStore_};
+  std::unique_ptr<TestServer> testServer_;
+  AbsolutePath mountPath_;
+  std::shared_ptr<FakeFuse> fuse_{std::make_shared<FakeFuse>()};
+};
+
+// `eden rm` unmounts a checkout, and `eden stop` arrives while the mount is
+// still shutting down: performCleanup() finds the mount in mountPoints_ and
+// waits on its unmount promise.
+TEST_F(EdenServerMountTest, StopWhileAMountIsShuttingDown) {
+  auto& server = testServer().getServer();
+  ScopedServerThread serverThread{server};
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return server.getStatus() == EdenServer::RunState::RUNNING;
+  }));
+  auto mount = mountCheckout();
+
+  // Hold the mount in SHUTTING_DOWN: its shutdown has started, and the
+  // continuation that erases it from mountPoints_ has not run.
+  auto& faultInjector = server.getServerState()->getFaultInjector();
+  faultInjector.injectBlock("mountShutdown", ".*");
+  auto unmountFuture = server.unmount(mountPath(), UnmountOptions{});
+  ASSERT_TRUE(driveMainEventBaseUntil(
+      server, [&] { return mount->getState() == MountState::SHUTTING_DOWN; }));
+  ASSERT_TRUE(faultInjector.waitUntilBlocked("mountShutdown", 5s));
+
+  server.stop();
+  ASSERT_TRUE(serverThread.waitForExit(5s));
+  serverThread.join();
+  ASSERT_NO_THROW(serverThread.throwIfServeFailed());
+  faultInjector.removeFault("mountShutdown", ".*");
+  faultInjector.unblock("mountShutdown", ".*");
+
+  // unmountAll() waits on the same promise the shutdown's continuation
+  // fulfills, so the stop waits for the shutdown and exits cleanly.
+  EXPECT_TRUE(server.performCleanup());
+  EXPECT_NO_THROW(std::move(unmountFuture).get(1s));
+}
+
+TEST_F(EdenServerMountTest, FailedUnmountClearsIntentionalMarker) {
+  auto& server = testServer().getServer();
+  auto mount = mountCheckout();
+  server.getServerState()->getFaultInjector().injectError(
+      "unmount",
+      ".*",
+      folly::make_exception_wrapper<std::runtime_error>("unmount failed"),
+      1);
+
+  EXPECT_THROW_RE(
+      server.unmount(mountPath(), UnmountOptions{})
+          .via(server.getMainEventBase())
+          .getVia(server.getMainEventBase()),
+      std::runtime_error,
+      "unmount failed");
+  EXPECT_FALSE(mount->getCheckoutConfig()->isIntentionallyUnmounted());
+  EXPECT_EQ(MountState::RUNNING, mount->getState());
+}
+
+TEST_F(EdenServerMountTest, DroppedUnmountCallbackDoesNotReschedule) {
+  class DroppingExecutor : public folly::Executor {
+   public:
+    void add(folly::Func task) override {
+      if (stopped) {
+        ++addedAfterStop;
+      } else {
+        tasks.push_back(std::move(task));
+      }
+    }
+
+    void drain() {
+      while (!tasks.empty()) {
+        auto ready = std::move(tasks);
+        tasks.clear();
+        for (auto& task : ready) {
+          task();
+        }
+      }
+    }
+
+    void stop() {
+      stopped = true;
+      tasks.clear();
+    }
+
+    bool stopped{false};
+    size_t addedAfterStop{0};
+    std::vector<folly::Func> tasks;
+  } executor;
+
+  auto& server = testServer().getServer();
+  auto mount = mountCheckout();
+  auto& faultInjector = server.getServerState()->getFaultInjector();
+  faultInjector.injectBlock("mountShutdown", ".*");
+  auto unmount = server.unmount(mountPath(), UnmountOptions{}).via(&executor);
+  executor.drain();
+  ASSERT_TRUE(driveMainEventBaseUntil(
+      server, [&] { return mount->getState() == MountState::SHUTTING_DOWN; }));
+  ASSERT_TRUE(faultInjector.waitUntilBlocked("mountShutdown", 5s));
+
+  faultInjector.removeFault("mountShutdown", ".*");
+  faultInjector.unblock("mountShutdown", ".*");
+  ASSERT_TRUE(driveMainEventBaseUntil(
+      server, [&] { return server.getAllMountPoints().empty(); }));
+  EXPECT_TRUE(unmount.isReady());
+
+  // A stopped pool discards queued callbacks rather than executing them.
+  // Destroying one must not enqueue another callback onto that same pool.
+  executor.stop();
+  EXPECT_EQ(0, executor.addedAfterStop);
+  ASSERT_TRUE(unmount.isReady());
+  EXPECT_NO_THROW(std::move(unmount).get());
+}
+#endif
 
 TEST(EdenServerMountHealthTest, OnlyRunningMountsAreProbed) {
   EXPECT_TRUE(EdenServer::shouldProbeMountHealth(MountState::RUNNING));

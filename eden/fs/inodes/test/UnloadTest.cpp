@@ -9,11 +9,13 @@
 
 #include <thread>
 
+#include <folly/chrono/Conv.h>
 #include <folly/test/TestUtils.h>
 #include <gtest/gtest.h>
 
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/fs/inodes/InodeMap.h"
+#include "eden/fs/inodes/InodeTimestamps.h"
 #include "eden/fs/inodes/ServerState.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/store/ObjectFetchContext.h"
@@ -64,10 +66,18 @@ TYPED_TEST(UnloadTest, inodesAreUnloaded) {
   auto code_ino = load("src/code.c"_relpath);
   auto test_ino = load("test/test.c"_relpath);
 
-  EXPECT_TRUE(inodeMap->lookupInode(readme_ino).get());
-  EXPECT_TRUE(inodeMap->lookupInode(wholefish_ino).get());
-  EXPECT_TRUE(inodeMap->lookupInode(code_ino).get());
-  EXPECT_TRUE(inodeMap->lookupInode(test_ino).get());
+  EXPECT_TRUE(
+      inodeMap->lookupInode(readme_ino, ObjectFetchContext::getNullContext())
+          .get());
+  EXPECT_TRUE(
+      inodeMap->lookupInode(wholefish_ino, ObjectFetchContext::getNullContext())
+          .get());
+  EXPECT_TRUE(
+      inodeMap->lookupInode(code_ino, ObjectFetchContext::getNullContext())
+          .get());
+  EXPECT_TRUE(
+      inodeMap->lookupInode(test_ino, ObjectFetchContext::getNullContext())
+          .get());
 
   // Now decrement the FUSE refcounts.
   inodeMap->decFsRefcount(readme_ino, 1);
@@ -155,10 +165,14 @@ TEST(UnloadAfterAsyncLoad, unloadRacesDeterministicallyWithInodeLoadComplete) {
           .semi()
           .via(testMount.getServerExecutor().get());
 
-  // Complete the backing store load on a background thread. The detached
-  // executor is QueuedImmediateExecutor, so inodeLoadComplete runs inline
-  // on this thread and blocks on the fault injection checkpoint.
-  std::thread bgThread([&] { builder.setReady("dir"); });
+  // Complete the backing store load on a background thread. The tree fetch
+  // resumes on the server executor, and draining it here runs
+  // inodeLoadComplete on this thread, where it blocks on the fault
+  // injection checkpoint.
+  std::thread bgThread([&] {
+    builder.setReady("dir");
+    testMount.drainServerExecutor();
+  });
 
   // Wait for inodeLoadComplete to hit the fault point. At this point:
   // - The inode is in loadedInodes_ and the DirEntry
@@ -187,9 +201,7 @@ TEST(UnloadAfterAsyncLoad, unloadRacesDeterministicallyWithInodeLoadComplete) {
   EXPECT_NE(kRootNodeId, dirInode->getNodeId());
 }
 
-TEST(
-    UnloadLastAccessedBefore,
-    unloadsInodesByLastFsRequestTimeNotMetadataAtime) {
+TEST(UnloadLastAccessedBefore, unloadsInodesByLastGcRefTimeNotMetadataAtime) {
   FakeTreeBuilder builder;
   builder.setFile("old.txt", "old contents");
   builder.setFile("new.txt", "new contents");
@@ -198,45 +210,39 @@ TEST(
   const auto* edenMount = testMount.getEdenMount().get();
   auto inodeMap = edenMount->getInodeMap();
 
-  // Load both files and give them FUSE references so they stay loaded
+  // Load both files. They stay loaded once the InodePtrs are released.
   auto oldInode = testMount.getInode("old.txt"_relpath);
   auto newInode = testMount.getInode("new.txt"_relpath);
-  auto oldIno = oldInode->getNodeId();
   auto newIno = newInode->getNodeId();
-  oldInode->incFsRefcount();
-  newInode->incFsRefcount();
 
-  // Advance the clock and touch only "new.txt" via updateLastFsRequestTime.
-  // Both inodes start with lastFsRequestTime from mount creation.
-  // After this, new.txt's lastFsRequestTime is 120s later than old.txt's.
+  // Advance the clock and touch only "new.txt" via markGcRef.
+  // Both inodes start with lastGcRefTime from mount creation.
+  // After this, new.txt's lastGcRefTime is 120s later than old.txt's.
   testMount.getClock().advance(120s);
-  newInode->updateLastFsRequestTime();
+  newInode->markGcRef();
 
-  // Use a cutoff between old and new lastFsRequestTime values.
-  auto cutoff = oldInode->getLastFsRequestTime().toTimespec();
+  // Use a cutoff between old and new lastGcRefTime values.
+  auto cutoff = oldInode->getLastGcRefTime().toTimespec();
   cutoff.tv_sec += 60;
 
-  // Release InodePtrs (FUSE refcount keeps them alive in InodeMap)
   oldInode.reset();
   newInode.reset();
-
-  // Drop FUSE references so inodes are eligible for unloading
-  inodeMap->decFsRefcount(oldIno, 1);
-  inodeMap->decFsRefcount(newIno, 1);
 
   auto countsBefore = inodeMap->getInodeCounts();
 
   auto rootInode = edenMount->getRootInode();
   auto unloaded = rootInode->unloadChildrenLastAccessedBefore(cutoff);
 
-  // old.txt (lastFsRequestTime < cutoff) should be unloaded.
-  // new.txt (lastFsRequestTime > cutoff) should remain loaded.
+  // old.txt (lastGcRefTime < cutoff) should be unloaded.
+  // new.txt (lastGcRefTime > cutoff) should remain loaded.
   EXPECT_GE(unloaded, 1);
   auto countsAfter = inodeMap->getInodeCounts();
   EXPECT_LT(countsAfter.fileCount, countsBefore.fileCount);
 
   // new.txt should still be loadable (still in loaded inodes)
-  EXPECT_TRUE(inodeMap->lookupInode(newIno).get());
+  EXPECT_TRUE(
+      inodeMap->lookupInode(newIno, ObjectFetchContext::getNullContext())
+          .get());
 }
 
 TEST(UnloadLastAccessedBefore, cancellationStopsUnloading) {
@@ -266,7 +272,7 @@ TEST(UnloadLastAccessedBefore, cancellationStopsUnloading) {
       edenMount->getRootInode()->unloadChildrenLastAccessedBefore(cutoff), 0);
 }
 
-TEST(UnloadLastAccessedBefore, preservesLastFsRequestTimeAcrossReload) {
+TEST(UnloadLastAccessedBefore, preservesLastGcRefTimeAcrossReload) {
   FakeTreeBuilder builder;
   builder.setFile("file.txt", "contents");
   TestMount testMount{builder};
@@ -276,7 +282,7 @@ TEST(UnloadLastAccessedBefore, preservesLastFsRequestTimeAcrossReload) {
   auto inode = testMount.getInode("file.txt"_relpath);
   auto inodeNumber = inode->getNodeId();
   inode->incFsRefcount();
-  auto lastFsRequestTime = inode->getLastFsRequestTime();
+  auto lastGcRefTime = inode->getLastGcRefTime();
 
   testMount.getClock().advance(120s);
   auto cutoff = testMount.getClock().getRealtime();
@@ -287,8 +293,10 @@ TEST(UnloadLastAccessedBefore, preservesLastFsRequestTimeAcrossReload) {
   EXPECT_FALSE(inodeMap->lookupLoadedInode(inodeNumber));
   EXPECT_GT(inodeMap->getInodeCounts().unloadedInodeCount, 0);
 
-  auto reloaded = inodeMap->lookupInode(inodeNumber).get();
-  EXPECT_EQ(lastFsRequestTime, reloaded->getLastFsRequestTime());
+  auto reloaded =
+      inodeMap->lookupInode(inodeNumber, ObjectFetchContext::getNullContext())
+          .get();
+  EXPECT_EQ(lastGcRefTime, reloaded->getLastGcRefTime());
 }
 
 TEST(UnloadLastAccessedBefore, getsUnloadedChildrenForGcInOneBatch) {
@@ -307,7 +315,7 @@ TEST(UnloadLastAccessedBefore, getsUnloadedChildrenForGcInOneBatch) {
   auto otherNumber = other->getNodeId();
   file->incFsRefcount();
   other->incFsRefcount();
-  auto expectedLastFsRequestTime = file->getLastFsRequestTime();
+  auto expectedLastGcRefTime = file->getLastGcRefTime();
 
   testMount.getClock().advance(120s);
   auto cutoff = testMount.getClock().getRealtime();
@@ -324,7 +332,7 @@ TEST(UnloadLastAccessedBefore, getsUnloadedChildrenForGcInOneBatch) {
 
   ASSERT_EQ(1, children.size());
   EXPECT_EQ("file.txt"_pc, children.front().name);
-  EXPECT_EQ(expectedLastFsRequestTime, children.front().lastFsRequestTime);
+  EXPECT_EQ(expectedLastGcRefTime, children.front().lastGcRefTime);
   EXPECT_EQ(1, children.front().numFsReferences);
 }
 
@@ -354,6 +362,75 @@ TEST(UnloadUnreferencedByFuse, inodesReferencedByFuseAreNotUnloaded) {
   EXPECT_EQ(2, counts.treeCount);
   EXPECT_EQ(1, counts.fileCount);
   EXPECT_EQ(0, counts.unloadedInodeCount);
+}
+
+TEST(UnloadUnreferencedByFuse, cutoffKeepsRecentlyReferencedInodes) {
+  FakeTreeBuilder builder;
+  builder.mkdir("src");
+  builder.setFile("src/file.txt", "contents");
+  // Start the clock well after the epoch, which a released reference's zero
+  // time and the default clock would otherwise share.
+  TestMount testMount;
+  testMount.getClock().set(
+      std::chrono::system_clock::time_point{} +
+      std::chrono::hours{24 * 365 * 50});
+  testMount.initialize(builder);
+
+  const auto* edenMount = testMount.getEdenMount().get();
+  auto inodeMap = edenMount->getInodeMap();
+  // Loaded the way a Thrift request loads it: no filesystem reference.
+  testMount.getInode("src/file.txt"_relpath);
+  auto now = testMount.getClock().getTimePoint();
+
+  // Nothing was referenced more than an hour ago.
+  EXPECT_EQ(
+      0,
+      edenMount->getRootInode()->unloadChildrenUnreferencedByFs(
+          {}, EdenTimestamp{folly::to<timespec>(now - 1h)}));
+  auto counts = inodeMap->getInodeCounts();
+  EXPECT_EQ(3, counts.treeCount);
+  EXPECT_EQ(5, counts.fileCount);
+
+  // Everything was referenced before an hour from now.
+  EXPECT_GT(
+      edenMount->getRootInode()->unloadChildrenUnreferencedByFs(
+          {}, EdenTimestamp{folly::to<timespec>(now + 1h)}),
+      0);
+  counts = inodeMap->getInodeCounts();
+  EXPECT_EQ(1, counts.treeCount);
+  EXPECT_EQ(0, counts.fileCount);
+}
+
+TEST(UnloadUnreferencedByFuse, kernelReleaseMakesInodeEligibleDespiteCutoff) {
+  FakeTreeBuilder builder;
+  builder.mkdir("src");
+  builder.setFile("src/file.txt", "contents");
+  TestMount testMount;
+  testMount.getClock().set(
+      std::chrono::system_clock::time_point{} +
+      std::chrono::hours{24 * 365 * 50});
+  testMount.initialize(builder);
+
+  const auto* edenMount = testMount.getEdenMount().get();
+  auto inodeMap = edenMount->getInodeMap();
+  auto inode = testMount.getInode("src/file.txt"_relpath);
+  auto inodeNumber = inode->getNodeId();
+  inode->incFsRefcount();
+  inode.reset();
+  inodeMap->decFsRefcount(inodeNumber, 1);
+  EXPECT_EQ(
+      EdenTimestamp{timespec{}},
+      testMount.getInode("src/file.txt"_relpath)->getLastGcRefTime());
+
+  auto now = testMount.getClock().getTimePoint();
+  auto before = inodeMap->getInodeCounts();
+  EXPECT_EQ(
+      1,
+      edenMount->getRootInode()->unloadChildrenUnreferencedByFs(
+          {}, EdenTimestamp{folly::to<timespec>(now - 1h)}));
+  auto after = inodeMap->getInodeCounts();
+  EXPECT_EQ(before.treeCount, after.treeCount);
+  EXPECT_EQ(before.fileCount - 1, after.fileCount);
 }
 
 TEST(UnloadUnreferencedByFuse, cancellationStopsUnloading) {

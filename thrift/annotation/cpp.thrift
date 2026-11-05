@@ -267,6 +267,22 @@ struct FieldInterceptor {
 struct UseOpEncode {}
 
 /**
+ * Enables compilation of C++ support for decoding RPC messages stored in
+ * apache::thrift::IOBufChain:
+ * - Requests sent by clients and received by servers.
+ * - Responses sent by servers and received by clients, for RPCs that return
+ *   one response.
+ *
+ * Applies to services defined in this IDL file.
+ *
+ * This annotation only compiles in support. Runtime use requires configuring
+ * the receiving Rocket connection to use the "iobuf_chain" frame parser.
+ * IOBufChain decoding currently supports only the Binary protocol.
+ */
+@scope.Program
+struct EnableIOBufChainSupport {}
+
+/**
  * Enum in C++ by default uses signed 32 bit integer. There is no need to specify
  * underlying type for signed 32 bit integer.
  * 64-bit is not supported to avoid truncation since enums are sent as 32-bit integers over the wire.
@@ -438,12 +454,13 @@ struct EnableCustomTypeOrdering {}
 struct GenerateServiceMethodDecorator {}
 
 /**
- * When applied to a service, generates only a FastClient instead of the
+ * When applied to a service, generates a FastClient in addition to the
  * standard AsyncClient. The FastClient uses the fast_thrift pipeline for
  * lower latency serialization and deserialization.
  *
- * Only request/response functions are supported. Functions using streams,
- * sinks, oneway, or interactions are skipped.
+ * The FastClient supports only request/response functions. Functions using
+ * streams, sinks, oneway, or interactions are skipped by the FastClient and
+ * remain available on the AsyncClient.
  */
 @scope.Service
 struct FastClient {}
@@ -510,3 +527,29 @@ struct DeclareEqualToSpecialization {}
 struct AllowCustomDefaultInAllocCtor {
   1: bool legacy_ignore_custom_default;
 }
+
+/**
+ * Allows the unstructured `cpp.allocator` annotation on this union, which
+ * unions otherwise reject.
+ *
+ * Internal and experimental: Thrift's own unit tests use it while support for
+ * `cpp.allocator` unions is incomplete. Do not use it elsewhere; it may change
+ * or go away without notice.
+ */
+@scope.Union
+@thrift.Experimental
+struct InternalExperimentalAllowAllocatorOnUnion {}
+
+/**
+ * Gives a string, binary or container field or typedef a PMR allocator-aware
+ * C++ type, such as `std::pmr::string` or `std::pmr::vector`, that can allocate
+ * from a `std::pmr::memory_resource` such as an arena. On a field, the field
+ * also allocates from its struct's memory resource. On a struct or union, it
+ * applies to every field it could annotate. Other languages ignore it.
+ */
+@scope.Field
+@scope.Struct
+@scope.Union
+@scope.Typedef
+@thrift.Experimental
+struct Arena {}

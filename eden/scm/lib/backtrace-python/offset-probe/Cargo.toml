@@ -3,11 +3,13 @@
 [package]
 name = "sapling-backtrace-python-offset-probe"
 version = "0.1.0"
+authors = ["Meta Source Control Team <sourcecontrol-dev@meta.com>"]
 edition = "2024"
 description = "Attmpt to obtain raw offsets used to extract Python frames. Intended to be used at build time."
 homepage = "https://sapling-scm.com/"
 repository = "https://github.com/facebook/sapling"
 license = "MIT"
+exclude = ["BUCK"]
 
 [lib]
 name = "backtrace_python_offset_probe"

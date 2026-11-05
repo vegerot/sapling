@@ -147,10 +147,8 @@ class MountTable(abc.ABC):
                 proc.join(timeout=kMountStaleSecondsTimeout)
             # if the process is alive at this point the only thing that we
             # can hope to kill it is the umount that we will trigger later.
-            # But we can still close all the resources the process might be
-            # holding on to to prevent deadlocks and such.
-            if proc.is_alive():
-                proc.close()
+            # Process.close() refuses a live process, so leave it to the
+            # interpreter's exit handlers.
             raise error
 
     def check_path_access(self, path: bytes, mount_type: bytes) -> None:
@@ -201,6 +199,10 @@ class MountTable(abc.ABC):
         "Creates a bind mount from source_path to dest_path."
 
 
+def _decode_mount_table_escapes(field: bytes) -> bytes:
+    return re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m.group(1), 8)]), field)
+
+
 def parse_mtab(contents: bytes) -> List[MountInfo]:
     mounts = []
     for line in contents.splitlines():
@@ -211,7 +213,11 @@ def parse_mtab(contents: bytes) -> List[MountInfo]:
             continue
         device, mount_point, vfstype, opts, freq, passno = entries
         mounts.append(
-            MountInfo(device=device, mount_point=mount_point, vfstype=vfstype)
+            MountInfo(
+                device=_decode_mount_table_escapes(device),
+                mount_point=_decode_mount_table_escapes(mount_point),
+                vfstype=vfstype,
+            )
         )
     return mounts
 

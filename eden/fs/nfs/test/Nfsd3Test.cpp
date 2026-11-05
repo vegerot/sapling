@@ -65,18 +65,25 @@ class FakeNfsDispatcher : public NfsDispatcher {
     return st;
   }
 
-  ImmediateFuture<folly::Unit> updateLastFsRequestTime(
-      InodeNumber /*ino*/) override {
+  ImmediateFuture<folly::Unit> markGcRef(
+      InodeNumber /*ino*/,
+      const ObjectFetchContextPtr& /*context*/) override {
     return folly::unit;
   }
 
-  // NfsDispatcher's operations are all pure virtual, but the auth tests
-  // only ever reach getattr, so every other operation is a one-line
-  // ENOENT stub.
   using Ino = InodeNumber;
   using Name = PathComponent;
   using Ctx = const ObjectFetchContextPtr&;
   using LookupRes = std::tuple<InodeNumber, struct stat>;
+
+  // The directory is always empty, so a lookup is a negative lookup.
+  ImmediateFuture<std::optional<LookupRes>> lookup(Ino, Name, Ctx) override {
+    return std::optional<LookupRes>{};
+  }
+
+  // NfsDispatcher's operations are all pure virtual, but the tests only
+  // ever reach getattr and lookup, so every other operation is a one-line
+  // ENOENT stub.
 #define ENOENT_STUB(name, Res, ...)                          \
   ImmediateFuture<Res> name(__VA_ARGS__) override {          \
     return makeImmediateFuture<Res>(                         \
@@ -84,7 +91,6 @@ class FakeNfsDispatcher : public NfsDispatcher {
   }
   ENOENT_STUB(setattr, SetattrRes, Ino, DesiredMetadata, Ctx)
   ENOENT_STUB(getParent, InodeNumber, Ino, Ctx)
-  ENOENT_STUB(lookup, LookupRes, Ino, Name, Ctx)
   ENOENT_STUB(readlink, std::string, Ino, Ctx)
   ENOENT_STUB(read, ReadRes, Ino, size_t, FileOffset, Ctx)
   ENOENT_STUB(
@@ -134,7 +140,6 @@ struct Nfsd3Test : ::testing::Test {
         std::move(dispatcher),
         &straceLogger_,
         std::make_shared<ProcessInfoCache>(),
-        /*fsEventLogger=*/nullptr,
         std::make_shared<EdenFsEventsLogger>(nullptr),
         *errorLogger_,
         /*requestTimeout=*/std::chrono::seconds{30},
@@ -355,6 +360,17 @@ struct Nfsd3Test : ::testing::Test {
   std::unique_ptr<Nfsd3, FsChannelDeleter> nfsd3_;
   int clientFd_ = -1;
 };
+
+TEST_F(Nfsd3Test, lookup_of_a_missing_name_is_a_negative_reply) {
+  const auto before = getCounter("nfs.error.noent.sum");
+  auto reply = sendLookup(1, userCred());
+  expectAcceptedSuccess(reply);
+  // The NFS status follows the RPC accept_stat at offset 24.
+  EXPECT_EQ(
+      readBigEndianU32(reply, 28),
+      static_cast<uint32_t>(nfsstat3::NFS3ERR_NOENT));
+  EXPECT_EQ(getCounter("nfs.error.noent.sum") - before, 1);
+}
 
 TEST_F(Nfsd3Test, default_config_counts_uid0_and_gid0) {
   auto uidBefore = getCounter("nfs.access.uid.0.sum");
@@ -676,24 +692,22 @@ TEST_F(Nfsd3Test, set_can_include_read) {
 TEST(NfsAccessRateLimiterTest, budget_refills_over_time) {
   NfsAccessRateLimiter limiter;
 
-  // Burst capacity: `count` accesses pass at one instant, further ones are
-  // rejected. (The token bucket accrues from time zero, so start the
-  // synthetic clock late enough for a full initial budget.)
+  // Burst capacity is available even at the clock's epoch.
   EXPECT_TRUE(
-      limiter.allow(/*count=*/2, /*windowSeconds=*/60, /*nowSeconds=*/1000.0));
-  EXPECT_TRUE(limiter.allow(2, 60, 1000.0));
-  EXPECT_FALSE(limiter.allow(2, 60, 1000.0));
+      limiter.allow(/*count=*/2, /*windowSeconds=*/60, /*nowSeconds=*/0.0));
+  EXPECT_TRUE(limiter.allow(2, 60, 0.0));
+  EXPECT_FALSE(limiter.allow(2, 60, 0.0));
 
   // The budget refills continuously at count/window: one window later the
   // full burst is available again.
-  EXPECT_TRUE(limiter.allow(2, 60, 1060.0));
-  EXPECT_TRUE(limiter.allow(2, 60, 1060.0));
-  EXPECT_FALSE(limiter.allow(2, 60, 1060.0));
+  EXPECT_TRUE(limiter.allow(2, 60, 60.0));
+  EXPECT_TRUE(limiter.allow(2, 60, 60.0));
+  EXPECT_FALSE(limiter.allow(2, 60, 60.0));
 
   // Degenerate configs: zero count admits nothing, zero window admits
   // everything.
-  EXPECT_FALSE(limiter.allow(0, 60, 1120.0));
-  EXPECT_TRUE(limiter.allow(2, 0, 1120.0));
+  EXPECT_FALSE(limiter.allow(0, 60, 120.0));
+  EXPECT_TRUE(limiter.allow(2, 0, 120.0));
 }
 
 TEST(InvalidatingInodesTest, removingAnInvalidationReleasesItsForgetCallback) {

@@ -13,18 +13,18 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:file",
+        "fbsource//xplat/folly:file_util",
+        "fbsource//xplat/folly/init:init",
+        "fbsource//xplat/folly/logging:logging",
+        "fbsource//xplat/folly/testing:test_util",
         "//eden/common/telemetry:log_info",
+        "//eden/common/testharness:scoped_env_var",
         "//eden/common/utils:file_utils",
         "//eden/common/utils:process",
-        "//eden/common/utils/test:scoped_env_var",
         "//eden/fs/privhelper:interface",
         "//eden/fs/service:startup_logger",
         "//eden/fs/service:startup_status_subscriber",
-        "//folly:file",
-        "//folly:file_util",
-        "//folly/init:init",
-        "//folly/logging:logging",
-        "//folly/testing:test_util",
     ],
 )
 
@@ -63,11 +63,11 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/io/async/test:util",
+        "fbsource//xplat/folly/logging:logging",
+        "fbsource//xplat/folly/logging/test:test_handler",
         "//eden/fs/service:server",
         "//eden/fs/testharness:test_server",
-        "//folly/io/async/test:util",
-        "//folly/logging:logging",
-        "//folly/logging/test:test_handler",
         "//thrift/lib/cpp2:server",
     ],
 )
@@ -83,6 +83,11 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:portability",
+        "fbsource//xplat/folly:range",
+        "fbsource//xplat/folly/coro:gtest_helpers",
+        "fbsource//xplat/folly/coro:task",
+        "fbsource//xplat/folly/executors:manual_executor",
         "//eden/fs/inodes:inodes",
         "//eden/fs/service:thrift-cpp2-types",
         "//eden/fs/service:thrift_glob_impl",
@@ -93,8 +98,29 @@ cpp_unittest(
         "//eden/fs/testharness:test_server_state",
         "//eden/fs/utils:matcher",
         "//fb303:service_data",
-        "//folly/coro:gtest_helpers",
-        "//folly/coro:task",
+    ],
+)
+
+cpp_unittest(
+    name = "glob_recurse_lifetime_test",
+    srcs = ["GlobRecurseLifetimeTest.cpp"],
+    network_access = network_access_utils.none(),
+    supports_static_listing = False,
+    deps = [
+        "fbsource//third-party/fmt:fmt",
+        "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/coro:invoke",
+        "fbsource//xplat/folly/coro:task",
+        "fbsource//xplat/folly/executors:cpu_thread_pool_executor",
+        "fbsource//xplat/folly/executors/thread_factory:named_thread_factory",
+        "fbsource//xplat/folly/futures:core",
+        "//eden/common/utils:fault_injector",
+        "//eden/fs/inodes:inodes",
+        "//eden/fs/service:thrift-cpp2-types",
+        "//eden/fs/service:thrift_glob_impl",
+        "//eden/fs/store:context",
+        "//eden/fs/testharness:fake_backing_store_and_tree_builder",
+        "//eden/fs/testharness:test_mount",
     ],
 )
 
@@ -117,9 +143,9 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:cancellation_token",
+        "fbsource//xplat/folly/futures:core",
         "//eden/fs/service:server",
-        "//folly:cancellation_token",
-        "//folly/futures:core",
     ],
 )
 
@@ -148,9 +174,9 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/fmt:fmt",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:file_util",
+        "fbsource//xplat/folly/testing:test_util",
         "//eden/fs/service:cgroup_file_cache_reclaimer",
-        "//folly:file_util",
-        "//folly/testing:test_util",
     ],
 )
 
@@ -164,10 +190,50 @@ cpp_unittest(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:cancellation_token",
+        "fbsource//xplat/folly:file_util",
+        "fbsource//xplat/folly/testing:test_util",
         "//eden/fs/service:pin_scan_runner",
-        "//folly:cancellation_token",
-        "//folly:file_util",
-        "//folly/testing:test_util",
+    ],
+)
+
+cpp_unittest(
+    name = "heartbeat_manager_test",
+    srcs = ["HeartbeatManagerTest.cpp"],
+    compatible_with = [
+        "ovr_config//os:linux",
+        "ovr_config//os:macos",
+    ],
+    network_access = network_access_utils.none(),
+    deps = [
+        "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:file_util",
+        "fbsource//xplat/folly/executors:manual_executor",
+        "fbsource//xplat/folly/testing:test_util",
+        "//eden/common/utils:path",
+        "//eden/fs/inodes/test:overlay_test_util",
+        "//eden/fs/service:server",
+    ],
+)
+
+cpp_unittest(
+    name = "thrift_get_object_impl_test",
+    srcs = ["ThriftGetObjectImplTest.cpp"],
+    compatible_with = [
+        "ovr_config//os:linux",
+        "ovr_config//os:windows",
+    ],
+    network_access = network_access_utils.none(),
+    supports_static_listing = False,
+    deps = [
+        "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:try",
+        "//eden/common/utils:case_sensitivity",
+        "//eden/fs/model:model",
+        "//eden/fs/service:thrift-cpp2-types",
+        "//eden/fs/service:thrift_get_object_impl",
+        "//eden/fs/testharness:fake_backing_store_and_tree_builder",
+        "//eden/fs/testharness:test_mount",
     ],
 )
 
@@ -178,9 +244,10 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:file_util",
+        "fbsource//xplat/folly/testing:test_util",
         "//eden/common/utils:path",
         "//eden/fs/service:server",
-        "//folly/testing:test_util",
     ],
 )
 
@@ -191,16 +258,16 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:file",
+        "fbsource//xplat/folly:file_util",
+        "fbsource//xplat/folly/futures:core",
+        "fbsource//xplat/folly/portability:fcntl",
+        "fbsource//xplat/folly/portability:unistd",
+        "fbsource//xplat/folly/testing:test_util",
         "//eden/common/utils:path",
         "//eden/fs/config:config",
         "//eden/fs/privhelper:interface",
         "//eden/fs/service:server",
-        "//folly:file",
-        "//folly:file_util",
-        "//folly/futures:core",
-        "//folly/portability:fcntl",
-        "//folly/portability:unistd",
-        "//folly/testing:test_util",
     ],
 )
 
@@ -211,23 +278,34 @@ cpp_unittest(
     network_access = network_access_utils.all(),
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:cancellation_token",
+        "fbsource//xplat/folly:exception_wrapper",
+        "fbsource//xplat/folly:executor",
+        "fbsource//xplat/folly:scope_guard",
+        "fbsource//xplat/folly/io:iobuf",
+        "fbsource//xplat/folly/io/async:async_base",
+        "fbsource//xplat/folly/io/async:async_socket",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/common/utils:fault_injector",
+        "//eden/common/utils:file_utils",
         "//eden/common/utils:utils",
+        "//eden/fs/config:config",
         "//eden/fs/inodes:inodes",
+        "//eden/fs/model:model",
         "//eden/fs/nfs:mountd_rpc",
         "//eden/fs/nfs:nfs_server",
         "//eden/fs/service:server",
+        "//eden/fs/service:thrift-cpp2-clients",
         "//eden/fs/store:context",
         "//eden/fs/takeover:takeover",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:fake_fuse",
+        "//eden/fs/testharness:fake_privhelper",
         "//eden/fs/testharness:test_mount",
         "//eden/fs/testharness:test_server",
         "//eden/fs/testharness:test_server_state",
-        "//folly:cancellation_token",
-        "//folly:exception_wrapper",
-        "//folly:scope_guard",
-        "//folly/io:iobuf",
+        "//thrift/lib/cpp/transport:transport-core",
+        "//thrift/lib/cpp2/async:header_client_channel",
     ],
     external_deps = [
         "gflags",

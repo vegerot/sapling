@@ -65,7 +65,6 @@ from .. import (
     scmutil,
     server,
     sshserver,
-    streamclone,
     templatekw,
     templater,
     ui as uimod,
@@ -128,7 +127,7 @@ globalopts = cmdutil._typedflags(
             "y",
             "noninteractive",
             False,
-            _("do not prompt, automatically pick the first choice for all prompts"),
+            _("do not prompt, use the default answer for all prompts"),
         ),
         ("q", "quiet", False, _("suppress output")),
         ("v", "verbose", False, _("enable additional output")),
@@ -1535,13 +1534,6 @@ def bundle(ui, repo, fname, dest=None, **opts):
             hint=_("see '@prog@ help bundlespec' for supported values for --type"),
         )
 
-    # Packed bundles are a pseudo bundle format for now.
-    if cgversion == "s1":
-        raise error.Abort(
-            _('packed bundles cannot be produced by "@prog@ bundle"'),
-            hint=_("use '@prog@ debugcreatestreamclonebundle'"),
-        )
-
     if opts.get("all"):
         if dest:
             raise error.Abort(_("--all is incompatible with specifying a destination"))
@@ -1784,7 +1776,15 @@ def _docommit(ui, repo, *pats, **opts):
     if opts.get(r"interactive"):
         opts.pop(r"interactive")
         ret = cmdutil.dorecord(
-            ui, repo, commit, None, False, cmdutil.recordfilter, *pats, **opts
+            ui,
+            repo,
+            commit,
+            None,
+            False,
+            cmdutil.recordfilter,
+            *pats,
+            inmemory=True,
+            **opts,
         )
         # ret can be 0 (no changes to record) or the value returned by
         # commit(), 1 if nothing changed or None on success.
@@ -2271,9 +2271,7 @@ def diff(ui, repo, *pats, **opts):
     to generate diffs in the git extended diff format. For more information,
     see :prog:`help diffs`.
 
-    ``--from-path`` and ``--to-path`` allow diffing between directories.
-    Files outside ``--from-path`` in the left side are ignored. See
-    :prog:`help directorybranching` for more information.
+    To compare directories, use :prog:`subtree diff`.
 
     .. note::
 
@@ -3921,7 +3919,13 @@ def locate(ui, repo, *pats, **opts):
             "t",
             "mutation",
             False,
-            _("use mutation history for DAG and diffs (EXPERIMENTAL)"),
+            _("link the revisions by mutation instead of by parent"),
+        ),
+        (
+            "",
+            "show-missing",
+            False,
+            _("with --mutation, show commits not available locally"),
         ),
     ]
     + walkopts,
@@ -3937,9 +3941,16 @@ def log(ui, repo, *pats, **opts):
     project.
 
     If no revision range is specified, the default revision range is the
-    current commit and all of its ancestors (``::.``). The experimental
-    ``--mutation`` option changes this default to the current commit and its
-    mutation predecessors (``predecessors(.)``).
+    current commit and all of its ancestors (``::.``).
+
+    The ``--mutation`` option links the revisions by mutation (amend,
+    rebase, fold, split and other rewrites) rather than by parent, and shows
+    patches and ``--stat`` against the commit each one was created from. Its
+    default revision range is the mutation history of the current commit
+    (``mutationhistory(.)``); use ``-r 'mutationhistory(REV)'`` for another
+    commit's, or :prog:`sl -t REV`. Commits that are not shown are skipped,
+    with a dashed line over them; ``--show-missing`` also shows the commits
+    not available locally.
 
     File history is shown without following the rename or copy
     history of files. To follow file history across renames and
@@ -3955,11 +3966,10 @@ def log(ui, repo, *pats, **opts):
     With the ``--graph`` option, revisions are shown as an ASCII art
     graph with the most recent commit at the top. The graph nodes
     are depicted as follows: **o** is a commit, **@** is a working
-    directory parent, **x** is obsolete, and **+** represents a fork
-    where the commit from the lines below is a parent of the **o**
-    merge on the same line. Paths in the graph are represented with
-    **|**, **/** and so forth. **:** in place of a **|** indicates
-    one or more revisions in a path are omitted.
+    directory parent, **x** is obsolete, and **v** is obsolete and diverged
+    (it was replaced by more than one visible version). Paths in the graph
+    are represented with **|**, **/** and so forth. **:** in place of a
+    **|** indicates one or more revisions in a path are omitted.
 
 
     .. container:: verbose
@@ -4073,6 +4083,9 @@ def log(ui, repo, *pats, **opts):
     if opts.get("follow") and opts.get("rev"):
         opts["rev"] = [revsetlang.formatspec("reverse(::%lr)", opts.get("rev"))]
         del opts["follow"]
+
+    if opts.get("show_missing") and not (opts.get("mutation") and opts.get("graph")):
+        raise error.Abort(_("--show-missing requires --mutation and --graph"))
 
     scmutil.maybe_show_path_typo_hint(ui, repo, pats, rev=opts.get("rev"))
 
@@ -4893,6 +4906,14 @@ def push(ui, repo, dest=None, **opts):
 
     Add ``--create`` to create the remote bookmark if it doesn't already exist.
 
+    Add ``--no-rebase`` to move the remote bookmark to exactly the pushed
+    commit instead of rebasing the commit onto the remote bookmark, which
+    ``--rebase`` (the default) does. The move must be a fast-forward unless
+    ``-f/--force`` is given or the ``NON_FAST_FORWARD=true`` push var is set.
+    ``--rebase`` and ``--no-rebase`` require ``--to``. Git pushes never
+    rebase, so ``--no-rebase`` changes nothing for Git repos and ``--rebase``
+    is an error.
+
     The ``-f/--force`` flag allows non-fast-forward pushes.
 
     If DESTINATION is omitted, the default path will be used. See
@@ -5419,6 +5440,11 @@ def resolve(ui, repo, *pats, **opts):
                 ms.recordactions()
                 if not proceed:
                     return 1
+                # conclude may re-mark files unresolved, so report them
+                if mergemod.recountunresolvedafterconclude(ui) and list(
+                    ms.unresolved()
+                ):
+                    ret = 1
 
     # Nudge users into finishing an unfinished operation
     unresolvedf = list(ms.unresolved())
@@ -5684,7 +5710,7 @@ def serve(ui, repo, **opts):
             "t",
             "mutation",
             False,
-            _("use mutation history for diffs (EXPERIMENTAL)"),
+            _("diff against the mutation predecessor"),
         ),
     ]
     + diffwsopts
@@ -6193,11 +6219,6 @@ def unbundle(ui, repo, fname1, *fnames, **opts):
                 f = hg.openpath(ui, fname)
                 gen = exchange.readbundle(ui, f, fname)
 
-                if isinstance(gen, streamclone.streamcloneapplier):
-                    raise error.Abort(
-                        _('packed bundles cannot be applied with "@prog@ unbundle"'),
-                        hint=_('use "@prog@ debugapplystreamclonebundle"'),
-                    )
                 url = "bundle:" + fname
                 txnname = "unbundle"
                 if not isinstance(gen, bundle2.unbundle20):
@@ -6269,7 +6290,7 @@ def _ensurebaserev(ui, repo, fname):
     legacyaliases=[
         "upd",
         "upda",
-        "updat",
+        "updat",  # typos:ignore-line
         "che",
         "chec",
         "check",

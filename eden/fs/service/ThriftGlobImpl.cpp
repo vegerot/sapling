@@ -209,13 +209,15 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
   auto globTries =
       co_await folly::coro::collectAllTryRange(std::move(globTasks));
 
+  fetchContext->throwIfCanceled();
+  for (auto& t : globTries) {
+    t.throwUnlessValue();
+  }
+
   // Post-process: sort and dedup results
   std::vector<GlobResult> sortedResults;
   if (!suppressFileList) {
     std::swap(sortedResults, *globResults->wlock());
-    for (auto& t : globTries) {
-      t.throwUnlessValue();
-    }
     std::sort(sortedResults.begin(), sortedResults.end());
     auto resultsNewEnd =
         std::unique(sortedResults.begin(), sortedResults.end());
@@ -266,8 +268,11 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
   // Prefetch blobs in parallel batches
   if (fileBlobsToPrefetch) {
     auto store = edenMount->getObjectStore();
-    auto blobs = fileBlobsToPrefetch->rlock();
-    auto range = folly::Range{blobs->data(), blobs->size()};
+    // All glob tasks have finished writing the list. Own its storage locally
+    // so the batch ranges stay valid without holding a lock across co_await.
+    std::vector<ObjectId> blobs;
+    std::swap(blobs, *fileBlobsToPrefetch->wlock());
+    auto range = folly::Range{blobs.data(), blobs.size()};
 
     std::vector<folly::coro::Task<void>> prefetchTasks;
     while (range.size() > prefetchBlobBatchSize) {
@@ -278,6 +283,7 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
               [store, curRange, fetchContext = fetchContext.copy()]()
                   -> folly::coro::Task<void> {
                 co_await folly::coro::co_reschedule_on_current_executor;
+                fetchContext->throwIfCanceled();
                 co_await store->prefetchBlobs(curRange, fetchContext);
               }));
     }
@@ -287,6 +293,7 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
               [store, range, fetchContext = fetchContext.copy()]()
                   -> folly::coro::Task<void> {
                 co_await folly::coro::co_reschedule_on_current_executor;
+                fetchContext->throwIfCanceled();
                 co_await store->prefetchBlobs(range, fetchContext);
               }));
     }
@@ -295,6 +302,9 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
     // to match the futures glob implementation — partial prefetching
     // is still useful.
     co_await folly::coro::collectAllTryRange(std::move(prefetchTasks));
+    // Batches skipped by a cancellation leave the prefetch incomplete, which
+    // must not be reported as success.
+    fetchContext->throwIfCanceled();
   }
 
   co_return out;

@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -176,6 +177,20 @@ impl InnerConfig {
         .await?
         .into_iter()
         .flatten()
+        .fold(
+            HashMap::<String, (BTreeSet<String>, bool)>::new(),
+            |mut map, (key, metadata)| {
+                let (tasks, log_only) = map.entry(key).or_insert_with(|| (BTreeSet::new(), true));
+                tasks.insert(metadata.task);
+                *log_only &= metadata.log_only;
+                map
+            },
+        )
+        .into_iter()
+        .map(|(key, (tasks, log_only))| {
+            let task = tasks.into_iter().collect::<Vec<_>>().join(", ");
+            (key, RedactedMetadata { task, log_only })
+        })
         .collect();
         Ok(Self {
             raw_config: config,
@@ -199,4 +214,104 @@ pub async fn load<'a, B: Blobstore>(
     let blob: Blob<RedactionKeyListId> = Blob::new(keylist_id, bytes.into_raw_bytes());
 
     <RedactionKeyList as BlobstoreValue>::from_blob(blob).map_err(LoadableError::Error)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use blobstore::Blobstore;
+    use context::CoreContext;
+    use fbinit::FacebookInit;
+    use memblob::Memblob;
+    use mononoke_macros::mononoke;
+    use mononoke_types::BlobstoreKey;
+    use mononoke_types::BlobstoreValue;
+    use mononoke_types::RedactionKeyList;
+    use redaction_set::RedactionSet;
+    use redaction_set::RedactionSets;
+    use scuba_ext::MononokeScubaSampleBuilder;
+
+    use super::*;
+    use crate::RedactedBlobstore;
+    use crate::RedactedBlobstoreConfig;
+
+    async fn store_keylist(
+        ctx: &CoreContext,
+        bs: &RedactionConfigBlobstore,
+        keys: &[&str],
+    ) -> Result<String> {
+        let blob = RedactionKeyList {
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+        }
+        .into_blob();
+        let id = *blob.id();
+        bs.put(ctx, id.blobstore_key(), blob.into()).await?;
+        Ok(id.to_string())
+    }
+
+    async fn metadata_for(
+        ctx: &CoreContext,
+        bs: &RedactionConfigBlobstore,
+        sets: Vec<RedactionSet>,
+        key: &str,
+    ) -> Result<(String, bool)> {
+        let config = Arc::new(RedactionSets {
+            all_redactions: sets,
+        });
+        let inner = InnerConfig::new(config, ctx, bs).await?;
+        let meta = inner.map.get(key).expect("key must be redacted");
+        Ok((meta.task.clone(), meta.log_only))
+    }
+
+    #[mononoke::fbinit_test]
+    async fn overlapping_redaction_sets_merge(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let bs = RedactionConfigBlobstore::new(Arc::new(Memblob::default()) as Arc<dyn Blobstore>);
+
+        // Two key lists that both contain "k".
+        let id_enforced = store_keylist(&ctx, &bs, &["k"]).await?;
+        let id_log_only = store_keylist(&ctx, &bs, &["k", "other"]).await?;
+
+        let enforced = RedactionSet {
+            reason: "T1 enforced".to_string(),
+            id: id_enforced,
+            enforce: true,
+        };
+        let log_only = RedactionSet {
+            reason: "T2 log only".to_string(),
+            id: id_log_only,
+            enforce: false,
+        };
+
+        // Whatever the order of the sets, the key enforced by T1 stays enforced and the
+        // merged entry names both sets.
+        let a = metadata_for(&ctx, &bs, vec![enforced.clone(), log_only.clone()], "k").await?;
+        let b = metadata_for(&ctx, &bs, vec![log_only.clone(), enforced.clone()], "k").await?;
+
+        // "k" is enforced by T1, so it is enforced (log_only == false) in both orders, and the
+        // task lists both sets in a fixed order.
+        let expected = ("T1 enforced, T2 log only".to_string(), false);
+        assert_eq!(
+            (&a, &b),
+            (&expected, &expected),
+            "an enforced key stays enforced, with the same metadata, regardless of order"
+        );
+
+        // And the observable effect: a get of the enforced key is denied.
+        let config = Arc::new(RedactionSets {
+            all_redactions: vec![enforced, log_only],
+        });
+        let inner = InnerConfig::new(config, &ctx, &bs).await?;
+        let redacted = RedactedBlobs::FromHashMapForTests(inner.map.clone());
+        let blob = RedactedBlobstore::new(
+            Memblob::default(),
+            RedactedBlobstoreConfig::new(
+                Some(Arc::new(redacted)),
+                MononokeScubaSampleBuilder::with_discard(),
+            ),
+        );
+        assert!(blob.get(&ctx, "k").await.is_err());
+        Ok(())
+    }
 }

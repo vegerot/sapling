@@ -20,6 +20,7 @@
 #include <fmt/format.h>
 #include <folly/Conv.h>
 #include <folly/MapUtil.h>
+#include <folly/Portability.h>
 #include <folly/String.h>
 #include <folly/init/Init.h>
 #include <folly/logging/LogConfigParser.h>
@@ -66,13 +67,8 @@
 #include "eden/fs/store/filter/HgSparseFilter.h"
 #include "eden/fs/store/sl/SaplingBackingStore.h"
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
-#include "eden/fs/telemetry/IScribeLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/WinStackTrace.h"
-
-#if EDEN_HAVE_GIT
-#include "eden/fs/store/git/GitBackingStore.h" // @manual
-#endif
 
 #ifdef EDEN_HAVE_FBINIT
 #include <common/init/light.h>
@@ -81,6 +77,11 @@
 DEFINE_bool(edenfs, false, "This legacy argument is ignored.");
 DEFINE_bool(allowRoot, false, "Allow running eden directly as root");
 DEFINE_string(edenLogLevel, "DBG2", "Logging level to use at startup");
+DEFINE_bool(
+    fatal_eden_bug,
+    folly::kIsDebug,
+    "Abort the daemon when an EDEN_BUG report fires instead of throwing. "
+    "Defaults to the build mode and is intended for correctness testing.");
 
 THRIFT_FLAG_DECLARE_bool(server_header_reject_framed);
 
@@ -221,8 +222,7 @@ void EdenMain::runServer(const EdenServer& server) {
   fb303::fbData->setExportedValue(
       "build_time_unix", folly::to<std::string>(EDEN_BUILD_TIME_UNIX));
 
-  fb303::withThriftFunctionStats(
-      kServiceName, server.getHandler().get(), [&] { server.serve(); });
+  fb303::withThriftFunctionStats(kServiceName, [&] { server.serve(); });
 }
 
 namespace {
@@ -234,8 +234,6 @@ std::shared_ptr<SaplingBackingStore> createSaplingBackingStore(
     std::unique_ptr<SaplingBackingStoreOptions> runtimeOptions) {
   return std::make_shared<SaplingBackingStore>(
       repoPath,
-      config.getMountPath(),
-      config.getClientDirectory(),
       config.getCaseSensitive(),
       params.sharedStats.copy(),
       params.serverState->getThreadPool().get(),
@@ -289,19 +287,6 @@ void EdenMain::registerStandardBackingStores() {
             std::move(hgSparseFilter),
             reloadableConfig);
       });
-
-  registerBackingStore(
-      BackingStoreType::GIT,
-      [](const CreateParams& params) -> std::shared_ptr<BackingStore> {
-#if EDEN_HAVE_GIT
-        const auto repoPath = realpath(params.name);
-        return std::make_shared<GitBackingStore>(repoPath);
-#else // EDEN_HAVE_GIT
-        (void)params;
-        throw std::domain_error(
-            "support for Git was not enabled in this EdenFS build");
-#endif // EDEN_HAVE_GIT
-      });
 }
 
 std::string DefaultEdenMain::getEdenfsBuildName() {
@@ -337,7 +322,7 @@ void DefaultEdenMain::init(int* argc, char*** argv) {
 #ifdef EDEN_HAVE_FBINIT
   facebook::init::initFacebookLight(argc, argv);
 #else
-  folly::init(argc, argv);
+  folly::unsafe_unscoped_init(argc, argv);
 #endif
 }
 
@@ -351,12 +336,6 @@ ActivityRecorderFactory DefaultEdenMain::getActivityRecorderFactory() {
   return [](std::shared_ptr<const EdenMount>) {
     return std::make_unique<NullActivityRecorder>();
   };
-}
-
-std::shared_ptr<IScribeLogger> DefaultEdenMain::getScribeLogger(
-    SessionInfo /*sessionInfo*/,
-    std::shared_ptr<EdenConfig> /*edenConfig*/) {
-  return std::make_shared<NullScribeLogger>();
 }
 
 #ifdef __APPLE__
@@ -481,6 +460,8 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
 
   // Make sure to run this before any flag values are read.
   main.init(&argc, &argv);
+
+  setEdenBugFatal(FLAGS_fatal_eden_bug);
 
   if (argc != 1) {
     fprintf(stderr, "error: unexpected trailing command line arguments\n");
@@ -643,8 +624,6 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
     auto sessionInfo = makeSessionInfo(
         identity, main.getLocalHostname(), main.getEdenfsVersion());
 
-    auto scribeLogger = main.getScribeLogger(sessionInfo, edenConfig);
-
     // Set the memory priority for the EdenFS daemon process. On macOS, this
     // modifies the process' Jetsam priority. On Linux, this modifies the value
     // of /proc/<pid>/oom_score_adj.
@@ -725,7 +704,6 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
         std::move(edenConfig),
         main.getActivityRecorderFactory(),
         main.getBackingStoreFactory(),
-        std::move(scribeLogger),
         std::move(startupStatusChannel),
         main.getEdenfsVersion());
 

@@ -27,10 +27,17 @@ Help for uncommit
       does not revert the state of the working copy. Changes that were contained
       in the uncommitted commit become pending changes in the working copy.
   
-      'sl uncommit' cannot be run on commits that have children. In other words,
-      you cannot uncommit a commit in the middle of a stack. Similarly, by
-      default, you cannot run 'sl uncommit' if there are pending changes in the
-      working copy.
+      The current commit can be in the middle of a stack. If some of its changes
+      are uncommitted, or all of them with "--keep", the commit is rewritten and
+      its descendants are restacked onto the new version as 'sl amend' restacks
+      them (see "amend.autorestack"). Descendants whose restack would conflict
+      are left on the old version; run 'sl restack' to move them. Uncommitting
+      every change of a commit that has descendants requires "--keep", which
+      leaves the commit in the stack, empty: without it, nothing would replace
+      the commit.
+  
+      By default, you cannot run 'sl uncommit' if there are pending changes in
+      the working copy.
   
       You can selectively uncommit files from the current commit by optionally
       specifying a list of files to remove. The specified files are removed from
@@ -41,8 +48,7 @@ Help for uncommit
          Running 'sl uncommit' is similar to running 'sl undo --keep'
          immediately after 'sl commit'. However, unlike 'sl undo', which can
          only undo a commit if it was the last operation you performed, 'sl
-         uncommit' can uncommit any draft commit in the graph that does not have
-         children.
+         uncommit' can uncommit any draft commit you check out.
   
   Options ([+] can be repeated):
   
@@ -154,7 +160,7 @@ Try partial uncommit, also moves bookmark
   │ │
   │ │ x  aa5000ec01a38397e1e2ad1eddc643c151459a9b empty
   │ ├─╯
-  │ o  0c07a3ccda771b25f1cb1edbd02e683723344ef1 new change abcde
+  │ x  0c07a3ccda771b25f1cb1edbd02e683723344ef1 new change abcde
   ├─╯
   │ o  6c4fd43ed714e7fcd8adbaa7b16c953c2e985b60 added file-abcde
   ├─╯
@@ -194,7 +200,7 @@ Testing with 'experimental.uncommitondirtywdir' on and off
   $ sl uncommit
   $ sl commit -m "files abcde + foo"
 
-Uncommit in the middle of a stack, does not move bookmark
+Uncommit in the middle of a stack
 
   $ sl checkout '.^^^'
   1 files updated, 0 files merged, 2 files removed, 0 files unresolved
@@ -214,7 +220,29 @@ Uncommit in the middle of a stack, does not move bookmark
   
   $ sl bookmark
      foo                       48e5bd7cd583
+
+Uncommitting every change of a commit with descendants is refused, since
+nothing would replace the commit; the hint points at --keep, which leaves it
+in the stack, empty. Uncommitting only some of the changes, as below, is
+allowed.
+
   $ sl uncommit
+  abort: cannot uncommit every change of a commit that has descendants
+  (use --keep to leave the commit in the stack, empty)
+  [255]
+  $ sl uncommit file-abc files
+  abort: cannot uncommit every change of a commit that has descendants
+  (use --keep to leave the commit in the stack, empty)
+  [255]
+  $ sl status
+  $ sl bookmark
+     foo                       48e5bd7cd583
+
+The rest of this test continues from the commit's parent with its changes
+pending, as plain uncommit used to leave it.
+
+  $ sl goto -q '.^'
+  $ sl revert -q -r abf2df566fc1 --all
   $ sl status
   M files
   A file-abc
@@ -244,6 +272,8 @@ Partial uncommit in the middle, does not move bookmark
   $ sl bookmark
      foo                       48e5bd7cd583
   $ sl uncommit file-ab
+  hint[amend-restack]: descendants of 69a232e754b0 are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
   $ sl status
   A file-ab
 
@@ -280,7 +310,7 @@ Partial uncommit in the middle, does not move bookmark
   │ │ │ │
   │ │ │ │ x  aa5000ec01a38397e1e2ad1eddc643c151459a9b empty
   │ │ │ ├─╯
-  │ │ │ o  0c07a3ccda771b25f1cb1edbd02e683723344ef1 new change abcde
+  │ │ │ x  0c07a3ccda771b25f1cb1edbd02e683723344ef1 new change abcde
   │ │ ├─╯
   │ │ │ o  6c4fd43ed714e7fcd8adbaa7b16c953c2e985b60 added file-abcde
   │ │ ├─╯
@@ -288,7 +318,7 @@ Partial uncommit in the middle, does not move bookmark
   │ │ │
   │ │ o  abf2df566fc193b3ac34d946e63c1583e4d4732b added file-abc
   │ ├─╯
-  │ o  69a232e754b08d568c4899475faf2eb44b857802 added file-ab
+  │ x  69a232e754b08d568c4899475faf2eb44b857802 added file-ab
   ├─╯
   o  3004d2d9b50883c1538fc754a3aeb55f1b4084f6 added file-a
   
@@ -435,3 +465,166 @@ and we have a pending removal of the copied file.
   $ sl st
   $ find .
   ./foo
+
+Copies and renames made by the commit stay recorded as pending copies, whether
+the whole commit or only those files are uncommitted
+  $ newrepo
+  $ echo m > moveme
+  $ echo c > c
+  $ sl commit -Aqm base
+  $ sl mv -q moveme moved
+  $ sl cp -q c c2
+  $ sl commit -qm work
+  $ sl uncommit
+  $ sl status -C
+  A c2
+    c
+  A moved
+    moveme
+  R moveme
+  $ sl commit -qm work
+  $ sl uncommit moved moveme c2
+  $ sl status -C
+  A c2
+    c
+  A moved
+    moveme
+  R moveme
+
+Partial uncommit replaces the commit: check the mutation it records, that the
+bookmark moves, and that undo restores the original commit
+  $ newrepo
+  $ enable undo
+  $ echo a > a
+  $ echo b > b
+  $ sl commit -Aqm 'add a and b'
+  $ sl bookmark book
+  $ OLD=$(sl log -r . -T '{node}')
+  $ sl bookmark
+   * book                      214d02328b23
+  $ sl uncommit b
+  $ sl status
+  A b
+  $ sl bookmark
+   * book                      0fe586ac1b64
+  $ sl log -r 'predecessors(.)' -T '{desc} {files}\n'
+  add a and b a b
+  add a and b a
+  $ sl log -r "successors($OLD)" -T '{desc} {files}\n'
+  add a and b a
+  $ sl log --hidden -r $OLD -T '{desc}: obsolete={obsolete} op={mutations % "{operation}"}\n'
+  add a and b: obsolete=obsolete op=uncommit
+  $ sl revert -q --all
+  $ sl undo -q
+  $ sl log -r . -T '{node|short} {files} obsolete={obsolete}\n'
+  214d02328b23 a b obsolete=
+  $ sl status
+  $ sl bookmark
+   * book                      214d02328b23
+
+Uncommit in the middle of a stack rewrites the commit and restacks its
+descendants as amend does. With the default amend.autorestack, which restacks
+only unchanged commits, they are left behind with a hint.
+
+  $ mkstack() {
+  >   newrepo "$1"
+  >   echo a > a
+  >   sl commit -qAm A
+  >   echo b > b
+  >   echo x > x
+  >   sl commit -qAm B
+  >   echo c > c
+  >   sl commit -qAm C
+  >   sl goto -q 'desc(B)'
+  > }
+
+  $ mkstack stack1
+  $ sl uncommit x
+  hint[amend-restack]: descendants of dc3103bc3938 are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
+  $ sl log -G -T '{desc} {files}\n'
+  @  B b
+  │
+  │ o  C c
+  │ │
+  │ x  B b x
+  ├─╯
+  o  A a
+  $ sl status
+  A x
+
+With amend.autorestack=no-conflict, the descendants are restacked onto the new
+version of the commit.
+
+  $ cat >> $HGRCPATH << 'EOF'
+  > [amend]
+  > autorestack = no-conflict
+  > [rebase]
+  > experimental.inmemory = true
+  > EOF
+  $ mkstack stack2
+  $ sl uncommit x
+  restacking children automatically (unless they conflict)
+  rebasing f7ff3acc4cda "C"
+  $ sl log -G -T '{desc} {files}\n'
+  o  C c
+  │
+  @  B b
+  │
+  o  A a
+  $ sl status
+  A x
+
+Uncommitting every change of a commit with descendants needs --keep. With it,
+the commit stays, empty, as a new version of the old one, and the descendants
+are restacked onto it.
+
+  $ mkstack stack3
+  $ sl uncommit
+  abort: cannot uncommit every change of a commit that has descendants
+  (use --keep to leave the commit in the stack, empty)
+  [255]
+  $ sl uncommit --keep
+  restacking children automatically (unless they conflict)
+  rebasing f7ff3acc4cda "C"
+  $ sl log -G -T '{desc} {files}\n'
+  o  C c
+  │
+  @  B
+  │
+  o  A a
+  $ sl log -r 'predecessors(.) - .' --hidden -T '{desc} {files}\n'
+  B b x
+  $ sl status
+  A b
+  A x
+
+A descendant whose restack would conflict stays on the old version with its
+own descendants, even with amend.autorestack=always: the uncommitted changes
+are in the working copy, so there is no merge to resolve.
+
+  $ mkstack stack4
+  $ sl goto -q 'desc(C)'
+  $ echo x2 >> x
+  $ sl commit -qm D
+  $ sl goto -q 'desc(B)'
+  $ sl uncommit x --config amend.autorestack=always
+  restacking children automatically (unless they conflict)
+  rebasing f7ff3acc4cda "C"
+  rebasing 93b9cfab1a4d "D"
+  restacking would create conflicts (hit merge conflicts in x), so you must run it manually
+  (run `sl restack` manually to restack this commit's children)
+  $ sl log -G -T '{desc} {files}\n'
+  o  C c
+  │
+  @  B b
+  │
+  │ o  D x
+  │ │
+  │ x  C c
+  │ │
+  │ x  B b x
+  ├─╯
+  o  A a
+  $ sl status
+  A x

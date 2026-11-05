@@ -27,7 +27,6 @@ namespace facebook::eden {
 // the Python CLI at fs/cli/config.py.
 constexpr BackingStoreType kSupportedRepositoryTypes[] = {
     BackingStoreType::HG,
-    BackingStoreType::GIT,
     BackingStoreType::RECAS,
     BackingStoreType::EMPTY,
     BackingStoreType::HTTP,
@@ -109,6 +108,11 @@ class CheckoutConfig {
    */
   void clearIntentionallyUnmountedFlag() const;
 
+  /**
+   * Throws if the flag file cannot be written.
+   */
+  void setIntentionallyUnmountedFlag() const;
+
   bool isIntentionallyUnmounted() const;
 
   const AbsolutePath& getMountPath() const {
@@ -121,7 +125,7 @@ class CheckoutConfig {
   /**
    * Get the repository type.
    *
-   * Currently supported types include "git", "hg", "filteredhg", "empty", and
+   * Currently supported types include "hg", "filteredhg", "empty", and
    * "recas".
    */
   const std::string& getRepoType() const {
@@ -187,17 +191,11 @@ class CheckoutConfig {
    * Get the inode catalog type that this mount's overlay should be using. The
    * type defaults to `std::nullopt` when not specified, indicating the
    * behavior should be to use the default inode catalog type behavior. On Linux
-   * and MacOS this is the `InodeCatalogType::Legacy` and on Windows this is
-   * some variant of `InodeCatalogType::Sqlite` where additional `EdenConfig`
-   * flags determine the behavior.
+   * and MacOS this is `InodeCatalogType::Legacy` and on Windows this is
+   * `InodeCatalogType::InMemory`.
    */
   std::optional<InodeCatalogType> getInodeCatalogType() const {
     return inodeCatalogType_;
-  }
-
-  /** Whether this repository is using tree overlay */
-  bool getEnableSqliteOverlay() const {
-    return enableSqliteOverlay_;
   }
 
   /** Whether use FUSE write back cache feature */
@@ -225,9 +223,6 @@ class CheckoutConfig {
   std::optional<InodeCatalogType> inodeCatalogType_;
   CaseSensitivity caseSensitive_{kPathMapDefaultCaseSensitive};
   bool requireUtf8Path_{true};
-
-  // Sqlite Overlay is default on Windows
-  bool enableSqliteOverlay_{folly::kIsWindows};
 
   bool useWriteBackCache_{false};
 

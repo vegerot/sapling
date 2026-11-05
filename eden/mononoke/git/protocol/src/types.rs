@@ -24,6 +24,7 @@ use git_types::ArcCgdmChangesetDivider;
 use git_types::DeltaObjectKind;
 use git_types::GDMV2Entry;
 use git_types::GDMV2ObjectEntry;
+use git_types::GitTreeId;
 use git_types::PackfileItem;
 use gix_hash::ObjectId;
 use metaconfig_types::GitConcurrencyParams;
@@ -400,6 +401,10 @@ pub struct FetchRequest {
     pub include_annotated_tags: bool,
     /// Flag indicating if the caller supports offset deltas
     pub offset_delta: bool,
+    /// The effective pack writer's delta representation, including server overrides.
+    pub delta_form: DeltaForm,
+    /// The shallow operation requested by the client.
+    pub shallow_variant: ShallowVariant,
     /// Request that various objects from the packfile be omitted using
     /// one of several filtering techniques
     pub filter: Option<FetchFilter>,
@@ -567,7 +572,7 @@ pub enum ShallowVariant {
     FromClientWithDepth(u32),
     /// Requests that the shallow clone/fetch should be cut at a specific time,
     /// instead of depth. The timestamp provided should be in the same format
-    /// as is expected for git rev-list --max-age <timestamp>
+    /// as is expected for `git rev-list --max-age <timestamp>`
     FromServerWithTime(usize),
     /// Requests that the shallow clone/fetch should be cut at a specific revision
     /// instead of a depth, i.e. the specified oid becomes the boundary at which the
@@ -757,6 +762,7 @@ pub(crate) struct FetchContainer {
     pub(crate) concurrency: PackfileConcurrency,
     pub(crate) packfile_item_inclusion: PackfileItemInclusion,
     pub(crate) shallow_info: Arc<Option<ShallowInfoResponse>>,
+    pub(crate) boundary_client_tree: Option<GitTreeId>,
     pub(crate) chain_breaking_mode: ChainBreakingMode,
     pub(crate) cgdm_changeset_divider: ArcCgdmChangesetDivider,
 }
@@ -787,6 +793,7 @@ impl FetchContainer {
             concurrency,
             packfile_item_inclusion,
             shallow_info,
+            boundary_client_tree: None,
             blobstore: repo.repo_blobstore_arc(),
             derived_data: repo.repo_derived_data_arc(),
             chain_breaking_mode,

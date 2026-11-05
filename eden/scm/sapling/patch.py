@@ -724,6 +724,9 @@ class mempatchbackend(abstractbackend):
         return fname in self.ctx
 
     def setfile(self, fname, data, mode, copysource):
+        if data is None:
+            # Mode-only change: keep the existing content.
+            data = self.ctx[fname].data()
         self.store.setfile(fname, data, mode, copysource)
 
 
@@ -1628,7 +1631,7 @@ class binhunk:
     def __init__(self, lr, fname):
         self.text = None
         self.delta = False
-        self.hunk = ["GIT binary patch\n"]
+        self.hunk = [b"GIT binary patch\n"]
         self._fname = fname
         self._read(lr)
 
@@ -1673,7 +1676,12 @@ class binhunk:
                     _('could not decode "%s" binary patch: %s') % (self._fname, str(e))
                 )
             line = getline(lr, self.hunk)
-        text = zlib.decompress(b"".join(dec))
+        try:
+            text = zlib.decompress(b"".join(dec))
+        except zlib.error as e:
+            raise PatchError(
+                _('could not decode "%s" binary patch: %s') % (self._fname, str(e))
+            )
         if len(text) != size:
             raise PatchError(
                 _('"%s" length is %d bytes, should be %d')

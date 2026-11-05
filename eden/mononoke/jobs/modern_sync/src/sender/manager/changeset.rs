@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -13,6 +14,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use backsyncer::advance_bookmark_counter;
+use bookmarks::BookmarkUpdateLogId;
 use context::CoreContext;
 use futures::channel::oneshot;
 use itertools::Itertools;
@@ -20,6 +23,7 @@ use mercurial_types::blobs::HgBlobChangeset;
 use metaconfig_types::ModernSyncChannelConfig;
 use mononoke_macros::mononoke;
 use mononoke_types::BonsaiChangeset;
+use mutable_counters::ArcMutableCounters;
 use mutable_counters::MutableCounters;
 use stats::define_stats;
 use stats::prelude::*;
@@ -30,10 +34,8 @@ use crate::sender::edenapi::BookmarkMove;
 use crate::sender::edenapi::EdenapiSender;
 use crate::sender::manager::BookmarkInfo;
 use crate::sender::manager::ChangesetMessage;
-use crate::sender::manager::MODERN_SYNC_BATCH_CHECKPOINT_NAME;
-use crate::sender::manager::MODERN_SYNC_COUNTER_NAME;
-use crate::sender::manager::MODERN_SYNC_CURRENT_ENTRY_ID;
 use crate::sender::manager::Manager;
+use crate::sender::manager::ModernSyncCounterNames;
 use crate::stat;
 
 define_stats! {
@@ -47,6 +49,30 @@ define_stats! {
     changesets_queue_capacity: dynamic_singleton_counter("{}.changesets.queue_capacity", (repo: String)),
     changesets_queue_len: dynamic_quantile_stat("{}.changesets.queue_len", (repo: String); Average; P 50, P 75, P 95, P 99; Duration::from_secs(60), Duration::from_secs(600), Duration::from_secs(3600)),
     changesets_queue_max_capacity: dynamic_singleton_counter("{}.changesets.queue_max_capacity", (repo: String)),
+}
+
+async fn advance_completed_counter(
+    ctx: &CoreContext,
+    counters: &ArcMutableCounters,
+    counter_name: &str,
+    target: i64,
+) -> Result<BookmarkUpdateLogId> {
+    let target = BookmarkUpdateLogId(target.try_into()?);
+    loop {
+        let Some(counter) = counters.get_counter(ctx, counter_name).await? else {
+            if counters
+                .set_counter_if_absent(ctx, counter_name, target.try_into()?)
+                .await?
+            {
+                return Ok(target);
+            }
+            continue;
+        };
+
+        let mut counter = counter.try_into()?;
+        advance_bookmark_counter(ctx, counters, counter_name, &mut counter, target).await?;
+        return Ok(counter);
+    }
 }
 
 pub(crate) struct ChangesetManager {
@@ -75,8 +101,8 @@ impl ChangesetManager {
         mc: Arc<dyn MutableCounters + Send + Sync>,
         current_batch: &mut Vec<(HgBlobChangeset, BonsaiChangeset)>,
         pending_log: &mut VecDeque<Option<i64>>,
-        latest_checkpoint: &mut Option<(u64, i64)>,
-        latest_entry_id: &mut Option<i64>,
+        latest_checkpoints: &mut HashMap<ModernSyncCounterNames, (u64, i64)>,
+        latest_entry_ids: &mut HashMap<ModernSyncCounterNames, i64>,
         latest_bookmark_chain: &mut Vec<BookmarkInfo>,
         pending_notification: &mut Option<oneshot::Sender<Result<()>>>,
     ) -> Result<(), anyhow::Error> {
@@ -100,17 +126,17 @@ impl ChangesetManager {
             STATS::sync_lag_seconds.add_value(lag, (reponame.clone(),));
         }
 
-        if let Some((position, id)) = latest_checkpoint.take() {
+        for (counter_names, (position, id)) in latest_checkpoints.drain() {
             tracing::info!("Setting checkpoint from entry {} to {}", id, position);
 
             let res_entry = mc
-                .set_counter(ctx, MODERN_SYNC_CURRENT_ENTRY_ID, id, None)
+                .set_counter(ctx, &counter_names.current_entry, id, None)
                 .await?;
 
             let res_checkpoint = mc
                 .set_counter(
                     ctx,
-                    MODERN_SYNC_BATCH_CHECKPOINT_NAME,
+                    &counter_names.batch_checkpoint,
                     position.try_into().unwrap(),
                     None,
                 )
@@ -166,14 +192,16 @@ impl ChangesetManager {
             }
         }
 
-        if let Some(id) = latest_entry_id.take() {
+        for (counter_names, id) in latest_entry_ids.drain() {
             tracing::info!("Marking entry {} as done", id);
-            let res = mc
-                .set_counter(ctx, MODERN_SYNC_COUNTER_NAME, id, None)
-                .await?;
-
-            if !res {
-                tracing::warn!("Failed to mark entry {} as synced", id);
+            let completed =
+                advance_completed_counter(ctx, &mc, &counter_names.completed_entry, id).await?;
+            if completed.0 as i64 > id {
+                tracing::info!(
+                    "Completed cursor {} is already at {}",
+                    counter_names.completed_entry,
+                    completed,
+                );
             }
         }
 
@@ -201,8 +229,8 @@ impl Manager for ChangesetManager {
 
             let mut pending_log = VecDeque::new();
 
-            let mut latest_in_entry_checkpoint = None;
-            let mut latest_entry_id = None;
+            let mut latest_in_entry_checkpoints = HashMap::new();
+            let mut latest_entry_ids = HashMap::new();
             let mut latest_bookmark_chain: Vec<BookmarkInfo> = Vec::new();
             let mut pending_notification = None;
 
@@ -261,10 +289,15 @@ impl Manager for ChangesetManager {
                                 current_batch.push((hg_cs, bcs));
                             }
 
-                            Some(ChangesetMessage::CheckpointInEntry(position, id))
+                            Some(ChangesetMessage::CheckpointInEntry {
+                                position,
+                                entry_id,
+                                counter_names,
+                            })
                                 if encountered_error.is_none() =>
                             {
-                                latest_in_entry_checkpoint = Some((position, id));
+                                latest_in_entry_checkpoints
+                                    .insert(counter_names, (position, entry_id));
                             }
 
                             Some(ChangesetMessage::FinishEntry(bookmark))
@@ -273,7 +306,8 @@ impl Manager for ChangesetManager {
                                 // Accumulate the contiguous chain of moves. The
                                 // flush replays every move to the replica so it
                                 // reuses each source log id.
-                                latest_entry_id = Some(bookmark.log_id);
+                                latest_entry_ids
+                                    .insert(bookmark.counter_names.clone(), bookmark.log_id);
                                 latest_bookmark_chain.push(bookmark);
                             }
 
@@ -306,7 +340,7 @@ impl Manager for ChangesetManager {
                             let now = std::time::Instant::now();
                             let changeset_ids = current_batch.iter().map(|c| c.1.get_changeset_id()).collect::<Vec<_>>();
                             stat::log_upload_changeset_start(&ctx, changeset_ids.clone());
-                            match ChangesetManager::flush_batch(reponame.clone(), &ctx, &changeset_es, mc.clone(), &mut current_batch, &mut pending_log, &mut latest_in_entry_checkpoint, &mut latest_entry_id, &mut latest_bookmark_chain, &mut pending_notification)
+                            match ChangesetManager::flush_batch(reponame.clone(), &ctx, &changeset_es, mc.clone(), &mut current_batch, &mut pending_log, &mut latest_in_entry_checkpoints, &mut latest_entry_ids, &mut latest_bookmark_chain, &mut pending_notification)
                             .await
                             {
                                 Ok(()) => {
@@ -326,7 +360,7 @@ impl Manager for ChangesetManager {
                         let now = std::time::Instant::now();
                         let changeset_ids = current_batch.iter().map(|c| c.1.get_changeset_id()).collect::<Vec<_>>();
                         stat::log_upload_changeset_start(&ctx, changeset_ids.clone());
-                        match ChangesetManager::flush_batch(reponame.clone(), &ctx, &changeset_es, mc.clone(), &mut current_batch, &mut pending_log, &mut latest_in_entry_checkpoint, &mut latest_entry_id, &mut latest_bookmark_chain, &mut pending_notification)
+                        match ChangesetManager::flush_batch(reponame.clone(), &ctx, &changeset_es, mc.clone(), &mut current_batch, &mut pending_log, &mut latest_in_entry_checkpoints, &mut latest_entry_ids, &mut latest_bookmark_chain, &mut pending_notification)
                         .await
                         {
                             Ok(()) => {
@@ -343,5 +377,108 @@ impl Manager for ChangesetManager {
 
             Ok(())
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    use async_trait::async_trait;
+    use fbinit::FacebookInit;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct TestMutableCounters {
+        counters: RwLock<HashMap<String, i64>>,
+    }
+
+    #[async_trait]
+    impl MutableCounters for TestMutableCounters {
+        async fn get_counter(&self, _ctx: &CoreContext, name: &str) -> Result<Option<i64>> {
+            Ok(self
+                .counters
+                .read()
+                .expect("test counter lock poisoned")
+                .get(name)
+                .copied())
+        }
+
+        async fn get_maybe_stale_counter(
+            &self,
+            ctx: &CoreContext,
+            name: &str,
+        ) -> Result<Option<i64>> {
+            self.get_counter(ctx, name).await
+        }
+
+        async fn set_counter(
+            &self,
+            _ctx: &CoreContext,
+            name: &str,
+            value: i64,
+            prev_value: Option<i64>,
+        ) -> Result<bool> {
+            let mut counters = self.counters.write().expect("test counter lock poisoned");
+            if let Some(prev_value) = prev_value
+                && counters.get(name).copied() != Some(prev_value)
+            {
+                return Ok(false);
+            }
+            counters.insert(name.to_string(), value);
+            Ok(true)
+        }
+
+        async fn set_counter_if_absent(
+            &self,
+            _ctx: &CoreContext,
+            name: &str,
+            value: i64,
+        ) -> Result<bool> {
+            let mut counters = self.counters.write().expect("test counter lock poisoned");
+            if counters.contains_key(name) {
+                return Ok(false);
+            }
+            counters.insert(name.to_string(), value);
+            Ok(true)
+        }
+
+        async fn get_all_counters(&self, _ctx: &CoreContext) -> Result<Vec<(String, i64)>> {
+            Ok(self
+                .counters
+                .read()
+                .expect("test counter lock poisoned")
+                .iter()
+                .map(|(name, value)| (name.clone(), *value))
+                .collect())
+        }
+    }
+
+    #[mononoke::fbinit_test]
+    async fn completed_counter_never_regresses(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let counters: ArcMutableCounters = Arc::new(TestMutableCounters::default());
+
+        assert_eq!(
+            advance_completed_counter(&ctx, &counters, "completed", 100).await?,
+            BookmarkUpdateLogId(100),
+        );
+        assert_eq!(
+            advance_completed_counter(&ctx, &counters, "completed", 120).await?,
+            BookmarkUpdateLogId(120),
+        );
+
+        counters
+            .set_counter(&ctx, "completed", 130, Some(120))
+            .await?;
+        assert_eq!(
+            advance_completed_counter(&ctx, &counters, "completed", 110).await?,
+            BookmarkUpdateLogId(130),
+        );
+        assert_eq!(counters.get_counter(&ctx, "completed").await?, Some(130));
+
+        Ok(())
     }
 }

@@ -61,30 +61,44 @@ use repos::RepoSpec;
 use repos::TierManifest;
 use stats::prelude::*;
 use tokio::sync::Notify;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
-fn repos_manager_concurrency() -> Result<usize> {
-    Ok(justknobs::get_as::<usize>(
-        "scm/mononoke:repos_manager_concurrency",
-        None,
-    ))
-}
+/// How many repos are built at once, at startup and per reconcile pass. Repo
+/// construction is CPU-heavy, so this trades startup time against CPU spikes.
+const REPOS_MANAGER_CONCURRENCY: usize = 30;
 
 define_stats! {
     prefix = "mononoke.app";
     completion_duration_secs: timeseries(Average, Sum, Count),
-    // Repo load failures (config load or facet build): at
-    // assignment via add_repo or add_repo_for_service, or on first request via
-    // ConfigDefinedRepoLoader for a repo assigned unbuilt.
+    // Repo load failures (config load or facet build) at assignment, via
+    // add_repo or add_repo_for_service.
     add_repo_failed: timeseries(Sum, Count),
+    // The same failures for a repo registered unbuilt, when ConfigDefinedRepoLoader
+    // builds it on its first request. Counted at most once per build attempt,
+    // so a repo that never builds adds one per failed-build retry window.
+    lazy_repo_build_failed: timeseries(Sum, Count),
+    // Successful repo builds, aggregated over repos so idle repos add no series:
+    // on first request via ConfigDefinedRepoLoader, and at assignment via add_repo.
+    lazy_repo_build_duration_ms: histogram(250, 0, 120_000, Average, Count; P 50; P 90; P 99),
+    add_repo_build_duration_ms: histogram(250, 0, 120_000, Average, Count; P 50; P 90; P 99),
+    // A tier member a request asked for after startup, built on that request
+    // (see `get_or_load_repo`), or that failed to load for it.
+    repo_loaded_on_demand: timeseries(Rate, Sum),
+    repo_load_on_demand_failed: timeseries(Rate, Sum),
     reconcile_applied: timeseries(Average, Sum, Count),
     reconcile_dropped: timeseries(Average, Sum, Count),
     reconcile_failed_repos: timeseries(Average, Sum, Count),
     reconcile_tick_duration_ms: timeseries(Average, Sum, Count),
     tier_names_len: timeseries(Average),
     tier_names_manifest_len: timeseries(Average),
+    // Per-task gauges, sampled on each reconcile tick: repos assigned to this
+    // task (built or not) and those of them that are built.
+    repos_assigned: timeseries(Average),
+    repos_built: timeseries(Average),
 }
 
 /// A manager of a MononokeRepos collection.
@@ -116,7 +130,13 @@ pub struct MononokeReposManager<Repo> {
     reconcile_driver: Arc<ReconcileDriver<Repo>>,
     // Background reconcile loop; aborted on Drop. None without split-loading.
     reconcile_loop_handle: Option<JoinHandle<()>>,
+    // The startup `--filter-repos` predicate, so a request-time load never
+    // widens the repo set the task was started with.
+    repo_filter: Option<RepoFilter>,
 }
+
+/// The startup repo filter, as the app environment carries it.
+pub type RepoFilter = Arc<dyn Fn(&str) -> bool + Send + Sync + 'static>;
 
 /// Whether `service` should defer building this repo until its first request.
 ///
@@ -141,10 +161,15 @@ fn lazy_for_service(repo_config: &RepoConfig, service: Option<ShardedService>) -
 /// Duplicates `add_repo` rather than sharing one body with it, because
 /// `add_repo` also needs the repo id from the resolved config and would have
 /// to resolve it a second time on every eager deep-shard load.
+///
+/// `build_permits` caps concurrent builds from every caller (first requests,
+/// Multi-Repo Land): a ceiling against bursts, not a throttle. Only a build
+/// holds a permit and no build loads another repo, so it cannot deadlock.
 struct ConfigDefinedRepoLoader {
     configs: Arc<MononokeConfigs>,
     repo_factory: Arc<RepoFactory>,
     redaction_disabled: bool,
+    build_permits: Arc<Semaphore>,
 }
 
 impl<Repo> RepoLoader<Repo> for ConfigDefinedRepoLoader
@@ -158,25 +183,36 @@ where
         let configs = self.configs.clone();
         let repo_factory = self.repo_factory.clone();
         let redaction_disabled = self.redaction_disabled;
+        let build_permits = self.build_permits.clone();
         async move {
+            let _permit = build_permits.acquire_owned().await?;
             // get_or_load_repo_config subscribes the per-repo ConfigHandle
             // internally.
             let mut repo_config = configs
                 .get_or_load_repo_config(&repo_name)
-                .inspect_err(|_| STATS::add_repo_failed.add_value(1))?;
+                .inspect_err(|_| STATS::lazy_repo_build_failed.add_value(1))?;
             if redaction_disabled {
                 repo_config.redaction = Redaction::Disabled;
             }
             let common_config = configs.repo_configs().common.clone();
+            let start = Instant::now();
             let repo = repo_factory
-                .build(repo_name, repo_config, common_config)
+                .build(repo_name.clone(), repo_config, common_config)
                 .await
-                .inspect_err(|_| STATS::add_repo_failed.add_value(1))?;
+                .inspect_err(|_| STATS::lazy_repo_build_failed.add_value(1))?;
+            STATS::lazy_repo_build_duration_ms.add_value(start.elapsed().as_millis() as i64);
+            info!(
+                "Built repo on first request: {} in {:?}",
+                repo_name,
+                start.elapsed()
+            );
             anyhow::Ok(repo)
         }
         .boxed()
     }
 }
+
+const LAZY_REPO_BUILD_CONCURRENCY_KNOB: &str = "scm/mononoke:lazy_repo_build_concurrency";
 
 impl<Repo> MononokeReposManager<Repo> {
     // Create a new `MononokeReposManager`.
@@ -218,10 +254,14 @@ impl<Repo> MononokeReposManager<Repo> {
             + Sync
             + 'static,
     {
+        // Read once, so a change needs a restart; floored so 0 cannot block all builds.
+        let build_concurrency =
+            justknobs::get_as::<usize>(LAZY_REPO_BUILD_CONCURRENCY_KNOB, None).max(1);
         let repos = Arc::new(MononokeRepos::new_lazy(Arc::new(ConfigDefinedRepoLoader {
             configs: configs.clone(),
             repo_factory: repo_factory.clone(),
             redaction_disabled,
+            build_permits: Arc::new(Semaphore::new(build_concurrency)),
         })));
         let repo_names_in_tier = Arc::new(ArcSwap::from_pointee(HashMap::new()));
         let reconcile_driver = Arc::new(ReconcileDriver {
@@ -239,7 +279,7 @@ impl<Repo> MononokeReposManager<Repo> {
         let manifest_source = match (configs.tier_name(), configs.manifest()) {
             (Some(tier), Some(manifest)) => {
                 let on = justknobs::eval(TIER_NAMES_FROM_MANIFEST_KNOB, None, Some(tier));
-                info!("tier_repo_names_from_manifest={on} for tier {tier}");
+                debug!("tier_repo_names_from_manifest={on} for tier {tier}");
                 if on {
                     repo_names_in_tier.store(Arc::new(repo_names_from_manifest(&manifest)));
                 }
@@ -257,6 +297,7 @@ impl<Repo> MononokeReposManager<Repo> {
             names_from_manifest,
             reconcile_driver,
             reconcile_loop_handle: None,
+            repo_filter: None,
         };
         mgr.populate_repos(repo_names).await?;
         let update_receiver =
@@ -310,11 +351,13 @@ impl<Repo> MononokeReposManager<Repo> {
             .inspect_err(|_| STATS::add_repo_failed.add_value(1))?;
         let repo_id = repo_config.repoid.id();
         let common_config = self.configs.repo_configs().common.clone();
+        let start = Instant::now();
         let repo = self
             .repo_factory
             .build(repo_name.to_string(), repo_config, common_config)
             .await
             .inspect_err(|_| STATS::add_repo_failed.add_value(1))?;
+        STATS::add_repo_build_duration_ms.add_value(start.elapsed().as_millis() as i64);
         self.repos.add(repo_name, repo_id, repo);
         self.repos
             .get_by_name(repo_name)
@@ -377,6 +420,37 @@ impl<Repo> MononokeReposManager<Repo> {
         self.configs.remove_repo_config_handle(repo_name);
     }
 
+    pub(crate) fn with_repo_filter(mut self, repo_filter: Option<RepoFilter>) -> Self {
+        self.repo_filter = repo_filter;
+        self
+    }
+
+    /// The repo, built on this request if it joined the tier after startup.
+    ///
+    /// Request-time counterpart of the ShardManager assignment path, for a
+    /// service that opened its whole tier: a name that is in the live tier
+    /// manifest but not in the collection is registered as a placeholder and
+    /// built through the collection's loader. The slot provides single-flight,
+    /// cancellation safety and the failed-build hold; eager startup is
+    /// unchanged, and placeholders exist only for names a request asked for.
+    ///
+    /// `None` when the repo is not served: outside the tier manifest (no
+    /// config is read for it), disabled, excluded by the startup repo filter,
+    /// or the collection has no loader. A config that does not load, or a
+    /// failed build, is this call's error.
+    pub async fn get_or_load_repo(&self, repo_name: &str) -> Result<Option<Arc<Repo>>>
+    where
+        Repo: Send + Sync + 'static,
+    {
+        get_or_load_repo_in(
+            &self.repos,
+            &self.configs,
+            self.repo_filter.as_ref(),
+            repo_name,
+        )
+        .await
+    }
+
     /// Run one reconciliation pass now. Delegates to the driver. No-op unless the
     /// `use_config_reconcile` killswitch is on (read every call).
     pub async fn reconcile(&self) -> Result<()>
@@ -415,6 +489,7 @@ impl<Repo> MononokeReposManager<Repo> {
                 let repo_id = repo_config.repoid.id();
                 let completed = completed.clone();
                 mononoke::spawn_task(async move {
+                    #[cfg(fbcode_build)]
                     let start = Instant::now();
                     info!("Initializing repo: {}", &repo_name);
                     let repo = repo_factory
@@ -435,8 +510,7 @@ impl<Repo> MononokeReposManager<Repo> {
                     anyhow::Ok((repo_id, repo_name, repo))
                 })
             })
-            // Repo construction can be heavy, limit concurrency via JK.
-            .buffer_unordered(repos_manager_concurrency()?)
+            .buffer_unordered(REPOS_MANAGER_CONCURRENCY)
             .map(|r| anyhow::Ok(r??))
             .try_collect::<Vec<_>>()
             .await?;
@@ -486,6 +560,69 @@ fn retain_live_cache_entries<T>(
 ) {
     let mut cache = cache.lock().expect("spec_hash_cache poisoned");
     cache.retain(|name, _| live.contains(name.as_str()));
+}
+
+/// Body of [`MononokeReposManager::get_or_load_repo`], over the pieces it
+/// needs, so the decision is testable without a `RepoFactory`.
+pub(crate) async fn get_or_load_repo_in<R>(
+    repos: &MononokeRepos<R>,
+    configs: &MononokeConfigs,
+    repo_filter: Option<&RepoFilter>,
+    repo_name: &str,
+) -> Result<Option<Arc<R>>>
+where
+    R: Send + Sync + 'static,
+{
+    if let Some(repo) = repos.get_by_name(repo_name) {
+        return Ok(Some(repo));
+    }
+    if !repos.loads_on_demand() {
+        return Ok(None);
+    }
+    if repo_filter.is_some_and(|filter| !filter(repo_name)) {
+        return Ok(None);
+    }
+    // Tier membership is the authorisation boundary: nothing outside the
+    // manifest is read, let alone built. Misses are rare, so no cache.
+    let Some(repo_id) = configs.manifest().and_then(|manifest| {
+        manifest
+            .repos
+            .iter()
+            .find(|entry| entry.repo_name == repo_name)
+            .map(|entry| entry.repo_id)
+    }) else {
+        return Ok(None);
+    };
+    let repo_config = match configs.get_or_load_repo_config(repo_name) {
+        Ok(repo_config) => repo_config,
+        Err(e) => {
+            STATS::repo_load_on_demand_failed.add_value(1);
+            warn!(
+                "Tier repo {} is in the manifest but its config did not load: {:#}",
+                repo_name, e
+            );
+            return Err(e).with_context(|| format!("loading config for tier repo {repo_name}"));
+        }
+    };
+    if !repo_config.enabled {
+        return Ok(None);
+    }
+
+    // No-op if a concurrent request or the reconcile loop got there first.
+    repos.add_placeholder(repo_name, repo_id);
+    match repos.get(repo_name).await {
+        Ok(Some(repo)) => {
+            STATS::repo_loaded_on_demand.add_value(1);
+            info!("Loaded tier repo on demand: {}", repo_name);
+            Ok(Some(repo))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => {
+            STATS::repo_load_on_demand_failed.add_value(1);
+            warn!("Tier repo {} did not build on demand: {:#}", repo_name, e);
+            Err(e.context(format!("loading tier repo {repo_name} on demand")))
+        }
+    }
 }
 
 /// Adapts `MononokeConfigs` to the `config_reconcile::ConfigSource` trait.
@@ -691,13 +828,9 @@ where
                 redaction_disabled: self.redaction_disabled,
             };
             let current = self.reconcile_state.load_full();
-            let outcome = config_reconcile::reconcile(
-                &config,
-                &manager,
-                &current,
-                repos_manager_concurrency()?,
-            )
-            .await?;
+            let outcome =
+                config_reconcile::reconcile(&config, &manager, &current, REPOS_MANAGER_CONCURRENCY)
+                    .await?;
 
             if outcome.built + outcome.rebuilt + outcome.dropped > 0 || !outcome.failed.is_empty() {
                 info!(
@@ -795,6 +928,8 @@ where
                 }
                 STATS::reconcile_tick_duration_ms
                     .add_value(start.elapsed().as_millis().try_into().unwrap_or(i64::MAX));
+                STATS::repos_assigned.add_value(driver.repos.iter_names().count() as i64);
+                STATS::repos_built.add_value(driver.repos.iter_loaded_names().count() as i64);
             }
         },
         trigger,
@@ -830,7 +965,7 @@ impl<Repo> Drop for MononokeReposManager<Repo> {
         // Stop the loop; otherwise it would run forever on a torn-down manager.
         if let Some(handle) = self.reconcile_loop_handle.as_ref() {
             handle.abort();
-            info!("Config reconcile loop stopped: repos manager dropped");
+            debug!("Config reconcile loop stopped: repos manager dropped");
         }
     }
 }
@@ -879,17 +1014,21 @@ const TIER_NAMES_FROM_MANIFEST_KNOB: &str = "scm/mononoke:tier_repo_names_from_m
 
 const GIT_SPEC_PATH_SEGMENT: &str = "/repos/git/";
 const HG_SPEC_PATH_SEGMENT: &str = "/repos/hg/";
+const P4_SPEC_PATH_SEGMENT: &str = "/repos/p4/";
 
 /// The identity scheme of a manifest entry, from where its spec lives.
-/// Configerator keeps Git repo specs under `repos/git/` and Mercurial repo
-/// specs under `repos/hg/`, with no exceptions in the tree (10,051 and 52
-/// entries in the SCS manifest on 2026-10-05). Anything else is `UNKNOWN`: it
-/// is still listed, but never matches a scheme filter.
+/// Configerator keeps Git repo specs under `repos/git/`, Mercurial repo
+/// specs under `repos/hg/` and Perforce mirror specs under `repos/p4/`, with
+/// no exceptions in the tree (10,051 and 52 entries in the SCS manifest on
+/// 2026-10-05). Anything else is `UNKNOWN`: it is still listed, but never
+/// matches a scheme filter.
 fn scheme_from_config_path(config_path: &str) -> CommitIdentityScheme {
     if config_path.contains(GIT_SPEC_PATH_SEGMENT) {
         CommitIdentityScheme::GIT
     } else if config_path.contains(HG_SPEC_PATH_SEGMENT) {
         CommitIdentityScheme::HG
+    } else if config_path.contains(P4_SPEC_PATH_SEGMENT) {
+        CommitIdentityScheme::P4
     } else {
         CommitIdentityScheme::UNKNOWN
     }

@@ -106,8 +106,6 @@ import {DiffStats, PendingDiffStats} from './DiffStats';
 import {FillCommitMessage} from './FillCommitMessage';
 import {CommitTitleByline, getFieldToAutofocus, Section, SmallCapsTitle} from './utils';
 
-import {useFeatureFlagSync} from '../featureFlags';
-import {AICodeReviewStatus} from '../firstPassCodeReview/AICodeReviewStatus';
 import {AICodeReviewUpsell} from '../firstPassCodeReview/AICodeReviewUpsell';
 import {Internal} from '../Internal';
 import {confirmSuggestedEditsForFiles} from '../SuggestedEdits';
@@ -204,11 +202,6 @@ function useFetchActiveDiffDetails(diffId?: string) {
 }
 
 export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
-  const rollbackFeatureEnabled = useFeatureFlagSync(Internal.featureFlags?.ShowRollbackPlan);
-  const aiCodeReviewUpsellEnabled = useFeatureFlagSync(Internal.featureFlags?.AICodeReviewUpsell);
-  const aiFirstPassCodeReviewEnabled = useFeatureFlagSync(
-    Internal.featureFlags?.AIFirstPassCodeReview,
-  );
   const [mode, setMode] = useAtom(commitMode);
   const isCommitMode = mode === 'commit';
   const hashOrHead = isCommitMode ? 'head' : commit.hash;
@@ -350,10 +343,6 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
         {schema
           .filter(field => !isCommitMode || field.type !== 'read-only')
           .map(field => {
-            if (!rollbackFeatureEnabled && field.type === 'custom') {
-              return;
-            }
-
             let editedFieldValue = editedMessage?.[field.key];
             if (editedFieldValue == null && isCommitMode) {
               // If the field is supposed to edited but not in the editedMessage,
@@ -381,15 +370,12 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
                 extra={
                   field.key === 'Title' ? (
                     <>
-                      {aiCodeReviewUpsellEnabled &&
-                        Internal.aiCodeReview?.enabled &&
-                        commit.isDot &&
-                        !isPublic && (
-                          <AICodeReviewUpsell
-                            isCommitMode={isCommitMode}
-                            hasUncommittedChanges={uncommittedChanges.length > 0}
-                          />
-                        )}
+                      {Internal.aiCodeReview?.enabled && commit.isDot && !isPublic && (
+                        <AICodeReviewUpsell
+                          isCommitMode={isCommitMode}
+                          hasUncommittedChanges={uncommittedChanges.length > 0}
+                        />
+                      )}
                       {!isCommitMode ? (
                         <>
                           <CommitTitleByline commit={commit} />
@@ -492,7 +478,6 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
             <FoldPreviewActions />
           ) : (
             <>
-              {aiCodeReviewUpsellEnabled && aiFirstPassCodeReviewEnabled && <AICodeReviewStatus />}
               <ActionsBar
                 commit={commit}
                 latestMessage={parsedFields}

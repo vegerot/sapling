@@ -1,3 +1,4 @@
+load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("//eden/scm:targets.bzl", "sl_rust_library")
 
 oncall("sapling")
@@ -7,29 +8,53 @@ sl_rust_library(
     srcs = glob(["src/**/*.rs"]),
     autocargo = {
         "cargo_toml_config": {
-            "lib": {"name": "cmdworktree"},
+            "dependencies_override": {
+                "dependencies": {
+                    "edenfs-core": {"optional": True},
+                    "edenfs-remove": {"optional": True},
+                    "sapling-async-runtime": {"optional": True},
+                    "sapling-edenfs-client": {"optional": True},
+                },
+            },
+            "features": {
+                "default": [],
+                "eden": [
+                    "sapling-clone/eden",
+                    "sapling-edenfs-client",
+                ],
+                "fb": [
+                    "edenfs-core",
+                    "edenfs-remove",
+                    "sapling-async-runtime",
+                ],
+            },
             "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
                 "license": "GPL-2.0-only",
                 "name": "cmdworktree",
-                "repository": "https://github.com/facebook/sapling",
             },
         },
     },
     crate_root = "src/lib.rs",
+    features = [
+        "eden",
+        "fb",
+    ],
     deps = [
         "fbsource//third-party/rust:anyhow",
-        "fbsource//third-party/rust:chrono",
         "fbsource//third-party/rust:fs-err",
         "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tracing",
+        "//eden/scm/lib/agentdetect:agentdetect",
         "//eden/scm/lib/clidispatch:clidispatch",
         "//eden/scm/lib/clone:clone",
         "//eden/scm/lib/commands/cmdutil:cmdutil",
+        "//eden/scm/lib/config/model:configmodel",
         "//eden/scm/lib/edenfs-client:edenfs-client",
         "//eden/scm/lib/encoding:encoding",
         "//eden/scm/lib/filters:filters",
         "//eden/scm/lib/formatter:formatter",
+        "//eden/scm/lib/gitcompat:gitcompat",
+        "//eden/scm/lib/hg-metrics:hg-metrics",
         "//eden/scm/lib/hook:hook",
         "//eden/scm/lib/identity:identity",
         "//eden/scm/lib/pathmatcher:pathmatcher",
@@ -43,5 +68,14 @@ sl_rust_library(
         "//eden/scm/lib/vfs:vfs",
         "//eden/scm/lib/workingcopy:workingcopy",
         "//eden/scm/lib/worktree:worktree",
-    ],
+    ]
+    + (
+        []
+        if rust_oss.is_oss_build()
+        else [
+            "//eden/fs/cli_rs/edenfs-core:edenfs-core",
+            "//eden/fs/cli_rs/edenfs-remove:edenfs-remove",
+            "//eden/scm/lib/async-runtime:async-runtime",
+        ]
+    ),
 )

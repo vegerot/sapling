@@ -67,6 +67,29 @@ mononoke_queries! {
          LIMIT 1"
     }
 
+    // Pessimistic bookmark lock for the modern_sync mirror path only. When
+    // the row already exists, two concurrent replays of one chain serialize
+    // here: the loser waits for the winner's commit, then reads the applied
+    // state and reports AlreadyProcessed instead of losing the
+    // compare-and-swap. Bookmark creation has no row to lock, so the
+    // mirror path re-checks after a lost INSERT instead (see
+    // store_mirror_batches). SQLite serializes writers on its own and
+    // rejects FOR UPDATE, so it keeps the plain SELECT.
+    pub(crate) read SelectBookmarkForUpdate(repo_id: RepositoryId, name: BookmarkName, category: BookmarkCategory) -> (ChangesetId, Option<u64>) {
+        mysql("SELECT changeset_id, log_id
+         FROM bookmarks
+         WHERE repo_id = {repo_id}
+           AND name = {name}
+           AND category = {category}
+         LIMIT 1 FOR UPDATE")
+        sqlite("SELECT changeset_id, log_id
+         FROM bookmarks
+         WHERE repo_id = {repo_id}
+           AND name = {name}
+           AND category = {category}
+         LIMIT 1")
+    }
+
     read SelectAll(
         repo_id: RepositoryId,
         limit: u64,
@@ -329,6 +352,27 @@ mononoke_queries! {
          ORDER BY id DESC
          LIMIT {max_records}
          OFFSET {offset}"
+    }
+
+    read SelectRecentlyMoved(
+        repo_id: RepositoryId,
+        limit: u64,
+        >list kinds: BookmarkKind
+    ) -> (BookmarkName, BookmarkCategory, ChangesetId) {
+        mysql("SELECT name, category, changeset_id
+         FROM bookmarks FORCE INDEX (repo_id_log_id)
+         WHERE repo_id = {repo_id}
+           AND log_id IS NOT NULL
+           AND hg_kind IN {kinds}
+         ORDER BY log_id DESC
+         LIMIT {limit}")
+        sqlite("SELECT name, category, changeset_id
+         FROM bookmarks
+         WHERE repo_id = {repo_id}
+           AND log_id IS NOT NULL
+           AND hg_kind IN {kinds}
+         ORDER BY log_id DESC
+         LIMIT {limit}")
     }
 
     pub(crate) read GetLargestLogId(repo_id: RepositoryId) -> (Option<u64>) {
@@ -673,6 +717,36 @@ impl Bookmarks for SqlBookmarks {
 }
 
 impl BookmarkUpdateLog for SqlBookmarks {
+    fn list_recently_moved_bookmarks(
+        &self,
+        ctx: CoreContext,
+        limit: u64,
+        freshness: Freshness,
+    ) -> BoxFuture<'static, Result<Vec<(BookmarkKey, ChangesetId)>>> {
+        let conn = self.connection(&ctx, freshness).clone();
+        let repo_id = self.repo_id;
+        async move {
+            let rows = SelectRecentlyMoved::query(
+                &conn,
+                ctx.sql_query_telemetry(),
+                &repo_id,
+                &limit,
+                BookmarkKind::ALL_PUBLISHING,
+            )
+            .await
+            .with_context(|| {
+                format!("Failed to read recently moved bookmarks for repo {repo_id}")
+            })?;
+            Ok(rows
+                .into_iter()
+                .map(|(name, category, cs_id)| {
+                    (BookmarkKey::with_name_and_category(name, category), cs_id)
+                })
+                .collect())
+        }
+        .boxed()
+    }
+
     fn list_bookmark_log_entries(
         &self,
         ctx: CoreContext,

@@ -5,25 +5,13 @@ oncall("sapling")
 sl_rust_library(
     name = "grepocompat",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {
-        "cargo_toml_config": {
-            "lib": {"name": "grepocompat"},
-            "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
-                "license": "MIT",
-                "name": "sapling-grepocompat",
-                "repository": "https://github.com/facebook/sapling",
-            },
-        },
-    },
+    autocargo = {},
     crate_root = "src/lib.rs",
-    test_deps = [
-        "//eden/scm/lib/blob:blob",
-    ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:fs-err",
+        "//eden/scm/lib/blob:blob",
+        "//eden/scm/lib/config/model:configmodel",
         "//eden/scm/lib/gitcompat:gitcompat",
         "//eden/scm/lib/grepomanifest:grepomanifest",
         "//eden/scm/lib/identity:identity",

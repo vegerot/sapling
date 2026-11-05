@@ -5,7 +5,6 @@
  * GNU General Public License version 2.
  */
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -16,6 +15,7 @@ use blobstore::Storable;
 use cloned::cloned;
 use context::CoreContext;
 use derived_data_manager::DerivationContext;
+use derived_data_manager::ManifestDerivation;
 use either::Either;
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -23,14 +23,10 @@ use futures::future::FutureExt;
 use futures::stream;
 use manifest::Entry;
 use manifest::LeafInfo;
-use manifest::ManifestOps;
-use manifest::ManifestParentReplacement;
 use manifest::TreeInfoSubentries;
 use manifest::derive_manifest;
-use manifest::derive_manifest_with_known_entries;
 use mononoke_types::BlobstoreValue;
 use mononoke_types::BonsaiChangeset;
-use mononoke_types::ChangesetId;
 use mononoke_types::ContentManifestId;
 use mononoke_types::MPath;
 use mononoke_types::NonRootMPath;
@@ -51,7 +47,6 @@ use restricted_paths_common::RestrictedPathsConfigBased;
 use restricted_paths_common::maybe_propagate_manifest_id_store_write_error;
 
 use crate::ContentManifestDerivationError;
-use crate::RootContentManifestId;
 
 pub(crate) fn get_changes(
     bcs: &BonsaiChangeset,
@@ -68,49 +63,6 @@ pub(crate) fn get_changes(
             )
         })
         .collect()
-}
-
-pub async fn get_content_manifest_subtree_changes(
-    ctx: &CoreContext,
-    derivation_ctx: &DerivationContext,
-    known: Option<&HashMap<ChangesetId, RootContentManifestId>>,
-    bcs: &BonsaiChangeset,
-) -> Result<Vec<ManifestParentReplacement<ContentManifestId, ContentManifestFile>>> {
-    let copy_sources = bcs
-        .subtree_changes()
-        .iter()
-        .filter_map(|(path, change)| {
-            let (from_cs_id, from_path) = change.copy_source()?;
-            Some((path, from_cs_id, from_path))
-        })
-        .collect::<Vec<_>>();
-    stream::iter(copy_sources)
-        .map(|(path, from_cs_id, from_path)| {
-            cloned!(ctx);
-            let blobstore = derivation_ctx.blobstore().clone();
-            async move {
-                let root = derivation_ctx
-                    .fetch_unknown_dependency::<RootContentManifestId>(&ctx, known, from_cs_id)
-                    .await?
-                    .into_content_manifest_id();
-                let entry = root
-                    .find_entry(ctx, blobstore, from_path.clone())
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Subtree copy source {from_path} does not exist in {from_cs_id}"
-                        )
-                    })?;
-                Ok(ManifestParentReplacement {
-                    path: path.clone(),
-                    replacements: vec![entry],
-                })
-            }
-        })
-        .buffered(100)
-        .try_collect()
-        .boxed()
-        .await
 }
 
 pub(crate) async fn empty_directory(
@@ -251,19 +203,15 @@ pub(crate) async fn derive_content_manifest(
     derivation_ctx: &DerivationContext,
     bonsai: BonsaiChangeset,
     parents: Vec<ContentManifestId>,
-    known: Option<&HashMap<ChangesetId, RootContentManifestId>>,
 ) -> Result<ContentManifestId> {
     let blobstore = derivation_ctx.blobstore();
     let restricted_paths = derivation_ctx.restricted_paths();
     let changes = get_changes(&bonsai);
-    let subtree_changes =
-        get_content_manifest_subtree_changes(ctx, derivation_ctx, known, &bonsai).await?;
     let derive_fut = derive_manifest(
         ctx.clone(),
         blobstore.clone(),
         parents.clone(),
         changes,
-        subtree_changes,
         {
             cloned!(blobstore, ctx, restricted_paths);
             move |tree_info| {
@@ -290,46 +238,38 @@ pub(crate) async fn derive_content_manifest(
     }
 }
 
-/// Path-scoped content manifest derivation for one pipeline stage; mirrors `derive_content_manifest`.
 pub(crate) async fn derive_content_manifest_entry(
     ctx: &CoreContext,
     derivation_ctx: &DerivationContext,
-    parents: Vec<Entry<ContentManifestId, ContentManifestFile>>,
+    input: ManifestDerivation<ContentManifestId, ContentManifestFile>,
     changes: Vec<(NonRootMPath, Option<ContentManifestFile>)>,
-    subtree_changes: Vec<ManifestParentReplacement<ContentManifestId, ContentManifestFile>>,
-    known_entries: HashMap<MPath, Option<Entry<ContentManifestId, ContentManifestFile>>>,
-    prefix: MPath,
 ) -> Result<Option<Entry<ContentManifestId, ContentManifestFile>>> {
     let blobstore = derivation_ctx.blobstore();
     let restricted_paths = derivation_ctx.restricted_paths();
-    let derive_fut = derive_manifest_with_known_entries(
-        ctx.clone(),
-        blobstore.clone(),
-        parents,
-        changes,
-        subtree_changes,
-        known_entries,
-        prefix,
-        {
-            cloned!(blobstore, ctx, restricted_paths);
-            move |tree_info| {
+    input
+        .derive(
+            ctx.clone(),
+            blobstore.clone(),
+            changes,
+            {
                 cloned!(blobstore, ctx, restricted_paths);
-                async move {
-                    create_content_manifest_directory(
-                        ctx,
-                        blobstore,
-                        &tree_info.path,
-                        &restricted_paths,
-                        tree_info.subentries,
-                    )
-                    .await
+                move |tree_info| {
+                    cloned!(blobstore, ctx, restricted_paths);
+                    async move {
+                        create_content_manifest_directory(
+                            ctx,
+                            blobstore,
+                            &tree_info.path,
+                            &restricted_paths,
+                            tree_info.subentries,
+                        )
+                        .await
+                    }
                 }
-            }
-        },
-        create_content_manifest_file,
-    )
-    .boxed();
-    derive_fut.await
+            },
+            create_content_manifest_file,
+        )
+        .await
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@
 #include <folly/futures/Promise.h>
 #include <folly/test/TestUtils.h>
 #include <gtest/gtest.h>
+#include <filesystem>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -32,6 +33,7 @@
 #include "eden/fs/journal/JournalDelta.h"
 #include "eden/fs/model/TestOps.h"
 #include "eden/fs/store/IObjectStore.h"
+#include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
 #include "eden/fs/testharness/FakeFuse.h"
 #include "eden/fs/testharness/FakePrivHelper.h"
@@ -193,6 +195,22 @@ TEST(EdenMount, pressureGcReclaimBackoff) {
   EXPECT_FALSE(edenMount->isPressureGcBackedOff());
 }
 
+TEST(EdenMount, reportsTheRunningInodeGC) {
+  FakeTreeBuilder builder;
+  TestMount testMount{builder};
+  const auto& edenMount = testMount.getEdenMount();
+  EXPECT_FALSE(edenMount->getRunningInodeGC().has_value());
+
+  auto lease = edenMount->tryStartInodeGC(/*pressureBased=*/true);
+  ASSERT_TRUE(lease);
+  auto gc = edenMount->getRunningInodeGC();
+  ASSERT_TRUE(gc.has_value());
+  EXPECT_TRUE(gc->pressureBased);
+
+  lease.reset();
+  EXPECT_FALSE(edenMount->getRunningInodeGC().has_value());
+}
+
 TEST(EdenMount, gcTreeLoadFailureLimit) {
   FakeTreeBuilder builder;
   TestMount testMount{builder};
@@ -342,6 +360,24 @@ TEST(EdenMount, canonicalizePathFromTree) {
       EXPECT_EQ(path, "bar/baz/TEST.c"_relpath);
     }
   }
+}
+
+TEST(EdenMount, walkDetectorLearnsWorkingCopyParent) {
+  TestMount testMount;
+
+  auto builder1 = FakeTreeBuilder();
+  builder1.setFile("src/main.c", "int main() { return 0; }\n");
+  builder1.finalize(testMount.getBackingStore(), true);
+  testMount.getBackingStore()->putCommit("1", builder1)->setReady();
+  auto builder2 = builder1.clone();
+  builder2.finalize(testMount.getBackingStore(), true);
+  testMount.getBackingStore()->putCommit("2", builder2)->setReady();
+
+  testMount.initialize(RootId("1"));
+  testMount.getEdenMount()->resetParent(RootId("2"));
+
+  const std::vector<RootId> expected{RootId("1"), RootId("2")};
+  EXPECT_EQ(expected, testMount.getWalkDetector().parents());
 }
 
 TEST(EdenMount, resetParents) {
@@ -696,12 +732,15 @@ TEST_F(ChownTest, UnloadedInodeWithZeroRefCount) {
   auto inodeMap = edenMount_->getInodeMap();
 
   auto fileIno = load();
-  EXPECT_TRUE(inodeMap->lookupInode(fileIno).get());
+  EXPECT_TRUE(
+      inodeMap->lookupInode(fileIno, ObjectFetchContext::getNullContext())
+          .get());
   // now unload it with a zero ref count
   inodeMap->decFsRefcount(fileIno, 1);
   edenMount_->getRootInode()->unloadChildrenNow();
 
-  auto chownFuture = edenMount_->chown(uid, gid);
+  auto chownFuture =
+      edenMount_->chown(uid, gid, ObjectFetchContext::getNullContext());
   EXPECT_FALSE(invalidatedFileInode(fileIno));
   std::move(chownFuture).get(10s);
 
@@ -712,11 +751,14 @@ TEST_F(ChownTest, UnloadedInodeWithPositiveRefCount) {
   auto inodeMap = edenMount_->getInodeMap();
 
   auto fileIno = load();
-  EXPECT_TRUE(inodeMap->lookupInode(fileIno).get());
+  EXPECT_TRUE(
+      inodeMap->lookupInode(fileIno, ObjectFetchContext::getNullContext())
+          .get());
   // now unload it with a positive ref count
   edenMount_->getRootInode()->unloadChildrenNow();
 
-  auto chownFuture = edenMount_->chown(uid, gid);
+  auto chownFuture =
+      edenMount_->chown(uid, gid, ObjectFetchContext::getNullContext());
   EXPECT_TRUE(invalidatedFileInode(fileIno));
   std::move(chownFuture).get(10s);
 
@@ -727,10 +769,13 @@ TEST_F(ChownTest, LoadedInode) {
   auto inodeMap = edenMount_->getInodeMap();
 
   auto fileIno = load();
-  EXPECT_TRUE(inodeMap->lookupInode(fileIno).get());
+  EXPECT_TRUE(
+      inodeMap->lookupInode(fileIno, ObjectFetchContext::getNullContext())
+          .get());
   edenMount_->getRootInode()->unloadChildrenNow();
 
-  auto chownFuture = edenMount_->chown(uid, gid);
+  auto chownFuture =
+      edenMount_->chown(uid, gid, ObjectFetchContext::getNullContext());
   EXPECT_TRUE(invalidatedFileInode(fileIno));
   std::move(chownFuture).get(10s);
 
@@ -1103,6 +1148,19 @@ TEST(EdenMountState, mountIsUninitializedAfterConstruction) {
   testMount.createMountWithoutInitializing(builder);
   EXPECT_EQ(
       testMount.getEdenMount()->getState(), EdenMount::State::UNINITIALIZED);
+}
+
+TEST(EdenMountState, mountIsInitErrorWhenSnapshotIsMissing) {
+  auto testMount = TestMount{};
+  auto builder = FakeTreeBuilder{};
+  testMount.createMountWithoutInitializing(builder);
+  auto& mount = *testMount.getEdenMount();
+  ASSERT_TRUE(
+      std::filesystem::remove(
+          mount.getCheckoutConfig()->getSnapshotPath().asString()));
+
+  EXPECT_THROW(mount.initialize().get(kTimeout), std::system_error);
+  EXPECT_EQ(mount.getState(), EdenMount::State::INIT_ERROR);
 }
 
 TEST(EdenMountState, mountIsInitializedAfterInitializationCompletes) {

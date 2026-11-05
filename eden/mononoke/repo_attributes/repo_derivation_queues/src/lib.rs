@@ -7,6 +7,7 @@
 
 mod dag_items;
 mod errors;
+mod repair;
 mod underived;
 
 use std::collections::HashMap;
@@ -41,17 +42,14 @@ pub struct DerivationQueueArgs {
     pub use_pipeline_zelos_config: bool,
 }
 
-pub use derived_data_manager::DerivationStagePayload;
-pub use derived_data_manager::ManifestStagePayload;
-pub use derived_data_manager::StageId;
-pub use derived_data_manager::StageKey;
-
 pub use crate::dag_items::DagItemDep;
 pub use crate::dag_items::DagItemId;
 pub use crate::dag_items::DagItemInfo;
 pub use crate::dag_items::DerivationDagItem;
 pub use crate::dag_items::derivation_priority_to_str;
 pub use crate::errors::InternalError;
+pub use crate::repair::RepairOptions;
+pub use crate::repair::RepairResult;
 pub use crate::underived::build_underived_batched_graph;
 
 /// Status of a single dependency: suffix and whether its `needed` node exists.
@@ -186,6 +184,14 @@ pub trait DerivationQueue {
     /// the derivation service first. Aborts on the first Zeus error.
     async fn unsafe_nuke(&self, ctx: &CoreContext) -> Result<NukeStats, InternalError>;
 
+    /// Derive and remove isolated stranded items. Destructive admin operations
+    /// must not overlap this operation. Dependency edges are never repaired.
+    async fn repair(
+        &self,
+        ctx: &CoreContext,
+        options: RepairOptions,
+    ) -> Result<Vec<RepairResult>, InternalError>;
+
     async fn extend_deriving_ttl(
         &self,
         ctx: &CoreContext,
@@ -316,13 +322,5 @@ impl DerivationQueueSummaryItem {
 
     pub fn priority(&self) -> DerivationPriority {
         self.dag_item_info.priority()
-    }
-
-    pub fn stage_id(&self) -> Option<&StageKey> {
-        self.dag_item_id.stage_id.as_ref()
-    }
-
-    pub fn stage_payload(&self) -> Option<&DerivationStagePayload> {
-        self.dag_item_info.stage_payload()
     }
 }

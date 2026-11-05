@@ -13,9 +13,9 @@ dunce = "1.0.5"
 edenfs-core = { version = "0.1.0", path = "../edenfs-core" }
 edenfs-utils = { version = "0.1.0", path = "../edenfs-utils" }
 fail = { version = "0.5.1", features = ["failpoints"] }
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 tempfile = "3.27.0"

@@ -21,6 +21,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "eden/fs/service/HeartbeatManager.h"
@@ -35,6 +36,7 @@
 #include <folly/SocketAddress.h>
 #include <folly/String.h>
 #include <folly/portability/Unistd.h>
+#include <thrift/lib/cpp/util/EnumUtils.h>
 
 #include <folly/json/json.h>
 #ifdef __APPLE__
@@ -49,7 +51,9 @@
 #endif
 #include <folly/chrono/Conv.h>
 #include <folly/coro/Invoke.h>
+#include <folly/coro/Sleep.h>
 #include <folly/coro/Task.h>
+#include <folly/coro/WithCancellation.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include <folly/futures/Future.h>
@@ -73,6 +77,7 @@
 #include "eden/common/telemetry/RequestMetricsScope.h"
 #include "eden/common/telemetry/SessionInfo.h"
 #include "eden/common/telemetry/StructuredLoggerFactory.h"
+#include "eden/common/utils/Bug.h"
 #include "eden/common/utils/EnumValue.h"
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/common/utils/FileUtils.h"
@@ -82,12 +87,14 @@
 #include "eden/common/utils/UnboundedQueueExecutor.h"
 #include "eden/common/utils/UserInfo.h"
 #include "eden/fs/config/CheckoutConfig.h"
+#include "eden/fs/config/MountProtocol.h"
 #include "eden/fs/config/RestrictedContentMode.h"
 #include "eden/fs/config/TomlConfig.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/InodeAccessLogger.h"
 #include "eden/fs/inodes/InodeBase.h"
 #include "eden/fs/inodes/InodeMap.h"
+#include "eden/fs/inodes/InodeTimestamps.h"
 #include "eden/fs/inodes/ServerState.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/journal/Journal.h"
@@ -104,7 +111,6 @@
 #include "eden/fs/service/ThriftStreamStartupStatusSubscriber.h"
 #include "eden/fs/service/ThriftUtil.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
-#include "eden/fs/store/BackingStoreLogger.h"
 #include "eden/fs/store/BlobCache.h"
 #include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/store/TreeCache.h"
@@ -115,7 +121,6 @@
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/EdenStructuredLogger.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
-#include "eden/fs/telemetry/IScribeLogger.h"
 #include "eden/fs/telemetry/IXplatLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
 #ifdef EDEN_HAVE_LOGGER
@@ -125,7 +130,6 @@
 #include "eden/fs/telemetry/XplatKeys.h"
 #include "eden/fs/utils/Clock.h"
 #include "eden/fs/utils/EdenError.h"
-#include "eden/fs/utils/EdenTaskQueue.h"
 #include "eden/fs/utils/FsChannelTypes.h"
 #include "eden/fs/utils/MountHealthCheck.h"
 #include "eden/fs/utils/NfsSocket.h"
@@ -138,7 +142,6 @@
 
 #ifdef EDEN_HAVE_SERVER_OBSERVER
 #include "common/fb303/cpp/ThreadPoolExecutorCounters.h" // @manual
-#include "common/network/Hostname.h"
 #include "eden/fs/service/facebook/ServerObserver.h" // @manual
 #endif
 
@@ -146,6 +149,7 @@
 #include <sys/wait.h>
 #include "eden/fs/fuse/FuseChannel.h"
 #include "eden/fs/inodes/Overlay.h"
+#include "eden/fs/nfs/Nfsd3.h"
 #include "eden/fs/notifications/CommandNotifier.h"
 #include "eden/fs/takeover/TakeoverClient.h"
 #include "eden/fs/takeover/TakeoverServer.h"
@@ -156,19 +160,27 @@
 #endif // !_WIN32
 
 DEFINE_bool(
-    debug,
-    false,
-    "run fuse in debug mode"); // TODO: remove; no longer needed
-DEFINE_bool(
     takeover,
     false,
     "If another edenfs process is already running, "
     "attempt to gracefully takeover its mount points.");
 DEFINE_bool(
+    forceTakeover,
+    false,
+    "With --takeover, make the running edenfs cancel the Thrift requests it "
+    "is serving instead of refusing the takeover while it is busy.");
+DEFINE_bool(
+    takeoverOnlyIfIdle,
+    false,
+    "With --takeover, let the running edenfs refuse the takeover while it has "
+    "served a checkout or a mount recently, as well as while it is busy.");
+DEFINE_bool(
     enable_fault_injection,
     false,
     "Enable the fault injection framework.");
 
+// Still passed by antlir's eden_access tooling; has had no effect since the
+// LocalStore was removed.
 DEFINE_string(local_storage_engine_unsafe, "", "DEPRECATED - has no effect.");
 
 DEFINE_int64(
@@ -219,6 +231,20 @@ void runInEventBaseThreadAndRethrow(folly::EventBase* evb, Fn&& fn) {
 }
 
 constexpr auto kMountHealthCheckTimeout = std::chrono::seconds{5};
+constexpr auto kChannelStopRecoveryDelay = std::chrono::milliseconds{500};
+
+// `source` of the eden_mount_health_issue row that reports a recovery's
+// outcome.
+constexpr std::string_view recoveryOutcomeSource(
+    CheckoutRecoveryTrigger trigger) {
+  switch (trigger) {
+    case CheckoutRecoveryTrigger::HealthCheckTick:
+      return "daemon_periodic";
+    case CheckoutRecoveryTrigger::ChannelStop:
+      return "daemon_channel_stop";
+  }
+  return "unknown";
+}
 
 using EmittedMountHealthIssues =
     folly::Synchronized<std::unordered_map<std::string, std::set<std::string>>>;
@@ -256,15 +282,31 @@ struct MountHealthIssueLogContext {
   MountHealthIssueLogContext(
       std::weak_ptr<EdenFsEventsLogger> edenFsEventsLogger,
       std::shared_ptr<EmittedMountHealthIssues> emittedMountHealthIssues,
+      EdenStatsPtr stats,
       std::string mountPath,
-      std::string repoSource)
+      std::string repoSource,
+      std::weak_ptr<EdenMount> mount,
+      std::shared_ptr<MountHealthProbeProgress> progress)
       : edenFsEventsLogger_{std::move(edenFsEventsLogger)},
         emittedMountHealthIssues{std::move(emittedMountHealthIssues)},
+        stats{std::move(stats)},
         mountPath{std::move(mountPath)},
-        repoSource{std::move(repoSource)} {}
+        repoSource{std::move(repoSource)},
+        mount{std::move(mount)},
+        progress{std::move(progress)} {}
 
-  void log(std::string reason, std::string error) const {
-    if (!shouldLogMountHealthIssue(
+  void count(StatsGroupBase::Counter MountHealthCheckStats::* counter) const {
+    stats->increment(counter);
+  }
+
+  void log(
+      std::string reason,
+      std::string error,
+      std::string causeDetail = {},
+      std::optional<double> durationS = std::nullopt,
+      bool deduplicate = true) const {
+    if (deduplicate &&
+        !shouldLogMountHealthIssue(
             emittedMountHealthIssues, mountPath, reason)) {
       return;
     }
@@ -272,24 +314,122 @@ struct MountHealthIssueLogContext {
     if (!edenFsEventsLogger) {
       return;
     }
-    edenFsEventsLogger->logEvent(
-        EdenMountHealthIssue{
-            "daemon_periodic",
-            std::move(reason),
-            std::string{mountPath},
-            std::string{mountPath},
-            "configured_checkout",
-            std::string{repoSource},
-            std::move(error),
-            false,
-            false});
+    EdenMountHealthIssue event{
+        "daemon_periodic",
+        std::move(reason),
+        std::string{mountPath},
+        std::string{mountPath},
+        "configured_checkout",
+        std::string{repoSource},
+        std::move(error),
+        false,
+        false};
+    event.cause_detail = std::move(causeDetail);
+    event.duration_s = durationS;
+    edenFsEventsLogger->logEvent(event);
   }
 
   std::weak_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
   std::shared_ptr<EmittedMountHealthIssues> emittedMountHealthIssues;
+  EdenStatsPtr stats;
   std::string mountPath;
   std::string repoSource;
+  // Weak, so that a stuck probe never keeps an unmounted checkout alive.
+  std::weak_ptr<EdenMount> mount;
+  std::shared_ptr<MountHealthProbeProgress> progress;
+  // With a hang threshold, the detail of a probe that ran past the 5 s
+  // timeout, taken then. Logged if the probe finishes before the threshold.
+  mutable folly::Synchronized<std::string> slowProbeDetail;
+  // Set once the probe was reported as hung.
+  mutable std::atomic_bool hung{false};
 };
+
+using RunningMountHealthChecks = folly::Synchronized<std::unordered_map<
+    std::string,
+    std::shared_ptr<const MountHealthProbeProgress>>>;
+
+/**
+ * The probes holding health check threads while another probe waits, as a
+ * JSON field.
+ */
+folly::dynamic describeProbesHoldingThreads(
+    const RunningMountHealthChecks& runningChecks,
+    const std::string& waitingMountPath,
+    std::chrono::steady_clock::time_point now) {
+  std::vector<
+      std::pair<std::string, std::shared_ptr<const MountHealthProbeProgress>>>
+      running;
+  {
+    auto checks = runningChecks.rlock();
+    for (const auto& [mountPath, progress] : *checks) {
+      if (mountPath != waitingMountPath && progress->started() &&
+          progress->step() != MountHealthProbeStep::Done) {
+        running.emplace_back(mountPath, progress);
+      }
+    }
+  }
+  // Reads /proc for each probe, so do it without holding the lock.
+  folly::dynamic holders = folly::dynamic::array;
+  for (const auto& [mountPath, progress] : running) {
+    auto holder = describeProbeProgress(*progress, now);
+    holder.update(describeProbeThread(*progress));
+    holder["mount"] = mountPath;
+    holders.push_back(std::move(holder));
+  }
+  return folly::dynamic::object("holders", std::move(holders));
+}
+
+/**
+ * The checkout's load, as JSON fields: the requests EdenFS is working on and
+ * the oldest one, the requests the kernel has queued, and whether a checkout
+ * or an inode GC is running.
+ */
+folly::dynamic describeFsChannelLoad(
+    EdenMount& mount,
+    std::chrono::steady_clock::time_point now) {
+  folly::dynamic detail = folly::dynamic::object(
+      "checkout_in_progress", mount.isCheckoutInProgress());
+#ifndef _WIN32
+  auto toMs = [](std::chrono::steady_clock::duration duration) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(duration)
+        .count();
+  };
+  auto byStartTime = [](const auto& a, const auto& b) {
+    return a.requestStartTime < b.requestStartTime;
+  };
+  if (auto* fuse = mount.getFuseChannel()) {
+    if (auto waiting =
+            readFuseConnectionWaiting(mount.getHealthCheckDevice())) {
+      detail["fuse_waiting"] = *waiting;
+    }
+    auto requests = fuse->getOutstandingRequests();
+    detail["outstanding"] = requests.size();
+    auto oldest =
+        std::min_element(requests.begin(), requests.end(), byStartTime);
+    if (oldest != requests.end()) {
+      detail["oldest_ms"] = toMs(now - oldest->requestStartTime);
+      detail["oldest_op"] = fuseOpcodeName(oldest->request.opcode).str();
+      detail["oldest_pid"] = oldest->request.pid;
+    }
+  } else if (auto* nfs = mount.getNfsdChannel()) {
+    auto requests = nfs->getOutstandingRequests();
+    detail["outstanding"] = requests.size();
+    auto oldest =
+        std::min_element(requests.begin(), requests.end(), byStartTime);
+    if (oldest != requests.end()) {
+      detail["oldest_ms"] = toMs(now - oldest->requestStartTime);
+    }
+  }
+#else
+  (void)now;
+#endif
+  if (auto gc = mount.getRunningInodeGC()) {
+    detail["gc_kind"] = gc->pressureBased ? "pressure" : "periodic";
+    detail["gc_age_ms"] =
+        std::chrono::duration_cast<std::chrono::milliseconds>(gc->age).count();
+  }
+  return detail;
+}
 
 folly::CPUThreadPoolExecutor* getMountHealthCheckThreadPool() {
   // Process-lifetime so a stuck filesystem syscall cannot make EdenServer
@@ -308,14 +448,41 @@ folly::CPUThreadPoolExecutor* getCgroupFileCacheReclaimThreadPool() {
 }
 #endif
 
+/**
+ * The JSON detail of a probe that ran too long: where it is, where its thread
+ * waits, the checkout's load and the host's pressure.
+ */
+std::string describeStuckProbe(
+    const MountHealthIssueLogContext& logContext,
+    std::chrono::steady_clock::time_point now,
+    const folly::dynamic& extraDetail = folly::dynamic::object) {
+  auto description = describeProbeProgress(*logContext.progress, now);
+  description.update(describeProbeThread(*logContext.progress));
+  if (auto mount = logContext.mount.lock()) {
+    description.update(describeFsChannelLoad(*mount, now));
+  }
+  description.update(describeSystemPressure());
+  description.update(extraDetail);
+  folly::json::serialization_opts sortedKeys;
+  sortedKeys.sort_keys = true;
+  return folly::json::serialize(description, sortedKeys);
+}
+
 void logMountHealthCheckTimeout(
     const MountHealthIssueLogContext& logContext,
-    std::string error) {
+    EdenMountHealthIssueReason reason,
+    std::string error,
+    const folly::dynamic& extraDetail = folly::dynamic::object) {
   try {
+    const auto now = std::chrono::steady_clock::now();
+    auto detail = describeStuckProbe(logContext, now, extraDetail);
+    XLOGF(WARN, "{} for {}: {}", error, logContext.mountPath, detail);
     logContext.log(
-        std::string{edenMountHealthIssueReasonString(
-            EdenMountHealthIssueReason::DaemonRunningMountTimedOut)},
-        std::move(error));
+        std::string{edenMountHealthIssueReasonString(reason)},
+        std::move(error),
+        std::move(detail),
+        std::chrono::duration<double>{now - logContext.progress->queued()}
+            .count());
   } catch (const std::exception& ex) {
     XLOGF(ERR, "EdenFS mount health timeout logging failed: {}", ex.what());
   } catch (...) {
@@ -323,47 +490,160 @@ void logMountHealthCheckTimeout(
   }
 }
 
+/**
+ * Logs a probe that ran past the 5 s timeout and then finished, once per
+ * probe rather than once per issue. `detail` was taken at the timeout.
+ */
+void logSlowMountHealthCheck(
+    const MountHealthIssueLogContext& logContext,
+    std::string detail) {
+  try {
+    const auto duration =
+        std::chrono::steady_clock::now() - logContext.progress->queued();
+    auto error = fmt::format(
+        "EdenFS mount health check took {} ms",
+        std::chrono::duration_cast<std::chrono::milliseconds>(duration)
+            .count());
+    XLOGF(WARN, "{} for {}: {}", error, logContext.mountPath, detail);
+    logContext.log(
+        std::string{edenMountHealthIssueReasonString(
+            EdenMountHealthIssueReason::DaemonRunningMountSlow)},
+        std::move(error),
+        std::move(detail),
+        std::chrono::duration<double>{duration}.count(),
+        /*deduplicate=*/false);
+  } catch (const std::exception& ex) {
+    XLOGF(ERR, "EdenFS mount health slow probe logging failed: {}", ex.what());
+  }
+}
+
+/**
+ * Logs the end of a hang, once per hang, with how long the probe ran and what
+ * it found.
+ */
+void logMountHealthCheckHangEnded(
+    const MountHealthIssueLogContext& logContext,
+    std::string_view result) {
+  try {
+    const auto duration =
+        std::chrono::steady_clock::now() - logContext.progress->queued();
+    const auto durationMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+    auto error = fmt::format(
+        "EdenFS mount health check hang ended after {} ms", durationMs);
+    auto detail = folly::toJson(
+        folly::dynamic::object("result", result)("probe_ms", durationMs));
+    XLOGF(WARN, "{} for {}: {}", error, logContext.mountPath, detail);
+    logContext.log(
+        std::string{edenMountHealthIssueReasonString(
+            EdenMountHealthIssueReason::DaemonRunningMountHangEnded)},
+        std::move(error),
+        std::move(detail),
+        std::chrono::duration<double>{duration}.count(),
+        /*deduplicate=*/false);
+  } catch (const std::exception& ex) {
+    XLOGF(ERR, "EdenFS mount health hang end logging failed: {}", ex.what());
+  }
+}
+
 void scheduleMountHealthCheckStartTimeout(
     std::shared_ptr<std::atomic_bool> started,
     std::shared_ptr<std::atomic_bool> completed,
-    std::shared_ptr<const MountHealthIssueLogContext> logContext) {
+    std::shared_ptr<const MountHealthIssueLogContext> logContext,
+    std::shared_ptr<const RunningMountHealthChecks> runningChecks) {
   folly::futures::detachOnGlobalCPUExecutor(
       folly::futures::sleep(kMountHealthCheckTimeout)
           .deferValue([started = std::move(started),
                        completed = std::move(completed),
-                       logContext = std::move(logContext)](auto&&) {
+                       logContext = std::move(logContext),
+                       runningChecks = std::move(runningChecks)](auto&&) {
             if (started->load(std::memory_order_acquire)) {
               return;
             }
             if (completed->exchange(true)) {
               return;
             }
+            logContext->count(&MountHealthCheckStats::notStarted);
             logMountHealthCheckTimeout(
                 *logContext,
+                EdenMountHealthIssueReason::DaemonRunningMountCheckNotStarted,
                 "EdenFS mount health check did not start within timeout; "
-                "worker pool may be saturated");
+                "worker pool may be saturated",
+                describeProbesHoldingThreads(
+                    *runningChecks,
+                    logContext->mountPath,
+                    std::chrono::steady_clock::now()));
+          }));
+}
+
+void scheduleMountHealthCheckHangTimeout(
+    std::shared_ptr<std::atomic_bool> completed,
+    std::shared_ptr<const MountHealthIssueLogContext> logContext,
+    std::chrono::nanoseconds delay) {
+  folly::futures::detachOnGlobalCPUExecutor(
+      folly::futures::sleep(
+          std::chrono::duration_cast<folly::HighResDuration>(delay))
+          .deferValue([completed = std::move(completed),
+                       logContext = std::move(logContext)](auto&&) {
+            // Set before claiming the probe, so a result that loses the race
+            // sees it.
+            logContext->hung.store(true, std::memory_order_release);
+            if (completed->exchange(true)) {
+              return;
+            }
+            logContext->count(&MountHealthCheckStats::hung);
+            logMountHealthCheckTimeout(
+                *logContext,
+                EdenMountHealthIssueReason::DaemonRunningMountHung,
+                "EdenFS mount health check hung");
           }));
 }
 
 void scheduleMountHealthCheckRuntimeTimeout(
     std::shared_ptr<std::atomic_bool> completed,
-    std::shared_ptr<const MountHealthIssueLogContext> logContext) {
+    std::shared_ptr<const MountHealthIssueLogContext> logContext,
+    std::chrono::nanoseconds hangThreshold) {
   folly::futures::detachOnGlobalCPUExecutor(
       folly::futures::sleep(kMountHealthCheckTimeout)
           .deferValue([completed = std::move(completed),
-                       logContext = std::move(logContext)](auto&&) {
+                       logContext = std::move(logContext),
+                       hangThreshold](auto&&) mutable {
+            if (hangThreshold > kMountHealthCheckTimeout) {
+              // A slow probe is reported when it finishes, or when it passes
+              // the threshold.
+              if (!completed->load(std::memory_order_acquire)) {
+                try {
+                  *logContext->slowProbeDetail.wlock() = describeStuckProbe(
+                      *logContext, std::chrono::steady_clock::now());
+                } catch (const std::exception& ex) {
+                  XLOGF(
+                      ERR,
+                      "EdenFS mount health check could not describe a slow "
+                      "probe: {}",
+                      ex.what());
+                }
+                scheduleMountHealthCheckHangTimeout(
+                    std::move(completed),
+                    std::move(logContext),
+                    hangThreshold - kMountHealthCheckTimeout);
+              }
+              return;
+            }
             if (completed->exchange(true)) {
               return;
             }
+            logContext->count(&MountHealthCheckStats::timedOut);
             logMountHealthCheckTimeout(
-                *logContext, "EdenFS mount health check timed out");
+                *logContext,
+                EdenMountHealthIssueReason::DaemonRunningMountTimedOut,
+                "EdenFS mount health check timed out");
           }));
 }
 
 std::shared_ptr<Notifier> getPlatformNotifier(
     std::shared_ptr<ReloadableConfig> config,
     std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
-    std::string version) {
+    const std::string& version) {
 #if defined(_WIN32)
   /*
    * If the E-Menu is disabled, we should create a Null Notifier
@@ -484,7 +764,7 @@ size_t getNumberPendingFuseRequests(const EdenMount* mount) {
   constexpr StringPiece kFusePendingRequestFile{"waiting"};
 
   auto mount_path = mount->getPath().c_str();
-  struct stat file_metadata;
+  struct stat file_metadata{};
 
   folly::checkUnixError(
       lstat(mount_path, &file_metadata),
@@ -505,15 +785,10 @@ size_t getNumberPendingFuseRequests(const EdenMount* mount) {
 }
 #endif // __linux__
 
-std::shared_ptr<folly::Executor> makeCheckoutRevisionThreads(
-    bool useCheckoutExecutor,
+std::shared_ptr<folly::Executor> makeDiffWorkThreads(
     std::shared_ptr<const EdenConfig>& edenConfig) {
-  if (useCheckoutExecutor) {
-    return std::make_shared<UnboundedQueueExecutor>(
-        edenConfig->numCheckoutThreads.getValue(),
-        "CheckoutRevisionThreadPool");
-  }
-  return nullptr;
+  return std::make_shared<UnboundedQueueExecutor>(
+      edenConfig->numDiffWorkThreads.getValue(), "DiffWorkThreadPool");
 }
 
 std::shared_ptr<folly::Executor> makePrefetchFilesV2Threads(
@@ -709,13 +984,8 @@ class EdenServer::ThriftServerEventHandler
   bool stoppingFromSignal_;
 };
 
-static constexpr folly::StringPiece kNfsReadCount60{"nfs.read_us.count.60"};
-static constexpr folly::StringPiece kNfsReadDirCount60{
-    "nfs.readdir_us.count.60"};
-static constexpr folly::StringPiece kNfsReadDirPlusCount60{
-    "nfs.readdirplus_us.count.60"};
-
 static constexpr folly::StringPiece kFsChannelTaskCount{"fs.task.count"};
+static constexpr folly::StringPiece kEdenBugCount{"bug.count"};
 static constexpr folly::StringPiece kMemoryVmRssBytes{"memory_vm_rss_bytes"};
 #ifdef __APPLE__
 static constexpr folly::StringPiece kMemoryCompressedBytes{
@@ -733,7 +1003,6 @@ EdenServer::EdenServer(
     std::shared_ptr<const EdenConfig> edenConfig,
     ActivityRecorderFactory activityRecorderFactory,
     BackingStoreFactory* backingStoreFactory,
-    std::shared_ptr<IScribeLogger> scribeLogger,
     std::shared_ptr<StartupStatusChannel> startupStatusChannel,
     std::string version)
     : originalCommandLine_{std::move(originalCommandLine)},
@@ -797,7 +1066,6 @@ EdenServer::EdenServer(
           structuredLogger_,
           notificationsStructuredLogger_,
           errorLogger_,
-          std::move(scribeLogger),
           config_,
           *edenConfig,
           nfsEventBaseThread_.getEventBase(),
@@ -831,16 +1099,13 @@ EdenServer::EdenServer(
       thriftUseResourcePools_{edenConfig->thriftUseResourcePools.getValue()},
       thriftUseSerialExecution_{
           edenConfig->thriftUseSerialExecution.getValue()},
-      thriftUseCheckoutExecutor_{
-          edenConfig->thriftUseCheckoutExecutor.getValue()},
-      checkoutRevisionExecutor_{
-          makeCheckoutRevisionThreads(thriftUseCheckoutExecutor_, edenConfig)},
+      diffWorkExecutor_{makeDiffWorkThreads(edenConfig)},
       thriftUsePrefetchExecutor_{
           edenConfig->thriftUsePrefetchExecutor.getValue()},
       prefetchFilesV2Executor_{
           makePrefetchFilesV2Threads(thriftUsePrefetchExecutor_, edenConfig)},
       runningMountHealthChecks_{std::make_shared<
-          folly::Synchronized<std::unordered_set<std::string>>>()},
+          std::decay_t<decltype(*runningMountHealthChecks_)>>()},
       progressManager_{
           std::make_unique<folly::Synchronized<EdenServer::ProgressManager>>()},
       startupStatusChannel_{std::move(startupStatusChannel)},
@@ -889,6 +1154,9 @@ EdenServer::EdenServer(
   counters->registerCallback(kFsChannelTaskCount, [this] {
     return this->getServerState()->getFsChannelThreadPool()->getTaskQueueSize();
   });
+
+  counters->registerCallback(
+      kEdenBugCount, [] { return static_cast<size_t>(getEdenBugCount()); });
 
   counters->registerCallback(kMemoryVmRssBytes, [] {
     auto memoryStats = facebook::eden::proc_util::readMemoryStats();
@@ -998,6 +1266,12 @@ void EdenServer::registerXplatTransforms() {
 #endif
 
 EdenServer::~EdenServer() {
+  // Each Thrift connection's processor holds the ServerState through its
+  // ThriftPermissionChecker, and the Thrift server drops its connections only
+  // when it is destroyed. Doing that first keeps everything the ServerState
+  // tears down on its way out, such as the NFS event base, alive until the
+  // last connection has let go.
+  server_.reset();
 #ifdef __linux__
   cgroupFileCacheReclaimState_->enabled.store(false, std::memory_order_release);
 #endif
@@ -1017,6 +1291,7 @@ EdenServer::~EdenServer() {
     }
   }
   counters->unregisterCallback(kFsChannelTaskCount);
+  counters->unregisterCallback(kEdenBugCount);
 #ifdef __APPLE__
   counters->unregisterCallback(kMemoryCompressedBytes);
   counters->unregisterCallback(kMemoryFootprintBytes);
@@ -1211,7 +1486,11 @@ void EdenServer::ProgressManager::printProgresses(
       break;
     }
   }
-  logger->logVerbose(prepare + content);
+  if (errorMessage.has_value()) {
+    logger->warn(prepare + content);
+  } else {
+    logger->logVerbose(prepare + content);
+  }
   totalLinesPrinted++;
 }
 
@@ -1269,7 +1548,7 @@ folly::SemiFuture<Unit> EdenServer::unmountAll() {
   // Use collectAll() rather than collect() to wait for all of the unmounts
   // to complete, and only check for errors once everything has finished.
   return folly::collectAll(futures).deferValue(
-      [](std::vector<folly::Try<Unit>> results) {
+      [](const std::vector<folly::Try<Unit>>& results) {
         for (const auto& result : results) {
           result.throwUnlessValue();
         }
@@ -1338,7 +1617,9 @@ Future<TakeoverData> EdenServer::stopMountsForTakeover(
               EdenErrorInfo::takeover(ex)
                   .withMountPoint(std::string(mountPath.view()))
                   .withMountStatus(
-                      fmt::format("{}", info.edenMount->getState()))
+                      fmt::format(
+                          "{}",
+                          folly::to_underlying(info.edenMount->getState())))
                   .withErrorType("takeover_shutdown_failed"));
         });
         if (outcome != ErrorLogOutcome::RateLimited) {
@@ -1411,25 +1692,6 @@ Future<TakeoverData> EdenServer::stopMountsForTakeover(
 
 void EdenServer::startPeriodicTasks() {
   auto config = serverState_->getReloadableConfig()->getEdenConfig();
-#ifdef EDEN_HAVE_OBC
-  if (config->enableOBCOnEden.getValue()) {
-    // Get the hostname without the ".facebook.com" suffix
-    auto hostname = facebook::network::getLocalHost(/*stripFbDomain=*/true);
-    std::vector<std::string> entities;
-    auto reWorkerID = std::getenv("REMOTE_EXECUTION_WORKER");
-    if (reWorkerID == nullptr) {
-      entities = {hostname};
-    } else {
-      entities = {hostname, fmt::format("{}:{}", hostname, reWorkerID)};
-    }
-    memory_vm_rss_bytes_ = monitoring::OBCAvg(
-        monitoring::OdsCategoryId::ODS_EDEN,
-        fmt::format("eden.{}", kMemoryVmRssBytes),
-        entities);
-    // Report memory usage stats once every 60 seconds
-    memoryStatsTask_.updateInterval(60s);
-  }
-#endif
   updatePeriodicTaskIntervals(*config);
 
 #ifndef _WIN32
@@ -1462,10 +1724,6 @@ void EdenServer::updatePeriodicTaskIntervals(const EdenConfig& config) {
           config.checkValidityInterval.getValue()));
 #endif
 
-  overlayTask_.updateInterval(
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          config.overlayMaintenanceInterval.getValue()));
-
   // Pressure-based GC ticks frequently so it can react quickly to sudden inode
   // growth. Each tick uses the pressure policy to decide which mounts are due.
   if (config.enableGc.getValue()) {
@@ -1480,19 +1738,6 @@ void EdenServer::updatePeriodicTaskIntervals(const EdenConfig& config) {
     }
   } else {
     gcTask_.updateInterval(0s);
-  }
-
-  if (config.enableNfsServer.getValue() &&
-      config.enableNfsCrawlDetection.getValue()) {
-    auto interval = config.nfsCrawlInterval.getValue();
-    XLOGF(
-        DBG4,
-        "NFS crawl detection enabled. Using interval = {}ns",
-        interval.count());
-    detectNfsCrawlTask_.updateInterval(
-        std::chrono::duration_cast<std::chrono::milliseconds>(interval));
-  } else {
-    detectNfsCrawlTask_.updateInterval(0s);
   }
 
 #ifdef __linux__
@@ -1512,10 +1757,6 @@ void EdenServer::updatePeriodicTaskIntervals(const EdenConfig& config) {
   refreshRestrictedRootsTask_.updateInterval(
       std::chrono::duration_cast<std::chrono::milliseconds>(
           config.restrictedRootRefreshInterval.getValue()));
-
-  accidentalUnmountRecoveryTask_.updateInterval(
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          config.accidentalUnmountRecoveryInterval.getValue()));
 
   mountHealthCheckTask_.updateInterval(
       std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1637,6 +1878,7 @@ void EdenServer::scheduleInodeUnload(std::chrono::milliseconds timeout) {
 #endif // !_WIN32
 
 ImmediateFuture<Unit> EdenServer::recover(TakeoverData&& data) {
+  handler_->disarmDelayedCancellation();
   return recoverImpl(std::move(data))
       .ensure(
           // Mark the server state as RUNNING once we finish setting up the
@@ -1654,6 +1896,9 @@ ImmediateFuture<Unit> EdenServer::recover(TakeoverData&& data) {
             // recovered daemon would never be restarted again.
             restartArmer_.clearArmed();
             armPrivHelperRestart();
+            // Recoveries cancelled while the takeover was under way, among
+            // others, are not mounted.
+            recoverCheckoutsNotServedSoon();
           });
 }
 
@@ -1726,6 +1971,7 @@ bool EdenServer::checkForPreviousHeartbeat(bool takeover) {
       config->silentDaemonExitLogShow.getValue(),
       serverState_->getThreadPool().get());
 }
+
 #endif
 
 Future<Unit> EdenServer::prepare(std::shared_ptr<StartupLogger> logger) {
@@ -1741,9 +1987,15 @@ Future<Unit> EdenServer::prepare(std::shared_ptr<StartupLogger> logger) {
           // the arm that follows relaunch a daemon the user stopped. Takeover
           // recovery, the one way back out, does not come through here.
           [this] {
-            auto state = runningState_.wlock();
-            if (state->state != RunState::SHUTTING_DOWN) {
+            {
+              auto state = runningState_.wlock();
+              if (state->state == RunState::SHUTTING_DOWN) {
+                return;
+              }
               state->state = RunState::RUNNING;
+            }
+            if (startedByTakeover_) {
+              recoverCheckoutsNotServedSoon();
             }
           });
 }
@@ -1751,6 +2003,31 @@ Future<Unit> EdenServer::prepare(std::shared_ptr<StartupLogger> logger) {
 namespace {
 bool shouldThrowDuringTakeover(const EdenConfig& config) {
   return config.clientThrowsDuringTakeover.getValue();
+}
+
+std::string describeLongRunningRequests(
+    const std::vector<EdenServiceHandler::LongRunningRequest>& requests,
+    ProcessInfoCache& processInfoCache) {
+  std::string description;
+  for (const auto& request : requests) {
+    if (!description.empty()) {
+      description += ", ";
+    }
+    std::string client = "an unknown client";
+    if (request.clientPid) {
+      auto pid = request.clientPid.value().get();
+      auto name = processInfoCache.getProcessName(pid);
+      client = name ? fmt::format("pid {} ({})", pid, *name)
+                    : fmt::format("pid {}", pid);
+    }
+    description += fmt::format(
+        "{} from {} running for {}{}",
+        request.method,
+        client,
+        durationToString(request.age),
+        request.cancelable ? "" : " (cannot be cancelled)");
+  }
+  return description;
 }
 
 std::chrono::seconds getTakeoverTimeoutSeconds(const EdenConfig& config) {
@@ -1772,11 +2049,6 @@ Future<TakeoverData> recoverPreparedTakeoverFromError(
 Future<Unit> EdenServer::prepareImpl(std::shared_ptr<StartupLogger> logger) {
   bool doingTakeover = false;
   auto edenDirLockResult = edenDir_.acquireLock();
-  if (edenDirLockResult.second.has_value()) {
-    // If it is during graceful restart and the old edenfs daemon process is
-    // still running, we need to keep the old daemon pid.
-    oldDaemonPid_ = edenDirLockResult.second;
-  }
   if (!edenDirLockResult.first) {
     // Another edenfs process is already running.
     //
@@ -1791,10 +2063,39 @@ Future<Unit> EdenServer::prepareImpl(std::shared_ptr<StartupLogger> logger) {
     }
     doingTakeover = true;
   }
+  startedByTakeover_ = doingTakeover;
   auto thriftRunningFuture = createThriftServer();
   // Start the PrivHelper client, using our main event base to drive its I/O
   serverState_->getPrivHelper()->setEdenFsEventsLogger(edenFsEventsLogger_);
   serverState_->getPrivHelper()->attachEventBase(mainEventBase_);
+#ifndef _WIN32
+  {
+    // Sent whether it is on or off: a privhelper that outlives this daemon
+    // keeps the last value it was told, so a reverted setting has to reach it.
+    const bool overrideFstype =
+        serverState_->getEdenConfig()->nfsOverrideFstype.getValue();
+    folly::futures::detachOn(
+        mainEventBase_,
+        serverState_->getPrivHelper()
+            ->setNfsFstypeOverride(overrideFstype)
+            .thenError([overrideFstype](folly::exception_wrapper&& ew) {
+              // An older privhelper rejects the request and keeps the
+              // override on, which only matters when it was meant to go off.
+              if (overrideFstype) {
+                XLOGF(
+                    DBG2,
+                    "the privhelper does not support the NFS filesystem type override setting: {}",
+                    ew.what());
+              } else {
+                XLOGF(
+                    WARN,
+                    "the privhelper did not turn the NFS filesystem type override off: {}",
+                    ew.what());
+              }
+            })
+            .semi());
+  }
+#endif
 
   startPeriodicTasks();
 
@@ -1820,6 +2121,8 @@ Future<Unit> EdenServer::prepareImpl(std::shared_ptr<StartupLogger> logger) {
       takeoverData = takeoverMounts(
           takeoverPath,
           getTakeoverTimeoutSeconds(*edenConfig),
+          FLAGS_forceTakeover,
+          FLAGS_takeoverOnlyIfIdle,
           shouldThrowDuringTakeover(*edenConfig));
     } catch (...) {
       auto ew = folly::exception_wrapper{std::current_exception()};
@@ -1842,6 +2145,26 @@ Future<Unit> EdenServer::prepareImpl(std::shared_ptr<StartupLogger> logger) {
       oldDaemonPid_ = oldDaemonPid.value();
     }
     server_->useExistingSocket(takeoverData.thriftSocket.release());
+
+    // The kernel keeps the NFS mounts the old daemon handed over, and only an
+    // NfsServer in this process can serve them, so build one even when the
+    // config has turned the NFS server off: the alternative is a daemon that
+    // dereferences a null NfsServer, or a mount nothing serves.
+    const auto nfsMounts = std::count_if(
+        takeoverData.mountPoints.begin(),
+        takeoverData.mountPoints.end(),
+        [](const TakeoverData::MountInfo& info) {
+          return info.getMountProtocol() == MountProtocol::NFS;
+        });
+    if (nfsMounts > 0 && !serverState_->getNfsServer()) {
+      logger->warn(
+          "experimental:enable-nfs-server is false, but the previous edenfs "
+          "handed over ",
+          nfsMounts,
+          " NFS mount(s); serving them with an NFS server until the next "
+          "full restart");
+      serverState_->createNfsServerForTakeover();
+    }
 #else
     NOT_IMPLEMENTED();
 #endif // !_WIN32
@@ -1879,12 +2202,42 @@ Future<Unit> EdenServer::prepareImpl(std::shared_ptr<StartupLogger> logger) {
       XLOG(DBG7, "Initializing mountd from scratch");
       std::optional<AbsolutePath> unixSocketPath;
       if (useUnixSocket) {
-        unixSocketPath = edenDir_.getMountdSocketPath();
+        // Every mount of this daemon follows the mountd's transport, so a
+        // socket path that would not fit anywhere means TCP for all of them,
+        // and so does a directory map that cannot be read to size them.
+        std::optional<std::string> why;
+        std::vector<std::string> checkoutIds;
+        try {
+          // The map has to outlive the loop: items() refers to it.
+          const auto dirs =
+              CheckoutConfig::loadClientDirectoryMap(edenDir_.getPath());
+          for (const auto& client : dirs.items()) {
+            checkoutIds.push_back(client.second.asString());
+          }
+        } catch (const std::exception& ex) {
+          why = fmt::format(
+              "the directory map could not be read to size the socket paths: {}",
+              ex.what());
+        }
+        if (!why) {
+          why = whyNfsCannotUseUnixSockets(
+              edenDir_.getMountdSocketPath(),
+              edenDir_.getClientsDir(),
+              checkoutIds);
+        }
+        if (why) {
+          logger->warn(
+              "Serving NFS over TCP although nfs:use-uds is set: ", *why);
+          XLOGF(
+              WARN,
+              "Serving NFS over TCP although nfs:use-uds is set: {}",
+              *why);
+        } else {
+          unixSocketPath = edenDir_.getMountdSocketPath();
+        }
       }
       runInEventBaseThreadAndRethrow(nfsEventBase, [&] {
-        nfsServer->initialize(
-            makeNfsSocket(std::move(unixSocketPath)),
-            serverState_->getEdenConfig()->registerMountd.getValue());
+        nfsServer->initialize(makeNfsSocket(std::move(unixSocketPath)));
       });
 #ifndef _WIN32
     }
@@ -2046,45 +2399,49 @@ std::vector<ImmediateFuture<Unit>> EdenServer::prepareMounts(
   logger->log("Remounting ", dirs.size(), " mount points...");
 
   for (const auto& client : dirs.items()) {
+    const auto mountPath = client.first.asString();
+    std::optional<size_t> progressIndex;
     auto mountFuture = makeImmediateFutureWith([&] {
-      auto mountPath = canonicalPath(client.first.stringPiece());
       auto edenClientPath =
           edenDir_.getCheckoutStateDir(client.second.stringPiece());
-      auto initialConfig =
-          CheckoutConfig::loadFromClientDirectory(mountPath, edenClientPath);
-      auto progressIndex = progressManager_->wlock()->registerEntry(
+      auto initialConfig = CheckoutConfig::loadFromClientDirectory(
+          canonicalPath(mountPath), edenClientPath);
+      auto index = progressManager_->wlock()->registerEntry(
           client.first.asString(), initialConfig->getOverlayPath().c_str());
+      progressIndex = index;
 
       return mount(
-                 std::move(initialConfig),
-                 false,
-                 [this, logger, progressIndex](auto percent) {
-                   progressManager_->wlock()->manageProgress(
-                       logger, progressIndex, percent);
-                 })
-          .thenTry([this, logger, mountPath, progressIndex](
-                       folly::Try<std::shared_ptr<EdenMount>>&& result) {
-            if (result.hasValue()) {
-              auto wl = progressManager_->wlock();
-              wl->finishProgress(progressIndex);
-              wl->printProgresses(logger);
-              return ImmediateFuture<folly::Unit>{std::in_place};
-            } else {
-              incrementStartupMountFailures();
-              auto errorMessage = fmt::format(
-                  "Failed to remount {}: {}\n",
-                  mountPath.value(),
-                  result.exception().what());
-              XLOG(DBG7, errorMessage);
-              auto wl = progressManager_->wlock();
-              wl->markFailed(progressIndex);
-              wl->printProgresses(logger, errorMessage);
-              return makeImmediateFuture<Unit>(std::move(result).exception());
-            }
+          std::move(initialConfig), false, [this, logger, index](auto percent) {
+            progressManager_->wlock()->manageProgress(logger, index, percent);
           });
     });
 
-    mountFutures.push_back(std::move(mountFuture));
+    // The factory runs eagerly, so the optional index is ready to capture.
+    // Handle failures outside it to include config and mount construction
+    // errors.
+    mountFutures.push_back(
+        std::move(mountFuture)
+            .thenTry([this, logger, mountPath, progressIndex](
+                         folly::Try<std::shared_ptr<EdenMount>>&& result) {
+              if (result.hasValue()) {
+                auto wl = progressManager_->wlock();
+                wl->finishProgress(progressIndex.value());
+                wl->printProgresses(logger);
+                return ImmediateFuture<folly::Unit>{std::in_place};
+              } else {
+                incrementStartupMountFailures();
+                auto errorMessage = fmt::format(
+                    "Failed to remount {}: {}\n",
+                    mountPath,
+                    result.exception().what());
+                auto wl = progressManager_->wlock();
+                if (progressIndex.has_value()) {
+                  wl->markFailed(progressIndex.value());
+                }
+                wl->printProgresses(logger, errorMessage);
+                return makeImmediateFuture<Unit>(std::move(result).exception());
+              }
+            }));
   }
   return mountFutures;
 }
@@ -2102,6 +2459,19 @@ void EdenServer::closeStorage() {
 
 bool EdenServer::performCleanup() {
   bool takeover = false;
+
+  // Unforced takeovers may still be waiting for Thrift requests to finish.
+  // Each wait holds this server and the main event base, so end them before
+  // anything is torn down: cancellation wakes each one, and its continuation
+  // runs on the main event base. The timer that cancels requests once the
+  // grace period expires has nothing left to do either, since the Thrift
+  // server has joined its requests by now.
+  takeoverWaitCancellation_.requestCancellation();
+  while (pendingTakeoverWaits_ != 0) {
+    mainEventBase_->loopOnce();
+  }
+  takeoverWaitCancellation_ = folly::CancellationSource{};
+  handler_->disarmDelayedCancellation();
 
   folly::stop_watch<> shutdown;
   bool shutdownSuccess = true;
@@ -2423,6 +2793,13 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
   auto backingStore =
       getBackingStore(bsType, initialConfig->getRepoSource(), *initialConfig);
 
+  std::shared_ptr<WalkDetector> walkDetector;
+  if (serverState_->getReloadableConfig()
+          ->getEdenConfig()
+          ->enableWalkDetector.getValue()) {
+    walkDetector =
+        backingStore->createWalkDetector(initialConfig->getMountPath());
+  }
   auto objectStore = ObjectStore::create(
       backingStore,
       treeCache_,
@@ -2430,8 +2807,11 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
       serverState_->getProcessInfoCache(),
       serverState_->getEdenFsEventsLogger(),
       serverState_->getReloadableConfig(),
-      initialConfig->getCaseSensitive());
-  auto journal = std::make_unique<Journal>(getStats().copy());
+      initialConfig->getCaseSensitive(),
+      folly::getKeepAliveToken(serverState_->getThreadPool().get()),
+      walkDetector);
+  auto journal = std::make_unique<Journal>(
+      getStats().copy(), &serverState_->getFaultInjector());
 
   // Create the EdenMount object and insert the mount into the mountPoints_ map.
   auto edenMount = EdenMount::create(
@@ -2440,7 +2820,9 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
       blobCache_,
       serverState_,
       std::move(journal),
-      getStats().copy());
+      getStats().copy(),
+      std::nullopt,
+      std::move(walkDetector));
   addToMountPoints(edenMount);
 
   if (fsckSemaphore_) {
@@ -2467,7 +2849,7 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
         return makeImmediateFuture<folly::Unit>(std::move(ew));
       })
       .thenValue([this,
-                  doTakeover,
+                  doTakeover = doTakeover,
                   readOnly,
                   edenMount,
                   mountStopWatch,
@@ -2482,8 +2864,15 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
               mountFinished(edenMount.get(), std::nullopt);
               return makeFuture<folly::Unit>(std::move(ew));
             })
-            .thenValue([edenMount, doTakeover, this](folly::Unit) mutable {
+            .thenValue([edenMount, doTakeover = doTakeover, this](
+                           folly::Unit) mutable {
               registerStats(edenMount);
+              // The checkout root is this mount's root now, so the health
+              // check can confirm it with statx from its first probe.
+              if (auto device =
+                      mountRootDevice(edenMount->getPath().asString())) {
+                edenMount->setHealthCheckDevice(*device);
+              }
 
               // Now that we've started the workers, arrange to call
               // mountFinished once the pool is torn down.
@@ -2496,7 +2885,10 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
                           optTakeover = std::move(takeover.value());
                         }
                         unregisterStats(edenMount.get());
-                        mountFinished(edenMount.get(), std::move(optTakeover));
+                        mountFinished(
+                            edenMount.get(),
+                            std::move(optTakeover),
+                            /*fsChannelCompleted=*/true);
                       });
 
               if (doTakeover) {
@@ -2507,9 +2899,15 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
                 // Perform all of the bind mounts associated with the
                 // client.  We don't need to do this for the takeover
                 // case as they are already mounted.
-                return edenMount->performBindMounts()
+                return serverState_->getFaultInjector()
+                    .checkAsync("mountBindMounts", edenMount->getPath().view())
+                    .semi()
+                    .deferValue([edenMount](auto&&) {
+                      return edenMount->performBindMounts();
+                    })
                     .deferValue([edenMount](auto&&) { return edenMount; })
-                    .deferError([edenMount](folly::exception_wrapper ew) {
+                    .deferError([edenMount](
+                                    const folly::exception_wrapper& ew) {
                       XLOG(
                           ERR,
                           "Error while performing bind mounts, will continue with mount anyway: {}",
@@ -2520,6 +2918,14 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
               }
             })
             .thenTry([this, mountStopWatch, doTakeover, edenMount](auto&& t) {
+              // A successful mount ends the outage, unless its channel has
+              // already stopped again. Earlier issues no longer apply, so the
+              // next outage is reported again.
+              if (t.hasValue() && !edenMount->getFsChannelStop()) {
+                resetCheckoutRecovery(edenMount->getPath());
+                clearMountHealthIssues(
+                    emittedMountHealthIssues_, edenMount->getPath().asString());
+              }
               auto* fsChannel = edenMount->getFsChannel();
               auto inodeCatalogType =
                   edenMount->getCheckoutConfig()->getInodeCatalogType();
@@ -2552,41 +2958,90 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
       });
 }
 
+namespace {
+// Best effort: failing to write the marker must not fail the unmount.
+void markIntentionallyUnmounted(const CheckoutConfig& config) {
+  try {
+    config.setIntentionallyUnmountedFlag();
+  } catch (const std::exception& ex) {
+    XLOGF(
+        WARN,
+        "Could not mark {} as intentionally unmounted: {}",
+        config.getMountPath(),
+        ex.what());
+  }
+}
+} // namespace
+
 folly::SemiFuture<Unit> EdenServer::unmount(
     AbsolutePathPiece mountPath,
     UnmountOptions options) {
-  return folly::makeSemiFutureWith([&] {
-           auto future = Future<Unit>::makeEmpty();
-           auto mount = std::shared_ptr<EdenMount>{};
-           {
-             const auto mountPoints = mountPoints_->wlock();
-             const auto it = mountPoints->find(mountPath);
-             if (it == mountPoints->end()) {
-               return folly::makeSemiFuture<Unit>(std::out_of_range(
-                   fmt::format("no such mount point {}", mountPath)));
-             }
-             future = it->second.unmountPromise.getFuture();
-             mount = it->second.edenMount;
-           }
+  auto future = Future<Unit>::makeEmpty();
+  auto mount = std::shared_ptr<EdenMount>{};
+  auto unmount = folly::makeSemiFutureWith([&] {
+    {
+      const auto mountPoints = mountPoints_->wlock();
+      const auto it = mountPoints->find(mountPath);
+      if (it == mountPoints->end()) {
+        return folly::makeSemiFuture<Unit>(std::out_of_range(
+            fmt::format("no such mount point {}", mountPath)));
+      }
+      future = it->second.unmountPromise.getFuture();
+      mount = it->second.edenMount;
+    }
 
-           // We capture the mount shared_ptr in the lambda to keep the
-           // EdenMount object alive during the call to unmount.
-           return mount->unmount(options).deferValue(
-               [mount, f = std::move(future)](auto&&) mutable {
-                 return std::move(f);
-               });
-         })
-      .deferError([path = mountPath.copy()](folly::exception_wrapper&& ew) {
-        XLOGF(ERR, "Failed to perform unmount for \"{}\": {}", path, ew.what());
-        return folly::makeSemiFuture<Unit>(std::move(ew));
+    // Written before teardown starts, so that unmount recovery never
+    // sees this checkout unmounted without the marker.
+    markIntentionallyUnmounted(*mount->getCheckoutConfig());
+    serverState_->getFaultInjector().check("unmount", mountPath.view());
+    return mount->unmount(options);
+  });
+
+  // Keep the mount alive through the channel unmount, then return the final
+  // shutdown promise without deferred callbacks that could outlive the pool.
+  return std::move(unmount).defer(
+      [this,
+       path = mountPath.copy(),
+       mount = std::move(mount),
+       future = std::move(future)](
+          folly::Try<Unit>&& result) mutable -> Future<Unit> {
+        if (result.hasException()) {
+          if (mount) {
+            bool stillMounted = false;
+            {
+              const auto mountPoints = mountPoints_->rlock();
+              const auto it = mountPoints->find(mount->getPath());
+              stillMounted =
+                  it != mountPoints->end() && it->second.edenMount == mount;
+            }
+            if (stillMounted) {
+              mount->getCheckoutConfig()->clearIntentionallyUnmountedFlag();
+            }
+          }
+          XLOGF(
+              ERR,
+              "Failed to perform unmount for \"{}\": {}",
+              path,
+              result.exception().what());
+          return folly::makeFuture<Unit>(std::move(result));
+        }
+        return std::move(future);
       });
 }
 
 void EdenServer::mountFinished(
     EdenMount* edenMount,
-    std::optional<TakeoverData::MountInfo> takeover) {
+    std::optional<TakeoverData::MountInfo> takeover,
+    bool fsChannelCompleted) {
   const auto& mountPath = edenMount->getPath();
-  XLOGF(INFO, "mount point \"{}\" stopped", mountPath);
+  const auto stop = edenMount->getFsChannelStop();
+  const std::string stopReason =
+      stop ? std::string{stop->reason.name} : "mount_failed";
+  XLOGF(INFO, "mount point \"{}\" stopped ({})", mountPath, stopReason);
+  recordCheckoutStop(
+      mountPath,
+      stopReason,
+      stop ? std::make_optional(stop->time) : std::nullopt);
 
   // Although it's uncommon for a GC to be running during unmount, we should
   // confirm any running GC exited before proceeding. Typically, GC stops on
@@ -2601,31 +3056,39 @@ void EdenServer::mountFinished(
   stopAllGarbageCollections(
       /*maxRetries=*/3, /*retryInterval=*/std::chrono::seconds(1));
 
-  // Save the unmount and takeover Promises
-  folly::SharedPromise<Unit> unmountPromise;
-  std::optional<folly::Promise<TakeoverData::MountInfo>> takeoverPromise;
   auto shutdownFuture = folly::SemiFuture<SerializedInodeMap>::makeEmpty();
+  bool doTakeover = false;
   {
     const auto mountPoints = mountPoints_->wlock();
     const auto it = mountPoints->find(mountPath);
     XCHECK(it != mountPoints->end());
-    unmountPromise = std::move(it->second.unmountPromise);
-    takeoverPromise = std::move(it->second.takeoverPromise);
 
-    const bool doTakeover = takeoverPromise.has_value();
+    doTakeover = it->second.takeoverPromise.has_value();
     // Shutdown the EdenMount, while holding the mountPoints_ lock. This is
     // done to avoid a race between checking isSafeForInodeAccess and the
     // InodeMap being destroyed. In that race, the rootInode may be a nullptr
     // thus leading to a nullptr dereference.
     shutdownFuture = edenMount->shutdown(doTakeover);
   }
+  // `takeover` is set for every channel that stopped cleanly; the takeover
+  // promise says whether this is a takeover.
+  const bool recoverAfterStop =
+      fsChannelCompleted &&
+      shouldRecoverAfterChannelStop(
+          *edenMount, stop && stop->reason.unexpected, doTakeover);
 
-  std::move(shutdownFuture)
+  serverState_->getFaultInjector()
+      .checkAsync("mountShutdown", mountPath.view())
+      .semi()
       .via(getMainEventBase())
+      .thenValue([shutdownFuture = std::move(shutdownFuture)](auto&&) mutable {
+        return std::move(shutdownFuture);
+      })
       .thenTry([this,
                 mountPath = mountPath,
-                unmountPromise = std::move(unmountPromise),
-                takeoverPromise = std::move(takeoverPromise),
+                clientDirectory =
+                    edenMount->getCheckoutConfig()->getClientDirectory(),
+                recoverAfterStop = recoverAfterStop,
                 takeoverData = std::move(takeover)](
                    folly::Try<SerializedInodeMap>&& result) mutable {
         // Erase the EdenMount from mountPoints_ before fulfilling the
@@ -2635,14 +3098,32 @@ void EdenServer::mountFinished(
         // `eden rm` relies on that to delete the checkout's configuration
         // without leaving the daemon serving a mount that no on-disk
         // configuration describes.
+        //
+        // The promises leave the entry only now. While the mount shuts
+        // down, unmount() and unmountAll() still find the entry and take
+        // futures from its unmountPromise; a SharedPromise moved out
+        // earlier leaves an empty one behind, and the futures taken from
+        // that one break when the entry is erased.
         std::shared_ptr<EdenMount> removedMount;
+        folly::SharedPromise<Unit> unmountPromise;
+        std::optional<folly::Promise<TakeoverData::MountInfo>> takeoverPromise;
         {
           const auto mountPoints = mountPoints_->wlock();
           const auto it = mountPoints->find(mountPath);
           if (it != mountPoints->end()) {
             removedMount = std::move(it->second.edenMount);
+            unmountPromise = std::move(it->second.unmountPromise);
+            takeoverPromise = std::move(it->second.takeoverPromise);
             mountPoints->erase(it);
           }
+        }
+        if (recoverAfterStop) {
+          // The short delay lets a concurrent `eden unmount` or `eden rm`
+          // write its marker first.
+          scheduleCallbackOnMainEventBase(
+              kChannelStopRecoveryDelay, [this, mountPath, clientDirectory] {
+                recoverCheckoutAfterChannelStop(mountPath, clientDirectory);
+              });
         }
         if (takeoverPromise) {
           takeoverPromise.value().setWith([&]() mutable {
@@ -2810,23 +3291,15 @@ ImmediateFuture<CheckoutResult> EdenServer::checkOutRevision(
   getServerState()->getNotifier()->signalCheckout(
       enumerateInProgressCheckouts() + 1);
 
-  // Set the detached executor on the fetch context if the checkout executor is
-  // enabled. This allows inode loading during checkout to run on the
-  // checkout executor instead of the immediate executor.
-  if (thriftUseCheckoutExecutor_) {
-    fetchContext->setDetachedExecutor(checkoutRevisionExecutor_.get());
-  }
+  // Inode loading during checkout runs on the diff work executor instead of
+  // the immediate executor.
+  fetchContext->setDetachedExecutor(diffWorkExecutor_.get());
 
-  ImmediateFuture<folly::Unit> asyncPoint{std::in_place};
-  if (thriftUseCheckoutExecutor_) {
-    // Insert an async point to ensure work happens on the checkout executor.
-    // Without this, any sync work in edenMount.checkout will run on the
-    // Thrift worker thread instead of the checkout executor.
-    asyncPoint = makeNotReadyImmediateFuture();
-  }
-
+  // Start from a not-ready future so that the synchronous part of
+  // edenMount.checkout runs on the diff work executor rather than the Thrift
+  // worker thread.
   auto checkoutFuture =
-      std::move(asyncPoint)
+      makeNotReadyImmediateFuture()
           .thenValue([&edenMount,
                       rootInode = mountHandle.getRootInode(),
                       root,
@@ -2846,25 +3319,23 @@ ImmediateFuture<CheckoutResult> EdenServer::checkOutRevision(
                 this, std::move(result), checkoutMode, isNfs, mountPath);
           });
 
-  if (thriftUseCheckoutExecutor_) {
-    // This is an UnboundedQueueExecutor, which is guaranteed to never block
-    // nor throw (except OOM), nor execute inline from `add()`.
-    //
-    // Thrift documentation states that "it is almost never a good idea to send
-    // work off Thrift’s CPU worker". However, it also notes that "user code may
-    // delegate the rest of the work to other thread pools, thus shifting load
-    // off Thrift’s CPU Workers thread and letting the thread pick up new
-    // incoming work" but warns that "if there is work offloaded to other thread
-    // pools, there should be backpressure mechanism that would block Thrift CPU
-    // Workers thread when those internal thread pools are overloaded."
-    //
-    // Without backpressure, EdenFS would see an increase in memory pressure.
-    // potential slowdowns, and/or OOMS. EdenFS only allows one checkout at a
-    // time (https://fburl.com/code/a6eoy8wu), which acts as the aforementioned
-    // backpressure mechanism.
-    checkoutFuture =
-        std::move(checkoutFuture).semi().via(checkoutRevisionExecutor_.get());
-  }
+  // This is an UnboundedQueueExecutor, which is guaranteed to never block
+  // nor throw (except OOM), nor execute inline from `add()`.
+  //
+  // Thrift documentation states that "it is almost never a good idea to send
+  // work off Thrift’s CPU worker". However, it also notes that "user code may
+  // delegate the rest of the work to other thread pools, thus shifting load
+  // off Thrift’s CPU Workers thread and letting the thread pick up new
+  // incoming work" but warns that "if there is work offloaded to other thread
+  // pools, there should be backpressure mechanism that would block Thrift CPU
+  // Workers thread when those internal thread pools are overloaded."
+  //
+  // Without backpressure, EdenFS would see an increase in memory pressure.
+  // potential slowdowns, and/or OOMS. EdenFS only allows one checkout at a
+  // time (https://fburl.com/code/a6eoy8wu), which acts as the aforementioned
+  // backpressure mechanism.
+  checkoutFuture =
+      std::move(checkoutFuture).semi().via(diffWorkExecutor_.get());
 
   return std::move(checkoutFuture).ensure([mountHandle] {});
 }
@@ -2898,10 +3369,8 @@ folly::coro::now_task<CheckoutResult> EdenServer::co_checkOutRevision(
   getServerState()->getNotifier()->signalCheckout(
       enumerateInProgressCheckouts() + 1);
 
-  // Helper that runs the checkout body. Extracted into a Task so it can
-  // either be scheduled on the dedicated checkout executor (when
-  // `thriftUseCheckoutExecutor_=true`) or run inline on the current
-  // executor.
+  // Helper that runs the checkout body. Extracted into a Task so it can be
+  // scheduled on the diff work executor.
   //
   // Captures are explicit (no [&]) so the lambda owns mountHandle and
   // doesn't alias stack locals if the Task is later detached.
@@ -2919,16 +3388,11 @@ folly::coro::now_task<CheckoutResult> EdenServer::co_checkOutRevision(
         checkoutMode);
   };
 
-  CheckoutResult result;
-  if (thriftUseCheckoutExecutor_) {
-    fetchContext->setDetachedExecutor(checkoutRevisionExecutor_.get());
-    // Pin the checkout body to the dedicated executor to isolate long
-    // checkouts from thrift worker thread starvation.
-    result = co_await folly::coro::co_withExecutor(
-        checkoutRevisionExecutor_.get(), checkoutBody());
-  } else {
-    result = co_await checkoutBody();
-  }
+  fetchContext->setDetachedExecutor(diffWorkExecutor_.get());
+  // Pin the checkout body to the diff work executor to isolate long
+  // checkouts from thrift worker thread starvation.
+  auto result = co_await folly::coro::co_withExecutor(
+      diffWorkExecutor_.get(), checkoutBody());
 
   co_return finishCheckoutPostProcessing(
       this, std::move(result), checkoutMode, isNfs, AbsolutePath{mountPath});
@@ -2980,7 +3444,8 @@ EdenServer::getSaplingBackingStores() {
 }
 
 std::vector<size_t> EdenServer::collectSaplingBackingStoreCounters(
-    std::function<size_t(const SaplingBackingStore&)> getCounterFromStore) {
+    const std::function<size_t(const SaplingBackingStore&)>&
+        getCounterFromStore) {
   std::vector<size_t> counters;
   for (const auto& store : this->getSaplingBackingStores()) {
     counters.emplace_back(getCounterFromStore(*store));
@@ -3053,14 +3518,12 @@ folly::SemiFuture<Unit> EdenServer::createThriftServer() {
   // server object destruction. This specifically matters in the takeover
   // shutdown code path.
   server_->setStopWorkersOnStopListening(false);
-  server_->leakOutstandingRequestsWhenServerStops(
-      edenConfig->thriftLeakOutstandingRequestsWhenServerStops.getValue());
 
-  // S532385: The above leakOutstandingRequestsWhenServerStops config has
-  // memory safety issues. We'd like to remove it, but removing it leads to a
-  // new class of bugs where outstanding requests do not complete and the
-  // server crashes as a result. This config attempts to mitigate that by
-  // allowing more time for each request to complete on shutdown.
+  // The server joins its in-flight requests when it stops. Returning from
+  // serve() while they still run, which Thrift's
+  // leakOutstandingRequestsWhenServerStops() permits, lets them reach the
+  // server and the mounts after shutdown has torn them down (S532385). A
+  // request that outlives this wait aborts the daemon instead.
   server_->setWorkersJoinTimeout(
       std::chrono::duration_cast<std::chrono::seconds>(
           edenConfig->thriftWorkersJoinTimeout.getValue()));
@@ -3192,13 +3655,222 @@ void EdenServer::stop() {
     markShuttingDownLocked(*state, "stop");
   }
 
+  handler_->logOutstandingThriftRequests("EdenServer::stop() called");
   handler_->cancelAllActiveRequests("EdenServer::stop() called");
   clearStartupStatusPublishers();
   shutdownSubscribers();
   server_->stop();
 }
 
-folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
+namespace {
+// `eden restart` tells a refused takeover from a failed one by these words,
+// which reach it through the new daemon's startup log. The CLI's
+// _TAKEOVER_REFUSED_MARKER matches them.
+constexpr std::string_view kTakeoverRefusedPhrase =
+    "refused the graceful restart";
+} // namespace
+
+void EdenServer::noteActivity(std::string_view what) {
+  recentActivity_.wlock()->emplace(
+      RecentActivity{std::string{what}, std::chrono::steady_clock::now()});
+}
+
+bool EdenServer::beginRecoveryMount(const AbsolutePath& mountPath) {
+  auto state = runningState_.wlock();
+  if (state->state != RunState::RUNNING) {
+    return false;
+  }
+  state->recoveryMounts[mountPath] = std::chrono::steady_clock::now();
+  return true;
+}
+
+void EdenServer::endRecoveryMount(const AbsolutePath& mountPath) {
+  runningState_.wlock()->recoveryMounts.erase(mountPath);
+}
+
+std::optional<std::string> EdenServer::refuseTakeoverForRecoveryMounts(
+    const RunStateData& state,
+    std::string_view why) {
+  if (state.recoveryMounts.empty()) {
+    return std::nullopt;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  std::string description;
+  auto oldest = std::chrono::steady_clock::duration::zero();
+  for (const auto& [mountPath, startedAt] : state.recoveryMounts) {
+    if (!description.empty()) {
+      description += ", ";
+    }
+    description += fmt::format(
+        "remounting {} for {}", mountPath, durationToString(now - startedAt));
+    oldest = std::max(oldest, now - startedAt);
+  }
+  XLOGF(WARN, "Refusing the graceful restart, {}: {}", why, description);
+  serverState_->getStats()->increment(&TakeoverStats::sendFailure);
+  edenFsEventsLogger_->logEvent(
+      TakeoverRefused{
+          description, std::chrono::duration<double>{oldest}.count()});
+  return fmt::format(
+      "EdenFS is recovering a checkout and {}: {}. Retry later.",
+      kTakeoverRefusedPhrase,
+      description);
+}
+
+folly::Future<TakeoverData> EdenServer::startTakeoverShutdown(
+    bool force,
+    bool onlyIfIdle) {
+#ifndef _WIN32
+  {
+    auto state = runningState_.rlock();
+    if (state->state != RunState::RUNNING) {
+      serverState_->getStats()->increment(&TakeoverStats::sendFailure);
+      return makeFuture<TakeoverData>(std::runtime_error(
+          folly::to<string>(
+              "can only perform graceful restart when running normally; "
+              "current state is ",
+              enumValue(state->state))));
+    }
+  }
+  auto config = serverState_->getEdenConfig();
+  if (force || !config->takeoverWaitsForRequests.getValue()) {
+    return startTakeoverShutdownNow(force);
+  }
+  if (onlyIfIdle) {
+    const auto window = config->takeoverRecentActivityWindow.getValue();
+    const auto activity = *recentActivity_.rlock();
+    const auto age = activity
+        ? std::chrono::steady_clock::now() - activity->when
+        : std::chrono::steady_clock::duration::max();
+    if (age < window) {
+      auto description =
+          fmt::format("{} ran {} ago", activity->what, durationToString(age));
+      XLOGF(
+          WARN,
+          "Refusing the graceful restart, EdenFS was in use recently: {}",
+          description);
+      serverState_->getStats()->increment(&TakeoverStats::sendFailure);
+      edenFsEventsLogger_->logEvent(
+          TakeoverRefused{
+              description, std::chrono::duration<double>{age}.count()});
+      return makeFuture<TakeoverData>(std::runtime_error(
+          fmt::format(
+              "EdenFS was in use recently and {}: {}. Retry later, or force "
+              "the restart.",
+              kTakeoverRefusedPhrase,
+              description)));
+    }
+  }
+  // Nothing changes while the requests in flight get their chance to finish;
+  // the main event base keeps serving in the meantime.
+  ++pendingTakeoverWaits_;
+  folly::SemiFuture<folly::Unit> waited;
+  try {
+    waited = folly::coro::co_withExecutor(
+                 getMainEventBase(),
+                 folly::coro::co_withCancellation(
+                     takeoverWaitCancellation_.getToken(),
+                     co_waitForInFlightRequests()))
+                 .start();
+  } catch (...) {
+    --pendingTakeoverWaits_;
+    throw;
+  }
+  return std::move(waited)
+      .via(getMainEventBase())
+      .thenTry([this](folly::Try<folly::Unit>&& waited) {
+        --pendingTakeoverWaits_;
+        if (waited.hasException<folly::OperationCancelled>()) {
+          throw std::runtime_error(
+              "EdenFS stopped while the graceful restart was waiting for "
+              "Thrift requests to finish");
+        }
+        waited.throwUnlessValue();
+        return startTakeoverShutdownNow(/*force=*/false);
+      });
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+folly::coro::Task<void> EdenServer::co_waitForInFlightRequests() {
+  const auto grace =
+      serverState_->getEdenConfig()->takeoverRequestGrace.getValue();
+  auto refuse =
+      [this](
+          const std::vector<EdenServiceHandler::LongRunningRequest>& requests,
+          std::string_view why) {
+        auto description = describeLongRunningRequests(
+            requests, *serverState_->getProcessInfoCache());
+        XLOGF(WARN, "Refusing the graceful restart, {}: {}", why, description);
+        serverState_->getStats()->increment(&TakeoverStats::sendFailure);
+        // getRequestsRunningLongerThan() lists the oldest request first.
+        edenFsEventsLogger_->logEvent(
+            TakeoverRefused{
+                description,
+                std::chrono::duration<double>{requests.front().age}.count()});
+        throw std::runtime_error(
+            fmt::format(
+                "EdenFS is busy and {}: {}. Retry later, or force the restart "
+                "to cancel the requests that support cancellation.",
+                kTakeoverRefusedPhrase,
+                description));
+      };
+
+  // A request that has already outlived the grace period is not worth
+  // waiting for.
+  auto outlived = handler_->getRequestsRunningLongerThan(grace);
+  if (!outlived.empty()) {
+    refuse(outlived, "requests have outlived the grace period");
+  }
+  auto inFlight =
+      handler_->getRequestsRunningLongerThan(std::chrono::nanoseconds{0});
+  auto recoveryMounts = [this] {
+    return runningState_.rlock()->recoveryMounts.size();
+  };
+  // Lets a test change the requests in flight once they have been looked at.
+  co_await serverState_->getFaultInjector().co_checkAsync(
+      "takeover", "wait_for_requests");
+  if (!inFlight.empty() || recoveryMounts() != 0) {
+    XLOGF(
+        INFO,
+        "Graceful restart: giving {} Thrift requests and {} checkout recoveries up to {} to finish",
+        inFlight.size(),
+        recoveryMounts(),
+        durationToString(grace));
+    const auto deadline = std::chrono::steady_clock::now() + grace;
+    const auto interval = std::min(
+        std::chrono::duration_cast<folly::HighResDuration>(grace),
+        folly::HighResDuration{std::chrono::seconds{1}});
+    // The daemon keeps serving while it waits, so every poll looks at all the
+    // requests in flight: a checkout that started during the wait must not be
+    // cut off by the restart either. The deadline bounds the wait all the
+    // same.
+    do {
+      // Lets a test change the requests in flight between two polls.
+      co_await serverState_->getFaultInjector().co_checkAsync(
+          "takeover_wait", "poll");
+      co_await folly::coro::sleep(interval);
+      inFlight =
+          handler_->getRequestsRunningLongerThan(std::chrono::nanoseconds{0});
+      if (std::chrono::steady_clock::now() >= deadline) {
+        if (!inFlight.empty()) {
+          refuse(inFlight, "requests did not finish within the grace period");
+        }
+        if (auto refusal = refuseTakeoverForRecoveryMounts(
+                *runningState_.rlock(),
+                "checkout recoveries did not finish within the grace period")) {
+          throw std::runtime_error(*refusal);
+        }
+      }
+    } while (!inFlight.empty() || recoveryMounts() != 0);
+  }
+  // Lets a test start a request once the wait is over, before the Thrift
+  // server stops.
+  co_await serverState_->getFaultInjector().co_checkAsync(
+      "takeover", "after_wait");
+}
+
+folly::Future<TakeoverData> EdenServer::startTakeoverShutdownNow(bool force) {
 #ifndef _WIN32
   // Track how long the takeover send takes and whether it succeeds.
   folly::stop_watch<std::chrono::microseconds> takeoverSendWatch;
@@ -3221,6 +3893,13 @@ folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
               enumValue(state->state))));
     }
 
+    // A recovery mount registers under this lock while RUNNING, so none can
+    // start once this check passes.
+    if (auto refusal = refuseTakeoverForRecoveryMounts(
+            *state, "a checkout recovery is mounting")) {
+      return makeFuture<TakeoverData>(std::runtime_error(*refusal));
+    }
+
     {
       const auto mountPoints = mountPoints_->rlock();
       for (const auto& entry : *mountPoints) {
@@ -3228,7 +3907,11 @@ folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
         if (!mount->isSafeForInodeAccess()) {
           serverState_->getStats()->increment(&TakeoverStats::sendFailure);
           return makeFuture<TakeoverData>(std::runtime_error(
-              "can only perform graceful restart when all mount points are initialized"));
+              fmt::format(
+                  "can only perform graceful restart when all mount points are "
+                  "initialized; mount {} is in state {}",
+                  mount->getPath(),
+                  apache::thrift::util::enumNameSafe(mount->getState()))));
           // TODO(xavierd): There is still a potential race after this check if
           // a mount is initiated at this point. Injecting a block below and
           // starting a mount would manifest it. In practice, this should be
@@ -3278,7 +3961,25 @@ folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
       .checkAsync("takeover", "server_shutdown")
       .semi()
       .via(getMainEventBase())
-      .thenValue([this](auto&&) {
+      .thenValue([this, force](auto&&) {
+        // The Thrift server cannot stop while a request or a stream keeps a
+        // connection busy. A forced takeover cancels everything. An unforced
+        // one has waited for the requests that were in flight, so it only
+        // ends the trace streams, which stay open until their client leaves,
+        // and arms a cancellation for the requests that arrived during the
+        // wait: one of those may be long too, and left alone it would hold
+        // the Thrift stop to its deadline, which ends the process.
+        if (force) {
+          handler_->cancelAllActiveRequests("forced graceful restart");
+        } else {
+          handler_->closeTraceStreams();
+          auto config = serverState_->getEdenConfig();
+          if (config->takeoverWaitsForRequests.getValue()) {
+            handler_->cancelActiveRequestsAfter(
+                config->takeoverRequestGrace.getValue(),
+                "graceful restart: the request grace period expired");
+          }
+        }
         shutdownSubscribers();
 
         // Stop the thrift server. In the future, we'd like to
@@ -3405,16 +4106,6 @@ void EdenServer::flushStatsNow() {
   SaplingBackingStore::flushCounters();
 }
 
-void EdenServer::reportMemoryStats() {
-#ifdef EDEN_HAVE_OBC
-  auto memoryStats = facebook::eden::proc_util::readMemoryStats();
-  if (memoryStats) {
-    // Bump the OBC counters for the current memory usage
-    memory_vm_rss_bytes_ += memoryStats->resident;
-  }
-#endif
-}
-
 #ifdef __linux__
 void EdenServer::scheduleCgroupFileCacheReclaim() {
   auto state = cgroupFileCacheReclaimState_;
@@ -3525,15 +4216,6 @@ void EdenServer::refreshBackingStore() {
   }
 }
 
-void EdenServer::manageOverlay() {
-  const auto mountPoints = mountPoints_->rlock();
-  for (const auto& [_, info] : *mountPoints) {
-    const auto& mount = info.edenMount;
-
-    mount->getOverlay()->maintenance();
-  }
-}
-
 namespace {
 /**
  * Directories pinned as process cwds/roots, which pressure GC must not
@@ -3579,6 +4261,13 @@ ImmediateFuture<uint64_t> garbageCollectInodesWithLease(
       shutdownToken, lease.getCancellationToken());
   auto keepRememberedParentTreesLoaded =
       pressureBased && mount.getFuseChannel() != nullptr;
+  // The sweep that follows applies the same cutoff, so an inode without a
+  // kernel reference that a status or Thrift request used recently is kept
+  // instead of being unloaded on every run.
+  std::optional<EdenTimestamp> sweepCutoff;
+  if (mount.getServerState()->getEdenConfig()->gcSweepHonorsCutoff.getValue()) {
+    sweepCutoff = EdenTimestamp{folly::to<timespec>(cutoff)};
+  }
   return inode
       // First step of garbage collection varies by platform (e.g., Linux,
       // macOS, Windows)
@@ -3603,7 +4292,7 @@ ImmediateFuture<uint64_t> garbageCollectInodesWithLease(
           })
       // Second step of garbage collection deletes all the unreferenced inodes
       .thenTry(
-          [inode, gcToken, keepRememberedParentTreesLoaded](
+          [inode, gcToken, keepRememberedParentTreesLoaded, sweepCutoff](
               folly::Try<uint64_t>&& invalidatedTry) -> InodeGCResult {
             size_t numUnloaded = 0;
             size_t zeroFsRefTreesRetained = 0;
@@ -3611,11 +4300,13 @@ ImmediateFuture<uint64_t> garbageCollectInodesWithLease(
             if (!cancelled) {
               if (keepRememberedParentTreesLoaded) {
                 auto unloadResult =
-                    inode->unloadChildrenUnreferencedByFsForInodeGC(gcToken);
+                    inode->unloadChildrenUnreferencedByFsForInodeGC(
+                        gcToken, sweepCutoff);
                 numUnloaded = unloadResult.unloaded;
                 zeroFsRefTreesRetained = unloadResult.zeroFsRefTreesRetained;
               } else {
-                numUnloaded = inode->unloadChildrenUnreferencedByFs(gcToken);
+                numUnloaded =
+                    inode->unloadChildrenUnreferencedByFs(gcToken, sweepCutoff);
               }
               // The sweep stops early once cancelled, so a partial count
               // must not be judged either.
@@ -3820,7 +4511,7 @@ ImmediateFuture<uint64_t> EdenServer::garbageCollectInodes(
     std::chrono::system_clock::time_point cutoff,
     const ObjectFetchContextPtr& context,
     bool pressureBased) {
-  auto lease = mount.tryStartInodeGC();
+  auto lease = mount.tryStartInodeGC(pressureBased);
   if (!lease) {
     XLOGF(
         DBG6,
@@ -3958,7 +4649,7 @@ void EdenServer::garbageCollectAllMounts() {
       }
     }
 
-    auto lease = mount.tryStartInodeGC();
+    auto lease = mount.tryStartInodeGC(pressureBasedGc);
     if (!lease) {
       XLOGF(
           DBG6,
@@ -4049,15 +4740,11 @@ void EdenServer::garbageCollectAllMounts() {
                edenFsEventsLogger,
                pinnedInodes = std::move(pinnedInodes),
                pinScanFailed]() mutable {
-                static auto context =
-                    ObjectFetchContext::getNullContextWithCauseDetail(
-                        ObjectFetchContext::StaticCauseDetail::fromLiteral(
-                            "EdenServer::garbageCollectAllMounts"));
                 return garbageCollectInodesWithLease(
                            mountHandle.getEdenMount(),
                            mountHandle.getRootInode(),
                            cutoff,
-                           context,
+                           ObjectFetchContext::getNullInodeGcContext(),
                            pressureBasedGc,
                            std::move(lease),
                            std::move(shutdownToken),
@@ -4120,12 +4807,15 @@ bool EdenServer::isInodeGCRunningForAnyMount() const {
 
 void EdenServer::scheduleRunningMountHealthCheck(
     const AbsolutePath& mountPath,
-    std::string repoSource) {
+    std::string repoSource,
+    std::weak_ptr<EdenMount> mount) {
   auto mountPathString = std::string{mountPath.view()};
   auto runningMountHealthChecks = runningMountHealthChecks_;
+  auto progress = std::make_shared<MountHealthProbeProgress>(
+      /*queued=*/std::chrono::steady_clock::now());
   {
     auto runningChecks = runningMountHealthChecks->wlock();
-    if (!runningChecks->insert(mountPathString).second) {
+    if (!runningChecks->emplace(mountPathString, progress).second) {
       return;
     }
   }
@@ -4139,23 +4829,57 @@ void EdenServer::scheduleRunningMountHealthCheck(
   auto logContext = make_shared<const MountHealthIssueLogContext>(
       serverState_->getEdenFsEventsLogger(),
       emittedMountHealthIssues,
+      serverState_->getStats().copy(),
       std::move(mountPathString),
-      std::move(repoSource));
+      std::move(repoSource),
+      std::move(mount),
+      std::move(progress));
+  logContext->count(&MountHealthCheckStats::probes);
 
-  scheduleMountHealthCheckStartTimeout(started, completed, logContext);
+  scheduleMountHealthCheckStartTimeout(
+      started, completed, logContext, runningMountHealthChecks);
+
+  // Only tests turn on fault injection. Otherwise this stays empty, so a probe
+  // never holds ServerState and never becomes its last owner.
+  auto faultInjectionState = serverState_->getFaultInjector().isEnabled()
+      ? std::weak_ptr<ServerState>{serverState_}
+      : std::weak_ptr<ServerState>{};
+
+  auto config = serverState_->getEdenConfig();
+  const auto hangThreshold = config->mountHealthCheckHangThreshold.getValue();
+  MountHealthCheckOptions options;
+  options.useStatx = config->mountHealthCheckStatx.getValue();
+  if (auto edenMount = logContext->mount.lock()) {
+    options.knownDevice = edenMount->getHealthCheckDevice();
+  }
 
   // Run the potentially blocking filesystem probe on a dedicated pool. The
   // runtime timeout is armed after the worker starts so executor queue delay
   // and a hung EdenFS mount can be reported separately.
   folly::via(
       getMountHealthCheckThreadPool(),
-      [started, completed, logContext]() {
+      [started,
+       completed,
+       logContext,
+       options,
+       hangThreshold,
+       serverState = std::move(faultInjectionState)]() {
         started->store(true, std::memory_order_release);
         if (completed->load(std::memory_order_acquire)) {
           return std::optional<EdenMountHealthCheckIssue>{};
         }
-        scheduleMountHealthCheckRuntimeTimeout(completed, logContext);
-        return checkRunningEdenMountHealth(logContext->mountPath);
+        auto& progress = *logContext->progress;
+        progress.start();
+        scheduleMountHealthCheckRuntimeTimeout(
+            completed, logContext, hangThreshold);
+        if (auto state = serverState.lock()) {
+          state->getFaultInjector().check(
+              "mountHealthCheck", logContext->mountPath);
+        }
+        auto issue = checkRunningEdenMountHealth(
+            logContext->mountPath, &progress, options);
+        progress.enter(MountHealthProbeStep::Done);
+        return issue;
       })
       .thenTry(
           [completed,
@@ -4168,8 +4892,38 @@ void EdenServer::scheduleRunningMountHealthCheck(
               auto runningChecks = runningMountHealthChecks->wlock();
               runningChecks->erase(logContext->mountPath);
             }
-            if (alreadyCompleted) {
+            if (auto device = logContext->progress->device()) {
+              if (auto edenMount = logContext->mount.lock()) {
+                edenMount->setHealthCheckDevice(device);
+              }
+            }
+            // A hung probe's late result is still handled, so that a
+            // healthy one clears the hung report.
+            const bool hangEnded = alreadyCompleted &&
+                logContext->hung.load(std::memory_order_acquire);
+            if (alreadyCompleted && !hangEnded) {
               return;
+            }
+            if (hangEnded) {
+              logContext->count(&MountHealthCheckStats::hangEnded);
+              std::string_view outcome = "healthy";
+              if (result.hasException()) {
+                outcome = "error";
+              } else if (result->has_value()) {
+                outcome = edenMountHealthIssueReasonString((*result)->reason);
+              }
+              logMountHealthCheckHangEnded(*logContext, outcome);
+            } else {
+              if (logContext->progress->mountCheckedByStatx()) {
+                logContext->count(&MountHealthCheckStats::statxMountCheck);
+              }
+              auto slowProbeDetail =
+                  std::move(*logContext->slowProbeDetail.wlock());
+              if (!slowProbeDetail.empty()) {
+                logContext->count(&MountHealthCheckStats::slow);
+                logSlowMountHealthCheck(
+                    *logContext, std::move(slowProbeDetail));
+              }
             }
             if (result.hasException()) {
               XLOGF(
@@ -4180,10 +4934,12 @@ void EdenServer::scheduleRunningMountHealthCheck(
             }
             const auto& issue = result.value();
             if (!issue.has_value()) {
+              logContext->count(&MountHealthCheckStats::healthy);
               clearMountHealthIssues(
                   emittedMountHealthIssues, logContext->mountPath);
               return;
             }
+            logContext->count(&MountHealthCheckStats::issue);
             logContext->log(
                 std::string{edenMountHealthIssueReasonString(issue->reason)},
                 issue->error);
@@ -4220,8 +4976,13 @@ void EdenServer::checkMountHealth() {
   // the live mount map -- not config.json -- is the authoritative input. Both
   // the paths to prune against and the paths to probe are collected under a
   // single lock, so they cannot describe two different snapshots.
+  struct ProbeTarget {
+    AbsolutePath mountPath;
+    std::string repoSource;
+    std::weak_ptr<EdenMount> mount;
+  };
   std::unordered_set<std::string> registeredMountPaths;
-  std::vector<std::pair<AbsolutePath, std::string>> probeTargets;
+  std::vector<ProbeTarget> probeTargets;
   {
     const auto mountPoints = mountPoints_->rlock();
     registeredMountPaths.reserve(mountPoints->size());
@@ -4242,113 +5003,503 @@ void EdenServer::checkMountHealth() {
       if (!shouldProbeMountHealth(mount->getState())) {
         continue;
       }
-      probeTargets.emplace_back(
-          mountPath, mount->getCheckoutConfig()->getRepoSource());
+      probeTargets.push_back(
+          ProbeTarget{
+              mountPath,
+              mount->getCheckoutConfig()->getRepoSource(),
+              mount->getWeakMount()});
     }
   }
+  // config.json is read on this thread, as accidental unmount recovery does;
+  // the probes below are the part that can block.
+  auto notServed = findCheckoutsNotServed();
+  for (const auto& [mountPath, config] : notServed) {
+    registeredMountPaths.insert(std::string{mountPath.view()});
+  }
+  const auto edenConfig = serverState_->getEdenConfig();
   pruneMountHealthIssues(emittedMountHealthIssues_, registeredMountPaths);
 
-  // The probe only needs the path and the repo source, both copied above, so
-  // no reference to the mount is held across the asynchronous check.
-  for (auto& [mountPath, repoSource] : probeTargets) {
-    scheduleRunningMountHealthCheck(mountPath, std::move(repoSource));
+  // The probe holds only a weak reference to the mount, so no strong
+  // reference is held across the asynchronous check.
+  for (auto& target : probeTargets) {
+    scheduleRunningMountHealthCheck(
+        target.mountPath,
+        std::move(target.repoSource),
+        std::move(target.mount));
+  }
+
+  for (auto& [mountPath, config] : notServed) {
+    // Recovery refuses a flapping checkout, so it is reported instead.
+    const bool flapping = isCheckoutFlapLimited(mountPath);
+    if (!flapping && edenConfig->mountHealthCheckRecovery.getValue()) {
+      // The outcome is reported once the recovery succeeds or gives up.
+      startCheckoutRecovery(
+          mountPath,
+          std::move(config),
+          CheckoutRecoveryTrigger::HealthCheckTick);
+      continue;
+    }
+    const auto issueReason = flapping
+        ? EdenMountHealthIssueReason::DaemonRunningCheckoutFlapping
+        : EdenMountHealthIssueReason::DaemonRunningCheckoutNotMounted;
+    const auto reason =
+        std::string{edenMountHealthIssueReasonString(issueReason)};
+    if (!shouldLogMountHealthIssue(
+            emittedMountHealthIssues_, mountPath.asString(), reason)) {
+      continue;
+    }
+    getStats()->increment(
+        flapping ? &CheckoutRecoveryStats::flapLimited
+                 : &CheckoutRecoveryStats::notServed);
+    auto stopReason = getCheckoutStopReason(mountPath);
+    serverState_->getEdenFsEventsLogger()->logEvent(
+        EdenMountHealthIssue{
+            "daemon_periodic",
+            reason,
+            mountPath.asString(),
+            mountPath.asString(),
+            "configured_checkout",
+            config->getRepoSource(),
+            stopReason.empty() ? "not_mounted_since_daemon_start" : stopReason,
+            false,
+            false});
   }
 }
 
-void EdenServer::accidentalUnmountRecovery() {
-  XLOGF(DBG5, "Performing accidental unmount recovery.");
+std::unique_ptr<CheckoutConfig> EdenServer::loadCheckoutNotServed(
+    const AbsolutePath& mountPath,
+    const AbsolutePath& clientDirectory) {
+  {
+    const auto mountPoints = mountPoints_->rlock();
+    if (mountPoints->find(mountPath) != mountPoints->end()) {
+      return nullptr;
+    }
+  }
+
+  // This mount point is not currently mounted, but it was configured
+  // in config.json.  This means that the client was unmounted.
+
+  auto nfsServer = serverState_->getNfsServer();
+  if (nfsServer && nfsServer->isMountRegistered(mountPath)) {
+    // This mount point is registered with the NFS server, so it is
+    // probably in the process of being unmounted.
+    return nullptr;
+  }
+
+  auto config =
+      CheckoutConfig::loadFromClientDirectory(mountPath, clientDirectory);
+  if (config->isIntentionallyUnmounted()) {
+    XLOGF(DBG5, "Mount point {} is intentionally unmounted.", mountPath);
+    return nullptr;
+  }
+  if (config->getInodeCatalogType() == InodeCatalogType::LegacyEphemeral) {
+    // An ephemeral overlay does not survive an unmount, so a remount would
+    // not bring back the checkout's local state.
+    XLOGF(DBG5, "Mount point {} has an ephemeral overlay.", mountPath);
+    return nullptr;
+  }
+  return config;
+}
+
+bool EdenServer::shouldRecoverAfterChannelStop(
+    const EdenMount& edenMount,
+    bool unexpectedStop,
+    bool takeover) {
+  if (!serverState_->getEdenConfig()->recoverOnChannelStop.getValue()) {
+    return false;
+  }
+  StatsGroupBase::Counter CheckoutRecoveryStats::* skipped = nullptr;
+  if (takeover) {
+    skipped = &CheckoutRecoveryStats::channelStopSkippedTakeover;
+  } else if (edenMount.isUnmountStarted()) {
+    skipped = &CheckoutRecoveryStats::channelStopSkippedUnmountRequested;
+  } else if (runningState_.rlock()->state != RunState::RUNNING) {
+    skipped = &CheckoutRecoveryStats::channelStopSkippedDaemonNotRunning;
+  } else if (!unexpectedStop) {
+    skipped = &CheckoutRecoveryStats::channelStopSkippedExpectedStop;
+  }
+  if (skipped) {
+    getStats()->increment(skipped);
+    return false;
+  }
+  return true;
+}
+
+void EdenServer::recoverCheckoutAfterChannelStop(
+    const AbsolutePath& mountPath,
+    const AbsolutePath& clientDirectory) {
+  if (runningState_.rlock()->state != RunState::RUNNING) {
+    getStats()->increment(
+        &CheckoutRecoveryStats::channelStopSkippedDaemonNotRunning);
+    return;
+  }
+  try {
+    auto config = loadCheckoutNotServed(mountPath, clientDirectory);
+    if (!config) {
+      getStats()->increment(
+          &CheckoutRecoveryStats::channelStopSkippedNotNeeded);
+      return;
+    }
+    // Retries, if any, come from the mount health check.
+    if (!startCheckoutRecovery(
+            mountPath,
+            std::move(config),
+            CheckoutRecoveryTrigger::ChannelStop)) {
+      getStats()->increment(
+          &CheckoutRecoveryStats::channelStopSkippedThrottled);
+    }
+  } catch (const std::exception& ex) {
+    XLOGF(
+        WARN,
+        "Could not recover {} after its channel stopped: {}",
+        mountPath,
+        folly::exceptionStr(ex));
+  }
+}
+
+std::vector<std::pair<AbsolutePath, std::unique_ptr<CheckoutConfig>>>
+EdenServer::findCheckoutsNotServed() {
+  std::vector<std::pair<AbsolutePath, std::unique_ptr<CheckoutConfig>>> result;
+  if (runningState_.rlock()->state != RunState::RUNNING) {
+    return result;
+  }
   folly::dynamic dirs = folly::dynamic::object();
   try {
     dirs = CheckoutConfig::loadClientDirectoryMap(edenDir_.getPath());
-  } catch (...) {
+  } catch (const std::exception& ex) {
+    XLOGF(WARN, "Could not parse config.json: {}", folly::exceptionStr(ex));
+    return result;
+  }
+  std::unordered_set<AbsolutePath> configuredPaths;
+  for (const auto& client : dirs.items()) {
+    try {
+      auto mountPath = canonicalPath(client.first.stringPiece());
+      configuredPaths.insert(mountPath);
+      if (auto config = loadCheckoutNotServed(
+              mountPath,
+              edenDir_.getCheckoutStateDir(client.second.stringPiece()))) {
+        result.emplace_back(std::move(mountPath), std::move(config));
+      }
+    } catch (const std::exception& ex) {
+      XLOGF(
+          WARN,
+          "Could not check whether {} is mounted: {}",
+          client.first.asString(),
+          folly::exceptionStr(ex));
+    }
+  }
+  pruneCheckoutRecoveries(configuredPaths);
+  return result;
+}
+
+void EdenServer::recoverCheckoutsNotServedSoon() {
+  const auto config = serverState_->getEdenConfig();
+  if (config->mountHealthCheckInterval.getValue() <=
+          std::chrono::nanoseconds{0} ||
+      !config->mountHealthCheckRecovery.getValue()) {
+    return;
+  }
+  scheduleCallbackOnMainEventBase(std::chrono::milliseconds{0}, [this] {
+    for (auto& [mountPath, checkoutConfig] : findCheckoutsNotServed()) {
+      // The next tick reports a flapping checkout.
+      if (!isCheckoutFlapLimited(mountPath)) {
+        startCheckoutRecovery(
+            mountPath,
+            std::move(checkoutConfig),
+            CheckoutRecoveryTrigger::HealthCheckTick);
+      }
+    }
+  });
+}
+
+std::string EdenServer::getCheckoutStopReason(const AbsolutePath& mountPath) {
+  auto states = checkoutRecoveryStates_.rlock();
+  auto it = states->find(mountPath);
+  return it == states->end() ? std::string{} : it->second.stopReason;
+}
+
+bool EdenServer::isCheckoutFlapLimited(const AbsolutePath& mountPath) const {
+  auto states = checkoutRecoveryStates_.rlock();
+  auto it = states->find(mountPath);
+  return it != states->end() && it->second.flaps >= kMaxCheckoutFlaps;
+}
+
+bool EdenServer::startCheckoutRecovery(
+    const AbsolutePath& mountPath,
+    std::unique_ptr<CheckoutConfig> initialConfig,
+    CheckoutRecoveryTrigger trigger) {
+  auto attempt = beginCheckoutRecovery(mountPath);
+  if (!attempt) {
+    return false;
+  }
+
+  XLOGF(
+      INFO,
+      "Mount point {} is not currently mounted, attempting to remount.",
+      mountPath);
+
+  AccidentalUnmountRecovery event{
+      /*error=*/"",
+      /*success=*/false,
+      /*repo_source=*/initialConfig->getRepoSource(),
+      /*mount_path=*/mountPath.asString(),
+      /*trigger=*/trigger,
+      /*attempt=*/attempt->number,
+      /*duration=*/0.0,
+      /*mount_protocol=*/
+      FieldConverter<MountProtocol>{}.toDebugString(
+          serverState_->getEdenConfig()->enableNfsServer.getValue()
+              ? initialConfig->getMountProtocol()
+              : kMountProtocolDefault),
+      /*stop_reason=*/attempt->stopReason.empty()
+          ? "not_mounted_since_daemon_start"
+          : attempt->stopReason};
+  folly::via(
+      getServerState()->getThreadPool().get(),
+      [this,
+       initialConfig = std::move(initialConfig),
+       edenFsEventsLogger = serverState_->getEdenFsEventsLogger(),
+       mountPath = mountPath,
+       event = std::move(event),
+       stoppedAt = attempt->stoppedAt]() mutable {
+        // A graceful restart may have started since this attempt was queued.
+        if (!beginRecoveryMount(mountPath)) {
+          cancelCheckoutRecovery(mountPath);
+          getStats()->increment(&CheckoutRecoveryStats::cancelled);
+          XLOGF(
+              INFO,
+              "Not remounting {}: EdenFS is no longer running",
+              mountPath);
+          return folly::makeSemiFuture();
+        }
+        getStats()->increment(&CheckoutRecoveryStats::attempt);
+        folly::stop_watch<> stopWatch;
+        return makeImmediateFutureWith([&] {
+                 return mount(std::move(initialConfig), /*readOnly=*/false);
+               })
+            .thenTry([this,
+                      mountPath,
+                      edenFsEventsLogger,
+                      event = std::move(event),
+                      stoppedAt,
+                      stopWatch](
+                         folly::Try<std::shared_ptr<EdenMount>>&&
+                             result) mutable {
+              endRecoveryMount(mountPath);
+              bool success = result.hasValue();
+              // End the attempt before counting it: a channel stop seen
+              // after the count must be judged as a flap, not as part of
+              // this attempt.
+              const bool gaveUp = endCheckoutRecovery(mountPath, success);
+              getStats()->increment(
+                  success ? &CheckoutRecoveryStats::success
+                          : &CheckoutRecoveryStats::failure);
+              event.gave_up = gaveUp;
+              if (gaveUp) {
+                getStats()->increment(&CheckoutRecoveryStats::gaveUp);
+                XLOGF(
+                    WARN,
+                    "Giving up recovering {} after {} failed attempts",
+                    mountPath,
+                    kMaxCheckoutRecoveryAttempts);
+              }
+              if (success || gaveUp) {
+                edenFsEventsLogger->logEvent(
+                    EdenMountHealthIssue{
+                        std::string{recoveryOutcomeSource(event.trigger)},
+                        std::string{edenMountHealthIssueReasonString(
+                            EdenMountHealthIssueReason::
+                                DaemonRunningCheckoutNotMounted)},
+                        mountPath.asString(),
+                        mountPath.asString(),
+                        "configured_checkout",
+                        event.repo_source,
+                        event.stop_reason,
+                        /*attempted_repair=*/true,
+                        success});
+              }
+              event.success = success;
+              if (success) {
+                event.mount_protocol =
+                    FieldConverter<MountProtocol>{}.toDebugString(
+                        result.value()->shouldBeOrIsNfsChannel()
+                            ? MountProtocol::NFS
+                            : kMountProtocolDefault);
+              }
+              event.error =
+                  success ? "" : result.exception().what().toStdString();
+              event.duration =
+                  std::chrono::duration<double>{stopWatch.elapsed()}.count();
+              if (stoppedAt) {
+                event.outage_age_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - *stoppedAt)
+                        .count();
+              }
+              edenFsEventsLogger->logEvent(event);
+              if (success) {
+                XLOGF(
+                    DBG3,
+                    "Automatically remounted mount: {}",
+                    mountPath.value());
+                return ImmediateFuture<folly::Unit>{std::in_place};
+              } else {
+                auto errorMessage = fmt::format(
+                    "Failed to remount {}: {}\n",
+                    mountPath.value(),
+                    result.exception().what());
+                XLOG(ERR, errorMessage);
+                return makeImmediateFuture<Unit>(std::move(result).exception());
+              }
+            })
+            .semi();
+      });
+  return true;
+}
+
+std::optional<EdenServer::CheckoutRecoveryAttempt>
+EdenServer::beginCheckoutRecovery(const AbsolutePath& mountPath) {
+  auto states = checkoutRecoveryStates_.wlock();
+  auto& state = (*states)[mountPath];
+  // Skip while a remount is pending, after giving up, or while flapping.
+  if (state.inFlight || state.gaveUp || state.flaps >= kMaxCheckoutFlaps) {
+    return std::nullopt;
+  }
+  state.inFlight = true;
+  state.stoppedDuringRecovery = false;
+  return CheckoutRecoveryAttempt{
+      state.failedAttempts + 1,
+      state.stopReason,
+      state.stopReason.empty() ? std::nullopt
+                               : std::make_optional(state.stoppedAt)};
+}
+
+void EdenServer::addCheckoutFlap(
+    const AbsolutePath& mountPath,
+    CheckoutRecoveryState& state) {
+  if (++state.flaps == kMaxCheckoutFlaps) {
     XLOGF(
         WARN,
-        "Could not parse config.json file: {} skipping accidental unmount recovery.",
-        folly::exceptionStr(std::current_exception()));
-    return;
+        "{} stopped {} times soon after being recovered; not recovering it again",
+        mountPath,
+        kMaxCheckoutFlaps);
   }
+}
 
-  if (dirs.empty()) {
-    XLOGF(
-        DBG5,
-        "No mount points currently configured, skipping accidental unmount recovery.");
-    return;
-  }
-
-  for (const auto& client : dirs.items()) {
-    auto mountPath = canonicalPath(client.first.stringPiece());
-    bool isMounted = false;
-    {
-      const auto mountPoints = mountPoints_->rlock();
-      isMounted = mountPoints->find(mountPath) != mountPoints->end();
+void EdenServer::recordCheckoutStop(
+    const AbsolutePath& mountPath,
+    std::string reason,
+    std::optional<std::chrono::steady_clock::time_point> channelStoppedAt) {
+  auto states = checkoutRecoveryStates_.wlock();
+  auto& state = (*states)[mountPath];
+  if (state.inFlight) {
+    // A recovery attempt's failed mount must not replace the original cause.
+    if (!channelStoppedAt) {
+      return;
     }
+    // The remounted channel started and stopped again: a new outage.
+    state.stoppedDuringRecovery = true;
+  }
+  const auto stoppedAt =
+      channelStoppedAt.value_or(std::chrono::steady_clock::now());
+  if (state.recoveredAt) {
+    if (stoppedAt - *state.recoveredAt < kCheckoutFlapWindow) {
+      addCheckoutFlap(mountPath, state);
+    } else {
+      state.flaps = 0;
+    }
+    state.recoveredAt.reset();
+  }
+  state.stopReason = std::move(reason);
+  state.stoppedAt = stoppedAt;
+}
 
-    if (!isMounted) {
-      // This mount point is not currently mounted, but it was configured
-      // in config.json.  This means that the client was unmounted.
-      // We should attempt to remount it, if it is unmounted accidentally.
+bool EdenServer::endCheckoutRecovery(
+    const AbsolutePath& mountPath,
+    bool success) {
+  auto states = checkoutRecoveryStates_.wlock();
+  auto it = states->try_emplace(mountPath).first;
+  auto& state = it->second;
+  if (success) {
+    // Only the flap count outlives a successful recovery.
+    CheckoutRecoveryState recovered;
+    recovered.flaps = state.flaps;
+    if (state.stoppedDuringRecovery) {
+      // The remounted channel already stopped again: a new outage, and a
+      // flap.
+      recovered.stopReason = std::move(state.stopReason);
+      recovered.stoppedAt = state.stoppedAt;
+      addCheckoutFlap(mountPath, recovered);
+    } else {
+      recovered.recoveredAt = std::chrono::steady_clock::now();
+    }
+    state = std::move(recovered);
+    return false;
+  }
+  if (state.resetRequested) {
+    // Mounted some other way while this attempt ran, so its failure (usually
+    // "already mounted") does not count.
+    if (!state.stoppedDuringRecovery) {
+      states->erase(it);
+      return false;
+    }
+    // That mount's channel already stopped again: keep the new outage.
+    CheckoutRecoveryState newOutage;
+    newOutage.stopReason = std::move(state.stopReason);
+    newOutage.stoppedAt = state.stoppedAt;
+    state = std::move(newOutage);
+    return false;
+  }
+  state.inFlight = false;
+  ++state.failedAttempts;
+  if (state.failedAttempts >= kMaxCheckoutRecoveryAttempts) {
+    state.gaveUp = true;
+    return true;
+  }
+  return false;
+}
 
-      auto nfsServer = serverState_->getNfsServer();
-      if (nfsServer && nfsServer->isMountRegistered(mountPath)) {
-        // This mount point is registered with the NFS server, so it is
-        // probably in the process of being unmounted.  We should not
-        // attempt to remount it.
-        continue;
-      }
+void EdenServer::cancelCheckoutRecovery(const AbsolutePath& mountPath) {
+  {
+    auto states = checkoutRecoveryStates_.wlock();
+    auto it = states->find(mountPath);
+    if (it == states->end()) {
+      return;
+    }
+    if (!it->second.resetRequested) {
+      it->second.inFlight = false;
+      return;
+    }
+  }
+  // Mounted some other way while this attempt was queued, which
+  // endCheckoutRecovery() does not count as a failure.
+  endCheckoutRecovery(mountPath, /*success=*/false);
+}
 
-      auto edenClientPath =
-          edenDir_.getCheckoutStateDir(client.second.stringPiece());
-      auto initialConfig =
-          CheckoutConfig::loadFromClientDirectory(mountPath, edenClientPath);
-      if (initialConfig->isIntentionallyUnmounted()) {
-        XLOGF(
-            DBG5,
-            "Mount point {} is intentionally unmounted, skipping unmount recovery.",
-            mountPath);
-        continue;
-      }
+void EdenServer::resetCheckoutRecovery(const AbsolutePath& mountPath) {
+  auto states = checkoutRecoveryStates_.wlock();
+  auto it = states->find(mountPath);
+  if (it == states->end()) {
+    return;
+  }
+  if (it->second.inFlight) {
+    // Let endCheckoutRecovery() apply the reset. A recovery attempt's own
+    // successful mount() also gets here.
+    it->second.resetRequested = true;
+    return;
+  }
+  states->erase(it);
+}
 
-      XLOGF(
-          INFO,
-          "Mount point {} is not currently mounted, attempting to remount.",
-          mountPath);
-
-      folly::via(
-          getServerState()->getThreadPool().get(),
-          [this,
-           initialConfig = std::move(initialConfig),
-           edenFsEventsLogger = serverState_->getEdenFsEventsLogger(),
-           mountPath,
-           repoName = client.second.asString()]() mutable {
-            return mount(std::move(initialConfig), /*readOnly=*/false)
-                .thenTry([mountPath,
-                          edenFsEventsLogger,
-                          repoName = std::move(repoName)](
-                             folly::Try<std::shared_ptr<EdenMount>>&& result) {
-                  bool success = result.hasValue();
-                  std::string exceptionMessage =
-                      success ? "" : result.exception().what().toStdString();
-                  edenFsEventsLogger->logEvent(
-                      AccidentalUnmountRecovery{
-                          exceptionMessage, success, repoName});
-                  if (success) {
-                    XLOGF(
-                        DBG3,
-                        "Automatically remounted mount: {}",
-                        mountPath.value());
-                    return ImmediateFuture<folly::Unit>{std::in_place};
-                  } else {
-                    auto errorMessage = fmt::format(
-                        "Failed to remount {}: {}\n",
-                        mountPath.value(),
-                        result.exception().what());
-                    XLOG(ERR, errorMessage);
-                    return makeImmediateFuture<Unit>(
-                        std::move(result).exception());
-                  }
-                })
-                .semi();
-          });
+void EdenServer::pruneCheckoutRecoveries(
+    const std::unordered_set<AbsolutePath>& configuredPaths) {
+  auto states = checkoutRecoveryStates_.wlock();
+  for (auto it = states->begin(); it != states->end();) {
+    // An in-flight entry is left for its attempt to finish.
+    if (!it->second.inFlight && !configuredPaths.contains(it->first)) {
+      it = states->erase(it);
+    } else {
+      ++it;
     }
   }
 }
@@ -4393,136 +5544,6 @@ void EdenServer::refreshRestrictedRoots() {
             ex.what());
       }
     });
-  }
-}
-
-void EdenServer::detectNfsCrawl() {
-  auto edenConfig = config_->getEdenConfig();
-  auto readThreshold = edenConfig->nfsCrawlReadThreshold.getValue();
-  auto readDirThreshold = edenConfig->nfsCrawlReadDirThreshold.getValue();
-  auto readCount = fb303::ServiceData::get()
-                       ->getCounterIfExists(kNfsReadCount60)
-                       .value_or(0);
-  // At runtime, use-readdirplus can change, but this does not change the state
-  // of the current mounts. Therefore, sum readdir and readdirplus counters and
-  // compare that to the readdir threshold.
-  auto readDirCount = fb303::ServiceData::get()
-                          ->getCounterIfExists(kNfsReadDirCount60)
-                          .value_or(0) +
-      fb303::ServiceData::get()
-          ->getCounterIfExists(kNfsReadDirPlusCount60)
-          .value_or(0);
-  if (readCount > readThreshold || readDirCount > readDirThreshold) {
-    XLOGF(
-        DBG2,
-        "NFS crawl detected, initiating process discovery and attribution: "
-        "[nfs.read_us.count.60 = {} > {} or nfs.readdir[plus]_us.count.60 = {} > {}]",
-        readCount,
-        readThreshold,
-        readDirCount,
-        readDirThreshold);
-
-    // Get list of excluded process names
-    auto exclusions = edenConfig->nfsCrawlExcludedProcessNames.getValue();
-
-    // Iterate over each mount
-    auto mountPoints = getMountPoints();
-    for (auto& mountPointHandle : mountPoints) {
-      if (mountPointHandle.getEdenMount().isNfsdChannel()) {
-        folly::via(
-            getServerState()->getThreadPool().get(),
-            [mountPointHandle,
-             exclusions,
-             serverState = serverState_,
-             readCount,
-             readThreshold,
-             readDirCount,
-             readDirThreshold]() {
-              const auto& mount = mountPointHandle.getEdenMount();
-
-              // Information about the processes we've observed accessing the
-              // mount and their parents. This represents a subtree of the
-              // processes running at the time of crawl detection with edges
-              // indicated by the ppid field. The init process (PID 1) is the
-              // implicit root of the tree.
-              std::unordered_map<pid_t, ProcessInfo> processRecords;
-
-              // We'll keep track of PIDs known not to be leaves in our tree to
-              // simplify traversal below.
-              std::unordered_set<pid_t> nonLeafPids;
-
-              // Get list of pids that have open files/paths on the mount
-              auto mountPids =
-                  proc_util::readProcessIdsForPath(mount.getPath());
-
-              for (pid_t pid : mountPids) {
-                // Walk up the process hierarchy from the PID seen accessing the
-                // mount until we hit either init or a process we've already
-                // recorded.
-                while (pid > 1 &&
-                       processRecords.find(pid) == processRecords.end()) {
-                  auto processInfo =
-                      serverState->getProcessInfoCache()->lookup(pid).get();
-                  auto ppid = processInfo.ppid;
-                  nonLeafPids.insert(ppid);
-                  processRecords.insert({pid, std::move(processInfo)});
-                  pid = ppid;
-                }
-              }
-
-              // Iterate over leaf PIDs and walk up their process hierarchies
-              // for logging.
-              for (const auto& pair : processRecords) {
-                auto pid = pair.first;
-                auto record = pair.second;
-                if (nonLeafPids.find(pid) != nonLeafPids.end() ||
-                    exclusions.find(record.simpleName) != exclusions.end()) {
-                  continue;
-                }
-
-                // Gather hierarchy into a stack so we can log in the order of
-                // "parent -> child -> grandchild".
-                std::vector<std::pair<pid_t, ProcessInfo>> hierarchy;
-                decltype(processRecords)::iterator itr;
-                while (pid > 1 &&
-                       (itr = processRecords.find(pid)) !=
-                           processRecords.end()) {
-                  pid = itr->second.ppid;
-                  hierarchy.emplace_back(pid, std::move(itr->second));
-                }
-
-                // Log process hierarchies
-                auto [p, pi] = std::move(hierarchy.back());
-                hierarchy.pop_back();
-                std::string output =
-                    fmt::format("[{}({}): {}]", pi.simpleName, p, pi.name);
-                while (!hierarchy.empty()) {
-                  fmt::format_to(std::back_inserter(output), " -> ");
-                  auto [child_p, child_pi] = std::move(hierarchy.back());
-                  hierarchy.pop_back();
-                  fmt::format_to(
-                      std::back_inserter(output),
-                      "[{}({}): {}]",
-                      child_pi.simpleName,
-                      child_p,
-                      child_pi.name);
-                }
-                XLOGF(
-                    DBG2,
-                    "NFS crawl detection found process with open files in mount point: {}\n  {}",
-                    mount.getPath(),
-                    output);
-                serverState->getEdenFsEventsLogger()->logEvent(
-                    NfsCrawlDetected{
-                        readCount,
-                        readThreshold,
-                        readDirCount,
-                        readDirThreshold,
-                        output});
-              }
-            });
-      }
-    }
   }
 }
 

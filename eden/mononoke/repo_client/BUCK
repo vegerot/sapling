@@ -1,6 +1,6 @@
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_treehugger")
+oncall("scm_server_infra")
 
 rust_library(
     name = "repo_client",
@@ -38,7 +38,6 @@ rust_library(
         "//common/rust/shed/futures_01_ext:futures_01_ext",
         "//common/rust/shed/futures_ext:futures_ext",
         "//common/rust/shed/futures_stats:futures_stats",
-        "//common/rust/shed/hostname:hostname",
         "//common/rust/shed/stats:stats",
         "//eden/mononoke/blobrepo:blobrepo_hg",
         "//eden/mononoke/blobstore:blobstore",

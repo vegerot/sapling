@@ -17,7 +17,7 @@ import {Icon} from 'isl-components/Icon';
 import {Subtle} from 'isl-components/Subtle';
 import {Tag} from 'isl-components/Tag';
 import {Tooltip} from 'isl-components/Tooltip';
-import {useAtomValue, useSetAtom} from 'jotai';
+import {atom, useAtomValue, useSetAtom} from 'jotai';
 import React, {memo, useState} from 'react';
 import {ComparisonType} from 'shared/Comparison';
 import {useContextMenu} from 'shared/ContextMenu';
@@ -26,6 +26,7 @@ import {useAutofocusRef} from 'shared/hooks';
 import {basename, guessPathSep, notEmpty, nullthrows} from 'shared/utils';
 import {AllBookmarksTruncated, Bookmark, Bookmarks, createBookmarkAtCommit} from './Bookmark';
 import {openBrowseUrlForHash, supportsBrowseUrlForHash} from './BrowseRepo';
+import {worktreeMutationsSupported} from './CheckedOutElsewhere';
 import css from './Commit.module.css';
 import {cloudSyncStateAtom} from './CommitCloud';
 import {hasUnsavedEditedCommitMessage} from './CommitInfoView/CommitInfoState';
@@ -53,7 +54,6 @@ import {
 import {DiffBadge, DiffFollower, DiffInfo} from './codeReview/DiffBadge';
 import {submitAsDraft} from './codeReview/DraftCheckbox';
 import {SyncStatus, syncStatusAtom} from './codeReview/syncStatus';
-import {getQeFlag, useFeatureFlagSync} from './featureFlags';
 import {FoldButton, useRunFoldPreview} from './fold';
 import {findPublicBaseAncestor} from './getCommitTree';
 import {t, T} from './i18n';
@@ -96,7 +96,6 @@ import {
 } from './selection';
 import {applicationinfo, inMergeConflicts, mergeConflicts} from './serverAPIState';
 import {SmartActionsDropdown} from './smartActions/SmartActionsDropdown';
-import {SmartActionsMenu} from './smartActions/SmartActionsMenu';
 import {useConfirmUnsavedEditsBeforeSplit} from './stackEdit/ui/ConfirmUnsavedEditsBeforeSplit';
 import {SplitButton} from './stackEdit/ui/SplitButton';
 import {editingStackIntentionHashes} from './stackEdit/ui/stackEditState';
@@ -108,16 +107,19 @@ import {short} from './utils';
 export const rebaseOffWarmWarningEnabled = localStorageBackedAtom<boolean>(
   'isl.rebase-off-warm-warning-enabled',
   true,
+  {portable: true},
 );
 
 export const distantRebaseWarningEnabled = localStorageBackedAtom<boolean>(
   'isl.distant-rebase-warning-enabled',
   true,
+  {portable: true},
 );
 
 export const rebaseOntoMasterWarningEnabled = localStorageBackedAtom<boolean>(
   'isl.rebase-onto-master-warning-enabled',
   true,
+  {portable: true},
 );
 
 export type CopyCommitHashFormat = 'long' | 'short';
@@ -158,6 +160,13 @@ function commitLabelForCommit(conflicts: MergeConflicts | undefined, hash: strin
   return null;
 }
 
+const hasUncommittedChangesAtom = atom(get => get(uncommittedChangesWithPreviews).length > 0);
+
+function RepoRelativeCwd() {
+  const cwd = useAtomValue(repoRelativeCwd);
+  return <pre>{cwd}</pre>;
+}
+
 export const Commit = memo(
   ({
     commit,
@@ -170,7 +179,7 @@ export const Commit = memo(
   }) => {
     const isPublic = commit.phase === 'public';
     const isObsoleted = commit.successorInfo != null;
-    const hasUncommittedChanges = (readAtom(uncommittedChangesWithPreviews).length ?? 0) > 0;
+    const hasUncommittedChanges = useAtomValue(hasUncommittedChangesAtom);
 
     const isIrrelevantToCwd = useIsIrrelevantToCwd(commit);
 
@@ -684,15 +693,8 @@ export const Commit = memo(
       );
     }
 
-    const useV2SmartActions = useFeatureFlagSync(Internal.featureFlags?.SmartActionsRedesign);
-    if (!isPublic && !actionsPrevented) {
-      if (useV2SmartActions) {
-        if (commit.isDot && !hasUncommittedChanges && !inConflicts) {
-          inlineCommitActions.push(<SmartActionsDropdown key="smartActions" commit={commit} />);
-        }
-      } else {
-        inlineCommitActions.push(<SmartActionsMenu key="smartActions" commit={commit} />);
-      }
+    if (!isPublic && !actionsPrevented && commit.isDot && !hasUncommittedChanges && !inConflicts) {
+      inlineCommitActions.push(<SmartActionsDropdown key="smartActions" commit={commit} />);
     }
 
     if (!isPublic && !actionsPrevented) {
@@ -746,7 +748,7 @@ export const Commit = memo(
                       <T
                         replace={{
                           $prefix: <pre>{commit.maxCommonPathPrefix}</pre>,
-                          $cwd: <pre>{readAtom(repoRelativeCwd)}</pre>,
+                          $cwd: <RepoRelativeCwd />,
                         }}>
                         This commit only contains files within: $prefix These are irrelevant to your
                         current working directory: $cwd
@@ -842,9 +844,11 @@ function CommitLabel({children}: {children?: ReactNode}) {
 
 /**
  * A label naming a sibling worktree currently checked out (`.`) at this commit,
- * followed by buttons to open, rename, and (for linked worktrees) remove it.
+ * followed by buttons to open and (for linked worktrees) rename and remove it.
+ * Rename and remove are only shown where the server reports worktree mutations are supported.
  */
 export function CheckedOutElsewhereBadge({wt}: {wt: WorktreeEntry}) {
+  const canMutate = useAtomValue(worktreeMutationsSupported);
   const name =
     wt.label != null && wt.label !== '' ? wt.label : basename(wt.path, guessPathSep(wt.path));
   const hoverTitle = t('Checked out in worktree $name', {replace: {$name: name}});
@@ -861,8 +865,8 @@ export function CheckedOutElsewhereBadge({wt}: {wt: WorktreeEntry}) {
         </Tag>
       </Tooltip>
       <OpenWorktreeButton wt={wt} name={name} />
-      <RenameWorktreeButton wt={wt} name={name} />
-      {wt.role === 'main' ? null : <RemoveWorktreeButton wt={wt} name={name} />}
+      {canMutate && <RenameWorktreeButton wt={wt} name={name} />}
+      {canMutate && wt.role !== 'main' && <RemoveWorktreeButton wt={wt} name={name} />}
     </span>
   );
 }
@@ -916,6 +920,9 @@ function OpenWorktreeButton({wt, name}: {wt: WorktreeEntry; name: string}) {
 
 function RenameWorktreeButton({wt, name}: {wt: WorktreeEntry; name: string}) {
   const runOperation = useRunOperation();
+  if (wt.role === 'main') {
+    return null;
+  }
   const title = t('Rename worktree $name', {replace: {$name: name}});
   return (
     <Tooltip title={title} delayMs={250}>
@@ -1369,10 +1376,7 @@ async function gotoAction(runOperation: ReturnType<typeof useRunOperation>, comm
   const shouldProceed = await runWarningChecks([
     () => maybeWarnAboutRebaseOntoMaster(commit),
     () => maybeWarnAboutOldDestination(commit),
-    async () => {
-      const showRebaseOntoWarm = await getQeFlag('isl_rebase_onto_warm_button');
-      return maybeWarnAboutRebaseOffWarm(commit, {showRebaseOntoWarm});
-    },
+    () => maybeWarnAboutRebaseOffWarm(commit, {showRebaseOntoWarm: true}),
   ]);
 
   if (!shouldProceed) {

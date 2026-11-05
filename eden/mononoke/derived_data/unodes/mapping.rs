@@ -35,8 +35,8 @@ use mononoke_types::NonRootMPath;
 use stats::prelude::*;
 use tracing::debug;
 
+use crate::derive::derive_unode_manifest;
 use crate::derive::derive_unode_manifest_stack;
-use crate::derive::derive_unode_manifest_with_subtree_changes;
 
 define_stats! {
     prefix = "mononoke.derived_data.unodes";
@@ -96,17 +96,15 @@ impl BonsaiDerivable for RootUnodeManifestId {
         _known: Option<&HashMap<ChangesetId, Self>>,
     ) -> Result<Self> {
         let csid = bonsai.get_changeset_id();
-        derive_unode_manifest_with_subtree_changes(
+        derive_unode_manifest(
             ctx,
             derivation_ctx,
-            None,
             csid,
             parents
                 .into_iter()
                 .map(|root_mf_id| root_mf_id.manifest_unode_id().clone())
                 .collect(),
             get_file_changes(&bonsai),
-            bonsai.subtree_changes(),
         )
         .map_ok(RootUnodeManifestId)
         .await
@@ -158,17 +156,15 @@ impl BonsaiDerivable for RootUnodeManifestId {
                     let parents = derivation_ctx
                         .fetch_unknown_parents(ctx, Some(&res), &bonsai)
                         .await?;
-                    let derived = derive_unode_manifest_with_subtree_changes(
+                    let derived = derive_unode_manifest(
                         ctx,
                         derivation_ctx,
-                        Some(&res),
                         bonsai.get_changeset_id(),
                         parents
                             .into_iter()
                             .map(|root_mf_id| root_mf_id.manifest_unode_id().clone())
                             .collect(),
                         get_file_changes(&bonsai),
-                        bonsai.subtree_changes(),
                     )
                     .await?;
                     res.insert(item.cs_id, RootUnodeManifestId(derived));

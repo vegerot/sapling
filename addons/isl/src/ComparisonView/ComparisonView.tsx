@@ -11,6 +11,7 @@ import type {Result} from '../types';
 import type {Context} from './SplitDiffView/types';
 
 import deepEqual from 'fast-deep-equal';
+import {Banner, BannerKind} from 'isl-components/Banner';
 import {Button} from 'isl-components/Button';
 import {Checkbox} from 'isl-components/Checkbox';
 import {Dropdown} from 'isl-components/Dropdown';
@@ -27,16 +28,22 @@ import {
   comparisonStringKey,
   labelForComparison,
 } from 'shared/Comparison';
-import {group, notEmpty} from 'shared/utils';
+import {group, notEmpty, nullthrows} from 'shared/utils';
 import serverAPI from '../ClientToServerAPI';
 import {EmptyState} from '../EmptyState';
 import {useGeneratedFileStatuses} from '../GeneratedFile';
 import {T, t} from '../i18n';
 import {atomFamilyWeak, atomLoadableWithRefresh, localStorageBackedAtom} from '../jotaiUtils';
+import {AddOperation} from '../operations/AddOperation';
+import {AddRemoveOperation} from '../operations/AddRemoveOperation';
+import {useRunOperation} from '../operationsState';
 import platform from '../platform';
 import {dagWithPreviews, uncommittedChangesWithPreviews} from '../previews';
-import {latestHeadCommit, latestUncommittedChangesData} from '../serverAPIState';
-import {themeState} from '../theme';
+import {
+  latestHeadCommit,
+  latestUncommittedChanges,
+  latestUncommittedChangesData,
+} from '../serverAPIState';
 import {copyAndShowToast} from '../toast';
 import {GeneratedStatus} from '../types';
 import {SplitDiffView} from './SplitDiffView';
@@ -56,6 +63,7 @@ function mapResult<T, U>(result: Result<T>, fn: (t: T) => U): Result<U> {
 const comparisonIgnoreWhitespace = localStorageBackedAtom<boolean>(
   'isl.comparison-ignore-whitespace',
   true,
+  {portable: true},
 );
 
 const currentComparisonData = atomFamilyWeak((comparison: Comparison) =>
@@ -117,6 +125,106 @@ const comparisonTargetIsCurrentAtom = atomFamilyWeak((comparison: Comparison) =>
   }),
 );
 
+/**
+ * Untracked files are never in a comparison's diff, so their focused diff view would be empty.
+ * Reads the status last reported by the server rather than the optimistic one, so the notice
+ * stays up until tracking the file has finished.
+ */
+const focusedFileIsUntrackedAtom = atomFamilyWeak((path: string) =>
+  atom(
+    get =>
+      path !== '' &&
+      get(latestUncommittedChanges).some(file => file.path === path && file.status === '?'),
+  ),
+);
+
+/**
+ * Untracked files in the working copy, which are left out of every comparison against head.
+ * Like {@link focusedFileIsUntrackedAtom}, this ignores optimistic state.
+ */
+const untrackedFilesAtom = atom(get =>
+  get(latestUncommittedChanges)
+    .filter(file => file.status === '?')
+    .map(file => file.path),
+);
+
+const MAX_UNTRACKED_FILES_IN_TOOLTIP = 20;
+
+function UntrackedFilesBanner({
+  paths,
+  onTracked,
+}: {
+  paths: Array<string>;
+  onTracked: () => unknown;
+}) {
+  const runOperation = useRunOperation();
+  const [isTracking, setIsTracking] = useState(false);
+  const shownPaths = paths.slice(0, MAX_UNTRACKED_FILES_IN_TOOLTIP);
+  const hiddenCount = paths.length - shownPaths.length;
+  const tooltip = [
+    ...shownPaths,
+    ...(hiddenCount > 0 ? [t('andMoreFiles', {count: hiddenCount})] : []),
+  ].join('\n');
+  return (
+    <Banner
+      className="comparison-view-untracked-files-banner"
+      kind={BannerKind.warning}
+      icon={<Icon icon="warning" />}
+      alwaysShowButtons
+      buttons={
+        <Button
+          data-testid="comparison-track-untracked-files"
+          disabled={isTracking}
+          onClick={async () => {
+            setIsTracking(true);
+            await runOperation(new AddRemoveOperation(paths));
+            setIsTracking(false);
+            onTracked();
+          }}>
+          <Icon icon={isTracking ? 'loading' : 'add'} slot="start" />
+          <T count={paths.length}>trackUntrackedFiles</T>
+        </Button>
+      }>
+      {paths.length === 1 ? (
+        <span data-testid="comparison-untracked-files-banner">
+          <T replace={{$path: paths[0]}}>$path is untracked and not included in this comparison</T>
+        </span>
+      ) : (
+        <Tooltip title={tooltip} placement="bottom">
+          <span data-testid="comparison-untracked-files-banner">
+            <T count={paths.length}>untrackedFilesNotShownInComparison</T>
+          </span>
+        </Tooltip>
+      )}
+    </Banner>
+  );
+}
+
+function UntrackedFileNotice({path, onTracked}: {path: string; onTracked: () => unknown}) {
+  const runOperation = useRunOperation();
+  const [isTracking, setIsTracking] = useState(false);
+  return (
+    <EmptyState>
+      <T>This file is untracked</T>
+      <Subtle>
+        <T>Track it to see its changes here and include it in a commit.</T>
+      </Subtle>
+      <Button
+        data-testid="comparison-track-untracked-file"
+        disabled={isTracking}
+        onClick={async () => {
+          setIsTracking(true);
+          await runOperation(new AddOperation(path));
+          setIsTracking(false);
+          onTracked();
+        }}>
+        <Icon icon={isTracking ? 'loading' : 'add'} slot="start" />
+        <T>Track file</T>
+      </Button>
+    </EmptyState>
+  );
+}
+
 type LineRangeKey = string;
 export function keyForLineRange(param: {path: string; comparison: Comparison}): LineRangeKey {
   return `${param.path}:${comparisonStringKey(param.comparison)}`;
@@ -126,6 +234,10 @@ type ComparisonDisplayMode = 'unified' | 'split';
 const comparisonDisplayMode = localStorageBackedAtom<ComparisonDisplayMode | 'responsive'>(
   'isl.comparison-display-mode',
   'responsive',
+  {
+    portable: true,
+    validate: value => ['responsive', 'unified', 'split'].includes(value as string),
+  },
 );
 
 export default function ComparisonView({
@@ -137,7 +249,15 @@ export default function ComparisonView({
   dismiss?: () => void;
   focusedFile?: string;
 }) {
-  const compared = useAtomValue(currentComparisonData(comparison));
+  const [compared, reloadComparison] = useAtom(currentComparisonData(comparison));
+  const focusedFileIsUntracked = useAtomValue(
+    focusedFileIsUntrackedAtom(
+      focusedFile != null && comparisonIsAgainstHead(comparison) ? focusedFile : '',
+    ),
+  );
+  const untrackedFiles = useAtomValue(untrackedFilesAtom);
+  const showUntrackedFilesBanner =
+    focusedFile == null && comparisonIsAgainstHead(comparison) && untrackedFiles.length > 0;
 
   const displayMode = useComparisonDisplayMode();
 
@@ -159,6 +279,8 @@ export default function ComparisonView({
   } else if (compared.state === 'hasError') {
     const error = compared.error instanceof Error ? compared.error : new Error(`${compared.error}`);
     content = <ErrorNotice error={error} title={t('Unable to load comparison')} />;
+  } else if (focusedFileIsUntracked) {
+    content = <UntrackedFileNotice path={nullthrows(focusedFile)} onTracked={reloadComparison} />;
   } else if (data?.value && data.value.length === 0) {
     content =
       comparison.type === ComparisonType.SinceLastCodeReviewSubmit ? (
@@ -174,7 +296,7 @@ export default function ComparisonView({
         </EmptyState>
       );
   } else {
-    let files = data.value ?? [];
+    let files = [...(data.value ?? [])];
     if (focusedFile != null) {
       files = files.filter(f => f.newFileName === focusedFile || f.oldFileName === focusedFile);
     }
@@ -234,7 +356,12 @@ export default function ComparisonView({
         dismiss={dismiss}
         focusedFile={focusedFile}
       />
-      <div className="comparison-view-details">{content}</div>
+      <div className="comparison-view-details">
+        {showUntrackedFilesBanner && (
+          <UntrackedFilesBanner paths={untrackedFiles} onTracked={reloadComparison} />
+        )}
+        {content}
+      </div>
     </div>
   );
 }
@@ -386,7 +513,7 @@ function ComparisonSettingsDropdown() {
 /**
  * Derive from the parsed diff state which files should be expanded or collapsed by default.
  * This state is the source of truth of which files are expanded/collapsed.
- * This is a hook instead of a recoil selector since it depends on the comparison
+ * This is a hook instead of a derived atom since it depends on the comparison
  * which is a prop.
  */
 function useCollapsedFilesState(data: {
@@ -467,6 +594,8 @@ function useComparisonDisplayMode(): ComparisonDisplayMode {
   return mode;
 }
 
+const latestHeadCommitHash = atom(get => get(latestHeadCommit)?.hash ?? '');
+
 function ComparisonViewFile({
   diff,
   comparison,
@@ -505,7 +634,10 @@ function ComparisonViewFile({
 
       const result = await serverAPI.nextMessageMatching(
         'comparisonContextLines',
-        msg => msg.path === id.path,
+        msg =>
+          msg.path === id.path &&
+          // Older servers don't say which lines they sent.
+          (msg.start == null || (msg.start === start && msg.numLines === numLines)),
       );
 
       return result.lines;
@@ -521,9 +653,7 @@ function ComparisonViewFile({
     // also changing the head commit's hash.
     // Note: we use latestHeadCommit WITHOUT previews, so we don't accidentally cache the file content
     // AGAIN on the same data while waiting for some new operation to finish.
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    useComparisonInvalidationKeyHook: () => useAtomValue(latestHeadCommit)?.hash ?? '',
-    useThemeHook: () => useAtomValue(themeState),
+    comparisonInvalidationKey: latestHeadCommitHash,
     t,
     collapsed,
     setCollapsed,

@@ -112,6 +112,8 @@ use repo_blobstore::RepoBlobstoreRef;
 use serde::Deserialize;
 use smallvec::SmallVec;
 use sorted_vector_map::SortedVectorMap;
+use stats::define_stats;
+use stats::prelude::TimeseriesStatic;
 use tracing::debug;
 use types::HgId;
 use types::Parents;
@@ -143,6 +145,12 @@ const PHASES_CHECK_LIMIT: usize = 10;
 
 const COMMITS_PER_USER_RATE_LIMIT: &str = "commits_per_user";
 const LOCATION_TO_HASH_COUNT_RATE_LIMIT: &str = "location_to_hash_count";
+
+define_stats! {
+    prefix = "mononoke.commit";
+    ephemeral_extend_by_snapshot_id: timeseries(Rate, Sum),
+    ephemeral_extend_by_bubble_id: timeseries(Rate, Sum),
+}
 
 #[derive(Debug, Deserialize, StateData, StaticResponseExtender)]
 pub struct RevlogDataParams {
@@ -537,6 +545,10 @@ impl SaplingRemoteApiHandler for UploadHgChangesetsHandler {
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
+        // Commit-cloud sync uploads drafts here before touching workspace refs.
+        if let Err(err) = repo.repo_ctx().ensure_commit_cloud_writable() {
+            return Err(HttpError::e400(err).into());
+        }
         let changesets = request.changesets;
 
         let ctx = repo.ctx().clone();
@@ -576,8 +588,8 @@ impl SaplingRemoteApiHandler for UploadHgChangesetsHandler {
             .await;
 
         let results = stored.into_iter().map(move |r| {
-            r.map(|(hg_cs_id, _bonsai_cs_id)| {
-                let hgid = HgId::from(hg_cs_id.into_nodehash());
+            r.map(|(hg_cs, _bonsai)| {
+                let hgid = HgId::from(hg_cs.get_changeset_id().into_nodehash());
                 UploadTokensResponse {
                     token: UploadToken::new_fake_token(AnyId::HgChangesetId(hgid), None),
                 }
@@ -607,6 +619,10 @@ impl SaplingRemoteApiHandler for UploadBonsaiChangesetHandler {
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
+        // Commit-cloud sync uploads drafts here before touching workspace refs.
+        if let Err(err) = repo.repo_ctx().ensure_commit_cloud_writable() {
+            return Err(HttpError::e400(err).into());
+        }
         let query = ectx.query();
         let bubble_id = query.bubble_id.map(BubbleId::new);
         let cs = request.changeset;
@@ -937,7 +953,31 @@ impl SaplingRemoteApiHandler for EphemeralExtendHandler {
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
-        let bubble_id = BubbleId::new(request.bubble_id);
+        let bubble_id = match (request.snapshot_id, request.bubble_id) {
+            (Some(snapshot_id), _) => {
+                STATS::ephemeral_extend_by_snapshot_id.add_value(1);
+                let cs_id = ChangesetId::from(snapshot_id);
+                repo.ephemeral_store()
+                    .bubble_from_changeset(repo.ctx(), &cs_id)
+                    .await
+                    .context("Failure in fetching bubble from changeset")?
+                    .ok_or_else(|| {
+                        HttpError::e404(MononokeError::NotAvailable(format!(
+                            "Snapshot for changeset {cs_id} not found in bubble"
+                        )))
+                    })?
+            }
+            (None, Some(bubble_id)) => {
+                STATS::ephemeral_extend_by_bubble_id.add_value(1);
+                BubbleId::new(bubble_id)
+            }
+            (None, None) => {
+                return Err(HttpError::e400(anyhow!(
+                    "Either snapshot_id or bubble_id must be provided"
+                ))
+                .into());
+            }
+        };
         let custom_duration = request.custom_duration_secs.map(Duration::from_secs);
 
         // Extend the bubble's TTL using the new method
@@ -973,7 +1013,7 @@ impl SaplingRemoteApiHandler for EphemeralExtendHandler {
         };
 
         let response = EphemeralExtendResponse {
-            bubble_id: request.bubble_id,
+            bubble_id: bubble_id.into(),
             result: api_outcome,
         };
 
@@ -1515,7 +1555,7 @@ impl SaplingRemoteApiHandler for UploadIdenticalChangesetsHandler {
                     commit_graph_writer
                         .add_many(&bs_ctx, graph_entries)
                         .await
-                        .context("While inserting into changeset table")?;
+                        .context("While inserting into commit graph")?;
                 }
                 Err(_empty) => {
                     // No changesets -- both put_futs and graph_entries are derived
@@ -1548,9 +1588,9 @@ impl SaplingRemoteApiHandler for UploadIdenticalChangesetsHandler {
             .clone()
             .into_iter()
             .map(|hg_cs| {
-                let (hg_cs_id, bcs) = hg_cs?;
+                let (hg_cs, bcs) = hg_cs?;
                 Ok(BonsaiHgMappingEntry {
-                    hg_cs_id,
+                    hg_cs_id: hg_cs.get_changeset_id(),
                     bcs_id: bcs.get_changeset_id(),
                 })
             })
@@ -1568,9 +1608,9 @@ impl SaplingRemoteApiHandler for UploadIdenticalChangesetsHandler {
             .await;
 
         let tokens = hg_changesets.into_iter().map(move |r| {
-            r.map(|(hg_cs_id, _)| {
+            r.map(|(hg_cs, _)| {
                 let hgid: types::hash::AbstractHashType<types::hgid::HgIdTypeInfo, 20> =
-                    HgId::from(hg_cs_id.into_nodehash());
+                    HgId::from(hg_cs.get_changeset_id().into_nodehash());
                 UploadTokensResponse {
                     token: UploadToken::new_fake_token(AnyId::HgChangesetId(hgid), None),
                 }

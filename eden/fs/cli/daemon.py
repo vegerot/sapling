@@ -26,7 +26,7 @@ from eden.fs.cli.util import (
     maybe_edensparse_migration,
 )
 
-from . import configutil, daemon_util, proc_utils as proc_utils_mod
+from . import configutil, daemon_util, error_report, proc_utils as proc_utils_mod
 from .config import EdenInstance
 from .util import get_pid_using_lockfile, poll_until, print_stderr, ShutdownError
 
@@ -345,28 +345,137 @@ def gracefully_restart_edenfs_service(
     daemon_binary: Optional[str] = None,
     edenfs_args: Optional[List[str]] = None,
     preserved_env: Optional[List[str]] = None,
+    force_takeover: bool = False,
+    only_if_idle: bool = False,
 ) -> int:
     """
     Gracefully restart the EdenFS service
     This function ensures a seamless transition from the old EdenFS instance to the new one.
-    It prevents the auto unmount recovery task from interfering with the restart process.
+
+    The running daemon refuses a takeover while it is serving long Thrift
+    requests. With force_takeover, it cancels them and proceeds. With
+    only_if_idle, it also refuses while it has served a checkout or a mount
+    recently.
     """
-    # Set the intentionally unmounted flag for all mounts to prevent auto unmount recovery
-    # during the restart process. This ensures that the old EdenFS mounts are not recovered
-    # while the new instance is taking over.
-    instance.set_intentionally_unmounted_for_all_mounts()
-    # Start the new EdenFS service, taking over from the old instance.
-    result = _start_edenfs_service(
+    # Unmount recovery and the health check's not-served scan run only while a
+    # daemon is RUNNING, and neither daemon is RUNNING during the handover.
+    return _start_edenfs_service(
         instance=instance,
         daemon_binary=daemon_binary,
         edenfs_args=edenfs_args,
         preserved_env=preserved_env,
         takeover=True,
+        force_takeover=force_takeover,
+        only_if_idle=only_if_idle,
     )
-    # Clear the intentionally unmounted flag after the restart is complete.
-    # This allows the auto unmount recovery task to resume its normal operation.
-    instance.clear_intentionally_unmounted_for_all_mounts()
-    return result
+
+
+# Flags that apply to one takeover only. They travel with --undefok so that a
+# daemon binary from an older package ignores them instead of refusing to
+# start.
+_UNDEFOK_TAKEOVER_FLAGS = "--undefok=forceTakeover,takeoverOnlyIfIdle"
+_FORCE_TAKEOVER_FLAG = "--forceTakeover"
+_ONLY_IF_IDLE_FLAG = "--takeoverOnlyIfIdle"
+_TAKEOVER_ONLY_ARGS = [
+    _UNDEFOK_TAKEOVER_FLAGS,
+    _FORCE_TAKEOVER_FLAG,
+    _ONLY_IF_IDLE_FLAG,
+]
+
+# Exit status of `eden restart --graceful` when the running daemon refused the
+# takeover and kept serving, so that a caller that retries later, such as the
+# restarter, can tell it from a restart that failed. This is EX_TEMPFAIL.
+TAKEOVER_REFUSED_EXIT_CODE = 75
+
+# The running daemon's refusal reaches the new daemon's startup log through
+# the takeover error. Both refusal messages carry these words; the daemon
+# keeps them in kTakeoverRefusedPhrase in EdenServer.cpp.
+_TAKEOVER_REFUSED_MARKER = "refused the graceful restart"
+
+# The error the daemon reported the last time a start failed, if any.
+_last_daemon_error: Optional[str] = None
+
+
+def _remember_daemon_error(daemon_error: Optional[str]) -> None:
+    global _last_daemon_error
+    _last_daemon_error = daemon_error
+
+
+def takeover_was_refused() -> bool:
+    """Whether the last daemon start failed because the running daemon refused
+    the takeover."""
+    return (
+        _last_daemon_error is not None
+        and _TAKEOVER_REFUSED_MARKER in _last_daemon_error
+    )
+
+
+def _takeover_only_flags(force_takeover: bool, only_if_idle: bool) -> List[str]:
+    """The daemon flags that apply to one takeover."""
+    if not (force_takeover or only_if_idle):
+        return []
+    flags = [_UNDEFOK_TAKEOVER_FLAGS]
+    if force_takeover:
+        flags.append(_FORCE_TAKEOVER_FLAG)
+    if only_if_idle:
+        flags.append(_ONLY_IF_IDLE_FLAG)
+    return flags
+
+
+def _drop_takeover_only_flags(
+    instance: EdenInstance,
+    cmd: List[str],
+    eden_env: Dict[str, str],
+    restart_cmd: List[str],
+) -> None:
+    """Rewrite the daemon args file without the flags meant for one takeover.
+
+    systemd replays the file on every later reload, whether or not this one
+    succeeded. A rewrite that fails leaves the file as it is: removing it would
+    leave systemd nothing to start the daemon from.
+    """
+    plain_cmd = [arg for arg in cmd if arg not in _TAKEOVER_ONLY_ARGS]
+    try:
+        daemon_util.write_daemon_args_file(
+            instance.state_dir, plain_cmd, eden_env, restart_cmd
+        )
+    except Exception as e:
+        args_file = instance.state_dir / daemon_util.DAEMON_ARGS_FILENAME
+        error_report.record(
+            f"could not drop the takeover flags from the daemon args file: {e}"
+        )
+        print_stderr(
+            "warning: could not drop the takeover flags from the daemon args "
+            f"file {args_file}: {e}. A later systemctl reload of edenfs would "
+            f"replay them. Remove {_FORCE_TAKEOVER_FLAG} and "
+            f"{_ONLY_IF_IDLE_FLAG} from that file by hand, or run "
+            "`eden restart --graceful` again once it is writable, which "
+            "rewrites it."
+        )
+
+
+def _start_edenfs_with_systemd(
+    instance: EdenInstance,
+    systemd_env: Dict[str, str],
+    takeover: bool,
+    cmd: List[str],
+    eden_env: Dict[str, str],
+    restart_cmd: List[str],
+    args_file_error: Optional[str],
+) -> int:
+    """Start or reload the daemon through systemd, which launches it from the
+    daemon args file written just before."""
+    if args_file_error is not None:
+        # systemd launches the daemon from the file rather than from this
+        # command, so there is nothing left for it to start.
+        print_stderr(f"error: failed to write the daemon args file: {args_file_error}")
+        error_report.record(f"failed to write the daemon args file: {args_file_error}")
+        return 1
+    try:
+        return _systemctl_start_or_reload(instance, systemd_env, takeover)
+    finally:
+        if any(arg in _TAKEOVER_ONLY_ARGS for arg in cmd):
+            _drop_takeover_only_flags(instance, cmd, eden_env, restart_cmd)
 
 
 def _daemon_args_file(instance: EdenInstance) -> Path:
@@ -423,8 +532,11 @@ def _start_edenfs_service(
     edenfs_args: Optional[List[str]] = None,
     preserved_env: Optional[List[str]] = None,
     takeover: bool = False,
+    force_takeover: bool = False,
+    only_if_idle: bool = False,
 ) -> int:
     """Get the command and environment to use to start edenfs."""
+    _remember_daemon_error(None)
     daemon_binary = daemon_util.find_daemon_binary(daemon_binary)
     cmd, privhelper = get_edenfs_cmd(instance, daemon_binary)
 
@@ -435,6 +547,10 @@ def _start_edenfs_service(
 
     if takeover:
         cmd.append("--takeover")
+        # The args file written below is replayed by systemd, possibly by a
+        # daemon binary from an older package after a downgrade, which the
+        # --undefok in these flags accounts for.
+        cmd.extend(_takeover_only_flags(force_takeover, only_if_idle))
     if edenfs_args:
         # A restarted daemon should behave like the one it replaces.
         cmd.extend(edenfs_args)
@@ -466,14 +582,15 @@ def _start_edenfs_service(
     )
 
     if use_systemd:
-        if args_file_error is not None:
-            # systemd launches the daemon from the file rather than from this
-            # command, so there is nothing left for it to start.
-            print_stderr(
-                f"error: failed to write the daemon args file: {args_file_error}"
-            )
-            return 1
-        return _systemctl_start_or_reload(instance, systemd_env, takeover)
+        return _start_edenfs_with_systemd(
+            instance,
+            systemd_env,
+            takeover,
+            cmd,
+            eden_env,
+            restart_cmd,
+            args_file_error,
+        )
 
     if args_file_error is not None:
         _warn_daemon_args_file_failure(instance, args_file_error)
@@ -492,13 +609,14 @@ def _start_edenfs_service(
         launch_env = eden_env
         use_systemd_cgroup = False
 
-    creation_flags = 0
-
     maybe_edensparse_migration(instance, EdensparseMigrationStep.PRE_EDEN_START)
-    exit_code = subprocess.call(
-        cmd, stdin=subprocess.DEVNULL, env=launch_env, creationflags=creation_flags
-    )
+    exit_code, daemon_error = _launch_daemon(instance, cmd, launch_env)
+    _remember_daemon_error(daemon_error)
     maybe_edensparse_migration(instance, EdensparseMigrationStep.POST_EDEN_START)
+    if exit_code != 0:
+        error_report.record(
+            daemon_error or f"edenfs daemon startup exited with status {exit_code}"
+        )
 
     if use_systemd_cgroup:
         instance.log_sample(
@@ -642,6 +760,69 @@ def _extract_daemon_error(startup_log_content: str) -> Optional[str]:
     return None
 
 
+def _new_startup_log(instance: EdenInstance) -> Path:
+    """Rotate the earlier startup logs. Return the log path for this start."""
+    startup_log = instance.state_dir / daemon_util.STARTUP_LOG_FILENAME
+    # TODO: make the retention count configurable
+    _rotate_startup_log(startup_log, keep=5)
+    return startup_log
+
+
+def _read_startup_log(startup_log: Path, start_time: float) -> Optional[str]:
+    """Return the startup log content if the log changed at or after `start_time`.
+
+    Return None if the log is older, missing, or unreadable. An older log is
+    the output of an earlier start. It stays if the rotation failed.
+    """
+    try:
+        if startup_log.exists() and startup_log.stat().st_mtime >= start_time:
+            return startup_log.read_text()
+    except OSError as e:
+        print_stderr(f"warning: failed to read startup log: {e}")
+    return None
+
+
+_STARTUP_NOTICE = (
+    "Starting EdenFS. The startup output will show when the start is complete."
+)
+
+
+def _launch_daemon(
+    instance: EdenInstance, cmd: List[str], env: Dict[str, str]
+) -> Tuple[int, Optional[str]]:
+    """Run the daemon launch command.
+
+    Outside Windows, the command writes its stderr to the startup log. The log
+    shows on stderr when the command exits. Return the exit code. On failure,
+    also return the daemon error from the log.
+    """
+    if sys.platform == "win32":
+        return subprocess.call(cmd, stdin=subprocess.DEVNULL, env=env), None
+
+    startup_log = _new_startup_log(instance)
+    start_time = time.time()
+    try:
+        instance.state_dir.mkdir(parents=True, exist_ok=True)
+        # Use a file, not a pipe. The privhelper inherits this stderr and can
+        # keep a pipe open after the daemon command exits.
+        log_file = open(startup_log, "wb")
+    except OSError as e:
+        print_stderr(f"warning: failed to open the startup log: {e}")
+        return subprocess.call(cmd, stdin=subprocess.DEVNULL, env=env), None
+    print_stderr(_STARTUP_NOTICE)
+    with log_file:
+        exit_code = subprocess.call(
+            cmd, stdin=subprocess.DEVNULL, stderr=log_file, env=env
+        )
+
+    content = _read_startup_log(startup_log, start_time)
+    if content:
+        sys.stderr.write(content)
+    if exit_code == 0 or not content:
+        return exit_code, None
+    return exit_code, _extract_daemon_error(content)
+
+
 def _systemctl_start_or_reload(
     instance: EdenInstance,
     systemd_env: Dict[str, str],
@@ -654,13 +835,11 @@ def _systemctl_start_or_reload(
     else:
         action = "start"
 
-    # Rotate old startup logs before launching so we only capture output
-    # from this invocation.  systemd uses StandardOutput=file: which appends,
-    # so stale content would otherwise leak into the CLI output.
-    # TODO: make the retention count configurable
-    startup_log = instance.state_dir / daemon_util.SYSTEMD_STARTUP_LOG_FILENAME
-    _rotate_startup_log(startup_log, keep=5)
+    # systemd appends to the startup log (StandardOutput=file:). Without the
+    # rotation, output of earlier starts goes into the CLI output.
+    startup_log = _new_startup_log(instance)
 
+    print_stderr(_STARTUP_NOTICE)
     start_time = time.time()
     result = subprocess.run(
         ["systemctl", "--user", action, unit],
@@ -671,15 +850,9 @@ def _systemctl_start_or_reload(
     rc = result.returncode
 
     # Display the daemon's startup output captured by systemd (StandardOutput=file:).
-    # Only read if created after we invoked systemctl, to avoid showing stale content
-    # from a previous run if log rotation failed.
-    startup_log_content: Optional[str] = None
-    try:
-        if startup_log.exists() and startup_log.stat().st_mtime >= start_time:
-            startup_log_content = startup_log.read_text()
-            sys.stderr.write(startup_log_content)
-    except OSError as e:
-        print_stderr(f"warning: failed to read startup log: {e}")
+    startup_log_content = _read_startup_log(startup_log, start_time)
+    if startup_log_content:
+        sys.stderr.write(startup_log_content)
 
     sample_kwargs: Dict[str, Union[bool, int, str]] = {
         "action": action,
@@ -694,10 +867,15 @@ def _systemctl_start_or_reload(
         # Always check the startup log for daemon errors independently of
         # systemctl stderr — systemctl's generic "Job failed" message doesn't
         # contain the actual daemon error (e.g. "error starting EdenFS: ...").
+        daemon_error = None
         if startup_log_content:
             daemon_error = _extract_daemon_error(startup_log_content)
             if daemon_error:
                 sample_kwargs["daemon_startup_log"] = daemon_error
+        _remember_daemon_error(daemon_error)
+        error_report.record(
+            daemon_error or result.stderr or f"systemctl {action} {unit} failed"
+        )
     instance.log_sample("systemctl_action", **sample_kwargs)
     return rc
 

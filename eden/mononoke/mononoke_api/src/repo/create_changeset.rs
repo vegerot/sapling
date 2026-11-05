@@ -62,6 +62,7 @@ use crate::file::FileId;
 use crate::file::FileType;
 use crate::path::MononokePathPrefixes;
 use crate::repo::RepoContext;
+use crate::restricted_paths::RestrictedPathsPolicy;
 use crate::specifiers::ChangesetSpecifier;
 
 #[derive(Clone, Debug)]
@@ -344,6 +345,14 @@ impl CreateChangeType {
     }
 }
 
+#[derive(Copy, Clone, Default, Eq, PartialEq, Debug)]
+pub(crate) enum StackContentChange {
+    #[default]
+    None,
+    Change(FileId),
+    Deletion,
+}
+
 impl CreateChange {
     pub(crate) async fn resolve<R: MononokeRepo>(
         &mut self,
@@ -499,7 +508,7 @@ pub(crate) async fn lookup_file_types_from_parents<R: MononokeRepo>(
             .collect();
 
         let path_contexts = parent_ctx
-            .paths_with_content(paths_to_query.into_iter())
+            .paths_with_content(paths_to_query.into_iter(), &RestrictedPathsPolicy::Strict)
             .await?;
 
         pin_mut!(path_contexts);
@@ -703,7 +712,7 @@ pub(crate) async fn verify_deleted_files_existed_in_a_parent<R: MononokeRepo>(
 
 pub(crate) async fn is_noop_file_change<R: MononokeRepo>(
     parent_ctxs: &[ChangesetContext<R>],
-    stack_changes: Option<&PathTree<Option<FileId>>>,
+    stack_changes: Option<&PathTree<StackContentChange>>,
     path: &NonRootMPath,
     change: &CreateChange,
 ) -> Result<bool, MononokeError> {
@@ -720,9 +729,17 @@ pub(crate) async fn is_noop_file_change<R: MononokeRepo>(
     if let Some(stack_changes) = stack_changes
         && let Some(stack_change) = stack_changes.get(path.as_mpath())
     {
-        if *stack_change == Some(content_id) {
+        if *stack_change == StackContentChange::Change(content_id) {
             return Ok(true);
         }
+    } else if let Some(stack_changes) = stack_changes
+        && stack_changes
+            .get_nearest_parent(path.as_mpath(), |change| {
+                *change != StackContentChange::None
+            })
+            .is_some()
+    {
+        return Ok(false);
     } else {
         let parents = stream::iter(parent_ctxs)
             .map(Ok::<_, MononokeError>)
@@ -759,7 +776,7 @@ pub(crate) async fn is_noop_file_change<R: MononokeRepo>(
 
 pub(crate) async fn verify_no_noop_file_changes<R: MononokeRepo>(
     parent_ctxs: &[ChangesetContext<R>],
-    stack_changes: Option<PathTree<Option<FileId>>>,
+    stack_changes: Option<PathTree<StackContentChange>>,
     file_changes: &SortedVectorMap<NonRootMPath, CreateChange>,
 ) -> Result<(), MononokeError> {
     stream::iter(file_changes)
@@ -777,7 +794,7 @@ pub(crate) async fn verify_no_noop_file_changes<R: MononokeRepo>(
 
 async fn remove_noop_file_changes<R: MononokeRepo>(
     parent_ctxs: &[ChangesetContext<R>],
-    stack_changes: Option<PathTree<Option<FileId>>>,
+    stack_changes: Option<PathTree<StackContentChange>>,
     file_changes: SortedVectorMap<NonRootMPath, CreateChange>,
 ) -> Result<SortedVectorMap<NonRootMPath, CreateChange>, MononokeError> {
     stream::iter(file_changes)
@@ -1415,11 +1432,14 @@ impl<R: MononokeRepo> RepoContext<R> {
                     for (path, change) in path_changes.iter() {
                         match change.content_id()? {
                             Some(content_id) => {
-                                stack_changes
-                                    .insert_and_prune(path.clone().into(), Some(content_id));
+                                stack_changes.insert_and_prune(
+                                    path.clone().into(),
+                                    StackContentChange::Change(content_id),
+                                );
                             }
                             None => {
-                                stack_changes.insert(path.clone().into(), None);
+                                stack_changes
+                                    .insert(path.clone().into(), StackContentChange::Deletion);
                             }
                         }
                     }

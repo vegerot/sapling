@@ -502,8 +502,8 @@ Verbose help for add
    -R --repository REPO       repository root directory or name of overlay
                               bundle file
       --cwd DIR               change working directory
-   -y --noninteractive        do not prompt, automatically pick the first choice
-                              for all prompts
+   -y --noninteractive        do not prompt, use the default answer for all
+                              prompts
    -q --quiet                 suppress output
    -v --verbose               enable additional output
       --color TYPE            when to colorize (boolean, always, auto, never, or
@@ -639,9 +639,7 @@ Test command without options
       generate diffs in the git extended diff format. For more information, see
       'sl help diffs'.
   
-      "--from-path" and "--to-path" allow diffing between directories. Files
-      outside "--from-path" in the left side are ignored. See 'sl help
-      directorybranching' for more information.
+      To compare directories, use 'sl subtree diff'.
   
       Note:
          'sl diff' might generate unexpected results during merges because it

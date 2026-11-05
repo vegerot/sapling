@@ -3,7 +3,12 @@
 [package]
 name = "minibench_examples"
 version = "0.1.0"
+authors = ["Meta Source Control Team <sourcecontrol-dev@meta.com>"]
 edition = "2024"
+homepage = "https://sapling-scm.com/"
+repository = "https://github.com/facebook/sapling"
+license = "MIT"
+exclude = ["BUCK"]
 
 [[bin]]
 name = "fs_read"
@@ -11,6 +16,6 @@ path = "fs_read.rs"
 
 [dependencies]
 crossbeam = "0.8.5"
-futures = { version = "0.3.34", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "std"], default-features = false }
 sapling-minibench = { version = "0.1.0", path = ".." }
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }

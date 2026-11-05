@@ -15,6 +15,7 @@ use std::vec::IntoIter;
 use futures::prelude::*;
 use url::Url;
 
+use crate::AuthResolver;
 use crate::Easy2H;
 use crate::claimer::RequestClaimer;
 use crate::dispatcher::AsyncRequestDispatcher;
@@ -69,6 +70,7 @@ pub(crate) struct WorkerClient {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub auth_resolver: Option<AuthResolver>,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
     pub ca_path: Option<PathBuf>,
@@ -118,6 +120,7 @@ impl Default for Config {
         tracing::debug!(curl_ssl=?ssl_version);
 
         Self {
+            auth_resolver: None,
             cert_path: None,
             key_path: None,
             ca_path: None,
@@ -279,6 +282,9 @@ impl HttpClient {
             responses.push(response);
         }
 
+        if !stream_requests.is_empty() {
+            self.resolve_auth()?;
+        }
         let stats = self.dispatcher.dispatch(client, stream_requests)?;
 
         Ok((responses, stats))
@@ -287,6 +293,7 @@ impl HttpClient {
     /// Async version of `send` for a single request.
     pub fn send_async_single(&self, request: Request) -> Result<ResponseFuture, HttpClientError> {
         crate::check_not_shutting_down()?;
+        self.resolve_auth()?;
         let client = self.worker_client();
         let (request, response) = self.prepare_async_request(request);
         let stats = self.dispatcher.dispatch(client, vec![request])?;
@@ -298,6 +305,14 @@ impl HttpClient {
             }
         }
         .boxed())
+    }
+
+    /// Resolve auth before dispatching so auth errors reach the caller directly.
+    fn resolve_auth(&self) -> Result<(), HttpClientError> {
+        if let Some(auth_resolver) = &self.config.auth_resolver {
+            auth_resolver.resolve()?;
+        }
+        Ok(())
     }
 
     fn prepare_async_request(&self, req: Request) -> (StreamRequest, ResponseFuture) {
@@ -372,6 +387,10 @@ impl HttpClient {
         req.set_client_info(&self.config.client_info);
         req.set_convert_cert(self.config.convert_cert);
         req.set_verbose(self.config.verbose);
+
+        if let Some(auth_resolver) = &self.config.auth_resolver {
+            req.set_auth_resolver(auth_resolver.clone());
+        }
 
         if let Some(domain) = req.ctx().url().domain() {
             if self.config.unix_socket_domains.contains(domain) {

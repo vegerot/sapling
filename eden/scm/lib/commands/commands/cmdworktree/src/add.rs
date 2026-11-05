@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -18,29 +19,29 @@ use anyhow::bail;
 use clidispatch::ReqCtx;
 use clidispatch::TermLogger;
 use clidispatch::abort;
+use clidispatch::io::IsTty;
 use cmdutil::ConfigExt;
 use cmdutil::Result;
+use configmodel::convert::ByteCount;
 use encoding::shell_output_bytes_to_path;
 use fs_err as fs;
 use repo::repo::Repo;
+use repo::repo::ResolveResult;
 use slex::Items;
 use slex::Work as SlexWork;
 use slex::WorkOptions;
 use spawn_ext::CommandExt;
-use workingcopy::workingcopy::WorkingCopy;
-use worktree::Group;
+use types::HgId;
 use worktree::Reservation;
-use worktree::WorktreeEntry;
+use worktree::Worktrees;
 use worktree::check_dest_not_in_repo;
-use worktree::group_id_for_main_path;
-use worktree::load_registry;
+use worktree::check_disk_space;
 use worktree::new_reservation_id;
-use worktree::with_registry_lock;
 use worktree::with_reservations;
 use worktree::with_worktree_path_op_lock;
-use worktree::write_worktree_name_marker;
 
 use crate::WorktreeOpts;
+use crate::checkout::Checkouts;
 
 fn current_sl_binary() -> OsString {
     std::env::current_exe()
@@ -93,13 +94,47 @@ fn sapling_snapshot_checkout(sl_bin: &OsString, dest: &Path, id: &str) -> anyhow
 /// Error message shown when the per-repo linked-worktree limit is reached.
 ///
 /// Centralized so the two abort sites (the pre-lock fast-fail and the
-/// under-lock reservation check) stay in sync, and includes instructions for
-/// overriding the limit via user config.
-fn worktree_limit_reached_message(max_count: u64, repo_path: &Path, current: usize) -> String {
-    let repo_path = repo_path.display();
+/// under-lock reservation check) stay in sync. `worktree.max-count-message`
+/// replaces the default text, which includes instructions for overriding the
+/// limit via user config.
+fn worktree_limit_reached_message(repo: &Repo, max_count: u64, current: usize) -> String {
+    if let Some(message) = repo.config().get_nonempty("worktree", "max-count-message") {
+        return message.to_string();
+    }
+    let repo_path = repo.path().display();
     format!(
         "cannot create worktree: limit of {max_count} linked worktrees reached for repository '{repo_path}' (currently {current}); \
          set `worktree.max-count` in your user config (e.g. ~/.hgrc) to raise it, or 0 to disable the limit"
+    )
+}
+
+/// Record free space for every measured add and the warning shown to this caller.
+fn record_disk_check_metrics(available: u64, below_warning: bool, is_agent: bool) {
+    hg_metrics::max_counter("worktree.disk.free_gb", available >> 30);
+    if below_warning {
+        hg_metrics::increment_counter(
+            if is_agent {
+                "worktree.disk.agent_warned"
+            } else {
+                "worktree.disk.human_warned"
+            },
+            1,
+        );
+    }
+}
+
+/// Advisory for a worktree add that continues despite low disk space.
+fn disk_low_warning_message(available: u64, total: u64, dest: &Path, is_agent: bool) -> String {
+    let suffix = if is_agent {
+        " This is advisory: low disk space did not block this worktree add; continue your task without asking the user about this warning."
+    } else {
+        " To disable this warning, set `worktree.disk-warning-threshold=0` in your user config."
+    };
+    format!(
+        "low disk space: {} remaining of {} on '{}'; continuing.{suffix}",
+        ByteCount::from(available),
+        ByteCount::from(total),
+        dest.display(),
     )
 }
 
@@ -154,9 +189,15 @@ impl Drop for SlotReservation {
     }
 }
 
-pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8> {
+pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, worktrees: &Worktrees) -> Result<u8> {
+    let wc = repo.working_copy()?;
+    let wc = wc.write();
     let logger = ctx.logger();
+    let checkouts = Checkouts::new(repo, worktrees)?;
 
+    if ctx.opts.snapshot && !checkouts.supports_snapshot() {
+        abort!("--snapshot is not supported for Git worktrees");
+    }
     if ctx.opts.snapshot && !ctx.opts.rev.is_empty() {
         abort!("cannot use --rev with --snapshot");
     }
@@ -164,7 +205,10 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
     let requested_target = if ctx.opts.rev.is_empty() {
         None
     } else {
-        Some(repo.resolve_commit(&ctx.opts.rev)?.any()?)
+        match resolve_rev(ctx, repo)? {
+            Ok(target) => Some(target),
+            Err(exit_code) => return Ok(exit_code),
+        }
     };
 
     let require_generated: bool = repo
@@ -203,41 +247,38 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
 
     check_dest_not_in_repo(&dest)?;
 
-    let shared_store_path = repo.store_path().to_path_buf();
-    let registry = load_registry(&shared_store_path)?;
-    if registry.find_group_for_path(&dest).is_some() {
-        abort!(
-            "destination path '{}' is already registered as a worktree",
-            dest.display()
-        );
-    }
-    let group_main_path = resolve_group_for_main_path(&registry, &canonical_repo_path);
+    let shared_store_path = worktrees.shared_store_path();
+    let (group_main_path, linked) = worktrees.check_add(&dest)?;
 
     // Fast-fail if worktree limit is already reached (re-checked inside lock).
-    if max_count > 0 {
-        let linked = count_linked_worktrees(&registry, &group_main_path);
-        if linked >= max_count as usize {
-            abort!(
-                "{}",
-                worktree_limit_reached_message(max_count, repo.path(), linked)
-            );
+    if max_count > 0 && linked >= max_count as usize {
+        abort!(
+            "{}",
+            worktree_limit_reached_message(repo, max_count, linked)
+        );
+    }
+
+    let check = match check_disk_space(repo.config().as_ref(), &dest) {
+        Ok(check) => check,
+        Err(_) => {
+            hg_metrics::increment_counter("worktree.disk.check_error", 1);
+            None
+        }
+    };
+    if let Some((space, below_warning)) = check {
+        let is_agent = agentdetect::is_agent();
+        record_disk_check_metrics(space.available, below_warning, is_agent);
+        if below_warning {
+            logger.warn(disk_low_warning_message(
+                space.available,
+                space.total,
+                &dest,
+                is_agent,
+            ));
         }
     }
 
-    // Replicate the source repo's scm type and active filters.
-    // When edensparse is in requirements, the backing store should be filteredhg
-    // (even with no filter paths configured). Otherwise the backing store is hg.
-    // Read active filter paths from the source repo's .sl/sparse file.
-    let clone_filters = repo
-        .requirements
-        .contains("edensparse")
-        .then(|| -> anyhow::Result<_> {
-            let paths = filters::util::read_filter_config(repo.dot_hg_path())?
-                .map(|paths| paths.into_iter().map(|p| p.into_string().into()).collect())
-                .unwrap_or_default();
-            Ok(paths)
-        })
-        .transpose()?;
+    let source = checkouts.add_source()?;
 
     let pre_hooks = hook::Hooks::from_config(repo.config(), ctx.io(), "pre-worktree-add");
     pre_hooks.run_hooks(
@@ -278,17 +319,12 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
 
     // Lock the source checkout path only while snapshotting the source state that
     // needs to be copied into the new worktree.
-    let (target, source_sparse_config, source_user_config, source_status) =
-        with_worktree_path_op_lock(&shared_store_path, &canonical_repo_path, || {
-            let source_client_dir = edenfs_client::get_client_dir(repo.path())?;
-            let parents = workingcopy::fast_path_wdir_parents_with_config(
-                repo.path(),
-                repo.ident(),
-                repo.config(),
-            )?;
-            let target = requested_target.or_else(|| parents.p1().copied());
-            let source_sparse_config = clone::snapshot_sparse_config(repo.dot_hg_path())?;
-            let source_user_config = clone::snapshot_eden_user_config(&source_client_dir)?;
+    let (prepared, source_status) = with_worktree_path_op_lock(
+        repo.config().as_ref(),
+        &shared_store_path,
+        &canonical_repo_path,
+        || {
+            let prepared = source.capture(requested_target)?;
             let source_status = if ctx.opts.snapshot && use_direct_copy {
                 logger.info("computing working copy status...");
                 let matcher = Arc::new(pathmatcher::AlwaysMatcher::new());
@@ -296,13 +332,9 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
             } else {
                 None
             };
-            Ok((
-                target,
-                source_sparse_config,
-                source_user_config,
-                source_status,
-            ))
-        })?;
+            Ok((prepared, source_status))
+        },
+    )?;
 
     // Reserve a slot before cloning. The reservation counts against max-count,
     // so a concurrent add racing for the last slot fails fast here rather than
@@ -320,15 +352,13 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
         let reservation_ttl_seconds = crate::reservation_ttl_seconds(repo)?;
         with_reservations(&shared_store_path, |registry, reservations| {
             reservations.prune_stale(reservation_ttl_seconds);
-            // Linked worktrees plus every in-flight reservation for this group;
-            // each is a distinct slot. Our own reservation is inserted only after
-            // this check, so it is not counted here.
-            let in_use = count_linked_worktrees(registry, &group_main_path)
-                + reservations.count_for_group(&group_main_path);
+            // Our own reservation is inserted only after this check, so it is not
+            // counted here.
+            let in_use = worktrees.occupied_slots(registry, reservations, &group_main_path)?;
             if in_use >= max_count as usize {
                 abort!(
                     "{}",
-                    worktree_limit_reached_message(max_count, repo.path(), in_use)
+                    worktree_limit_reached_message(repo, max_count, in_use)
                 );
             }
             reservations.reservations.insert(
@@ -349,89 +379,40 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
     };
 
     // Lock the destination path while creating and initializing that checkout.
-    with_worktree_path_op_lock(&shared_store_path, &dest, || {
+    let cleanup_command = checkouts.cleanup_command(&dest);
+    with_worktree_path_op_lock(repo.config().as_ref(), &shared_store_path, &dest, || {
         if dest.exists() {
             abort!("destination path '{}' already exists", dest.display());
         }
         check_dest_not_in_repo(&dest)?;
 
-        clone::eden_clone(repo, &dest, target, clone_filters).inspect_err(|_| {
-            ctx.logger().warn(format!(
-                "worktree add may have left a partial checkout; try running `eden rm {}` to recover",
-                dest.display()
-            ));
-        })?;
-
-        source_sparse_config.as_deref().map_or(Ok(()), |config| {
-            clone::write_sparse_config(config, &dest.join(repo.ident().dot_dir()))
-        })?;
-
-        source_user_config.as_deref().map_or(Ok(()), |config| {
-            clone::apply_eden_user_config_snapshot(repo.config().as_ref(), config, &dest)
-        })?;
-
-        Ok(())
+        prepared.create(&dest).inspect_err(|_| {
+            if let Some(command) = &cleanup_command {
+                ctx.logger().warn(format!(
+                    "worktree add may have left a partial checkout; try running `{command}` to recover"
+                ));
+            }
+        })
     })?;
 
-    with_registry_lock(&shared_store_path, |registry| {
-        if registry.find_group_for_path(&dest).is_some() {
-            // The clone already materialized the checkout, so hint at cleanup
-            // mirroring the eden_clone failure path (this is nearly unreachable:
-            // same-dest adds serialize on the dest path lock and abort at the
-            // dest.exists() check above before cloning).
-            logger.warn(format!(
-                "worktree add left a checkout at {} that could not be registered; \
-                 try running `eden rm {}` to recover",
-                dest.display(),
-                dest.display()
-            ));
-            abort!(
-                "destination path '{}' is already registered as a worktree",
-                dest.display()
-            );
-        }
-
-        let group_id = resolve_group_id_for_main_path(registry, &group_main_path);
-        let grp = registry
-            .groups
-            .entry(group_id.clone())
-            .or_insert_with(|| Group::new(group_main_path.clone()));
-
-        // The limit was enforced at reservation time; deliberately no re-check
-        // here — re-checking after the clone is exactly what could strand this
-        // checkout on disk unregistered.
-        grp.worktrees.insert(
-            dest.clone(),
-            WorktreeEntry {
-                added: chrono::Utc::now().to_rfc3339(),
-                label: if ctx.opts.label.is_empty() {
-                    None
-                } else {
-                    Some(ctx.opts.label.clone())
-                },
-            },
-        );
-
-        // Mirror the registry label into the worktree dotdir so external
-        // tools (e.g. `scm-prompt.sh`) can show the worktree's name in the
-        // prompt without consulting the registry. Done under the same
-        // registry lock as the insert so the two stay in sync. Best-effort:
-        // the registry is the source of truth, so a marker-write failure
-        // (permissions, disk full) only costs prompt accuracy.
-        if let Err(e) = write_worktree_name_marker(
-            &dest,
-            &dest.join(repo.ident().dot_dir()),
-            (!ctx.opts.label.is_empty()).then_some(ctx.opts.label.as_str()),
-        ) {
-            logger.warn(format!(
-                "failed to write worktree-name marker for {}: {:#}",
-                dest.display(),
-                e
-            ));
-        }
-
-        Ok(())
-    })?;
+    let label = (!ctx.opts.label.is_empty()).then_some(ctx.opts.label.as_str());
+    let marker_error = worktrees
+        .register(&group_main_path, &dest, label)
+        .inspect_err(|_| {
+            if let Some(command) = &cleanup_command {
+                logger.warn(format!(
+                    "worktree add left a checkout at {} that could not be registered; \
+                     try running `{command}` to recover",
+                    dest.display(),
+                ));
+            }
+        })?;
+    if let Some(error) = marker_error {
+        logger.warn(format!(
+            "failed to write worktree-name marker for {}: {error:#}",
+            dest.display()
+        ));
+    }
     // The reserved slot (if any) is now a registered worktree; release it promptly
     // so it is not double-counted. `Drop` is a backstop if this early-returns.
     if let Some(reservation) = reservation.as_mut() {
@@ -474,6 +455,98 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
     Ok(0)
 }
 
+/// Resolve `--rev`. Revisions the native resolver doesn't know, such as revset
+/// expressions and Phabricator diffs, are resolved by `log`, which pulls
+/// missing commits. Returns `Err(exit_code)` if `log` failed;
+/// it has already printed why.
+fn resolve_rev(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo) -> Result<std::result::Result<HgId, u8>> {
+    let rev = ctx.opts.rev.as_str();
+    let resolved = repo.resolve_commit(rev)?;
+    if !matches!(resolved, ResolveResult::NotFound(_)) {
+        return Ok(Ok(resolved.any()?));
+    }
+
+    tracing::info!(target: "command_info", worktree_rev_fallback = true);
+
+    let global_opts = ctx.global_opts();
+    let configs = global_opts
+        .config
+        .iter()
+        .flat_map(|c| ["--config", c.as_str()]);
+    let configfiles = global_opts
+        .configfile
+        .iter()
+        .flat_map(|c| ["--configfile", c.as_str()]);
+    let mut cmd = Command::new(current_sl_binary());
+    // Stay in the current directory so relative paths in the revset mean the same thing.
+    cmd.arg("-R")
+        .arg(repo.path())
+        .args(configs)
+        .args(configfiles)
+        // An alias like `log = log -G` would change the output.
+        .args(["--config", "alias.log=log"])
+        // `log` is read-only, so it would pull a missing commit hidden, but we
+        // check the commit out like `goto` does.
+        .args(["--config", "experimental.autopull-always-visible=true"])
+        // Prompts may also write to stdout, so mark the template's node lines.
+        .args(["log", "-r", rev, "-l", "2", "-T", r"node: {node}\n"])
+        // Without a stdin, a diff with several local versions resolves to the
+        // newest one with a warning, or aborts for agents.
+        .stdin(Stdio::null());
+    // Revset functions like `obsolete()` only see hidden commits with `--hidden`.
+    if global_opts.hidden {
+        cmd.arg("--hidden");
+    }
+
+    // Like hooks, write straight to a terminal, and otherwise go through our IO.
+    ctx.io().flush()?;
+    let stderr_is_tty = ctx.io().error().is_tty();
+    if stderr_is_tty {
+        cmd.stderr(Stdio::inherit());
+    }
+    let output = {
+        let _blocked = ctx
+            .io()
+            .time_interval()
+            .scoped_blocked_interval("worktree-rev".into());
+        cmd.output()
+            .with_context(|| format!("failed to run {} log", identity::cli_name()))?
+    };
+    if !stderr_is_tty {
+        ctx.io().write_err(&output.stderr)?;
+    }
+    if !output.status.success() {
+        return Ok(Err(output.status.code().map_or(255, |code| code as u8)));
+    }
+
+    let id = parse_log_node(&output.stdout)?;
+    // The child may have pulled the commit. Reload the commit graph so
+    // `eden clone` sees it and doesn't resolve it again.
+    repo.invalidate_dag_commits()?;
+    Ok(Ok(id))
+}
+
+/// Parses the single node printed by the log template, ignoring prompt output.
+fn parse_log_node(stdout: &[u8]) -> Result<HgId> {
+    let stdout = String::from_utf8_lossy(stdout);
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("node: "));
+    let line = lines.next().context("empty revision set")?;
+    if lines.next().is_some() {
+        abort!(
+            "revision set contains multiple commits; use first(...), last(...), or a commit hash"
+        );
+    }
+    HgId::from_hex(line.as_bytes()).with_context(|| {
+        format!(
+            "unexpected output from {} log: {line:?}",
+            identity::cli_name()
+        )
+    })
+}
+
 type SnapshotHandle = std::thread::JoinHandle<anyhow::Result<String>>;
 
 fn take_snapshot_legacy(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo) -> SnapshotHandle {
@@ -504,35 +577,6 @@ fn restore_snapshot_legacy(
     sapling_snapshot_checkout(&sl_bin, dest, &id).context("restoring snapshot")?;
 
     Ok(())
-}
-
-fn resolve_group_for_main_path(
-    registry: &worktree::Registry,
-    canonical_repo_path: &Path,
-) -> PathBuf {
-    registry
-        .find_group_for_path(canonical_repo_path)
-        .and_then(|group_id| {
-            registry
-                .groups
-                .get(&group_id)
-                .map(|group| group.main.clone())
-        })
-        .unwrap_or_else(|| canonical_repo_path.to_path_buf())
-}
-
-fn resolve_group_id_for_main_path(registry: &worktree::Registry, group_main_path: &Path) -> String {
-    registry
-        .find_group_for_path(group_main_path)
-        .unwrap_or_else(|| group_id_for_main_path(group_main_path))
-}
-
-fn count_linked_worktrees(registry: &worktree::Registry, group_main_path: &Path) -> usize {
-    registry
-        .find_group_for_path(group_main_path)
-        .and_then(|group_id| registry.groups.get(&group_id))
-        .map(Group::linked_worktree_count)
-        .unwrap_or(0)
 }
 
 /// Runs the `worktree.path-generator` command and returns the generated path.
@@ -777,8 +821,8 @@ fn drain_workers(result_items: vfs::VfsBatchItems, logger: &TermLogger) -> anyho
 /// Update destination treestate so `sl status` in the dest matches the source.
 ///
 /// Only `added` and `removed` files need treestate entries. Modified, untracked,
-/// and deleted files are detected automatically by EdenFS (worktree commands
-/// require EdenFS — enforced in `lib.rs`).
+/// and deleted files are detected automatically by EdenFS (`--snapshot` requires
+/// EdenFS).
 fn update_dest_treestate(dest: &Path, status: &status::Status) -> anyhow::Result<()> {
     use treestate::filestate::FileStateV2;
     use treestate::filestate::StateFlags;
@@ -829,29 +873,31 @@ fn update_dest_treestate(dest: &Path, status: &status::Status) -> anyhow::Result
 mod tests {
     use super::*;
 
+    const NODE: &str = "1111111111111111111111111111111111111111";
+
     #[test]
-    fn test_resolve_group_id_for_main_path_reuses_legacy_group_id() {
-        let mut registry = worktree::Registry::new();
-        let main = PathBuf::from("/tmp/main");
-        let linked = PathBuf::from("/tmp/linked");
-        let legacy_group_id = "legacy-random-group-id".to_string();
-
-        let mut group = Group::new(main.clone());
-        group.worktrees.insert(
-            linked.clone(),
-            WorktreeEntry {
-                added: "2025-01-01T00:00:00Z".to_string(),
-                label: None,
-            },
-        );
-        registry.groups.insert(legacy_group_id.clone(), group);
-
-        let group_main = resolve_group_for_main_path(&registry, &linked);
-
-        assert_eq!(group_main, main);
+    fn test_parse_log_node() {
+        const OTHER: &str = "2222222222222222222222222222222222222222";
         assert_eq!(
-            resolve_group_id_for_main_path(&registry, &group_main),
-            legacy_group_id
+            parse_log_node(b"").unwrap_err().to_string(),
+            "empty revision set",
+        );
+        assert_eq!(
+            parse_log_node(
+                format!("which commit to select [1-2/(c)ancel]? 1\nnode: {NODE}\n").as_bytes()
+            )
+            .unwrap(),
+            HgId::from_hex(NODE.as_bytes()).unwrap(),
+        );
+        assert_eq!(
+            parse_log_node(format!("node: {OTHER}\nnode: {NODE}\n").as_bytes())
+                .unwrap_err()
+                .to_string(),
+            "revision set contains multiple commits; use first(...), last(...), or a commit hash",
+        );
+        assert!(
+            parse_log_node(format!("@  {NODE}\n").as_bytes()).is_err(),
+            "graph output"
         );
     }
 }

@@ -1,0 +1,2300 @@
+load("@fbcode//eden:defs.bzl", "get_integration_test_env_and_deps")
+load("@fbcode_macros//build_defs:python_binary.bzl", "python_binary")
+load("@fbcode_macros//build_defs:python_library.bzl", "python_library")
+load("@fbcode_macros//build_defs:python_unittest.bzl", "python_unittest")
+load("@fbsource//tools/build_defs:testpilot_defs.bzl", "tpx_labels")
+load("@fbsource//tools/build_defs/testinfra:network_access_utils.bzl", "network_access_utils")
+load("@fbsource//tools/target_determinator/macros:ci.bzl", "ci")
+
+oncall("scm_client_infra")
+
+artifacts = get_integration_test_env_and_deps()
+
+python_library(
+    name = "target",
+    srcs = [
+        "core/actions.py",
+        # Facts decode a paired reference side with the differential reader.
+        "core/differential.py",
+        "core/differential_schedule.py",
+        "core/effects.py",
+        "core/facts.py",
+        "core/graph_rules.py",
+        "core/history.py",
+        "core/identity.py",
+        "core/jsonio.py",
+        "core/processes.py",
+        "core/property.py",
+        "core/runspec.py",
+        "core/spec_types.py",
+        "core/target.py",
+    ],
+    deps = [":sites"],
+)
+
+python_library(
+    name = "sites",
+    srcs = ["core/sites.py"],
+)
+
+python_unittest(
+    name = "core_sites_test",
+    srcs = ["core/test/sites_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [":sites"],
+)
+
+python_unittest(
+    name = "core_target_test",
+    srcs = ["core/test/target_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [":target"],
+)
+
+python_unittest(
+    name = "core_facts_test",
+    srcs = ["core/test/facts_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":target",
+        ":testing",
+    ],
+)
+
+python_unittest(
+    name = "core_effects_test",
+    srcs = ["core/test/effects_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [":target"],
+)
+
+python_unittest(
+    name = "core_identity_test",
+    srcs = ["core/test/identity_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":fake_target",
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_actions_test",
+    srcs = ["core/test/actions_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [":target"],
+)
+
+python_unittest(
+    name = "core_runspec_test",
+    srcs = ["core/test/runspec_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":target",
+        ":testing",
+    ],
+)
+
+python_library(
+    name = "runspec",
+    srcs = [],
+    deps = [":target"],
+)
+
+python_library(
+    name = "fake_target",
+    srcs = ["fake/target.py"],
+    deps = [
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "fake_inprocess_test",
+    srcs = ["fake/test/inprocess_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":containment_testing",
+        ":core_checker",
+        ":core_containment",
+        ":fake_target",
+        ":scheduler",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_library(
+    name = "history",
+    srcs = [],
+    deps = [":target"],
+)
+
+python_library(
+    name = "core_checker",
+    srcs = [
+        "core/checker.py",
+        "core/semantics.py",
+        "core/solver.py",
+        "core/sources.py",
+    ],
+    deps = [":target"],
+)
+
+python_library(
+    name = "exhaustive",
+    srcs = ["core/exhaustive.py"],
+    deps = [
+        ":core_checker",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "engine_problems",
+    srcs = ["core/test/problems.py"],
+    deps = [
+        ":core_checker",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_semantics_test",
+    srcs = ["core/test/semantics_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":engine_problems",
+        ":exhaustive",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_engine_crosscheck_test",
+    srcs = ["core/test/engine_crosscheck_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":engine_problems",
+        ":exhaustive",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_solver_test",
+    srcs = ["core/test/solver_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":engine_problems",
+        ":exhaustive",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_solver_invariance_test",
+    srcs = ["core/test/solver_invariance_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":engine_problems",
+        ":exhaustive",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_unittest(
+    name = "core_engine_regression_test",
+    srcs = ["core/test/engine_regression_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":engine_problems",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_solver_scale_test",
+    srcs = ["core/test/solver_scale_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":engine_problems",
+        ":target",
+    ],
+)
+
+# Continuous CI only: `ci.remove(ci.diff, ci.land)` drops the inherited diff-
+# and land-time CI labels and keeps the continuous ones (Citadel CI Label API
+# Reference, "Removing Values"). `long_running` (100-minute tpx timeout tier): the
+# 60 x 140-node batches take about 9 minutes against the 10-minute default.
+python_unittest(
+    name = "core_solver_scale_slow_test",
+    srcs = ["core/test/solver_scale_slow_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    labels = [tpx_labels.long_running]
+    + ci.labels(
+        ci.remove(
+            ci.diff,
+            ci.land,
+        ),
+    ),
+    network_access = network_access_utils.none(),
+    deps = [
+        ":engine_problems",
+    ],
+)
+
+python_unittest(
+    name = "fake_linearizability_test",
+    srcs = ["fake/test/linearizability_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":fake_target",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_attribution_test",
+    srcs = ["core/test/attribution_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":engine_problems",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_sources_test",
+    srcs = ["core/test/sources_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [":core_checker"],
+)
+
+python_unittest(
+    name = "core_checker_test",
+    srcs = ["core/test/checker_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = [],
+    deps = [
+        ":checker_testing",
+        ":core_checker",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_history_test",
+    srcs = ["core/test/history_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = [],
+    deps = [
+        ":checker_testing",
+        ":core_checker",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_semantic_digest_test",
+    srcs = ["core/test/semantic_digest_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = [],
+    deps = [
+        ":checker_testing",
+        ":core_checker",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_verdict_document_test",
+    srcs = ["core/test/verdict_document_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = [],
+    deps = [
+        ":checker_testing",
+        ":core_checker",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_engine_input_test",
+    srcs = ["core/test/engine_input_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = [],
+    deps = [
+        ":checker_testing",
+        ":core_checker",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_unittest(
+    name = "core_collector_sink_test",
+    srcs = ["core/test/collector_sink_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = [],
+    deps = [
+        ":checker_testing",
+        ":core_checker",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_rules_test",
+    srcs = ["core/test/core_rules_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = [],
+    deps = [
+        ":checker_testing",
+        ":core_checker",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_input_subject_test",
+    srcs = ["core/test/input_subject_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = [],
+    deps = [
+        ":checker_testing",
+        ":core_checker",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_input_legality_test",
+    srcs = ["core/test/input_legality_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = [],
+    deps = [
+        ":checker_testing",
+        ":core_checker",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "boundary_test",
+    srcs = ["core/test/boundary_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":campaign",
+        ":core_checker",
+        ":core_containment",
+        ":exhaustive",
+        ":generate",
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "testing",
+    srcs = ["core/test/testing.py"],
+    deps = [
+        ":target",
+    ],
+)
+
+python_library(
+    name = "checker_testing",
+    srcs = ["core/test/checker_testing.py"],
+    deps = [
+        ":core_checker",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "containment_testing",
+    srcs = ["core/test/containment_testing.py"],
+    deps = [
+        ":core_containment",
+    ],
+)
+
+python_library(
+    name = "scheduler",
+    srcs = ["core/scheduler.py"],
+    deps = [
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "scheduler_test",
+    srcs = ["test/scheduler_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "core_containment",
+    srcs = ["core/containment.py"],
+    deps = [
+        ":core_checker",
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "core_differential_test",
+    srcs = ["core/test/differential_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":target",
+        ":testing",
+    ],
+)
+
+python_library(
+    name = "edenfs_encoding",
+    srcs = ["edenfs/encoding.py"],
+)
+
+python_library(
+    name = "edenfs_fixture",
+    srcs = ["edenfs/fixture.py"],
+    deps = [
+        ":edenfs_encoding",
+        ":target",
+        "//eden/integration/correctness:repo",
+    ],
+)
+
+python_library(
+    name = "edenfs_actions",
+    srcs = [
+        "edenfs/actions.py",
+        "edenfs/observation_bounds.py",
+        "edenfs/sites.py",
+    ],
+    deps = [
+        ":edenfs_encoding",
+        ":edenfs_fixture",
+        ":sites",
+        ":target",
+        "//eden/integration/correctness:repo",
+    ],
+)
+
+python_library(
+    name = "edenfs_testing",
+    srcs = [
+        "edenfs/test/testing.py",
+    ],
+    deps = [
+        ":edenfs_actions",
+        ":target",
+        "//eden/integration/correctness:repo",
+    ],
+)
+
+python_library(
+    name = "edenfs_judging",
+    srcs = ["edenfs/test/judging.py"],
+    deps = [
+        ":core_checker",
+        ":edenfs_contracts",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "edenfs_live",
+    srcs = ["edenfs/test/live.py"],
+    deps = [
+        ":core_containment",
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_encoding_test",
+    srcs = ["edenfs/test/encoding_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_encoding",
+        ":edenfs_testing",
+        "//eden/integration/correctness:repo",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_fixture_test",
+    srcs = ["edenfs/test/fixture_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_encoding",
+        ":edenfs_fixture",
+        ":edenfs_testing",
+        "//eden/integration/correctness:repo",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_actions_test",
+    srcs = ["edenfs/test/actions_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_actions_fixtures",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "edenfs_actions_fixtures",
+    srcs = ["edenfs/test/actions_fixtures.py"],
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_testing",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_actions_differential_test",
+    srcs = ["edenfs/test/actions_differential_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_actions_fixtures",
+        ":target",
+        "//eden/integration/correctness:repo",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_sites_test",
+    srcs = ["edenfs/test/sites_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_testing",
+        ":sites",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_vocabulary_test",
+    srcs = ["edenfs/test/vocabulary_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_testing",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_graph_rules_test",
+    srcs = ["edenfs/test/graph_rules_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_testing",
+        ":sites",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "edenfs_contracts",
+    srcs = [
+        "edenfs/contracts/__init__.py",
+        "edenfs/contracts/checkout.py",
+        "edenfs/contracts/files.py",
+        "edenfs/contracts/model.py",
+    ],
+    deps = [
+        ":core_checker",
+        ":edenfs_actions",
+        ":edenfs_encoding",
+        ":edenfs_fixture",
+        ":sites",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "edenfs_contracts_fixtures",
+    srcs = ["edenfs/test/contracts_fixtures.py"],
+    deps = [
+        ":core_checker",
+        ":edenfs_actions",
+        ":edenfs_contracts",
+        ":edenfs_encoding",
+        ":edenfs_testing",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_contracts_invariants_test",
+    srcs = ["edenfs/test/contracts_invariants_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_contracts",
+        ":edenfs_contracts_fixtures",
+        ":edenfs_encoding",
+        ":edenfs_testing",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_contracts_checkout_semantics_test",
+    srcs = ["edenfs/test/contracts_checkout_semantics_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_contracts",
+        ":edenfs_contracts_fixtures",
+        ":edenfs_encoding",
+        ":edenfs_testing",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_contracts_interruption_test",
+    srcs = ["edenfs/test/contracts_interruption_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_contracts",
+        ":edenfs_contracts_fixtures",
+        ":edenfs_testing",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_contracts_checkout_structure_test",
+    srcs = ["edenfs/test/contracts_checkout_structure_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_contracts",
+        ":edenfs_contracts_fixtures",
+        ":edenfs_encoding",
+        ":edenfs_fixture",
+        ":edenfs_testing",
+        ":target",
+        ":testing",
+        "//eden/integration/correctness:repo",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_contracts_errno_test",
+    srcs = ["edenfs/test/contracts_errno_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":edenfs_actions",
+        ":edenfs_contracts",
+        ":edenfs_contracts_fixtures",
+        ":edenfs_testing",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_contracts_mutations_test",
+    srcs = ["edenfs/test/contracts_mutations_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_contracts",
+        ":edenfs_contracts_fixtures",
+        ":edenfs_encoding",
+        ":edenfs_testing",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_library(
+    name = "edenfs_results",
+    srcs = ["edenfs/file_results.py"],
+    deps = [
+        ":core_checker",
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "edenfs_reference",
+    srcs = [
+        "edenfs/executor.py",
+        "edenfs/reference.py",
+        "edenfs/sapling_processes.py",
+    ],
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_encoding",
+        ":edenfs_results",
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "environment",
+    srcs = ["edenfs/environment.py"],
+    deps = [
+        ":edenfs_encoding",
+        ":edenfs_fixture",
+        ":edenfs_reference",
+        ":target",
+        "//eden/fs/cli:lib",
+        # Only eden.integration.correctness.repo is imported from here.
+        "//eden/integration/correctness:repo",
+        "//eden/integration/lib:lib",
+        "//eden/test_support:py",
+    ],
+)
+
+python_library(
+    name = "edenfs_backends",
+    srcs = [
+        "edenfs/backend_processes.py",
+        "edenfs/backend_scm.py",
+        "edenfs/backends.py",
+        "edenfs/faults.py",
+    ],
+    deps = [
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_actions",
+        ":edenfs_encoding",
+        ":edenfs_reference",
+        ":edenfs_results",
+        ":environment",
+        ":scheduler",
+        ":target",
+        "//eden/fs/py/eden/thrift:client",
+        "//eden/fs/service:thrift-python-types",
+        "//eden/integration/lib:lib",
+        "//thrift/lib/python:types",
+    ],
+)
+
+python_library(
+    name = "edenfs_differential_backend",
+    srcs = ["edenfs/differential_backend.py"],
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_reference",
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "edenfs_properties",
+    srcs = [
+        "edenfs/properties/attributes.py",
+        "edenfs/properties/bytes.py",
+        "edenfs/properties/checkout.py",
+        "edenfs/properties/common.py",
+        "edenfs/properties/cross_channel.py",
+        "edenfs/properties/differential.py",
+        "edenfs/properties/existence.py",
+        "edenfs/properties/fd.py",
+        "edenfs/properties/journal.py",
+        "edenfs/properties/listing.py",
+        "edenfs/properties/manifest.py",
+        "edenfs/properties/namespace.py",
+        "edenfs/properties/readdir.py",
+        "edenfs/properties/result_shape.py",
+        "edenfs/properties/status.py",
+    ],
+    deps = [
+        ":core_checker",
+        ":edenfs_actions",
+        ":edenfs_contracts",
+        ":edenfs_encoding",
+        ":edenfs_fixture",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "edenfs_target",
+    srcs = ["edenfs/target.py"],
+    deps = [
+        ":core_containment",
+        ":edenfs_actions",
+        ":edenfs_backends",
+        ":edenfs_contracts",
+        ":edenfs_differential_backend",
+        ":edenfs_properties",
+        ":edenfs_reference",
+        ":environment",
+        ":target",
+    ],
+)
+
+# The kernel as the reference for the POSIX layer: real concurrent histories.
+python_unittest(
+    name = "edenfs_posix_lane_test",
+    srcs = ["edenfs/test/posix_lane_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":edenfs_encoding",
+        ":edenfs_fixture",
+        ":edenfs_reference",
+        ":edenfs_target",
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_properties_test",
+    srcs = ["edenfs/test/properties_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = glob([
+        "edenfs/test/red_controls/**/*",
+        "edenfs/test/sapling_evidence/*",
+    ]),
+    deps = [
+        ":core_checker",
+        ":corpus_author",
+        ":edenfs_contracts",
+        ":edenfs_encoding",
+        ":edenfs_judging",
+        ":edenfs_properties",
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_status_property_test",
+    srcs = ["edenfs/test/status_property_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = glob([
+        "edenfs/test/red_controls/**/*",
+        "edenfs/test/sapling_evidence/*",
+    ]),
+    deps = [
+        ":core_checker",
+        ":corpus_author",
+        ":edenfs_contracts",
+        ":edenfs_judging",
+        ":edenfs_properties",
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_bytes_property_test",
+    srcs = ["edenfs/test/bytes_property_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = glob([
+        "edenfs/test/red_controls/**/*",
+        "edenfs/test/sapling_evidence/*",
+    ]),
+    deps = [
+        ":corpus_author",
+        ":edenfs_contracts",
+        ":edenfs_judging",
+        ":edenfs_properties",
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_cross_channel_property_test",
+    srcs = ["edenfs/test/cross_channel_property_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":corpus_author",
+        ":edenfs_judging",
+        ":edenfs_properties",
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_journal_property_test",
+    srcs = ["edenfs/test/journal_property_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":corpus_author",
+        ":edenfs_judging",
+        ":edenfs_properties",
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "generate_compose_test",
+    srcs = ["test/generate_compose_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":generate",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_differential_property_test",
+    srcs = ["edenfs/test/differential_property_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":corpus_author",
+        ":edenfs_judging",
+        ":edenfs_testing",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_readdir_property_test",
+    srcs = ["edenfs/test/readdir_property_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":corpus_author",
+        ":edenfs_contracts",
+        ":edenfs_judging",
+        ":edenfs_properties",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_attributes_property_test",
+    srcs = ["edenfs/test/attributes_property_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":corpus_author",
+        ":edenfs_judging",
+        ":edenfs_testing",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_fd_property_test",
+    srcs = ["edenfs/test/fd_property_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":corpus_author",
+        ":edenfs_contracts",
+        ":edenfs_judging",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_existence_listing_manifest_property_test",
+    srcs = ["edenfs/test/existence_listing_manifest_property_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":corpus_author",
+        ":edenfs_contracts",
+        ":edenfs_encoding",
+        ":edenfs_fixture",
+        ":edenfs_judging",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_disturbed_parity_test",
+    srcs = ["edenfs/test/disturbed_parity_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":corpus_author",
+        ":edenfs_contracts",
+        ":edenfs_judging",
+        ":edenfs_properties",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_checkout_property_test",
+    srcs = ["edenfs/test/checkout_property_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":corpus",
+        ":corpus_author",
+        ":edenfs_contracts",
+        ":edenfs_judging",
+        ":edenfs_target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_checkout_count_property_test",
+    srcs = ["edenfs/test/checkout_count_property_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":corpus_author",
+        ":edenfs_contracts",
+        ":edenfs_judging",
+        ":edenfs_recorded_count",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "edenfs_recorded_count",
+    srcs = ["edenfs/test/recorded_count.py"],
+    resources = glob(["edenfs/test/recorded/*"]),
+    deps = [
+        ":core_checker",
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+# Continuous CI only (see `core_solver_scale_slow_test`); about 4 minutes.
+python_unittest(
+    name = "edenfs_namespace_checkout_slow_test",
+    srcs = ["edenfs/test/namespace_checkout_slow_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    labels = ci.labels(
+        ci.remove(
+            ci.diff,
+            ci.land,
+        ),
+    ),
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_recorded_count",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_actions_target_test",
+    srcs = ["edenfs/test/actions_target_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_target_test",
+    srcs = ["edenfs/test/target_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":edenfs_actions",
+        ":edenfs_backends",
+        ":edenfs_contracts",
+        ":edenfs_differential_backend",
+        ":edenfs_encoding",
+        ":edenfs_reference",
+        ":edenfs_results",
+        ":edenfs_target",
+        ":environment",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_observation_bounds_test",
+    srcs = ["edenfs/test/observation_bounds_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_encoding",
+        ":edenfs_fixture",
+        ":edenfs_testing",
+        ":target",
+        "//eden/integration/correctness:repo",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_results_test",
+    srcs = ["edenfs/test/file_results_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [":edenfs_results"],
+)
+
+python_unittest(
+    name = "edenfs_result_schema_test",
+    srcs = ["edenfs/test/result_schema_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":backends_fixtures",
+        ":core_checker",
+        ":edenfs_actions",
+        ":edenfs_actions_fixtures",
+        ":edenfs_backends",
+        ":edenfs_differential_backend",
+        ":edenfs_encoding",
+        ":edenfs_reference",
+        ":edenfs_results",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":scheduler",
+        ":target",
+        "//eden/fs/service:thrift-python-types",
+        "//eden/integration/correctness:repo",
+        "//eden/integration/lib:lib",
+        "//thrift/lib/python:types",
+    ],
+)
+
+python_unittest(
+    name = "reference_test",
+    srcs = ["edenfs/test/reference_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":backends_fixtures",
+        ":edenfs_actions",
+        ":edenfs_backends",
+        ":edenfs_differential_backend",
+        ":edenfs_encoding",
+        ":edenfs_reference",
+        ":edenfs_testing",
+        ":environment",
+        ":reference_fixtures",
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "reference_fixtures",
+    srcs = ["edenfs/test/reference_fixtures.py"],
+    deps = [
+        ":backends_fixtures",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "differential_backend_test",
+    srcs = ["edenfs/test/differential_backend_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":backends_fixtures",
+        ":core_checker",
+        ":edenfs_actions",
+        ":edenfs_backends",
+        ":edenfs_differential_backend",
+        ":edenfs_encoding",
+        ":edenfs_reference",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":environment",
+        ":reference_fixtures",
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "backends_live_test",
+    srcs = ["edenfs/test/backends_live_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    deps = [
+        ":backends_fixtures",
+        # `run_live` spawns the runner from this par's `cli.py`.
+        ":containment",  # @manual
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_backends",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":environment",
+        ":generate",
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "reference_live_test",
+    srcs = ["edenfs/test/reference_live_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    deps = [
+        ":backends_fixtures",
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_actions",
+        ":edenfs_contracts",
+        ":edenfs_encoding",
+        ":edenfs_fixture",
+        ":edenfs_live",
+        ":edenfs_target",
+        ":environment",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_red_control_live_test",
+    srcs = ["edenfs/test/red_control_live_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    deps = [
+        ":backends_fixtures",
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_live",
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_namespace_live_test",
+    srcs = ["edenfs/test/namespace_live_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    deps = [
+        ":backends_fixtures",
+        ":core_checker",
+        ":edenfs_live",
+        ":edenfs_target",
+        ":generate",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "edenfs_metadata_live_test",
+    srcs = ["edenfs/test/metadata_live_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    deps = [
+        ":backends_fixtures",
+        ":core_checker",
+        ":edenfs_fixture",
+        ":edenfs_live",
+        ":edenfs_target",
+        ":generate",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "environment_test",
+    srcs = ["edenfs/test/environment_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    deps = [
+        ":core_containment",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":environment",
+        ":environment_fixtures",
+        ":target",
+        "//eden/integration/correctness:repo",
+        "//eden/test_support:py",
+    ],
+)
+
+python_library(
+    name = "environment_fixtures",
+    srcs = ["edenfs/test/environment_fixtures.py"],
+    deps = [
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "environment_live_test",
+    srcs = ["edenfs/test/environment_live_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    deps = [
+        ":backends_fixtures",
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_encoding",
+        ":edenfs_live",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":environment",
+        ":environment_fixtures",
+        ":runspec",
+        ":target",
+        "//eden/fs/service:thrift-python-types",
+        "//eden/integration/correctness:repo",
+        "//eden/test_support:py",
+    ],
+)
+
+python_unittest(
+    name = "faults_test",
+    srcs = ["edenfs/test/faults_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_backends",
+        ":scheduler",
+        ":target",
+        "//eden/fs/py/eden/thrift:client",
+        "//thrift/lib/python:types",
+    ],
+)
+
+python_library(
+    name = "backends_fixtures",
+    srcs = ["edenfs/test/backends_fixtures.py"],
+    deps = [
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_encoding",
+        ":edenfs_target",
+        ":target",
+        "//eden/test_support:py",
+    ],
+)
+
+python_unittest(
+    name = "backends_process_test",
+    srcs = ["edenfs/test/backends_process_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    deps = [
+        ":backends_fixtures",
+        ":core_containment",
+        ":edenfs_backends",
+        ":environment",
+        ":scheduler",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "backends_scm_test",
+    srcs = ["edenfs/test/backends_scm_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    deps = [
+        ":backends_fixtures",
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_backends",
+        ":edenfs_reference",
+        ":edenfs_results",
+        ":edenfs_target",
+        ":environment",
+        ":scheduler",
+        ":target",
+        "//eden/fs/py/eden/thrift:client",
+        "//eden/fs/service:thrift-python-types",
+        "//eden/test_support:py",
+        "//thrift/lib/python:types",
+    ],
+)
+
+python_library(
+    name = "fault_fixtures",
+    srcs = ["test/fault_fixtures.py"],
+    deps = [
+        ":backends_fixtures",
+        ":core_checker",
+        ":edenfs_actions",
+        ":edenfs_encoding",
+        ":edenfs_fixture",
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "fault_validation_test",
+    srcs = ["test/fault_validation_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_backends",
+        ":environment",
+        ":fault_fixtures",
+        ":scheduler",
+        ":target",
+        "//eden/fs/service:thrift-python-types",
+    ],
+)
+
+# `long_running` (100-minute tpx timeout tier): a hang must reach the RunSpec's own
+# runner deadline and the harness cleanup before tpx stops the test.
+python_unittest(
+    name = "fault_live_test",
+    srcs = ["test/fault_live_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    labels = [tpx_labels.long_running],
+    network_access = network_access_utils.all(),
+    deps = [
+        ":backends_fixtures",
+        ":campaign",
+        ":containment",
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_actions",
+        ":edenfs_backends",
+        ":edenfs_properties",
+        ":edenfs_target",
+        ":environment",
+        ":fault_fixtures",
+        ":scheduler",
+        ":target",
+        ":tasking",
+        "//eden/fs/service:thrift-python-types",
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_library(
+    name = "generate",
+    srcs = ["core/generate.py"],
+    deps = [
+        ":sites",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "generate_test",
+    srcs = ["test/generate_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_target",
+        ":fake_target",
+        ":generate",
+        ":generation_fixtures",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "sites_engage_test",
+    srcs = ["edenfs/test/sites_engage_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":edenfs_actions",
+        ":edenfs_encoding",
+        ":edenfs_target",
+        ":generate",
+        ":target",
+        "//eden/integration/correctness:repo",
+    ],
+)
+
+python_library(
+    name = "generation_fixtures",
+    srcs = ["test/generation_fixtures.py"],
+    deps = [
+        ":edenfs_fixture",
+        ":edenfs_target",
+        ":fake_target",
+        ":generate",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "generate_overlap_test",
+    srcs = ["test/generate_overlap_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":campaign_fixtures",
+        ":edenfs_actions",
+        ":edenfs_target",
+        ":generate",
+        ":generation_fixtures",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "generate_rates_test",
+    srcs = ["test/generate_rates_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":campaign_fixtures",
+        ":edenfs_actions",
+        ":edenfs_target",
+        ":fake_target",
+        ":generate",
+        ":generation_fixtures",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "generate_summary_test",
+    srcs = ["test/generate_summary_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":campaign_fixtures",
+        ":edenfs_actions",
+        ":edenfs_target",
+        ":generate",
+        ":generation_fixtures",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_library(
+    name = "corpus",
+    srcs = [
+        "test/corpus/export.py",
+        "test/corpus/loader.py",
+    ],
+    deps = [
+        ":corpus_author",
+        ":target",
+        ":waiting",
+    ],
+)
+
+# `buck2 run fbcode//eden/integration/correctness/exploratory:corpus_export -- <family>/<case> <dir>`
+python_binary(
+    name = "corpus_export",
+    main_function = "eden.integration.correctness.exploratory.test.corpus.export.main",
+    deps = [":corpus"],
+)
+
+python_library(
+    name = "corpus_author",
+    srcs = [
+        "test/corpus/author.py",
+        "test/corpus/catalog.py",
+        "test/corpus/families/__init__.py",
+        "test/corpus/families/aggregate_omission.py",
+        "test/corpus/families/attributes.py",
+        "test/corpus/families/bytes_status.py",
+        "test/corpus/families/checkout_interrupted.py",
+        "test/corpus/families/checkout_sl.py",
+        "test/corpus/families/checkout_thrift.py",
+        "test/corpus/families/common.py",
+        "test/corpus/families/cross_channel.py",
+        "test/corpus/families/differential.py",
+        "test/corpus/families/differential_validation.py",
+        "test/corpus/families/direct.py",
+        "test/corpus/families/errno_twins.py",
+        "test/corpus/families/existence.py",
+        "test/corpus/families/fd.py",
+        "test/corpus/families/journal.py",
+        "test/corpus/families/manifest.py",
+        "test/corpus/families/not_evaluated.py",
+        "test/corpus/families/readdir.py",
+        "test/corpus/families/rename.py",
+        "test/corpus/families/repeated_producers.py",
+        "test/corpus/families/task_key.py",
+        "test/corpus/families/windows.py",
+    ],
+    deps = [
+        ":core_checker",
+        ":edenfs_actions",
+        ":edenfs_encoding",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":target",
+        "//eden/integration/correctness:repo",
+    ],
+)
+
+python_library(
+    name = "waiting",
+    srcs = ["test/waiting.py"],
+)
+
+python_unittest(
+    name = "waiting_test",
+    srcs = ["test/waiting_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [":waiting"],
+)
+
+python_unittest(
+    name = "corpus_engine_test",
+    srcs = ["test/corpus/corpus_engine_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":corpus",
+        ":edenfs_contracts",
+        ":edenfs_target",
+        ":target",
+        ":testing",
+        ":waiting",
+    ],
+)
+
+python_unittest(
+    name = "corpus_test",
+    srcs = ["test/corpus/corpus_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":corpus",
+        ":corpus_author",
+        ":edenfs_actions",
+        ":edenfs_contracts",
+        ":edenfs_encoding",
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "campaign",
+    srcs = ["core/campaign.py"],
+    deps = [
+        ":core_checker",
+        ":core_containment",
+        ":generate",
+        ":target",
+    ],
+)
+
+# Typed task identity, the findings report, replay, and the run admission and
+# verdict-file readers. Nothing here talks to a service.
+python_library(
+    name = "tasking",
+    srcs = [
+        "findings.py",
+        "schemas.py",
+    ],
+    deps = [
+        ":campaign",
+        ":core_checker",
+        ":core_containment",
+        ":scheduler",
+        ":target",
+    ],
+)
+
+# Files findings as subtasks of the findings parent task; every task read and
+# write is one `meta` CLI subprocess behind `filing.Tasks`.
+python_library(
+    name = "filing",
+    srcs = ["filing.py"],
+    deps = [
+        ":core_checker",
+        ":target",
+        ":tasking",
+    ],
+)
+
+python_unittest(
+    name = "filing_test",
+    srcs = ["test/filing_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":cli_fixtures",
+        ":containment",
+        ":core_checker",
+        ":fake_target",
+        ":filing",
+        ":tasking",
+    ],
+)
+
+# The one place the CLI names its targets.
+python_library(
+    name = "targets",
+    srcs = ["targets.py"],
+    deps = [
+        ":edenfs_target",
+        ":fake_target",
+        ":target",
+    ],
+)
+
+# cli.py ships with the runner libraries so the runner lookup
+# (core/containment.py looks for cli.py) resolves in every link tree.
+python_library(
+    name = "containment",
+    srcs = [
+        "advisory.py",
+        "cli.py",
+    ],
+    deps = [
+        ":campaign",
+        ":core_checker",
+        ":core_containment",
+        ":filing",
+        ":generate",
+        ":sites",
+        ":target",
+        ":targets",
+        ":tasking",
+    ],
+)
+
+python_binary(
+    name = "explore",
+    main_function = "eden.integration.correctness.exploratory.cli.main",
+    deps = [":containment"],
+)
+
+python_unittest(
+    name = "cli_test",
+    srcs = ["test/cli_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":cli_fixtures",
+        ":containment",
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_actions",
+        ":edenfs_target",
+        ":target",
+        ":testing",
+    ],
+)
+
+python_unittest(
+    name = "nightly_test",
+    srcs = ["ci/test/nightly_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = [
+        "ci/nightly.json",
+        "ci/release-decks.json",
+        "decks/red-control.json",
+    ],
+    deps = [
+        ":campaign",
+        ":cli_fixtures",
+        ":containment",
+        ":sites",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "tasking_fixtures",
+    srcs = ["test/tasking_fixtures.py"],
+    deps = [
+        ":core_checker",
+        ":core_containment",
+        ":fake_target",
+        ":scheduler",
+        ":target",
+        ":tasking",
+    ],
+)
+
+python_library(
+    name = "cli_fixtures",
+    srcs = ["test/cli_fixtures.py"],
+    deps = [
+        ":campaign",
+        ":containment",
+        ":core_checker",
+        ":core_containment",
+        ":fake_target",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "campaign_fixtures",
+    srcs = ["test/campaign_fixtures.py"],
+    resources = glob(["edenfs/test/red_controls/**/*"]),
+    deps = [
+        ":campaign",
+        ":core_checker",
+        ":core_containment",
+        ":corpus_author",
+        ":edenfs_target",
+        ":generate",
+        ":generation_fixtures",
+        ":target",
+        ":tasking",
+    ],
+)
+
+python_unittest(
+    name = "golden_test",
+    srcs = ["test/golden_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    resources = glob(["testdata/golden/*"]),
+    deps = [
+        ":campaign_fixtures",
+        ":corpus_author",
+        ":target",
+        ":tasking",
+    ],
+)
+
+python_unittest(
+    name = "schemas_test",
+    srcs = ["test/schemas_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":target",
+        ":tasking",
+        ":tasking_fixtures",
+    ],
+)
+
+python_unittest(
+    name = "findings_records_test",
+    srcs = ["test/findings_records_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":core_containment",
+        ":target",
+        ":tasking",
+        ":tasking_fixtures",
+    ],
+)
+
+python_unittest(
+    name = "findings_keying_test",
+    srcs = ["test/findings_keying_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":campaign",
+        ":core_checker",
+        ":corpus",
+        ":corpus_author",
+        ":edenfs_judging",
+        ":edenfs_target",
+        ":fake_target",
+        ":target",
+        ":tasking",
+        ":tasking_fixtures",
+    ],
+)
+
+python_unittest(
+    name = "findings_report_test",
+    srcs = ["test/findings_report_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":cli_fixtures",
+        ":containment",
+        ":core_checker",
+        ":core_containment",
+        ":fake_target",
+        ":target",
+        ":tasking",
+    ],
+)
+
+python_unittest(
+    name = "campaign_run_test",
+    srcs = ["test/campaign_run_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":campaign",
+        ":cli_fixtures",
+        ":containment",
+        ":core_containment",
+        ":fake_target",
+        ":generate",
+        ":target",
+        ":targets",
+        ":tasking",
+        ":tasking_fixtures",
+    ],
+)
+
+python_unittest(
+    name = "telemetry_test",
+    srcs = ["test/telemetry_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":campaign",
+        ":cli_fixtures",
+        ":containment",
+        ":core_checker",
+        ":core_containment",
+        ":fake_target",
+        ":target",
+        ":tasking_fixtures",
+    ],
+)
+
+python_unittest(
+    name = "campaign_report_test",
+    srcs = ["test/campaign_report_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":campaign",
+        ":cli_fixtures",
+        ":containment",
+        ":core_containment",
+        ":edenfs_target",
+        ":fake_target",
+        ":target",
+        ":targets",
+        ":tasking_fixtures",
+    ],
+)
+
+python_unittest(
+    name = "campaign_account_test",
+    srcs = ["test/campaign_account_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":campaign",
+        ":cli_fixtures",
+        ":containment",
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_testing",
+        ":fake_target",
+        ":target",
+        ":targets",
+        ":tasking_fixtures",
+    ],
+)
+
+python_unittest(
+    name = "campaign_plan_test",
+    srcs = ["test/campaign_plan_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":campaign",
+        ":cli_fixtures",
+        ":containment",
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_target",
+        ":fake_target",
+        ":generate",
+        ":target",
+        ":targets",
+    ],
+)
+
+python_unittest(
+    name = "containment_test",
+    srcs = ["test/containment_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":containment",
+        ":containment_testing",
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_target",
+        ":edenfs_testing",
+        ":fake_target",
+        ":target",
+        ":targets",
+        ":testing",
+    ],
+)
+
+python_unittest(
+    name = "advisory_test",
+    srcs = ["test/advisory_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":containment",
+        ":core_checker",
+        ":core_containment",
+        ":fake_target",
+        ":target",
+        ":tasking",
+        ":tasking_fixtures",
+    ],
+)
+
+python_library(
+    name = "known_reproducers",
+    srcs = ["test/known_reproducers.py"],
+    resources = glob(["test/corpus/known/**/*"]),
+    deps = [
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+python_unittest(
+    name = "decks_test",
+    srcs = ["test/decks_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    resources = glob([
+        "decks/*.json",
+        "test/deck_histories/*.history.jsonl",
+    ])
+    + [
+        "ci/release-decks.json",
+    ],
+    deps = [
+        ":containment",
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_actions",
+        ":edenfs_target",
+        ":known_reproducers",
+        ":target",
+        ":tasking",
+        ":tasking_fixtures",
+        ":waiting",
+    ],
+)
+
+# `long_running` (100-minute tpx timeout tier): a hang must reach the RunSpec's own
+# runner deadline and the harness cleanup before tpx stops the test.
+python_unittest(
+    name = "decks_live_test",
+    srcs = ["test/decks_live_test.py"],
+    # Exploratory MVP runs FUSE on Linux.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    labels = [tpx_labels.long_running],
+    network_access = network_access_utils.all(),
+    resources = glob(["decks/*.json"]),
+    # Methods are generated from deck metadata.
+    supports_static_listing = False,
+    deps = [
+        ":backends_fixtures",
+        ":containment",
+        ":core_checker",
+        ":core_containment",
+        ":edenfs_actions",
+        ":edenfs_target",
+        ":generate",
+        ":sites",
+        ":target",
+        ":tasking",
+        ":waiting",
+    ],
+)
+
+python_library(
+    name = "legal_simulator",
+    srcs = ["test/legal_simulator.py"],
+    deps = [
+        ":core_checker",
+        ":corpus_author",
+        ":edenfs_target",
+        ":target",
+    ],
+)
+
+python_library(
+    name = "planted_counts",
+    srcs = ["test/planted_counts.py"],
+    deps = [
+        ":core_checker",
+        ":legal_simulator",
+        ":waiting",
+    ],
+)
+
+python_unittest(
+    name = "legal_batch_test",
+    srcs = ["test/legal_batch_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    network_access = network_access_utils.none(),
+    deps = [
+        ":core_checker",
+        ":legal_simulator",
+        ":planted_counts",
+        ":waiting",
+    ],
+)
+
+# Continuous CI only (see `core_solver_scale_slow_test`); about 9 minutes.
+python_unittest(
+    name = "legal_batch_slow_test",
+    srcs = ["test/legal_batch_slow_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
+    labels = [tpx_labels.long_running]
+    + ci.labels(
+        ci.remove(
+            ci.diff,
+            ci.land,
+        ),
+    ),
+    network_access = network_access_utils.none(),
+    deps = [
+        ":planted_counts",
+    ],
+)

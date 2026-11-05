@@ -29,11 +29,15 @@ use git_types::fetch_git_delta_manifest;
 use git_types::fetch_non_blob_git_object;
 use git_types::tree::GitEntry;
 use gix_hash::ObjectId;
+use manifest::Diff;
 use manifest::ManifestOps;
+use manifest::PathOrPrefix;
 use metaconfig_types::GitDeltaManifestVersion;
 use mononoke_macros::mononoke;
 use mononoke_types::ChangesetId;
+use mononoke_types::MPath;
 use mononoke_types::hash::GitSha1;
+use packfile::pack::DeltaForm;
 use repo_blobstore::ArcRepoBlobstore;
 use repo_derived_data::ArcRepoDerivedData;
 use rustc_hash::FxHashSet;
@@ -41,6 +45,8 @@ use scuba_ext::FutureStatsScubaExt;
 use scuba_ext::MononokeScubaSampleBuilder;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
+use tokio_util::task::AbortOnDrop;
+use tokio_util::task::AbortOnDropHandle;
 use weight_observer::WeightedItem;
 
 use crate::OptionalWeightObserver;
@@ -81,6 +87,46 @@ use crate::utils::filter_object;
 use crate::utils::tag_entries_to_hashes;
 use crate::utils::to_git_object_stream;
 
+#[cfg(test)]
+mod tag_tests;
+#[cfg(test)]
+mod tests;
+
+/// Prune only relative deepens of one existing shallow tip to one new boundary.
+/// External bases require both negotiated thin packs and a ref-capable writer.
+async fn boundary_client_tree(
+    fetch_container: &FetchContainer,
+    request: &FetchRequest,
+) -> Result<Option<GitTreeId>> {
+    let ([have], [want]) = (request.bases.as_slice(), request.heads.as_slice()) else {
+        return Ok(None);
+    };
+    let Some(shallow_info) = fetch_container.shallow_info.as_ref() else {
+        return Ok(None);
+    };
+    let ([client], [_boundary]) = (
+        shallow_info.client_shallow.as_slice(),
+        shallow_info.packfile_commits.boundary_commits.as_slice(),
+    ) else {
+        return Ok(None);
+    };
+    if have != want
+        || client.oid() != *have
+        || fetch_container.filter.is_some()
+        || !request.include_out_of_pack_deltas
+        || request.delta_form != DeltaForm::RefAndOffset
+        || !matches!(request.shallow_variant, ShallowVariant::FromClientWithDepth(depth) if depth > 0)
+    {
+        return Ok(None);
+    }
+    let tree = fetch_non_blob_git_object(&fetch_container.ctx, &fetch_container.blobstore, have)
+        .await
+        .with_context(|| format!("Error fetching client shallow commit {have:?}"))?
+        .with_parsed_as_commit(|commit| GitTreeId(commit.tree()))
+        .ok_or_else(|| anyhow::anyhow!("Client shallow object {have:?} is not a commit"))?;
+    Ok(Some(tree))
+}
+
 /// Fetch and collect the tree and blob objects that are expressed as full objects
 /// for the boundary commits of a shallow fetch
 async fn boundary_trees_and_blobs(
@@ -92,6 +138,7 @@ async fn boundary_trees_and_blobs(
         filter,
         concurrency,
         shallow_info,
+        boundary_client_tree,
         ..
     } = fetch_container;
     let boundary_commits = match shallow_info.as_ref() {
@@ -105,29 +152,61 @@ async fn boundary_trees_and_blobs(
                 .context("Error in fetching boundary commit")?
                 .with_parsed_as_commit(|commit| GitTreeId(commit.tree()))
                 .ok_or_else(|| anyhow::anyhow!("Git object {git_commit_id:?} is not a commit"))?;
-            let objects = root_tree.list_all_entries((*ctx).clone(), blobstore.clone()).try_collect::<Vec<_>>().await?;
-            let objects = stream::iter(objects).map(async |(path, entry)| {
-                // If the entry is a submodule OR if the request has no filter or doesn't care about size, then let's assume size as 0
-                let size = if entry.is_submodule() || filter.as_ref().as_ref().is_none_or(|filter| filter.no_size_constraint()) {
-                    0
-                } else {
-                    entry.size(&ctx, &blobstore).await?
-                };
-                Ok((path, entry, size))
-            })
-            .buffer_unordered(concurrency.trees_and_blobs)
-            .try_filter_map(async |(path, entry, size)| {
-                let kind = entry.kind();
-                let oid = entry.oid();
-                // If the entry corresponds to a submodules (and shows up as a commit), then we ignore it
-                // If the object is ignored by the filter, then we ignore it
-                if !filter_object(filter.clone(), &path, kind, size) || entry.is_submodule() {
-                    anyhow::Ok(None)
-                } else {
-                    Ok(Some(FullObjectEntry::new(changeset_id, path, oid, size, kind)))
-                }
-            })
-            .try_collect::<FxHashSet<_>>()
+            let max_tree_depth = filter.as_ref().as_ref().map(|filter| filter.max_tree_depth);
+            let max_blob_size = filter
+                .as_ref()
+                .as_ref()
+                .filter(|filter| !filter.no_size_constraint())
+                .map(|filter| filter.max_blob_size);
+            let entries = match boundary_client_tree {
+                Some(client_tree) if filter.is_none() => client_tree.filtered_diff(
+                    (*ctx).clone(),
+                    blobstore.clone(),
+                    root_tree,
+                    blobstore.clone(),
+                    |diff| match diff {
+                        Diff::Added(path, entry) => Some((path, entry)),
+                        Diff::Changed(path, old, new)
+                            if old.is_submodule() || old.oid() != new.oid() =>
+                        {
+                            Some((path, new))
+                        }
+                        _ => None,
+                    },
+                    |diff| !matches!(diff, Diff::Removed(..)),
+                    Default::default(),
+                ),
+                // Keep the per-directory spawn for filtered traversal: size lookups
+                // downstream may depend on directory reads that must keep progressing.
+                _ => root_tree.find_entries_filtered(
+                    (*ctx).clone(),
+                    blobstore.clone(),
+                    [PathOrPrefix::Prefix(MPath::ROOT)],
+                    move |path, _| max_tree_depth.is_none_or(|depth| path.depth() < depth),
+                ),
+            };
+            let objects = entries
+                .map_ok(async |(path, entry)| {
+                    let kind = entry.kind();
+                    if entry.is_submodule() || !filter_object(filter.clone(), &path, kind, 0) {
+                        return anyhow::Ok(None);
+                    }
+                    let size = if let Some(max_blob_size) = max_blob_size
+                        && kind.is_blob()
+                    {
+                        let size = entry.size(&ctx, &blobstore).await?;
+                        if size >= max_blob_size {
+                            return Ok(None);
+                        }
+                        size
+                    } else {
+                        0
+                    };
+                    Ok(Some(FullObjectEntry::new(changeset_id, path, entry.oid(), size, kind)))
+                })
+                .try_buffer_unordered(concurrency.trees_and_blobs)
+                .try_filter_map(futures::future::ok)
+                .try_collect::<FxHashSet<_>>()
             .await
             .with_context(|| {
                 format!(
@@ -398,7 +477,7 @@ fn packfile_stream_from_changesets<'a, T: GDMEntryProvider + Send + 'static>(
     let (packfile_item_sender, packfile_item_receiver) =
         mpsc::channel::<Result<WeightedItem<PackfileItem>>>(2 * concurrency.trees_and_blobs);
 
-    mononoke::spawn_task(async move {
+    let gdm_task = AbortOnDropHandle::new(mononoke::spawn_task(async move {
         let mut stream = stream::iter(changesets_or_groups)
             .map(Ok)
             .map_ok({
@@ -418,14 +497,14 @@ fn packfile_stream_from_changesets<'a, T: GDMEntryProvider + Send + 'static>(
         while let Some(item) = stream.next().await {
             match item {
                 Err(entry_err) => {
-                    if let Err(send_err) = gdm_sender.send(Err(entry_err)).await {
-                        tracing::warn!("Error sending GDM entry error: {send_err:?}");
+                    if gdm_sender.send(Err(entry_err)).await.is_err() {
+                        return anyhow::Ok(());
                     }
                 }
                 Ok(entries) => {
                     for entry in entries {
-                        if let Err(send_err) = gdm_sender.send(Ok(entry)).await {
-                            tracing::warn!("Error sending GDM entry: {send_err:?}");
+                        if gdm_sender.send(Ok(entry)).await.is_err() {
+                            return anyhow::Ok(());
                         }
                     }
                 }
@@ -433,9 +512,11 @@ fn packfile_stream_from_changesets<'a, T: GDMEntryProvider + Send + 'static>(
         }
 
         anyhow::Ok(())
-    });
+    }));
 
-    mononoke::spawn_task(async move {
+    let cancel_gdm_on_pack_exit = AbortOnDrop::new(gdm_task.abort_handle());
+    let packfile_task = AbortOnDropHandle::new(mononoke::spawn_task(async move {
+        let _cancel_gdm_on_pack_exit = cancel_gdm_on_pack_exit;
         let max_buffer =
             justknobs::get_as::<usize>("scm/mononoke:git_generator_buffer_bytes", None);
 
@@ -490,15 +571,25 @@ fn packfile_stream_from_changesets<'a, T: GDMEntryProvider + Send + 'static>(
             .boxed();
 
         while let Some(item) = stream.next().await {
-            if let Err(err) = packfile_item_sender.send(item).await {
-                tracing::warn!("Error sending packfile item: {err:?}");
+            if packfile_item_sender.send(item).await.is_err() {
+                return anyhow::Ok(());
             }
         }
 
         anyhow::Ok(())
-    });
+    }));
 
-    tokio_stream::wrappers::ReceiverStream::new(packfile_item_receiver).boxed()
+    let mut receiver = packfile_item_receiver;
+    let mut tasks = Some((gdm_task, packfile_task));
+    stream::poll_fn(move |cx| {
+        receiver.poll_recv(cx).map(|item| {
+            if item.is_none() {
+                drop(tasks.take());
+            }
+            item
+        })
+    })
+    .boxed()
 }
 
 /// Create a stream of packfile items containing blob and tree objects that need to be included in the packfile/bundle.
@@ -787,7 +878,7 @@ async fn tags_packfile_stream<'a>(
     // NOTE: Fun git trick. If the client says it doesn't want tags, then instead of excluding all tags (like regular systems)
     // we still send the tags that were explicitly part of the client's WANT request :)
     let required_tag_names = match include_tags {
-        true => list_tags(&ctx, repo, refs_source)
+        true if !requested_commits.is_empty() => list_tags(&ctx, repo, refs_source)
             .await
             .map(|entries| {
                 entries
@@ -802,8 +893,11 @@ async fn tags_packfile_stream<'a>(
                     .collect::<FxHashSet<_>>()
             })
             .context("Error in getting tags pointing to input set of commits")?,
-        false => FxHashSet::default(),
+        _ => FxHashSet::default(),
     };
+    if required_tag_names.is_empty() && requested_tag_names.is_empty() {
+        return Ok((stream::empty().boxed(), 0));
+    }
     // Fetch entries corresponding to annotated tags in the repo or with names
     // that match the requested tag names
     let tag_entries = repo
@@ -1022,6 +1116,10 @@ pub async fn fetch_response<'a>(
                 "Converted HAVE Git commits to Bonsais",
                 "Read".to_string(),
             );
+    let fetch_container = FetchContainer {
+        boundary_client_tree: boundary_client_tree(&fetch_container, &request).await?,
+        ..fetch_container
+    };
     progress_writer
         .send("Converting WANT Git commits to Bonsais\n".to_string())
         .await?;

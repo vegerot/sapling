@@ -1,10 +1,13 @@
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_treehugger")
+oncall("scm_server_infra")
 
 rust_library(
     name = "commit_graph_types",
     srcs = glob(["src/**/*.rs"]),
+    test_deps = [
+        "//eden/mononoke/common/mononoke_macros:mononoke_macros",
+    ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-trait",
@@ -16,6 +19,7 @@ rust_library(
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:smallvec",
         "fbsource//third-party/rust:vec1",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/mononoke_types:mononoke_types",
         "//eden/mononoke/repo_attributes/commit_graph/commit_graph_types/if:commit_graph_thrift-rust",
         "//eden/mononoke/repo_attributes/repo_identity:repo_identity",

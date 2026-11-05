@@ -130,6 +130,13 @@ impl CoreContext {
         self.logging.perf_counters()
     }
 
+    /// Charge CPU executed in the current Folly request context, including
+    /// inherited task contexts, to this request's perf counters.
+    pub fn track_cpu_time(&self) {
+        #[cfg(fbcode_build)]
+        crate::cpu_time::track_cpu_time(self.perf_counters().clone());
+    }
+
     pub fn metadata(&self) -> &Metadata {
         self.session.metadata()
     }
@@ -168,6 +175,22 @@ impl CoreContext {
 
     pub fn set_nocache_thriftcache(&self) {
         self.logging.set_nocache_thriftcache();
+    }
+
+    pub fn partial_response(&self) -> bool {
+        self.logging.partial_response()
+    }
+
+    pub fn set_partial_response(&self) {
+        self.logging.set_partial_response();
+    }
+
+    pub fn potential_partial_response(&self) -> bool {
+        self.logging.potential_partial_response()
+    }
+
+    pub fn set_potential_partial_response(&self) {
+        self.logging.set_potential_partial_response();
     }
 
     pub fn sql_query_telemetry(&self) -> SqlQueryTelemetry {

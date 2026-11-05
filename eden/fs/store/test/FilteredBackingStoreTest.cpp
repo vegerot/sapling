@@ -15,12 +15,14 @@
 #include <folly/coro/Task.h>
 #include <folly/coro/Timeout.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/GlobalExecutor.h>
 #include <folly/executors/ManualExecutor.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/test/TestUtils.h>
 #include <folly/testing/TestUtil.h>
 #include <gtest/gtest.h>
+#include <limits>
 
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/FaultInjector.h"
@@ -31,9 +33,11 @@
 #include "eden/fs/store/FilteredBackingStore.h"
 #include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/store/TreeCache.h"
+#include "eden/fs/store/WalkDetector.h"
 #include "eden/fs/store/filter/HgSparseFilter.h"
 #include "eden/fs/store/sl/SaplingBackingStore.h"
 #include "eden/fs/store/sl/SaplingBackingStoreOptions.h"
+#include "eden/fs/store/sl/SaplingObjectId.h"
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
@@ -64,7 +68,6 @@ filtered_out";
 struct TestRepo {
   folly::test::TemporaryDirectory testDir{"eden_filtered_backing_store_test"};
   AbsolutePath testPath = canonicalPath(testDir.path().string());
-  AbsolutePath clientPath = testPath + "client"_pc;
   HgRepo repo{testPath + "repo"_pc};
   RootId commit1;
   Hash20 manifest1;
@@ -164,8 +167,6 @@ struct SaplingFilteredBackingStoreTest : FilteredBackingStoreTestBase {
   std::shared_ptr<SaplingBackingStore> wrappedStore_{
       std::make_shared<SaplingBackingStore>(
           repo.path(),
-          repo.path(),
-          clientPath,
           kPathMapDefaultCaseSensitive,
           stats.copy(),
           &executor_,
@@ -232,7 +233,8 @@ TEST_F(
       nullptr,
       nullptr,
       edenConfig,
-      CaseSensitivity::Sensitive);
+      CaseSensitivity::Sensitive,
+      folly::getGlobalCPUExecutor());
 
   auto rawManifestId = makeTestId("1");
   auto filteredTreeId = ObjectId{FilteredObjectId{
@@ -1058,6 +1060,46 @@ TEST_F(SaplingFilteredBackingStoreTest, testMercurialFFINullFilter) {
   EXPECT_NE(helloFindRes, srcRes->cend());
 }
 
+TEST_F(SaplingFilteredBackingStoreTest, walkDetectorAcceptsRawAndFilteredIds) {
+  // Under the null filter the root's directories are recursively unfiltered,
+  // so the entries of their trees keep their raw sapling ids while the root's
+  // own entries carry filtered ids.
+  auto rootDirRes = folly::coro::blockingWait(
+      folly::coro::timeout(
+          filteredStoreFFI_->co_getRootTree(
+              RootId{FilteredBackingStore::createFilteredRootId(
+                  commit1.value(), "null")},
+              ObjectFetchContext::getNullContext()),
+          kTestTimeout));
+  auto srcId = rootDirRes.tree->find("src"_pc)->second.getObjectId();
+  auto fooTxtId = rootDirRes.tree->find("foo.txt"_pc)->second.getObjectId();
+  auto srcTree =
+      filteredStoreFFI_->getTree(srcId, ObjectFetchContext::getNullContext())
+          .get(kTestTimeout)
+          .tree;
+  auto helloId = srcTree->find("hello.txt"_pc)->second.getObjectId();
+  ASSERT_TRUE(SlOid::hasValidType(helloId));
+  ASSERT_FALSE(SlOid::hasValidType(fooTxtId));
+
+  auto detector = filteredStoreFFI_->createWalkDetector(testPath + "mount"_pc);
+  ASSERT_NE(detector, nullptr);
+  EXPECT_NO_THROW(detector->witnessFileRead(
+      helloId,
+      ObjectFetchContext::FromNetworkFetch,
+      OptionalProcessId{},
+      std::nullopt));
+  EXPECT_NO_THROW(detector->witnessFileRead(
+      fooTxtId,
+      ObjectFetchContext::FromNetworkFetch,
+      OptionalProcessId{},
+      std::nullopt));
+  EXPECT_NO_THROW(detector->witnessTreeRead(
+      srcId,
+      *srcTree,
+      ObjectFetchContext::FromNetworkFetch,
+      OptionalProcessId{}));
+}
+
 TEST_F(SaplingFilteredBackingStoreTest, testMercurialFFIInvalidFOID) {
   // Set up one commit with a root tree
   auto filterRelPath = RelativePath{"filter"};
@@ -1139,6 +1181,34 @@ TEST_F(FakeSubstringFilteredBackingStoreTest, testCompareRootsById) {
   EXPECT_EQ(
       filteredStore_->compareRootsById(rootId1V1, rootId3),
       ObjectComparison::Different);
+}
+
+TEST_F(FakeSubstringFilteredBackingStoreTest, parseObjectIdRenderedTree) {
+  auto foid =
+      FilteredObjectId{RelativePath{"a/b"}, "V1:foo", makeTestId("0000")};
+  auto rendered = filteredStore_->renderObjectId(ObjectId{foid.getValue()});
+  EXPECT_EQ(ObjectId{foid.getValue()}, filteredStore_->parseObjectId(rendered));
+}
+
+TEST_F(FakeSubstringFilteredBackingStoreTest, parseObjectIdMalformedTree) {
+  EXPECT_THROW(filteredStore_->parseObjectId("17:abc"), std::invalid_argument);
+  EXPECT_THROW(filteredStore_->parseObjectId("17:"), std::invalid_argument);
+  EXPECT_THROW(filteredStore_->parseObjectId("17:3:ab"), std::invalid_argument);
+  EXPECT_THROW(
+      filteredStore_->parseObjectId("17:3:foo5:ab"), std::invalid_argument);
+}
+
+TEST_F(FakeSubstringFilteredBackingStoreTest, parseObjectIdLengthNearMax) {
+  // Adding a length this close to SIZE_MAX to an index wraps the end index
+  // back into the string, so an end-index bounds check alone accepts these.
+  auto huge = fmt::format("{}", std::numeric_limits<size_t>::max() - 2);
+  auto tail = std::string(13, 'p') + std::string(40, 'a');
+  EXPECT_THROW(
+      filteredStore_->parseObjectId(fmt::format("17:{}:{}", huge, tail)),
+      std::invalid_argument);
+  EXPECT_THROW(
+      filteredStore_->parseObjectId(fmt::format("17:3:foo{}:{}", huge, tail)),
+      std::invalid_argument);
 }
 
 TEST_F(FakeSubstringFilteredBackingStoreTest, parseObjectIdRawHex) {

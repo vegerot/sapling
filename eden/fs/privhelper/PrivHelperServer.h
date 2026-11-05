@@ -11,6 +11,7 @@
 #include <folly/File.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <atomic>
 #include <functional>
 #include <limits>
 #include <map>
@@ -34,6 +35,8 @@ class Cursor;
 } // namespace folly
 
 namespace facebook::eden {
+
+struct MountTableEntry;
 
 struct FileAccessMonitorProcess {
   SpawnedProcess proc;
@@ -71,13 +74,26 @@ struct FileAccessMonitorProcess {
  */
 void detachFromParentProcessGroup();
 
+/** Select the served owner, retaining CLI selection during hardening rollback.
+ */
+struct PrivHelperOwner {
+  uid_t uid;
+  gid_t gid;
+};
+
+PrivHelperOwner resolvePrivHelperOwner(
+    uid_t realUid,
+    gid_t realGid,
+    uid_t cliUid,
+    gid_t cliGid);
+
 /**
- * Whether an NFS mount with these options needs the macOS f_fstypename
- * override ("edenfs:") applied after mounting.
+ * Whether an NFS mount with these options gets the macOS f_fstypename
+ * override ("edenfs:") applied after mounting, while the override is on.
  *
- * EdenFS NFS mounts are identified by their "edenfs:" mount source (see
- * is_edenfs_nfs_mount()). macOS replaces f_mntfromname for Unix-domain socket
- * transports, so only those mounts need the override.
+ * macOS replaces f_mntfromname for Unix-domain socket transports, so only
+ * those mounts need it. With the override off they are recognized by the
+ * name of the nfsd socket instead, see is_edenfs_nfs_mount().
  */
 bool needsFstypeOverride(const NFSMountOptions& options);
 
@@ -115,6 +131,10 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
    * Run the PrivHelperServer main loop.
    */
   void run();
+
+  bool nfsFstypeOverrideEnabled() const {
+    return nfsFstypeOverride_.load(std::memory_order_relaxed);
+  }
 
  private:
   // UnixSocket::ReceiveCallback methods
@@ -176,11 +196,18 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
 
   void unmountStaleMount(const std::string& mountPoint, int mountFd);
 
-  // Clean up stale redirection mounts under a checkout path that were left
-  // behind when EdenFS crashed without properly unmounting.
-  SanityCheckResult cleanupStaleBindMounts(const std::string& checkoutPath);
-
  protected:
+  // Clean up descendants of the already-authorized checkout directory.
+  SanityCheckResult cleanupStaleBindMounts(
+      const std::string& checkoutPath,
+      int checkoutFd);
+  SanityCheckResult insecureCleanupStaleBindMounts(
+      const std::string& checkoutPath);
+#ifdef __linux__
+  virtual std::vector<MountTableEntry> mountsForCleanup() const;
+  virtual int unmountCleanupMount(int mountFd);
+#endif
+
   virtual int statMountPoint(const char* path, struct stat* st) const;
 
   // Uses stat to determine if there's a stale mount point at the given path. If
@@ -313,6 +340,7 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
       UnixSocket::Message& request);
   UnixSocket::Message processStopFam();
   UnixSocket::Message processSetFuseReadAhead(folly::io::Cursor& cursor);
+  UnixSocket::Message processSetNfsFstypeOverride(folly::io::Cursor& cursor);
   virtual AbsolutePath getFamBinaryPath() const;
 
   // Virtual so tests can replace a pathname after its descriptor is checked.
@@ -406,7 +434,6 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
   enum class BindUnmountResult {
     Unmounted,
     AlreadyUnmounted,
-    ProcFdUnavailable,
   };
 
   BindUnmountResult bindUnmountByFd(
@@ -429,6 +456,10 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
   // Written from eofReceived() and read after the loop exits, both on the
   // EventBase thread, so it needs no synchronization.
   bool peerExited_{false};
+
+  // Whether nfsMount() overrides the filesystem type of mounts served over a
+  // Unix domain socket. Atomic only so tests can read it from another thread.
+  std::atomic<bool> nfsFstypeOverride_{true};
 
   // The privhelper server only has a single thread,
   // so we don't need to lock the following state

@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use cached_config::ModificationTime;
 use cached_config::TestSource;
-use metaconfig_parser::config::load_configs_from_raw;
 use metaconfig_types::CommonConfig;
 use mononoke_macros::mononoke;
 use repos::RawAllowlistIdentity;
@@ -24,7 +23,6 @@ use repos::RawDbLocal;
 use repos::RawMetadataConfig;
 use repos::RawRedactionConfig;
 use repos::RawRepoConfig;
-use repos::RawRepoConfigs;
 use repos::RawStorageConfig;
 use repos::TierRepoEntry;
 
@@ -528,76 +526,29 @@ fn parseable_manifest(trusted_tier: &str) -> TierManifest {
     manifest
 }
 
-/// The cutover-safety equivalence; must hold while the file-backed blob path exists.
-#[mononoke::test]
-fn test_manifest_and_blob_agree_on_common_and_storage() {
-    let common = test_raw_common_config("test_trusted_tier");
-
-    let (blob_configs, blob_storage) = load_configs_from_raw(RawRepoConfigs {
-        common: common.clone(),
-        storage: test_storage_map(),
-        ..Default::default()
-    })
-    .expect("blob parses");
-
-    let (manifest_common, manifest_storage) = parse_manifest_common_and_storage(&TierManifest {
-        common,
-        storage: test_storage_map(),
-        ..Default::default()
-    })
-    .expect("manifest parses");
-
-    assert_eq!(
-        blob_configs.common, manifest_common,
-        "common must be identical from either source"
-    );
-    assert_eq!(
-        blob_storage, manifest_storage,
-        "storage must be identical from either source"
-    );
-}
-
 // --- Manifest-mode startup semantics (manifest_path ⇒ manifest authoritative) ---
 
-/// Configerator-style tier config path; `tier_name` derives to `scs`.
-const TEST_CONFIG_PATH: &str = "configerator://scm/mononoke/repos/tiers/scs";
-/// The store-relative path the legacy blob would be read from.
-const TEST_BLOB_PATH: &str = "scm/mononoke/repos/tiers/scs";
 const TEST_MANIFEST_PATH: &str = "scm/mononoke/repos/tiers/scs_manifest";
-
-/// Legacy tier blob whose `common` carries `trusted_tier`, to tell the two sources apart.
-pub(crate) fn valid_blob_json(trusted_tier: &str) -> String {
-    serde_json::to_string(&RawRepoConfigs {
-        common: test_raw_common_config(trusted_tier),
-        storage: test_storage_map(),
-        ..Default::default()
-    })
-    .expect("RawRepoConfigs serializes")
-}
 
 /// Runtime handle for `MononokeConfigs::new` to spawn tasks onto; tests never drive them.
 fn test_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
+        // The watcher runs on this runtime and reads knobs, which are thread-local in tests.
+        .on_thread_start(mononoke::override_just_knobs)
         .enable_all()
         .build()
         .expect("test runtime builds")
 }
 
-// Blob path deliberately absent from the store, so `Ok` proves the blob was never touched.
 #[mononoke::test]
-fn test_manifest_mode_constructs_without_blob_path() {
+fn test_tier_mode_constructs_from_manifest() {
     let manifest_json = serde_json::to_string(&parseable_manifest("manifest_tier")).unwrap();
     let store = make_store(&[(TEST_MANIFEST_PATH, manifest_json.as_str())]);
     let rt = test_runtime();
 
-    let cfg = MononokeConfigs::new(
-        TEST_CONFIG_PATH,
-        &store,
-        Some(TEST_MANIFEST_PATH),
-        rt.handle().clone(),
-    )
-    .expect("manifest mode must construct without the legacy blob path registered");
+    let cfg = MononokeConfigs::new(TEST_TIER, &store, rt.handle().clone())
+        .expect("tier mode must construct from the manifest alone");
 
     assert_eq!(
         cfg.repo_configs().common.trusted_parties_hipster_tier,
@@ -618,9 +569,9 @@ fn test_manifest_mode_constructs_without_blob_path() {
     );
 }
 
-// Fail-closed startup: an unparsable manifest aborts construction despite a valid blob.
+// Fail-closed startup: an unparsable manifest aborts construction.
 #[mononoke::test]
-fn test_manifest_mode_fails_closed_on_unparsable_manifest() {
+fn test_tier_mode_fails_closed_on_unparsable_manifest() {
     // Default RawCommonConfig is unparsable (required fields fail conversion).
     let bad_manifest = TierManifest {
         storage: test_storage_map(),
@@ -631,41 +582,14 @@ fn test_manifest_mode_fails_closed_on_unparsable_manifest() {
         "fixture must be unparsable, else this test passes for the wrong reason"
     );
     let manifest_json = serde_json::to_string(&bad_manifest).unwrap();
-    let blob_json = valid_blob_json("blob_tier");
-    let store = make_store(&[
-        (TEST_MANIFEST_PATH, manifest_json.as_str()),
-        (TEST_BLOB_PATH, blob_json.as_str()),
-    ]);
+    let store = make_store(&[(TEST_MANIFEST_PATH, manifest_json.as_str())]);
     let rt = test_runtime();
 
-    let result = MononokeConfigs::new(
-        TEST_CONFIG_PATH,
-        &store,
-        Some(TEST_MANIFEST_PATH),
-        rt.handle().clone(),
-    );
+    let result = MononokeConfigs::new(TEST_TIER, &store, rt.handle().clone());
 
     assert!(
         result.is_err(),
-        "manifest mode must fail closed on an unparsable manifest instead of \
-         falling back to the blob",
-    );
-}
-
-// manifest_path=None is the only path that reads the legacy blob.
-#[mononoke::test]
-fn test_no_manifest_serves_legacy_blob() {
-    let blob_json = valid_blob_json("blob_tier");
-    let store = make_store(&[(TEST_BLOB_PATH, blob_json.as_str())]);
-    let rt = test_runtime();
-
-    let cfg = MononokeConfigs::new(TEST_CONFIG_PATH, &store, None, rt.handle().clone())
-        .expect("blob-backed path must construct");
-
-    assert_eq!(
-        cfg.repo_configs().common.trusted_parties_hipster_tier,
-        Some("blob_tier".to_string()),
-        "without a manifest the blob is the only source",
+        "tier mode must fail closed on an unparsable manifest",
     );
 }
 
@@ -699,13 +623,8 @@ fn test_watcher_bootstrap_serves_manifest_repos_without_a_change() {
     ]);
     let rt = test_runtime();
 
-    let cfg = MononokeConfigs::new(
-        TEST_CONFIG_PATH,
-        &store,
-        Some(TEST_MANIFEST_PATH),
-        rt.handle().clone(),
-    )
-    .expect("manifest mode must construct");
+    let cfg = MononokeConfigs::new(TEST_TIER, &store, rt.handle().clone())
+        .expect("manifest mode must construct");
 
     // Poll: the bootstrap needs no config fire, only scheduling on the watcher task.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);

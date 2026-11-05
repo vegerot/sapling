@@ -13,7 +13,6 @@
 #include <folly/io/IOBuf.h>
 #include <folly/logging/xlog.h>
 #include <folly/testing/TestUtil.h>
-#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -45,7 +44,6 @@
 #include "eden/fs/store/TreeCache.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
-#include "eden/fs/telemetry/IScribeLogger.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
 #include "eden/fs/testharness/FakeClock.h"
 #include "eden/fs/testharness/FakeFuse.h"
@@ -63,11 +61,6 @@ using std::make_shared;
 using std::make_unique;
 using std::shared_ptr;
 using std::string;
-
-DEFINE_int32(
-    num_eden_test_threads,
-    2,
-    "the number of eden CPU worker threads to create during unit tests");
 
 namespace facebook::eden {
 
@@ -105,8 +98,8 @@ TestMount::TestMount(
   edenConfig_->enableActivityBuffer.setValue(
       enableActivityBuffer, ConfigSourceType::Default, true);
 
-  // By default, we should not allocate an NFS server (including mountd and
-  // rpcbindd) on an EventBase in unit tests.
+  // By default, we should not allocate an NFS server (including mountd) on
+  // an EventBase in unit tests.
   edenConfig_->enableNfsServer.setValue(false, ConfigSourceType::Default, true);
 
   if (configureEdenConfig_) {
@@ -139,7 +132,6 @@ TestMount::TestMount(
       make_shared<NullStructuredLogger>(),
       make_shared<NullStructuredLogger>(),
       errorLogger_ ? errorLogger_ : make_shared<ErrorLogger>(),
-      make_shared<NullScribeLogger>(),
       reloadableConfig,
       *edenConfig_,
       nullptr,
@@ -246,19 +238,18 @@ void TestMount::initialize(
     const RootId& initialCommitId,
     FakeTreeBuilder& rootBuilder,
     bool startReady,
-    InodeCatalogType inodeCatalogType,
-    InodeCatalogOptions inodeCatalogOptions) {
+    InodeCatalogType inodeCatalogType) {
   createMountWithoutInitializing(
-      initialCommitId,
-      rootBuilder,
-      startReady,
-      inodeCatalogType,
-      inodeCatalogOptions);
+      initialCommitId, rootBuilder, startReady, inodeCatalogType);
   initializeEdenMount();
 }
 
 void TestMount::initializeEdenMount() {
-  edenMount_->initialize()
+  edenMount_
+      ->initialize(
+          [](auto) {},
+          /*takeover=*/std::nullopt, /*takeoverMountProtocol=*/
+          mountProtocol_)
       .semi()
       .via(serverExecutor_.get())
       .getVia(serverExecutor_.get());
@@ -269,8 +260,7 @@ void TestMount::createMountWithoutInitializing(
     const RootId& initialCommitId,
     FakeTreeBuilder& rootBuilder,
     bool startReady,
-    InodeCatalogType inodeCatalogType,
-    InodeCatalogOptions inodeCatalogOptions) {
+    InodeCatalogType inodeCatalogType) {
   // Finalize rootBuilder and get the root Tree
   rootBuilder.finalize(backingStore_, startReady);
   auto rootTree = rootBuilder.getRoot();
@@ -282,12 +272,19 @@ void TestMount::createMountWithoutInitializing(
   setInitialCommit(initialCommitId, rootTree->get().getObjectId());
 
   // Create edenMount_
-  createMount(inodeCatalogType, inodeCatalogOptions);
+  createMount(inodeCatalogType);
 }
 
-void TestMount::createMount(
-    InodeCatalogType inodeCatalogType,
-    InodeCatalogOptions inodeCatalogOptions) {
+FakeWalkDetector& TestMount::getWalkDetector() const {
+  auto* detector =
+      dynamic_cast<FakeWalkDetector*>(edenMount_->getWalkDetector());
+  XCHECK(detector) << "FakeBackingStore mounts always have a walk detector";
+  return *detector;
+}
+
+void TestMount::createMount(InodeCatalogType inodeCatalogType) {
+  auto walkDetector =
+      backingStore_->createWalkDetector(config_->getMountPath());
   shared_ptr<ObjectStore> objectStore = ObjectStore::create(
       backingStore_,
       treeCache_,
@@ -295,8 +292,11 @@ void TestMount::createMount(
       std::make_shared<ProcessInfoCache>(),
       serverState_->getEdenFsEventsLogger(),
       serverState_->getReloadableConfig(),
-      config_->getCaseSensitive());
-  auto journal = std::make_unique<Journal>(stats_.copy());
+      config_->getCaseSensitive(),
+      folly::getKeepAliveToken(serverState_->getThreadPool().get()),
+      walkDetector);
+  auto journal = std::make_unique<Journal>(
+      stats_.copy(), &serverState_->getFaultInjector());
   edenMount_ = EdenMount::create(
       std::move(config_),
       std::move(objectStore),
@@ -305,7 +305,7 @@ void TestMount::createMount(
       std::move(journal),
       stats_.copy(),
       inodeCatalogType,
-      inodeCatalogOptions);
+      std::move(walkDetector));
 #ifndef _WIN32
   dispatcher_ = EdenDispatcherFactory::makeFuseDispatcher(edenMount_.get());
 #endif
@@ -324,18 +324,6 @@ RootId TestMount::nextCommitId() {
 
 void TestMount::initialize(FakeTreeBuilder& rootBuilder, bool startReady) {
   initialize(nextCommitId(), rootBuilder, startReady);
-}
-
-void TestMount::initialize(
-    FakeTreeBuilder& rootBuilder,
-    InodeCatalogType inodeCatalogType,
-    InodeCatalogOptions inodeCatalogOptions) {
-  initialize(
-      nextCommitId(),
-      rootBuilder,
-      /* startReady */ true,
-      inodeCatalogType,
-      inodeCatalogOptions);
 }
 
 void TestMount::createMountWithoutInitializing(
@@ -399,6 +387,7 @@ void TestMount::remount(bool simulateUncleanShutdown) {
   auto config = make_unique<CheckoutConfig>(*edenMount_->getCheckoutConfig());
   auto overlayPath = config->getOverlayPath();
   // Create a new ObjectStore pointing to our local store and backing store
+  auto walkDetector = backingStore_->createWalkDetector(config->getMountPath());
   auto objectStore = ObjectStore::create(
       backingStore_,
       treeCache_,
@@ -406,9 +395,12 @@ void TestMount::remount(bool simulateUncleanShutdown) {
       std::make_shared<ProcessInfoCache>(),
       serverState_->getEdenFsEventsLogger(),
       std::make_shared<ReloadableConfig>(edenConfig_),
-      config->getCaseSensitive());
+      config->getCaseSensitive(),
+      folly::getKeepAliveToken(serverState_->getThreadPool().get()),
+      walkDetector);
 
-  auto journal = std::make_unique<Journal>(stats_.copy());
+  auto journal = std::make_unique<Journal>(
+      stats_.copy(), &serverState_->getFaultInjector());
 
   // Reset the edenMount_ pointer.  This will destroy the old EdenMount
   // assuming that no-one else still has any references to it.
@@ -457,8 +449,8 @@ void TestMount::remount(bool simulateUncleanShutdown) {
       serverState_,
       std::move(journal),
       stats_.copy(),
-      kDefaultInodeCatalogType,
-      kDefaultInodeCatalogOptions);
+      kInodeCatalogTypeDefault,
+      std::move(walkDetector));
   initializeEdenMount();
 }
 
@@ -467,6 +459,7 @@ void TestMount::remountGracefully() {
   // Create a new copy of the CheckoutConfig
   auto config = make_unique<CheckoutConfig>(*edenMount_->getCheckoutConfig());
   // Create a new ObjectStore pointing to our local store and backing store
+  auto walkDetector = backingStore_->createWalkDetector(config->getMountPath());
   auto objectStore = ObjectStore::create(
       backingStore_,
       treeCache_,
@@ -474,9 +467,12 @@ void TestMount::remountGracefully() {
       std::make_shared<ProcessInfoCache>(),
       serverState_->getEdenFsEventsLogger(),
       std::make_shared<ReloadableConfig>(edenConfig_),
-      config->getCaseSensitive());
+      config->getCaseSensitive(),
+      folly::getKeepAliveToken(serverState_->getThreadPool().get()),
+      walkDetector);
 
-  auto journal = std::make_unique<Journal>(stats_.copy());
+  auto journal = std::make_unique<Journal>(
+      stats_.copy(), &serverState_->getFaultInjector());
 
   rootInode_.reset();
 
@@ -508,8 +504,8 @@ void TestMount::remountGracefully() {
       serverState_,
       std::move(journal),
       stats_.copy(),
-      kDefaultInodeCatalogType,
-      kDefaultInodeCatalogOptions);
+      kInodeCatalogTypeDefault,
+      std::move(walkDetector));
   edenMount_
       ->initialize(
           [](auto) {},

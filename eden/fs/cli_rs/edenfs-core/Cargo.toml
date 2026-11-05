@@ -9,7 +9,7 @@ license = "GPLv2+"
 
 [dependencies]
 anyhow = "1.0.104"
-async-recursion = "1.1.1"
+async-recursion = "1.2.0"
 async-trait = "0.1.92"
 byteorder = "1.5"
 dirs = "7.0"
@@ -18,23 +18,23 @@ edenfs-config = { version = "0.1.0", path = "../edenfs-config" }
 edenfs-error = { version = "0.1.0", path = "../edenfs-error" }
 edenfs-utils = { version = "0.1.0", path = "../edenfs-utils" }
 fbthrift_socket = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-hg_util = { package = "sapling-util", version = "0.1.0", path = "../../../scm/lib/util" }
+hg_util = { package = "sapling-util", version = "0.2.0", path = "../../../scm/lib/util" }
 rayon = "1.11.0"
 regex = "1.13.1"
-sapling-atomicfile = { version = "0.1.0", path = "../../../scm/lib/atomicfile" }
+sapling-atomicfile = { version = "0.2.0", path = "../../../scm/lib/atomicfile" }
 sapling-thrift-types = { version = "0.1.0", path = "../../../scm/lib/thrift-types" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shlex = "2.0.1"
 strum = { version = "0.28.0", features = ["derive"] }
 subprocess = "0.2.15"
 sysinfo = "0.39.6"
 thiserror = "2.0.21"
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tokio-uds-compat = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-toml = { version = "1.1.6", features = ["preserve_order"] }
+toml = { version = "1.1.8", features = ["preserve_order"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
-uuid = { version = "1.26.1", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
+uuid = { version = "1.28.0", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
 
 [dev-dependencies]
 rand = "0.10.3"
@@ -47,7 +47,7 @@ libc = "0.2.186"
 [target.'cfg(target_os = "macos")'.dependencies]
 eden_apfs_mount_helper = { version = "0.1.0", path = "../../../scm/exec/eden_apfs_mount_helper" }
 libc = "0.2.186"
-psutil = "5.4.0"
+psutil = { version = "5.4.0", features = ["disk"], default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 mkscratch = { version = "0.1.0", path = "../../../scm/exec/scratch" }

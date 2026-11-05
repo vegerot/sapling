@@ -4,11 +4,10 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
-
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -358,6 +357,24 @@ class CloneTest(testcase.EdenRepoTest):
         self.eden.remove(empty_dir)
         self.eden.wait_for_checkout_removed(empty_dir)
 
+    def test_clone_into_configured_mount_path(self) -> None:
+        # A path that config.json still lists (here: unmounted and then
+        # deleted from disk, as a user does before re-cloning) is refused
+        # before anything is created.
+        self.eden.unmount(Path(self.mount))
+        shutil.rmtree(self.mount)
+        result = self.eden.run_unchecked(
+            "clone",
+            self.repo.path,
+            self.mount,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(0, result.returncode)
+        stderr = result.stderr.decode()
+        self.assertIn("already configured", stderr)
+        self.assertNotIn("already exists", stderr)
+
 
 @testcase.eden_repo_test
 class CloneBlockedAtMaxClonesTest(testcase.EdenRepoTest):
@@ -479,7 +496,8 @@ class CloneFakeEdenFSTestBase(ServiceTestCaseBase):
         )
 
         stop_cmd = base_args + ["stop"]
-        self.exit_stack.callback(subprocess.call, stop_cmd)
+        # Stop before TemporaryDirectoryMixin removes the daemon's state directory.
+        self.addCleanup(subprocess.check_call, stop_cmd, env=env)
 
         # Pass through any output from the clone command
         sys.stdout.write(proc.stdout)

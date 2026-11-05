@@ -200,6 +200,9 @@ where
                         expanded_base_mfs.into_iter().unzip();
 
                     let (replacement_here, replacement_children) = replacements.expand();
+                    let has_descendant_replacements = replacement_here
+                        .as_ref()
+                        .is_some_and(|tree| !tree.subentries.is_empty());
                     if let Some(replacement) = replacement_here.and_then(|tree| tree.value) {
                         parent_values = vec![Some(replacement)];
                     }
@@ -212,10 +215,18 @@ where
                             .iter()
                             .position(|parent_value| parent_value.as_ref() == Some(&value))
                         {
-                            out.push(Ok(ManifestComparison::Same(
-                                Span::Element(prefix.to_element()?, value),
-                                index,
-                            )));
+                            if has_descendant_replacements {
+                                out.push(Ok(ManifestComparison::Changed(
+                                    prefix.to_element()?,
+                                    value,
+                                    parent_values,
+                                )));
+                            } else {
+                                out.push(Ok(ManifestComparison::Same(
+                                    Span::Element(prefix.to_element()?, value),
+                                    index,
+                                )));
+                            }
                         } else if parent_values.is_empty()
                             || parent_values.iter().all(Option::is_none)
                         {
@@ -364,13 +375,14 @@ pub(crate) fn classify_child<T, Leaf>(
 /// This is the shared node-level core behind both the unordered
 /// [`crate::ManifestOps::filtered_diff`] and the ordered
 /// [`diff_weighted_children`], which drive it with the unweighted and weighted
-/// views of the same directory. `old_trie` and `new_trie` may come from different
+/// views of the same directory. [`crate::bonsai_diff_sharded`] runs it once per
+/// parent. `old_trie` and `new_trie` may come from different
 /// blobstores, and either may be absent (an added or removed subtree).
 /// `replacements` are applied to the old side as the comparison descends.
 ///
 /// The returned children are in unspecified order; callers that need them sorted
 /// (e.g. the ordered path) must sort by element.
-async fn diff_trie_children<T, V, Store>(
+pub(crate) async fn diff_trie_children<T, V, Store>(
     ctx: &CoreContext,
     new_store: &Store,
     new_trie: Option<T>,

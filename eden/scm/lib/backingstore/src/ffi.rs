@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -34,7 +35,9 @@ use types::fetch_mode::FetchMode;
 
 use crate::backingstore::BackingStore;
 use crate::backingstore::HgCacheStats;
+use crate::facebook;
 use crate::ffi_errors::into_backingstore_err;
+use crate::walk::WalkDetector;
 
 #[cxx::bridge(namespace = sapling)]
 pub(crate) mod ffi {
@@ -42,16 +45,18 @@ pub(crate) mod ffi {
     #[namespace = "facebook::eden"]
     #[repr(u8)]
     pub enum FetchCause {
-        // Lowest Priority - Unknown orginination
+        // Lowest Priority - unknown origination
         Unknown = 0,
+        // Inode garbage collection loading the trees it scans
+        InodeGc = 1,
         // The request originated from a Thrift prefetch endpoint
-        Prefetch = 1,
+        Prefetch = 2,
         // The request originated from a Thrift glob endpoint
-        Glob = 2,
+        Glob = 3,
         // The request originated from a Thrift endpoint
-        Thrift = 3,
+        Thrift = 4,
         // Highest Priority - The request originated from FUSE/NFS/PrjFS
-        Fs = 4,
+        Fs = 5,
     }
 
     #[namespace = "facebook::eden"]
@@ -97,7 +102,6 @@ pub(crate) mod ffi {
     pub struct Request<'a> {
         oid: &'a [u8],
         cause: FetchCause,
-        pid: u32,
         // TODO: mode: FetchMode
         // TODO: cri: ClientRequestInfo
     }
@@ -166,7 +170,7 @@ pub(crate) mod ffi {
         type EdenFsEventsLogger;
 
         #[namespace = "folly"]
-        type IOBuf = iobuf::IOBuf;
+        type IOBuf = crate::facebook::IOBuf;
 
         type GetTreeBatchResolver;
         type GetTreeAuxBatchResolver;
@@ -225,7 +229,7 @@ pub(crate) mod ffi {
             ttype: TreeEntryType,
             is_restricted: bool,
             has_acl: bool,
-        );
+        ) -> Result<()>;
 
         fn add_entry_with_aux_data(
             self: Pin<&mut TreeBuilder>,
@@ -237,17 +241,13 @@ pub(crate) mod ffi {
             blake3: &[u8; 32],
             is_restricted: bool,
             has_acl: bool,
-        );
+        ) -> Result<()>;
 
         fn mark_missing(self: Pin<&mut TreeBuilder>);
 
-        fn reserve(self: Pin<&mut TreeBuilder>, capacity: usize);
+        fn reserve(self: Pin<&mut TreeBuilder>, capacity: usize) -> Result<()>;
 
-        fn set_aux_data(self: Pin<&mut TreeBuilder>, digest: &[u8; 32], size: u64);
-
-        fn num_files(&self) -> usize;
-
-        fn num_dirs(&self) -> usize;
+        fn set_aux_data(self: Pin<&mut TreeBuilder>, digest: &[u8; 32], size: u64) -> Result<()>;
     }
 
     pub struct GetTreeResult {
@@ -336,8 +336,6 @@ pub(crate) mod ffi {
 
         pub fn sapling_backingstore_new(
             repository: &str,
-            mount: &str,
-            eden_client_dir: &str,
             walk_mode: &str,
             eden_fs_events_logger: SharedPtr<EdenFsEventsLogger>,
         ) -> Result<Box<BackingStore>>;
@@ -423,15 +421,31 @@ pub(crate) mod ffi {
             paths: Vec<String>,
         ) -> GetPathAclInfosResult;
 
-        pub fn sapling_backingstore_witness_file_read(
+        pub fn sapling_dogfooding_host(store: &BackingStore) -> Result<bool>;
+
+        /// Walk detection for one mount of the store. The witness functions take the store the
+        /// detector was created from so it follows the store's current configuration.
+        type WalkDetector;
+
+        pub fn sapling_backingstore_walk_detector(
             store: &BackingStore,
-            path: &str,
+            mount: &str,
+        ) -> Box<WalkDetector>;
+
+        pub fn sapling_walk_detector_witness_file_read(
+            store: &BackingStore,
+            detector: &WalkDetector,
+            path: &[u8],
             local: bool,
             pid: u32,
+            dir_size_known: bool,
+            dir_num_files: usize,
+            dir_num_dirs: usize,
         );
 
-        pub fn sapling_backingstore_witness_dir_read(
+        pub fn sapling_walk_detector_witness_dir_read(
             store: &BackingStore,
+            detector: &WalkDetector,
             path: &[u8],
             num_files: usize,
             num_dirs: usize,
@@ -439,9 +453,19 @@ pub(crate) mod ffi {
             pid: u32,
         );
 
-        pub fn sapling_dogfooding_host(store: &BackingStore) -> Result<bool>;
+        pub fn sapling_walk_detector_witness_dir_size(
+            store: &BackingStore,
+            detector: &WalkDetector,
+            path: &[u8],
+            num_files: usize,
+            num_dirs: usize,
+        );
 
-        pub fn sapling_backingstore_set_parent_hint(store: &BackingStore, parent_id: &str);
+        pub fn sapling_walk_detector_set_parent_hint(
+            store: &BackingStore,
+            detector: &WalkDetector,
+            parent_id: &str,
+        );
 
         pub fn sapling_backingstore_get_cache_stats(store: &BackingStore) -> GetCacheStatsResult;
 
@@ -497,6 +521,7 @@ impl From<ffi::FetchMode> for FetchMode {
 impl From<ffi::FetchCause> for FetchCause {
     fn from(fetch_cause: ffi::FetchCause) -> Self {
         match fetch_cause {
+            ffi::FetchCause::InodeGc => FetchCause::EdenInodeGc,
             ffi::FetchCause::Unknown => FetchCause::EdenUnknown,
             ffi::FetchCause::Prefetch => FetchCause::EdenPrefetch,
             ffi::FetchCause::Glob => FetchCause::EdenGlob,
@@ -514,14 +539,15 @@ fn select_cause(fetch_causes_iter: impl Iterator<Item = ffi::FetchCause>) -> (Fe
     let mut most_popular_cause = None;
     let mut len = 0;
     let mut max_count = 0;
-    let mut cause_counts = [0; 5];
+    let mut cause_counts = [0; 6];
     for cause in fetch_causes_iter {
         let cause_index = match cause {
             ffi::FetchCause::Unknown => 0,
-            ffi::FetchCause::Prefetch => 1,
-            ffi::FetchCause::Glob => 2,
-            ffi::FetchCause::Thrift => 3,
-            ffi::FetchCause::Fs => 4,
+            ffi::FetchCause::InodeGc => 1,
+            ffi::FetchCause::Prefetch => 2,
+            ffi::FetchCause::Glob => 3,
+            ffi::FetchCause::Thrift => 4,
+            ffi::FetchCause::Fs => 5,
             _ => 0, // should never happen
         };
         len += 1;
@@ -575,8 +601,6 @@ macro_rules! resolve_result {
 
 pub fn sapling_backingstore_new(
     repository: &str,
-    mount: &str,
-    eden_client_dir: &str,
     walk_mode: &str,
     eden_fs_events_logger: SharedPtr<ffi::EdenFsEventsLogger>,
 ) -> Result<Box<BackingStore>> {
@@ -596,13 +620,85 @@ pub fn sapling_backingstore_new(
         extra_sapling_configs.push(format!("backingstore.walk-mode={v}"));
     }
 
-    let store = BackingStore::new_with_config_and_client_dir(
-        repository,
-        mount,
-        eden_client_dir,
-        &extra_sapling_configs,
-    )?;
+    let store = BackingStore::new_with_config(repository, &extra_sapling_configs)?;
     Ok(Box::new(store))
+}
+
+pub fn sapling_backingstore_walk_detector(store: &BackingStore, mount: &str) -> Box<WalkDetector> {
+    Box::new(store.walk_detector(Path::new(mount)))
+}
+
+/// The path of a walk report. Paths from sapling object ids were copied from a Sapling `RepoPath`
+/// and inode paths passed EdenFS's component checks, so only UTF-8 is left to verify: a checkout
+/// without `require-utf8-path` can hold a local directory name that is not, and such a report is
+/// dropped.
+fn walk_path(path: &[u8]) -> Option<&RepoPath> {
+    match std::str::from_utf8(path) {
+        // SAFETY: the components were validated by Sapling or EdenFS, as described above.
+        Ok(path) => Some(unsafe { RepoPath::from_str_unchecked(path) }),
+        Err(err) => {
+            tracing::debug!(?err, "ignoring walk report for a non-UTF-8 path");
+            None
+        }
+    }
+}
+
+pub fn sapling_walk_detector_witness_file_read(
+    store: &BackingStore,
+    detector: &WalkDetector,
+    path: &[u8],
+    local: bool,
+    pid: u32,
+    dir_size_known: bool,
+    dir_num_files: usize,
+    dir_num_dirs: usize,
+) {
+    let Some(path) = walk_path(path) else {
+        return;
+    };
+    detector.witness_file_read(
+        store,
+        path,
+        local,
+        pid,
+        dir_size_known.then_some((dir_num_files, dir_num_dirs)),
+    );
+}
+
+pub fn sapling_walk_detector_witness_dir_read(
+    store: &BackingStore,
+    detector: &WalkDetector,
+    path: &[u8],
+    num_files: usize,
+    num_dirs: usize,
+    local: bool,
+    pid: u32,
+) {
+    let Some(path) = walk_path(path) else {
+        return;
+    };
+    detector.witness_dir_read(store, path, local, num_files, num_dirs, pid);
+}
+
+pub fn sapling_walk_detector_witness_dir_size(
+    store: &BackingStore,
+    detector: &WalkDetector,
+    path: &[u8],
+    num_files: usize,
+    num_dirs: usize,
+) {
+    let Some(path) = walk_path(path) else {
+        return;
+    };
+    detector.witness_dir_size(store, path, num_files, num_dirs);
+}
+
+pub fn sapling_walk_detector_set_parent_hint(
+    store: &BackingStore,
+    detector: &WalkDetector,
+    parent_id: &str,
+) {
+    detector.set_parent_hint(store, parent_id);
 }
 
 pub fn sapling_backingstore_set_scribe_logging_enabled(enabled: bool) {
@@ -699,7 +795,7 @@ fn add_tree_to_builder(
 
     // Pre-allocate the per-entry storage.
     if let Some(hint) = tree.size_hint() {
-        builder.as_mut().reserve(hint);
+        builder.as_mut().reserve(hint)?;
     }
 
     for entry in tree.iter()? {
@@ -731,7 +827,7 @@ fn add_tree_to_builder(
                 aux.blake3.as_byte_array(),
                 is_restricted,
                 has_acl,
-            );
+            )?;
         } else {
             builder.as_mut().add_entry(
                 name.as_str(),
@@ -739,7 +835,7 @@ fn add_tree_to_builder(
                 ttype,
                 is_restricted,
                 has_acl,
-            );
+            )?;
         }
     }
 
@@ -747,7 +843,7 @@ fn add_tree_to_builder(
         builder.as_mut().set_aux_data(
             aux.augmented_manifest_id.as_byte_array(),
             aux.augmented_manifest_size,
-        );
+        )?;
     }
 
     Ok(())
@@ -790,34 +886,11 @@ pub fn sapling_backingstore_get_tree_batch(
 
             let resolver = resolver.clone();
 
-            if should_trigger_walk_detection(req.cause) && error.is_null() {
-                let path = path_from_oid(req.oid);
-                if !path.is_empty() {
-                    sapling_backingstore_witness_dir_read(
-                        store,
-                        path,
-                        builder.num_files(),
-                        builder.num_dirs(),
-                        fetch_mode.is_local(),
-                        req.pid,
-                    );
-                }
-            }
-
             unsafe {
                 ffi::sapling_backingstore_get_tree_batch_handler(resolver, idx, error, builder)
             };
         },
     );
-}
-
-fn path_from_oid(oid: &[u8]) -> &[u8] {
-    // TODO: don't assume knowledge about the sl ObjectId format.
-    if oid.len() <= 21 { &[] } else { &oid[21..] }
-}
-
-fn should_trigger_walk_detection(cause: ffi::FetchCause) -> bool {
-    !matches!(cause, ffi::FetchCause::Prefetch | ffi::FetchCause::Glob)
 }
 
 pub fn sapling_backingstore_get_tree_aux(
@@ -870,7 +943,7 @@ pub fn sapling_backingstore_get_blob(
         FetchContext::new_with_mode_and_cause(FetchMode::from(fetch_mode), FetchCause::EdenUnknown),
         node,
     );
-    let (data, error) = resolve_result!(res, transform_some: |blob: blob::Blob| blob.into_iobuf().into(), replace_none: UniquePtr::null());
+    let (data, error) = resolve_result!(res, transform_some: facebook::blob_into_iobuf, replace_none: UniquePtr::null());
     ffi::GetBlobResult { data, error }
 }
 
@@ -909,7 +982,7 @@ pub fn sapling_backingstore_get_blob_batch(
                         )
                     }
                 }
-                Some(blob) => (UniquePtr::null(), blob.into_iobuf().into()),
+                Some(blob) => (UniquePtr::null(), facebook::blob_into_iobuf(blob)),
             },
             Err(error) => (into_backingstore_err(error), UniquePtr::null()),
         };
@@ -970,10 +1043,6 @@ pub fn sapling_backingstore_get_file_aux_batch(
 
 pub fn sapling_dogfooding_host(store: &BackingStore) -> Result<bool> {
     store.dogfooding_host().map_err(Into::into)
-}
-
-pub fn sapling_backingstore_set_parent_hint(store: &BackingStore, parent_id: &str) {
-    store.set_parent_hint(parent_id);
 }
 
 /// Flatten a `CacheUsage` into (state, used, limit) for the FFI struct.
@@ -1140,36 +1209,6 @@ pub fn sapling_backingstore_check_path_permissions(
     }
 }
 
-pub fn sapling_backingstore_witness_file_read(
-    store: &BackingStore,
-    path: &str,
-    local: bool,
-    pid: u32,
-) {
-    // `path` comes from eden's RelativePath type, which validates for utf-8 and illegal chars.
-    // This is performance sensitive code, so skip the checks.
-    store.witness_file_read(unsafe { RepoPath::from_str_unchecked(path) }, local, pid);
-}
-
-pub fn sapling_backingstore_witness_dir_read(
-    store: &BackingStore,
-    path: &[u8],
-    num_files: usize,
-    num_dirs: usize,
-    local: bool,
-    pid: u32,
-) {
-    store.witness_dir_read(
-        // `path` comes from eden's RelativePath type, which validates for utf-8 and illegal chars.
-        // This is performance sensitive code, so skip the checks.
-        unsafe { RepoPath::from_str_unchecked(str::from_utf8_unchecked(path)) },
-        local,
-        num_files,
-        num_dirs,
-        pid,
-    );
-}
-
 pub fn sapling_flush_counters() {
     metrics::Registry::global().sync();
 }
@@ -1334,6 +1373,7 @@ mod tests {
     #[test]
     fn test_select_cause() {
         let causes = [
+            ffi::FetchCause::InodeGc,
             ffi::FetchCause::Unknown,
             ffi::FetchCause::Prefetch,
             ffi::FetchCause::Glob,
@@ -1368,14 +1408,5 @@ mod tests {
         // All the same cause - return `true`.
         let selected = select_cause(std::iter::repeat_n(ffi::FetchCause::Prefetch, 5));
         assert_eq!(selected, (FetchCause::EdenPrefetch, true));
-    }
-
-    #[test]
-    fn test_walk_detection_fetch_causes() {
-        assert!(!should_trigger_walk_detection(ffi::FetchCause::Prefetch));
-        assert!(!should_trigger_walk_detection(ffi::FetchCause::Glob));
-        assert!(should_trigger_walk_detection(ffi::FetchCause::Unknown));
-        assert!(should_trigger_walk_detection(ffi::FetchCause::Thrift));
-        assert!(should_trigger_walk_detection(ffi::FetchCause::Fs));
     }
 }

@@ -30,10 +30,13 @@ repo_identity = { version = "0.1.0", path = "../../../repo_attributes/repo_ident
 sapling-clientinfo = { version = "0.1.0", path = "../../../../scm/lib/clientinfo" }
 sharding_ext = { version = "0.1.0", path = "../../../cmdlib/sharding_ext" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
 fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 mononoke_macros = { version = "0.1.0", path = "../../../common/mononoke_macros" }
 tests_utils = { version = "0.1.0", path = "../../../tests/utils" }
+
+[lints]
+workspace = true

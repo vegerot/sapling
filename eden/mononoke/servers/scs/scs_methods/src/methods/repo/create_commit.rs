@@ -6,10 +6,8 @@
  */
 
 use std::collections::BTreeMap;
-use std::collections::HashSet;
 
 use bytes::Bytes;
-use chrono::Utc;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use derived_data_manager::DerivableType;
@@ -17,8 +15,6 @@ use futures::stream;
 use futures::stream::FuturesOrdered;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
-use mercurial_mutation::HgMutationEntry;
-use mercurial_mutation::HgMutationStoreRef;
 use metaconfig_types::CommitIdentityScheme;
 use mononoke_api::ChangesetContext;
 use mononoke_api::ChangesetId;
@@ -34,6 +30,8 @@ use mononoke_api::FileId;
 use mononoke_api::FileType;
 use mononoke_api::Repo;
 use mononoke_api::RepoContext;
+use mononoke_api_hg::CommitMutation;
+use mononoke_api_hg::RepoContextHgExt;
 use mononoke_types::DateTime as MononokeDateTime;
 use mononoke_types::hash::GitSha1;
 use mononoke_types::hash::Sha1;
@@ -46,6 +44,33 @@ use crate::commit_id::map_commit_identities;
 use crate::commit_id::map_commit_identity;
 use crate::from_request::FromRequest;
 use crate::source_control_impl::SourceControlServiceImpl;
+
+/// A mutation to record for a commit that is about to be created.
+struct PendingMutation {
+    predecessors: Vec<ChangesetId>,
+    op: String,
+    user: String,
+}
+
+impl PendingMutation {
+    fn for_commit(self, successor: ChangesetId) -> CommitMutation {
+        CommitMutation {
+            successor,
+            predecessors: self.predecessors,
+            op: self.op,
+            user: self.user,
+        }
+    }
+}
+
+/// The user a mutation is recorded under when the request names none: the
+/// service identity, else the caller's user name, else "scs".
+fn default_mutation_user(ctx: &CoreContext, service_identity: Option<&str>) -> String {
+    service_identity
+        .or_else(|| ctx.metadata().unix_name())
+        .unwrap_or("scs")
+        .to_string()
+}
 
 impl SourceControlServiceImpl {
     /// Convert thrift parent CommitIds to ChangesetContexts.
@@ -78,6 +103,59 @@ impl SourceControlServiceImpl {
         }
 
         Ok(parents)
+    }
+
+    /// Check a mutation in a commit-creation request and resolve its
+    /// predecessors.
+    async fn convert_create_commit_mutation_info(
+        repo: &RepoContext<Repo>,
+        info: &thrift::RepoCreateCommitParamsMutationInfo,
+        service_identity: Option<&str>,
+    ) -> Result<PendingMutation, scs_errors::ServiceError> {
+        if repo.config().default_commit_identity_scheme != CommitIdentityScheme::HG {
+            return Err(scs_errors::invalid_request(
+                "mutation info is only supported in Mercurial repos",
+            )
+            .into());
+        }
+        if info.predecessors.is_empty() {
+            return Err(scs_errors::invalid_request(
+                "mutation info must name at least one predecessor",
+            )
+            .into());
+        }
+        if info.op.is_empty() {
+            return Err(scs_errors::invalid_request("mutation info must name an operation").into());
+        }
+        let user = match info.user.as_deref() {
+            Some("") => {
+                return Err(scs_errors::invalid_request("mutation user must not be empty").into());
+            }
+            Some(user) => user.to_string(),
+            None => default_mutation_user(repo.ctx(), service_identity),
+        };
+
+        let predecessors = info
+            .predecessors
+            .iter()
+            .map(|predecessor| async move {
+                let changeset_specifier = ChangesetSpecifier::from_request(predecessor)
+                    .context("invalid commit id for predecessor")?;
+                let changeset = repo
+                    .changeset(changeset_specifier)
+                    .await?
+                    .ok_or_else(|| scs_errors::commit_not_found(predecessor.to_string()))?;
+                Ok::<_, scs_errors::ServiceError>(changeset.id())
+            })
+            .collect::<FuturesOrdered<_>>()
+            .try_collect()
+            .await?;
+
+        Ok(PendingMutation {
+            predecessors,
+            op: info.op.clone(),
+            user,
+        })
     }
 
     async fn convert_create_commit_file_content(
@@ -267,6 +345,17 @@ impl SourceControlServiceImpl {
 
         let parent_ctxs = Self::convert_create_commit_parents(&repo, &params.parents).await?;
         let parent_ids: Vec<ChangesetId> = parent_ctxs.iter().map(|ctx| ctx.id()).collect();
+        let mutation = match params.mutation_info.as_ref() {
+            Some(info) => Some(
+                Self::convert_create_commit_mutation_info(
+                    &repo,
+                    info,
+                    params.service_identity.as_deref(),
+                )
+                .await?,
+            ),
+            None => None,
+        };
         let mut info = CreateInfo::from_request(&params.info)?;
         let changes = Self::convert_create_commit_changes(&repo, params.changes).await?;
         let bubble = None;
@@ -285,6 +374,14 @@ impl SourceControlServiceImpl {
         let created_changeset = repo
             .create_changeset(parent_ids, info, changes, bubble, checks)
             .await?;
+        if let Some(mutation) = mutation {
+            repo.clone()
+                .hg()
+                .record_hg_mutations(vec![
+                    mutation.for_commit(created_changeset.changeset_ctx.id()),
+                ])
+                .await?;
+        }
 
         // If you ask for a git identity back, then we'll assume that you supplied one to us
         // and set it. Later, when we can derive a git commit hash, this'll become more
@@ -345,6 +442,24 @@ impl SourceControlServiceImpl {
             }
         }
 
+        let service_identity = params.service_identity.as_deref();
+        let mutations: Vec<Option<PendingMutation>> = params
+            .commits
+            .iter()
+            .map(|commit| async move {
+                match commit.mutation_info.as_ref() {
+                    Some(info) => {
+                        Self::convert_create_commit_mutation_info(repo, info, service_identity)
+                            .await
+                            .map(Some)
+                    }
+                    None => Ok(None),
+                }
+            })
+            .collect::<FuturesOrdered<_>>()
+            .try_collect()
+            .await?;
+
         let changes_stack =
             stream::iter(
                 params.commits.into_iter().map({
@@ -361,6 +476,19 @@ impl SourceControlServiceImpl {
         let stack = repo
             .create_changeset_stack(stack_parent_ids, info_stack, changes_stack, bubble, checks)
             .await?;
+        let stack_mutations: Vec<CommitMutation> = stack
+            .iter()
+            .zip(mutations)
+            .filter_map(|(created_changeset, mutation)| {
+                Some(mutation?.for_commit(created_changeset.changeset_ctx.id()))
+            })
+            .collect();
+        if !stack_mutations.is_empty() {
+            repo.clone()
+                .hg()
+                .record_hg_mutations(stack_mutations)
+                .await?;
+        }
         // If you ask for a git identity back, then we'll assume that you supplied one to us
         // and set it. Later, when we can derive a git commit hash, this'll become more
         // open, because we'll only do the check if you ask for a hash different to the
@@ -415,6 +543,13 @@ impl SourceControlServiceImpl {
             .repo_for_service(ctx.clone(), &repo, params.service_identity.clone())
             .await?;
 
+        if params.keep_folded_commits && params.mutation_info.is_some() {
+            return Err(scs_errors::invalid_request(
+                "keep_folded_commits cannot be combined with mutation_info",
+            )
+            .into());
+        }
+
         let checks = CreateChangesetChecks::from_request(&params.checks)?;
         repo.enforce_create_commit_check_bypass(&checks).await?;
 
@@ -460,65 +595,29 @@ impl SourceControlServiceImpl {
             .collect()
             .await;
 
-        // Store mutation info for Mercurial repositories
-        if repo.config().default_commit_identity_scheme == CommitIdentityScheme::HG {
-            // Derive HgChangesetId for successor
-            let successor_hg_id =
-                folded_changeset
-                    .changeset_ctx
-                    .hg_id()
-                    .await?
-                    .ok_or_else(|| {
-                        scs_errors::internal_error(
-                            "failed to derive mercurial id for folded commit",
-                        )
-                    })?;
-
-            // Derive HgChangesetIds for all predecessors
-            let predecessor_hg_ids = repo
-                .many_changeset_hg_ids(predecessor_ids.clone())
-                .await?
-                .into_iter()
-                .map(|(_, hg_id)| hg_id)
-                .collect::<Vec<_>>();
-
-            // Get operation and user from mutation_info or use defaults
+        if !params.keep_folded_commits
+            && repo.config().default_commit_identity_scheme == CommitIdentityScheme::HG
+        {
             let (op, user) = match &params.mutation_info {
                 Some(info) => (info.op.clone(), info.user.clone()),
                 None => (
-                    // Default op: "amend" for single predecessor, "fold" for multiple
                     if predecessor_ids.len() == 1 {
                         "amend".to_string()
                     } else {
                         "fold".to_string()
                     },
-                    // Use service identity or a default
-                    params
-                        .service_identity
-                        .clone()
-                        .unwrap_or_else(|| "scs".to_string()),
+                    default_mutation_user(repo.ctx(), params.service_identity.as_deref()),
                 ),
             };
-
-            // Create mutation entry
-            let mutation_entry = HgMutationEntry::new(
-                successor_hg_id,
-                predecessor_hg_ids,
-                vec![], // No split commits for fold
-                op,
-                user,
-                Utc::now().timestamp(),
-                0,      // UTC timezone offset
-                vec![], // No extra info
-            );
-
-            // Store in mutation store
-            let hg_changeset_ids = HashSet::from([successor_hg_id]);
-            repo.repo()
-                .hg_mutation_store()
-                .add_entries(repo.ctx(), hg_changeset_ids, vec![mutation_entry])
-                .await
-                .map_err(scs_errors::internal_error)?;
+            repo.clone()
+                .hg()
+                .record_hg_mutations(vec![CommitMutation {
+                    successor: folded_changeset.changeset_ctx.id(),
+                    predecessors: predecessor_ids.clone(),
+                    op,
+                    user,
+                }])
+                .await?;
         }
 
         if params

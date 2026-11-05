@@ -416,9 +416,15 @@ macro_rules! impl_into_thrift_error {
 
 impl_into_thrift_error!(service::ListReposExn);
 impl_into_thrift_error!(service::RepoExistsExn);
+impl_into_thrift_error!(service::StorageConfigExistsExn);
+impl_into_thrift_error!(service::CreateOrgStorageConfigExn);
+impl_into_thrift_error!(service::DeleteOrgStorageConfigExn);
+impl_into_thrift_error!(service::OrgStorageConfigPollExn);
+impl_into_thrift_error!(service::OrgStorageConfigExn);
 impl_into_thrift_error!(service::RepoInfoExn);
 impl_into_thrift_error!(service::GitRepoStateExn);
 impl_into_thrift_error!(service::RepoResolveBookmarkExn);
+impl_into_thrift_error!(restricted_paths service::RepoResolveP4FileRevisionExn);
 impl_into_thrift_error!(service::RepoResolveCommitPrefixExn);
 impl_into_thrift_error!(service::RepoListBookmarksExn);
 impl_into_thrift_error!(service::RepoCreateCommitExn);
@@ -612,7 +618,6 @@ pub fn not_available(reason: String) -> thrift::RequestError {
     }
 }
 
-#[allow(unused)]
 pub fn not_implemented(reason: String) -> thrift::RequestError {
     thrift::RequestError {
         kind: thrift::RequestErrorKind::NOT_IMPLEMENTED,

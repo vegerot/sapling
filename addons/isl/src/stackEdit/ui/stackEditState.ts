@@ -42,7 +42,7 @@ type StackStateWithOperationProps = {
   splitRange: SplitRangeRecord;
 };
 
-type Intention = 'general' | 'split' | 'absorb';
+export type Intention = 'general' | 'split' | 'absorb';
 
 /** Description of a stack edit operation. Used for display purpose. */
 export type StackEditOpDescription =
@@ -203,7 +203,7 @@ type StackEditState = {
   history: Loading<History>;
 };
 
-/** Lightweight recoil Loadable alternative that is not coupled with Promise. */
+/** Like Jotai's `loadable`, but not coupled with Promise. */
 export type Loading<T> =
   | {
       state: 'loading';
@@ -426,8 +426,6 @@ export const loadingStackState = atom<Loading<null>>(get => {
 
 const hasValueState: Loading<null> = {state: 'hasValue', value: null};
 
-export const shouldAutoSplitState = atom<boolean>(false);
-
 /** APIs exposed via useStackEditState() */
 class UseStackEditState {
   state: StackEditState;
@@ -569,8 +567,6 @@ export type {UseStackEditState};
  * `loadingStackState.state` is `hasValue`. This is the main state for
  * reading and updating the `CommitStackState`.
  */
-// This is not a recoil selector for flexibility.
-// See https://github.com/facebookexperimental/Recoil/issues/673
 export function useStackEditState() {
   const [state, setState] = useAtom(stackEditState);
   return new UseStackEditState(state, setState);

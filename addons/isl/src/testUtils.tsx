@@ -46,10 +46,16 @@ export function expectMessageSentToServer(message: Partial<ClientToServerMessage
   expect(filterMessages(message.type)).toContainEqual(message);
 }
 
+export function getMessagesOfTypeSentToServer<K extends string>(
+  wantedType: K,
+): Array<ClientToServerMessage & {type: K}> {
+  return filterMessages(wantedType) as Array<ClientToServerMessage & {type: K}>;
+}
+
 export function getLastMessageOfTypeSentToServer<K extends string>(
   wantedType: K,
 ): (ClientToServerMessage & {type: K}) | undefined {
-  const values = filterMessages(wantedType) as Array<ClientToServerMessage & {type: K}>;
+  const values = getMessagesOfTypeSentToServer(wantedType);
   return values[values.length - 1];
 }
 
@@ -76,13 +82,14 @@ export function simulateWorktreeInfo(
     label?: string;
     node?: string;
   }>,
+  supportsMutation = true,
 ) {
   act(() => {
     simulateMessageFromServer({
       type: 'subscriptionResult',
       kind: 'worktreeInfo',
       subscriptionID: mostRecentSubscriptionIds.worktreeInfo,
-      data: {sharedRoot, worktrees: worktrees as WorktreeEntry[]},
+      data: {sharedRoot, worktrees: worktrees as WorktreeEntry[], supportsMutation},
     });
   });
 }

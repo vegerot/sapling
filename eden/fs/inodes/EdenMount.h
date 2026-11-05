@@ -34,7 +34,6 @@
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/config/CheckoutConfig.h"
 #include "eden/fs/config/EdenConfig.h"
-#include "eden/fs/config/InodeCatalogOptions.h"
 #include "eden/fs/config/InodeCatalogType.h"
 #include "eden/fs/inodes/CacheHint.h"
 #include "eden/fs/inodes/FsChannel.h"
@@ -52,6 +51,7 @@
 #include "eden/fs/store/BlobAccess.h"
 #include "eden/fs/store/ScmStatusCache.h"
 #include "eden/fs/store/ScmStatusDiffCallback.h"
+#include "eden/fs/store/WalkDetector.h"
 #include "eden/fs/takeover/TakeoverData.h"
 #include "eden/fs/telemetry/ActivityBuffer.h"
 #include "eden/fs/telemetry/IActivityRecorder.h"
@@ -97,7 +97,6 @@ class OverlayFileAccess;
 class PrjfsChannel;
 class ServerState;
 class Tree;
-class TreePrefetchLease;
 class UnboundedQueueExecutor;
 template <typename T>
 class ImmediateFuture;
@@ -162,7 +161,7 @@ struct InodeTraceEvent : TraceEventBase {
   InodeType inodeType;
   InodeEventType eventType;
   InodeEventProgress progress;
-  std::chrono::microseconds duration;
+  std::chrono::microseconds duration{};
   // Always null-terminated, and saves space in the trace event structure.
   std::shared_ptr<char[]> path;
 
@@ -372,12 +371,14 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       std::unique_ptr<Journal> journal,
       EdenStatsPtr stats,
       std::optional<InodeCatalogType> inodeCatalogType = std::nullopt,
-      std::optional<InodeCatalogOptions> inodeCatalogOptions = std::nullopt);
+      std::shared_ptr<WalkDetector> walkDetector = nullptr);
 
   /**
    * Asynchronous EdenMount initialization - post instantiation.
    *
    * If takeover data is specified, it is used to initialize the inode map.
+   *
+   * On any error, the mount moves to INIT_ERROR and the returned future fails.
    */
   [[nodiscard]] ImmediateFuture<folly::Unit> initialize(
       OverlayChecker::ProgressCallback&& progressCallback = [](auto) {},
@@ -589,6 +590,14 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    */
   const std::shared_ptr<ObjectStore>& getObjectStore() const {
     return objectStore_;
+  }
+
+  /**
+   * The walk detector that watches this mount's reads, or nullptr when the
+   * backing store does not detect walks.
+   */
+  WalkDetector* getWalkDetector() const {
+    return walkDetector_.get();
   }
 
   /**
@@ -908,7 +917,8 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   /**
    * Chown the repository to the given uid and gid
    */
-  ImmediateFuture<folly::Unit> chown(uid_t uid, gid_t gid);
+  ImmediateFuture<folly::Unit>
+  chown(uid_t uid, gid_t gid, const ObjectFetchContextPtr& context);
 
   [[nodiscard]] folly::coro::now_task<std::unique_ptr<ScmStatus>> co_diff(
       TreeInodePtr rootInode,
@@ -1040,6 +1050,27 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   [[nodiscard]] folly::Future<TakeoverData::MountInfo>
   getFsChannelCompletionFuture();
 
+  struct FsChannelStop {
+    FsStopReason reason;
+    // When the channel was asked to stop, before its outstanding requests
+    // finished.
+    std::chrono::steady_clock::time_point time;
+  };
+
+  /**
+   * Whether unmount() was called on this mount.
+   */
+  bool isUnmountStarted() const {
+    return mountingUnmountingState_.rlock()->fsChannelUnmountStarted();
+  }
+
+  /**
+   * Why and when the FsChannel stopped, or unset if it has not stopped.
+   */
+  std::optional<FsChannelStop> getFsChannelStop() const {
+    return *fsChannelStop_.rlock();
+  }
+
   Owner getOwner() const {
     return *owner_.rlock();
   }
@@ -1116,20 +1147,6 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       RelativePathPiece fromRoot,
       const ObjectFetchContextPtr& context);
 
-  /**
-   * Request to start a new tree prefetch.
-   *
-   * Returns a new TreePrefetchLease if you can start a new prefetch, or
-   * std::nullopt if there are too many prefetches already in progress and a new
-   * one should not be started.  If a TreePrefetchLease object is returned the
-   * caller should hold onto it until the prefetch is complete.  When the
-   * TreePrefetchLease is destroyed this will inform the EdenMount that the
-   * prefetch has finished.
-   */
-  [[nodiscard]] std::optional<TreePrefetchLease> tryStartTreePrefetch(
-      TreeInodePtr treeInode,
-      const ObjectFetchContext& context);
-
   /** Holds GC admission for either a background GC or checkout. */
   class InodeGCLease {
    public:
@@ -1171,7 +1188,26 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * This returns a std::nullopt if a background GC is still running or
    * checkout currently holds the GC lease.
    */
-  std::optional<InodeGCLease> tryStartInodeGC();
+  std::optional<InodeGCLease> tryStartInodeGC(bool pressureBased = false);
+
+  struct RunningInodeGC {
+    std::chrono::steady_clock::duration age;
+    bool pressureBased;
+  };
+
+  /** The running background inode GC, if any. */
+  std::optional<RunningInodeGC> getRunningInodeGC() const;
+
+  /**
+   * The kernel device of this mount, as last seen by the mount health check,
+   * or 0 if not seen yet.
+   */
+  uint64_t getHealthCheckDevice() const {
+    return healthCheckDevice_.load(std::memory_order_relaxed);
+  }
+  void setHealthCheckDevice(uint64_t device) {
+    healthCheckDevice_.store(device, std::memory_order_relaxed);
+  }
 
   /**
    * Count a tree-load failure in the active GC run, cancelling it and backing
@@ -1296,12 +1332,6 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   InodeCatalogType getInodeCatalogType(
       std::optional<InodeCatalogType> inodeCatalogType);
 
-  /**
-   * Returns InodeCatalogOptions options based on settings.
-   */
-  InodeCatalogOptions getInodeCatalogOptions(
-      std::optional<InodeCatalogOptions> inodeCatalogOptions);
-
   EdenMount(
       std::unique_ptr<CheckoutConfig> checkoutConfig,
       std::shared_ptr<ObjectStore> objectStore,
@@ -1309,12 +1339,22 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       std::shared_ptr<ServerState> serverState,
       std::unique_ptr<Journal> journal,
       EdenStatsPtr stats,
-      std::optional<InodeCatalogType> inodeCatalogType = std::nullopt,
-      std::optional<InodeCatalogOptions> inodeCatalogOptions = std::nullopt);
+      std::optional<InodeCatalogType> inodeCatalogType,
+      std::shared_ptr<WalkDetector> walkDetector);
+
+  /**
+   * Tell the walk detector, if this mount has one, which commit the working
+   * copy is at.
+   */
+  void setWalkDetectorParent(const RootId& parent);
 
   // Forbidden copy constructor and assignment operator
   EdenMount(EdenMount const&) = delete;
   EdenMount& operator=(EdenMount const&) = delete;
+
+  ImmediateFuture<folly::Unit> initializeImpl(
+      OverlayChecker::ProgressCallback&& progressCallback,
+      const std::optional<SerializedInodeMap>& takeover);
 
   TreeInodePtr createRootInode(std::shared_ptr<const Tree> tree);
 
@@ -1331,7 +1371,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    */
   std::unique_ptr<DiffContext> createDiffContext(
       DiffCallback* callback,
-      folly::CancellationToken cancellation,
+      const folly::CancellationToken& cancellation,
       const ObjectFetchContextPtr& fetchContext,
       bool listIgnored = false) const;
 
@@ -1377,8 +1417,6 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    */
   ~EdenMount();
 
-  friend class TreePrefetchLease;
-  void treePrefetchFinished() noexcept;
   void releaseInodeGCLease(bool representsRunningGc) noexcept;
 
   const std::unique_ptr<const CheckoutConfig> checkoutConfig_;
@@ -1423,6 +1461,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   InodePathCache inodePathCache_;
 
   std::shared_ptr<ObjectStore> objectStore_;
+  std::shared_ptr<WalkDetector> walkDetector_;
   std::shared_ptr<BlobCache> blobCache_;
   BlobAccess blobAccess_;
   std::shared_ptr<Overlay> overlay_;
@@ -1528,6 +1567,8 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
 
   folly::Synchronized<MountingUnmountingState> mountingUnmountingState_;
 
+  folly::Synchronized<std::optional<FsChannelStop>> fsChannelStop_;
+
   /**
    * The current state of the mount point.
    */
@@ -1539,13 +1580,10 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    */
   folly::Synchronized<Owner> owner_;
 
-  /**
-   * The number of tree prefetches in progress for this mount point.
-   */
-  std::atomic<uint64_t> numPrefetchesInProgress_{0};
-
   struct InodeGCState {
     bool gcRunning{false};
+    bool pressureBased{false};
+    std::chrono::steady_clock::time_point startTime;
     uint64_t inhibitorCount{0};
     uint64_t treeLoadFailureLimit{0};
     uint64_t remainingTreeLoadFailures{0};
@@ -1590,6 +1628,8 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * running again. See isPressureGcBackedOff().
    */
   std::atomic<bool> pressureGcBackoff_{false};
+
+  std::atomic<uint64_t> healthCheckDevice_{0};
 };
 
 /**

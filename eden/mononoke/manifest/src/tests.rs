@@ -7,27 +7,42 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::Result;
+use async_trait::async_trait;
+use blobstore::BlobstoreBytes;
+use blobstore::BlobstoreGetData;
+use blobstore::BlobstoreIsPresent;
 use blobstore::KeyedBlobstore;
 use blobstore::Loadable;
 use blobstore::Storable;
 use borrowed::borrowed;
-use cloned::cloned;
 use context::CoreContext;
 use fbinit::FacebookInit;
+use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use maplit::btreemap;
+use maplit::hashset;
 use memblob::KeyedMemblob;
 use mononoke_macros::mononoke;
+use mononoke_types::BlobstoreValue;
+use mononoke_types::ContentManifestId;
 use mononoke_types::FileType;
 use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
+use mononoke_types::content_manifest::ContentManifest;
+use mononoke_types::content_manifest::ContentManifestEntry;
+use mononoke_types::content_manifest::ContentManifestFile;
 use mononoke_types::path::MPath;
+use mononoke_types::sharded_map_v2::ShardedMapV2Node;
 use mononoke_types_mocks::changesetid::ONES_CSID;
 use mononoke_types_mocks::changesetid::THREES_CSID;
 use mononoke_types_mocks::changesetid::TWOS_CSID;
+use mononoke_types_mocks::contentid::ONES_CTID;
+use mononoke_types_mocks::contentid::TWOS_CTID;
 use pretty_assertions::assert_eq;
 
 pub(crate) use crate::Diff;
@@ -35,19 +50,16 @@ pub(crate) use crate::Entry;
 pub(crate) use crate::Manifest;
 pub(crate) use crate::ManifestOps;
 pub(crate) use crate::ManifestOrderedOps;
-pub(crate) use crate::ManifestParentReplacement;
 pub(crate) use crate::PathOrPrefix;
-pub(crate) use crate::TreeInfo;
-pub(crate) use crate::derive_manifest_with_known_entries;
 pub(crate) use crate::find_intersection_of_diffs;
 use crate::find_intersection_of_diffs_and_parents_pruned;
-pub(crate) use crate::flatten_subentries;
 
+mod cancellation_tests;
+mod replacement_tests;
 pub mod test_manifest;
 
 use self::test_manifest::TestLeaf;
 use self::test_manifest::TestLeafId;
-use self::test_manifest::TestManifest;
 use self::test_manifest::TestManifestId;
 use self::test_manifest::derive_stack_of_test_manifests;
 use self::test_manifest::derive_test_manifest;
@@ -1433,6 +1445,244 @@ async fn test_diff_intersection_parent_entries_and_pruning(fb: FacebookInit) -> 
     Ok(())
 }
 
+#[mononoke::fbinit_test]
+async fn test_bonsai_diff_sharded_matches_bonsai_diff(fb: FacebookInit) -> Result<()> {
+    let blobstore: Arc<dyn KeyedBlobstore> = Arc::new(KeyedMemblob::default());
+    let ctx = CoreContext::test_mock(fb);
+    let base = derive_test_manifest(
+        &ctx,
+        &blobstore,
+        vec![],
+        btreemap! {
+            "dir/same" => Some("base"),
+            "dir/changed" => Some("base"),
+            "file_to_dir" => Some("base"),
+            "dir_to_file/child" => Some("base"),
+            "deleted/child" => Some("base"),
+        },
+    )
+    .await?
+    .unwrap();
+    let left = derive_test_manifest(
+        &ctx,
+        &blobstore,
+        vec![base],
+        btreemap! {
+            "dir/changed" => Some("left"),
+            "file_to_dir" => None,
+            "file_to_dir/child" => Some("left"),
+            "deleted/child" => None,
+            "added" => Some("left"),
+        },
+    )
+    .await?
+    .unwrap();
+    let right = derive_test_manifest(
+        &ctx,
+        &blobstore,
+        vec![base],
+        btreemap! {
+            "dir/changed" => Some("right"),
+            "dir_to_file/child" => None,
+            "dir_to_file" => Some("right"),
+        },
+    )
+    .await?
+    .unwrap();
+
+    for (node, parents) in [
+        (left, vec![base]),
+        (right, vec![base]),
+        (base, vec![left]),
+        (left, vec![base, right]),
+        (base, vec![left, right]),
+        (left, vec![left]),
+        (left, vec![]),
+    ] {
+        let diff = |sharded: bool| {
+            let parents = parents.iter().cloned().collect();
+            let changes = if sharded {
+                crate::bonsai_diff_sharded(ctx.clone(), blobstore.clone(), node, parents).boxed()
+            } else {
+                crate::bonsai_diff(ctx.clone(), blobstore.clone(), node, parents).boxed()
+            };
+            changes.try_collect::<std::collections::HashSet<_>>()
+        };
+        assert_eq!(
+            diff(true).await?,
+            diff(false).await?,
+            "the sharded diff of {node:?} against {parents:?} matches the full diff"
+        );
+    }
+    Ok(())
+}
+
+/// Records the key of every `get`, so a test can see which shards a diff loads.
+#[derive(Debug, Default)]
+struct RecordingBlobstore {
+    inner: KeyedMemblob,
+    gets: Mutex<Vec<String>>,
+}
+
+impl RecordingBlobstore {
+    /// The content manifest shards read since the last call.
+    fn take_shard_reads(&self) -> HashSet<String> {
+        self.gets
+            .lock()
+            .expect("lock poisoned")
+            .drain(..)
+            .filter(|key| key.starts_with("contentmf.map2node."))
+            .collect()
+    }
+}
+
+impl std::fmt::Display for RecordingBlobstore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RecordingBlobstore")
+    }
+}
+
+#[async_trait]
+impl KeyedBlobstore for RecordingBlobstore {
+    async fn get<'a>(
+        &'a self,
+        ctx: &'a CoreContext,
+        key: &'a str,
+    ) -> Result<Option<BlobstoreGetData>> {
+        self.gets
+            .lock()
+            .expect("lock poisoned")
+            .push(key.to_string());
+        self.inner.get(ctx, key).await
+    }
+
+    async fn put<'a>(
+        &'a self,
+        ctx: &'a CoreContext,
+        key: String,
+        value: BlobstoreBytes,
+    ) -> Result<()> {
+        self.inner.put(ctx, key, value).await
+    }
+
+    async fn is_present<'a>(
+        &'a self,
+        ctx: &'a CoreContext,
+        key: &'a str,
+    ) -> Result<BlobstoreIsPresent> {
+        self.inner.is_present(ctx, key).await
+    }
+
+    async fn copy<'a>(
+        &'a self,
+        ctx: &'a CoreContext,
+        old_key: &'a str,
+        new_key: String,
+    ) -> Result<()> {
+        self.inner.copy(ctx, old_key, new_key).await
+    }
+
+    async fn unlink<'a>(&'a self, ctx: &'a CoreContext, key: &'a str) -> Result<()> {
+        self.inner.unlink(ctx, key).await
+    }
+}
+
+#[mononoke::fbinit_test]
+async fn test_bonsai_diff_sharded_skips_shards_shared_by_a_merge_and_both_parents(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let blobstore = Arc::new(RecordingBlobstore::default());
+    // Every file has a distinct size, so no two shards have the same content and
+    // a shard id stands for one position in the directory.
+    let file = |i: u64, content_id| ContentManifestFile {
+        content_id,
+        file_type: FileType::Regular,
+        size: i,
+    };
+    // A root directory of 5,000 files, stored as many shards.
+    let store_manifest = async |changed: &[u64]| {
+        let entries = (0..5_000).map(|i| {
+            let content_id = if changed.contains(&i) {
+                TWOS_CTID
+            } else {
+                ONES_CTID
+            };
+            (
+                format!("f{i:04}"),
+                ContentManifestEntry::File(file(i, content_id)),
+            )
+        });
+        let subentries = ShardedMapV2Node::from_entries(&ctx, &blobstore, entries).await?;
+        ContentManifest { subentries }
+            .into_blob()
+            .store(&ctx, &blobstore)
+            .await
+    };
+    // Each parent changes a file in a different shard, and the merge keeps both changes.
+    let left = store_manifest(&[1_999]).await?;
+    let right = store_manifest(&[4_999]).await?;
+    let merge = store_manifest(&[1_999, 4_999]).await?;
+
+    let list_shards = async |id: ContentManifestId| {
+        blobstore.take_shard_reads();
+        id.load(&ctx, &blobstore)
+            .await?
+            .into_subentries(&ctx, &blobstore)
+            .try_collect::<Vec<_>>()
+            .await?;
+        anyhow::Ok(blobstore.take_shard_reads())
+    };
+    let merge_shards = list_shards(merge).await?;
+    let left_shards = list_shards(left).await?;
+    let right_shards = list_shards(right).await?;
+    let all_shards: HashSet<String> = merge_shards
+        .iter()
+        .chain(&left_shards)
+        .chain(&right_shards)
+        .cloned()
+        .collect();
+    let shared_shards: HashSet<String> = merge_shards
+        .iter()
+        .filter(|key| left_shards.contains(*key) && right_shards.contains(*key))
+        .cloned()
+        .collect();
+    assert!(
+        !shared_shards.is_empty(),
+        "the merge and both parents should share shards"
+    );
+
+    let parents = hashset! {left, right};
+    blobstore.take_shard_reads();
+    let full: HashSet<_> =
+        crate::bonsai_diff(ctx.clone(), blobstore.clone(), merge, parents.clone())
+            .try_collect()
+            .await?;
+    let full_reads = blobstore.take_shard_reads();
+    let sharded: HashSet<_> =
+        crate::bonsai_diff_sharded(ctx.clone(), blobstore.clone(), merge, parents)
+            .try_collect()
+            .await?;
+    let sharded_reads = blobstore.take_shard_reads();
+
+    let expected = hashset! {
+        crate::BonsaiDiffFileChange::ChangedReusedId(NonRootMPath::new("f1999")?, file(1_999, TWOS_CTID)),
+        crate::BonsaiDiffFileChange::ChangedReusedId(NonRootMPath::new("f4999")?, file(4_999, TWOS_CTID)),
+    };
+    assert_eq!(full, expected);
+    assert_eq!(sharded, expected);
+    assert_eq!(
+        full_reads, all_shards,
+        "bonsai_diff reads every shard of the merge and both parents"
+    );
+    assert_eq!(
+        sharded_reads,
+        all_shards.difference(&shared_shards).cloned().collect(),
+        "bonsai_diff_sharded reads every shard that differs from either parent, and none the merge shares with both"
+    );
+    Ok(())
+}
+
 /// Look up an entry at a given single-element path in a manifest.
 async fn lookup_entry(
     ctx: &CoreContext,
@@ -1875,254 +2125,6 @@ async fn test_derive_manifest_with_prefix(fb: FacebookInit) -> Result<()> {
 
         assert_eq!(files(expected_dir_id).await?, files(dir_entry).await?);
     }
-
-    Ok(())
-}
-
-#[mononoke::fbinit_test]
-async fn test_derive_manifest_with_subtree_changes(fb: FacebookInit) -> Result<()> {
-    let blobstore: Arc<dyn KeyedBlobstore> = Arc::new(KeyedMemblob::default());
-    let ctx = CoreContext::test_mock(fb);
-    borrowed!(ctx, blobstore);
-
-    let derive = {
-        move |parents, changes| async move {
-            derive_test_manifest(ctx, blobstore, parents, changes)
-                .await
-                .map(|mf| mf.expect("expect non empty manifest"))
-        }
-    };
-
-    let files = move |manifest_id| list_test_manifest(ctx, blobstore, manifest_id);
-
-    // Create a source manifest with files at src/a and src/b.
-    let source_mf = derive(
-        vec![],
-        btreemap! {
-            "/src/a" => Some("sa"),
-            "/src/b" => Some("sb"),
-        },
-    )
-    .await?;
-
-    // Create a parent manifest with files at dest/x and other/y.
-    let parent_mf = derive(
-        vec![],
-        btreemap! {
-            "/dest/x" => Some("dx"),
-            "/other/y" => Some("oy"),
-        },
-    )
-    .await?;
-
-    // Extract the source's "src" subtree entry.
-    let src_entry = lookup_entry(ctx, blobstore, source_mf, "src").await?;
-
-    // Derive from parent with a subtree_change that replaces "dest" with source's "src" entry.
-    // This simulates a subtree copy: dest/ should get the contents of src/.
-    let subtree_change = ManifestParentReplacement {
-        path: MPath::new("dest")?,
-        replacements: vec![src_entry],
-    };
-
-    // Changes applied on top of the subtree replacement:
-    // - delete dest/a (exists in source, proving deletions work on replaced subtree)
-    // - add dest/z (new file, proving additions work on replaced subtree)
-    // dest/b is NOT in the changes, so it can only appear via subtree replacement.
-    let changes: BTreeMap<&str, Option<&str>> = btreemap! {
-        "/dest/a" => None,
-        "/dest/z" => Some("zz"),
-    };
-
-    let result = derive_manifest_with_known_entries(
-        ctx.clone(),
-        blobstore.clone(),
-        vec![Entry::Tree(parent_mf)],
-        {
-            let mut changes_vec = Vec::new();
-            for (path, change) in &changes {
-                let path = NonRootMPath::new(*path)?;
-                changes_vec.push((path, change.map(TestLeaf::new)));
-            }
-            changes_vec
-        },
-        vec![subtree_change],
-        HashMap::new(),
-        MPath::ROOT,
-        {
-            cloned!(ctx, blobstore);
-            move |TreeInfo { subentries, .. }| {
-                cloned!(ctx, blobstore);
-                async move {
-                    let id = TestManifest(
-                        flatten_subentries(&ctx, &(), subentries)
-                            .await?
-                            .map(|(path, (_ctx, entry))| (path, entry))
-                            .collect(),
-                    )
-                    .store(&ctx, &blobstore)
-                    .await?;
-                    Ok(((), id))
-                }
-            }
-        },
-        {
-            cloned!(ctx, blobstore);
-            move |leaf_info| {
-                cloned!(ctx, blobstore);
-                async move {
-                    match leaf_info.change {
-                        None => Err(anyhow::Error::msg("leaf only conflict")),
-                        Some(change) => {
-                            let id = change.store(&ctx, &blobstore).await?;
-                            Ok(((), (FileType::Regular, id)))
-                        }
-                    }
-                }
-            }
-        },
-    )
-    .await?
-    .and_then(|entry| entry.into_tree())
-    .expect("expect non empty manifest");
-
-    // dest/b: "sb" from subtree replacement (proves replacement worked, parent didn't have it)
-    // dest/a: deleted by file change (proves deletions apply on top of replacement)
-    // dest/z: "zz" from file change (proves additions apply on top of replacement)
-    // other/y: "oy" unchanged from parent
-    assert_eq!(
-        files(result).await?,
-        files_reference(btreemap! {
-            "dest/b" => "sb",
-            "dest/z" => "zz",
-            "other/y" => "oy",
-        })?
-    );
-
-    Ok(())
-}
-
-#[mononoke::fbinit_test]
-async fn test_derive_manifest_with_subtree_changes_and_prefix(fb: FacebookInit) -> Result<()> {
-    let blobstore: Arc<dyn KeyedBlobstore> = Arc::new(KeyedMemblob::default());
-    let ctx = CoreContext::test_mock(fb);
-    borrowed!(ctx, blobstore);
-
-    let derive = {
-        move |parents, changes| async move {
-            derive_test_manifest(ctx, blobstore, parents, changes)
-                .await
-                .map(|mf| mf.expect("expect non empty manifest"))
-        }
-    };
-
-    let files = move |manifest_id| list_test_manifest(ctx, blobstore, manifest_id);
-
-    // Create a source manifest with files at dir/a and dir/b.
-    let source_mf = derive(
-        vec![],
-        btreemap! {
-            "/dir/a" => Some("da"),
-            "/dir/b" => Some("db"),
-        },
-    )
-    .await?;
-
-    // Create a parent manifest with files at dir/x and other/y.
-    let parent_mf = derive(
-        vec![],
-        btreemap! {
-            "/dir/x" => Some("dx"),
-            "/other/y" => Some("oy"),
-        },
-    )
-    .await?;
-
-    // Extract the source's "dir" subtree entry to use as replacement.
-    let source_dir_entry = lookup_entry(ctx, blobstore, source_mf, "dir").await?;
-
-    // Extract the parent's "dir" subtree entry as the parent for prefixed derivation.
-    let parent_dir_entry = lookup_entry(ctx, blobstore, parent_mf, "dir").await?;
-
-    // Derive with prefix "dir", passing a subtree_change at path "dir".
-    // With prefix stripping, the subtree_change path "dir" should become ROOT,
-    // meaning the replacement applies to the root of the prefixed derivation.
-    let subtree_change = ManifestParentReplacement {
-        path: MPath::new("dir")?,
-        replacements: vec![source_dir_entry.clone()],
-    };
-
-    // Changes applied on top of the subtree replacement:
-    // - delete dir/b (exists in source, proving deletions work on replaced subtree)
-    // - add dir/z (new file, proving additions work on replaced subtree)
-    // dir/a is NOT in the changes, so it can only appear via subtree replacement.
-    let changes: BTreeMap<&str, Option<&str>> = btreemap! {
-        "/dir/b" => None,
-        "/dir/z" => Some("zz"),
-    };
-
-    let result = derive_manifest_with_known_entries(
-        ctx.clone(),
-        blobstore.clone(),
-        vec![parent_dir_entry],
-        {
-            let mut changes_vec = Vec::new();
-            for (path, change) in &changes {
-                let path = NonRootMPath::new(*path)?;
-                changes_vec.push((path, change.map(TestLeaf::new)));
-            }
-            changes_vec
-        },
-        vec![subtree_change],
-        HashMap::new(),
-        MPath::new("dir")?,
-        {
-            cloned!(ctx, blobstore);
-            move |TreeInfo { subentries, .. }| {
-                cloned!(ctx, blobstore);
-                async move {
-                    let id = TestManifest(
-                        flatten_subentries(&ctx, &(), subentries)
-                            .await?
-                            .map(|(path, (_ctx, entry))| (path, entry))
-                            .collect(),
-                    )
-                    .store(&ctx, &blobstore)
-                    .await?;
-                    Ok(((), id))
-                }
-            }
-        },
-        {
-            cloned!(ctx, blobstore);
-            move |leaf_info| {
-                cloned!(ctx, blobstore);
-                async move {
-                    match leaf_info.change {
-                        None => Err(anyhow::Error::msg("leaf only conflict")),
-                        Some(change) => {
-                            let id = change.store(&ctx, &blobstore).await?;
-                            Ok(((), (FileType::Regular, id)))
-                        }
-                    }
-                }
-            }
-        },
-    )
-    .await?
-    .and_then(|entry| entry.into_tree())
-    .expect("expect non empty manifest");
-
-    // dir/a: "da" from subtree replacement (proves replacement worked, parent didn't have it)
-    // dir/b: deleted by file change (proves deletions apply on top of replacement)
-    // dir/z: "zz" from file change (proves additions apply on top of replacement)
-    assert_eq!(
-        files(result).await?,
-        files_reference(btreemap! {
-            "a" => "da",
-            "z" => "zz",
-        })?
-    );
 
     Ok(())
 }

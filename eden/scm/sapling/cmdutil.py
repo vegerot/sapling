@@ -61,6 +61,7 @@ from . import (
     templater,
     util,
     vfs as vfsmod,
+    wcoverlay,
 )
 from .i18n import _, _x
 from .node import bin, hex, nullid, nullrev, short
@@ -378,7 +379,23 @@ def recordfilter(ui, originalhunks, operation=None):
     return newchunks, newopts
 
 
-def dorecord(ui, repo, commitfunc, cmdsuggest, backupall, filterfn, *pats, **opts):
+def dorecord(
+    ui,
+    repo,
+    commitfunc,
+    cmdsuggest,
+    backupall,
+    filterfn,
+    *pats,
+    inmemory=False,
+    **opts,
+):
+    """Select changes with ``filterfn`` and pass them to ``commitfunc``.
+
+    With ``inmemory``, ``commitfunc`` sees the selected content through a
+    working copy overlay and the files on disk are left untouched. Otherwise
+    the working copy is temporarily rewritten to the selected content.
+    """
     if not ui.interactive():
         if cmdsuggest:
             msg = _("running non-interactively, use %s instead") % cmdsuggest
@@ -454,6 +471,11 @@ def dorecord(ui, repo, commitfunc, cmdsuggest, backupall, filterfn, *pats, **opt
         if not newfiles:
             ui.status(_("no changes to record\n"))
             return 0
+
+        if inmemory and ui.configbool("record", "inmemory", True):
+            ui.metrics.inc("record.inmemory", 1)
+            return _commitselectedinmemory(ui, repo, commitfunc, chunks, newfiles, opts)
+        ui.metrics.inc("record.workingcopy", 1)
 
         modified = set(status.modified)
 
@@ -587,6 +609,60 @@ def dorecord(ui, repo, commitfunc, cmdsuggest, backupall, filterfn, *pats, **opt
             return recordfunc(ui, repo, message, match, opts)
 
     return commit(ui, repo, recordinwlock, pats, opts)
+
+
+def _commitselectedinmemory(ui, repo, commitfunc, chunks, newfiles, opts):
+    """Run ``commitfunc`` with the selected chunks overlaid on the working copy"""
+    fp = io.BytesIO()
+    for c in chunks:
+        c.write(fp)
+    patchdata = fp.getvalue()
+
+    if opts.get("review", False):
+        patchtext = (
+            crecordmod.diffhelptext + crecordmod.patchhelptext + patchdata.decode()
+        )
+        patchdata = ui.edit(patchtext, "", action="diff", repopath=repo.path).encode()
+
+    overlay = selectedcontents(ui, repo, patchdata, newfiles)
+    with wcoverlay.applied(repo, overlay):
+        return commitfunc(ui, repo, *[repo.wjoin(f) for f in newfiles], **opts)
+
+
+def selectedcontents(ui, repo, patchdata, paths):
+    """Apply a patch to the working copy parent in memory.
+
+    Return {path: (data, flags)} for each of ``paths`` that exists after the
+    patch. Paths removed by the patch are omitted.
+    """
+    p1 = repo["."]
+
+    def p1filectx(_repo, _memctx, path):
+        return p1[path] if path in p1 else None
+
+    mctx = context.memctx(repo, [p1], "", [], p1filectx)
+    store = patch.mempatchstore(mctx)
+    backend = patch.mempatchbackend(ui, mctx, store)
+    try:
+        ret = patch.applydiff(ui, io.BytesIO(patchdata), backend, store)
+    except error.PatchError as err:
+        raise error.Abort(str(err)) from err
+    if ret < 0:
+        # Only a hunk edited during selection can fail to apply.
+        raise error.Abort(
+            _("selected changes do not apply to %s") % ", ".join(backend.rejs),
+            hint=_(
+                "an edited hunk no longer matches the file; select it again "
+                "without editing, or keep its context lines unchanged"
+            ),
+        )
+
+    contents = {}
+    for path in paths:
+        fctx = mctx[path]
+        if fctx is not None:
+            contents[path] = (fctx.data(), fctx.flags())
+    return contents
 
 
 class dirnode:
@@ -886,6 +962,9 @@ def logmessage(repo, opts):
 
     message = opts.get("message")
     logfile = opts.get("logfile")
+    # Typed -m values are lists. Commands that fill in an existing message
+    # (amend, graft, shelve, --reuse-message) pass a str, which is not checked.
+    typed = isinstance(message, list) or bool(logfile)
 
     if message and logfile:
         raise error.Abort(_("options --message and --logfile are mutually exclusive"))
@@ -901,6 +980,8 @@ def logmessage(repo, opts):
             raise error.Abort(
                 _("can't read commit message '%s': %s") % (logfile, inst.strerror)
             )
+    if typed and message:
+        _checkescapednewlines(ui, message)
 
     message = _update_commit_message_fields(
         message,
@@ -909,6 +990,43 @@ def logmessage(repo, opts):
     )
 
     return message
+
+
+def _checkescapednewlines(ui, message):
+    r"""Abort agents and warn humans if the title has a typed "\n" before a field.
+
+    The "\n" is stored as two characters, so the whole message becomes the
+    title. Only the title is checked: a body may quote "\n" on purpose.
+    """
+    title = message.lstrip().split("\n", 1)[0]
+    fields = ui.configlist("committemplate", "commit-message-fields")
+    if "\\n" not in title or not fields:
+        return
+    if not ui.configbool("commit", "check-escaped-newlines", True):
+        return
+    match = re.search(
+        r"\\n\s*(%s):" % "|".join(re.escape(field) for field in fields),
+        title,
+        re.IGNORECASE,
+    )
+    if not match:
+        return
+    if ui.plain():
+        ui.metrics.inc("commit.escapednewline.automation_allowed", 1)
+        return
+
+    msg = _("commit message title contains a '\\n' escape sequence before '%s:'") % (
+        match.group(1)
+    )
+    hint = _(
+        "use literal newlines instead of '\\n' escape sequences, "
+        "which @Product@ does not interpret"
+    )
+    if bindings.agentdetect.is_agent():
+        ui.metrics.inc("commit.escapednewline.agent_rejected", 1)
+        raise error.Abort(msg, hint=hint)
+    ui.metrics.inc("commit.escapednewline.human_warned", 1)
+    ui.warn(_("warning: %s\n(%s)\n") % (msg, hint))
 
 
 def _update_commit_message_fields(
@@ -3172,7 +3290,10 @@ def _logrevs(repo, opts):
     elif follow:
         revs = repo.revs("reverse(:.)")
     elif opts.get("mutation"):
-        revs = repo.revs("reverse(predecessors(.))")
+        if repo.dirstate.p1() == nullid:
+            revs = smartset.baseset(repo=repo)
+        else:
+            revs = repo.revs("mutationhistory(.)")
     else:
         revs = repo.revs("all()")
         revs.reverse()
@@ -3202,7 +3323,9 @@ def getgraphlogrevs(repo, pats, opts):
             # always "reverse" in this case. So just do a reverse sort.
             revs = repo.revs(expr) & revs
             revs.sort(reverse=True)
-    if opts.get("rev"):
+    if opts.get("mutation"):
+        revs = smartset.baseset(graphmod.mutationsort(repo, revs), repo=repo)
+    elif opts.get("rev"):
         # User-specified revs might be unsorted, but don't sort before
         # _makelogrevset because it might depend on the order of revs
         if not (revs.isdescending() or revs.istopo()):
@@ -3236,6 +3359,8 @@ def getlogrevs(repo, pats, opts):
             # always "reverse" in this case. So just do a reverse sort.
             revs = repo.revs(expr) & revs
             revs.sort(reverse=True)
+    if opts.get("mutation"):
+        revs = smartset.baseset(graphmod.mutationsort(repo, revs), repo=repo)
     if limit is not None:
         revs = revs.slice(0, limit)
     return revs, expr, filematcher
@@ -3372,6 +3497,8 @@ def displaygraph(
     repogetrenamed = repogetrenamed or {}
     repofilematcher = repofilematcher or {}
     props = props or {}
+    if out is None:
+        out = ui.write
     formatnode = _graphnodeformatter(ui, displayer)
     prevfn = None
     if mutation:
@@ -3416,6 +3543,11 @@ def displaygraph(
 
     show_abbreviated_ancestors = ShowAbbreviatedAncestorsWhen.load_from_config(repo.ui)
     for graphnodeid, _type, ctx, parents in dag:
+        if _type == graphmod.MISSINGCHANGESET:
+            # "ctx" is the node of a commit that is not available locally.
+            msg = _("%s  (not available locally)\n") % hex(ctx)[:12]
+            out(renderer.nextrow(graphnodeid, parents, "?", msg))
+            continue
         curr_repo = ctx.repo()
         if curr_repo.root != prev_repo.root:
             getrenamed = repogetrenamed.get(curr_repo.root)
@@ -3450,6 +3582,9 @@ def displaygraph(
             gpnodes = gprevs
         else:
             gpnodes = curr_repo.changelog.tonodes(gprevs)
+        if mutation and gpnodes:
+            # {grandparents} can only refer to commits available locally.
+            gpnodes = curr_repo.changelog.filternodes(gpnodes, local=True)
         revcache = {"copies": copies, "gpnodes": gpnodes}
         if xreponame:
             revcache["xreponame"] = xreponame
@@ -3468,10 +3603,7 @@ def displaygraph(
             for s in displayer.hunk.pop(ctx.rev())
         )
         nextrow = renderer.nextrow(graphnodeid, parents, char, msg)
-        if out is not None:
-            out(nextrow)
-        else:
-            ui.write(nextrow)
+        out(nextrow)
         if on_output is not None:
             on_output(
                 ctx,
@@ -3531,7 +3663,8 @@ def graphlog(ui, repo, pats: Tuple[str, ...], opts: Dict[str, Any]):
 
     ui.pager("log")
     displayer = show_changeset(ui, repo, opts, buffered=True)
-    graphnodeid_to_rev = lambda graphnodeid: graphnodeid[1]
+    # The mutation graph's ids are already nodes.
+    graphnodeid_to_rev = None if mutation else lambda graphnodeid: graphnodeid[1]
     displaygraph(
         ui,
         repo,
@@ -3570,21 +3703,17 @@ def mutation_prevfn(ctx):
 
 def _logdagwalker(repo, pats, opts, repogetrenamed, repofilematcher, repoids, mutation):
     revs, expr, filematcher = getgraphlogrevs(repo, pats, opts)
-    dag = None
-    if mutation:
-        nodes = repo.changelog.tonodes(revs)
-        # Mutation dag might contain nodes unknown to the main dag. Filter them out via subdag.
-        # ".subdag" is a trade-off. If we migrate graphmod.dagwalker to not use rev numbers,
-        # then we might drop ".subdag" here. See also test-glob-mutation.t
-        dag = repo._mutationstore.getdag(nodes).subdag(nodes)
     template = opts.get("template") or ""
-    if repo.root not in repoids:
-        repoids[repo.root] = len(repoids)
-    rid = repoids[repo.root]
-    rev_to_graphnodeid = lambda rev: (rid, rev)
-    revdag = graphmod.dagwalker(
-        repo, revs, template, idfunc=rev_to_graphnodeid, dag=dag
-    )
+    if mutation:
+        revdag = graphmod.mutationdagwalker(
+            repo, revs, template, showmissing=opts.get("show_missing")
+        )
+    else:
+        if repo.root not in repoids:
+            repoids[repo.root] = len(repoids)
+        rid = repoids[repo.root]
+        rev_to_graphnodeid = lambda rev: (rid, rev)
+        revdag = graphmod.dagwalker(repo, revs, template, idfunc=rev_to_graphnodeid)
 
     getrenamed = None
     if opts.get("copies"):
@@ -3595,6 +3724,8 @@ def _logdagwalker(repo, pats, opts, repogetrenamed, repofilematcher, repoids, mu
 
     repogetrenamed[repo.root] = getrenamed
     repofilematcher[repo.root] = filematcher
+    if mutation:
+        return revdag
     return _dagfollowxrepo(
         repo, pats, opts, revdag, repogetrenamed, repofilematcher, repoids, mutation
     )
@@ -4229,7 +4360,7 @@ def _amend(ui, repo, wctx, old, extra, opts, matcher):
         # and modified in the amend to "normal" in the dirstate.
         normalfiles = set(status.modified + status.added) & filestoamend
         for f in normalfiles:
-            dirstate.normal(f)
+            wcoverlay.marknormal(repo, f)
 
         # Update the state of files which were removed in the amend
         # to "removed" in the dirstate.

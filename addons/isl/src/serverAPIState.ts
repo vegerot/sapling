@@ -25,7 +25,7 @@ import type {
 import {Set as ImSet} from 'immutable';
 import {DEFAULT_DAYS_OF_COMMITS_TO_LOAD} from 'isl-server/src/constants';
 import type {Atom} from 'jotai';
-import {atom} from 'jotai';
+import {atom, useAtomValue} from 'jotai';
 import {reuseEqualObjects} from 'shared/deepEqualExt';
 import {randomId} from 'shared/utils';
 import {
@@ -146,6 +146,16 @@ registerDisposable(
   }),
   import.meta.hot,
 );
+
+/** Whether `platform.promptAgent` is available. Hosts report this when the connection opens. */
+const supportsAgentPromptsAtom = atom(get => {
+  get(reconnectingStatus);
+  return platform.supportsAgentPrompts?.() === true;
+});
+
+export function useSupportsAgentPrompts(): boolean {
+  return useAtomValue(supportsAgentPromptsAtom);
+}
 
 export async function forceFetchCommit(revset: string): Promise<CommitInfo> {
   serverAPI.postMessage({
@@ -441,15 +451,6 @@ registerDisposable(
 );
 
 export const isFetchingAdditionalCommits = atom(false);
-registerDisposable(
-  isFetchingAdditionalCommits,
-  serverAPI.onMessageOfType('subscriptionResult', e => {
-    if (e.kind === 'smartlogCommits') {
-      writeAtom(isFetchingAdditionalCommits, false);
-    }
-  }),
-  import.meta.hot,
-);
 registerDisposable(
   isFetchingAdditionalCommits,
   serverAPI.onMessageOfType('subscriptionResult', e => {

@@ -14,6 +14,7 @@ use anyhow::anyhow;
 use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMappingRef;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
+use bonsai_p4_mapping::BonsaiP4MappingRef;
 use bonsai_svnrev_mapping::BonsaiSvnrevMappingRef;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarksRef;
@@ -26,12 +27,16 @@ use futures::stream::FuturesOrdered;
 use mercurial_types::HgChangesetId;
 use mononoke_types::ChangesetId;
 use mononoke_types::Globalrev;
+use mononoke_types::P4ChangelistId;
 use mononoke_types::Svnrev;
 use mononoke_types::hash::GitSha1;
 use strum::Display;
 
-pub trait Repo =
-    BonsaiHgMappingRef + BonsaiGitMappingRef + BonsaiGlobalrevMappingRef + BonsaiSvnrevMappingRef;
+pub trait Repo = BonsaiHgMappingRef
+    + BonsaiGitMappingRef
+    + BonsaiGlobalrevMappingRef
+    + BonsaiSvnrevMappingRef
+    + BonsaiP4MappingRef;
 
 #[derive(Copy, Clone, Eq, PartialEq, ValueEnum, Display)]
 #[strum(serialize_all = "kebab_case")]
@@ -50,6 +55,9 @@ pub enum IdentityScheme {
 
     /// Subversion revision (legacy)
     Svnrev,
+
+    /// Perforce changelist number (Perforce mirror repos)
+    P4Changelist,
 }
 
 impl IdentityScheme {
@@ -98,6 +106,19 @@ impl IdentityScheme {
                     .await?
                     .ok_or_else(|| anyhow!("svnrev-bonsai mapping not found for {svnrev}"))?
             }
+            IdentityScheme::P4Changelist => {
+                let cl = P4ChangelistId::new(
+                    commit_id
+                        .parse::<u64>()
+                        .context("Invalid p4 changelist number")?,
+                );
+                repo.bonsai_p4_mapping()
+                    .get_bonsai_from_p4_changelist_id(ctx, cl)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!("p4-bonsai mapping not found for changelist {}", cl.id())
+                    })?
+            }
         };
         Ok(cs_id)
     }
@@ -137,6 +158,11 @@ impl IdentityScheme {
                 .await?
                 .as_ref()
                 .map(ToString::to_string),
+            IdentityScheme::P4Changelist => repo
+                .bonsai_p4_mapping()
+                .get_p4_changelist_id_from_bonsai(ctx, cs_id)
+                .await?
+                .map(|cl| cl.id().to_string()),
         };
         Ok(commit_id)
     }
@@ -144,11 +170,11 @@ impl IdentityScheme {
 
 /// Parse a general commit ID from a string
 ///
-/// The string can either be of the form <scheme>=<id>, or just
+/// The string can either be of the form `<scheme>=<id>`, or just
 /// a bare id, in which case the scheme will be inferred.
 ///
-/// For inferred schemes, globalrevs should be prefixed by 'm', and svnrevs
-/// should be prefixed by 's'.
+/// For inferred schemes, globalrevs should be prefixed by 'm', svnrevs by 's'
+/// and Perforce changelists by 'p'.
 ///
 /// Hash types are inferred from their length (64 characters for
 /// 32-byte bonsai hashes, 40 characters for 20-byte Mercurial or
@@ -172,6 +198,10 @@ pub async fn parse_commit_id(
     } else if let Some(svnrev) = commit_id.strip_prefix('s') {
         IdentityScheme::Svnrev
             .parse_commit_id(ctx, repo, svnrev)
+            .await
+    } else if let Some(changelist) = commit_id.strip_prefix('p') {
+        IdentityScheme::P4Changelist
+            .parse_commit_id(ctx, repo, changelist)
             .await
     } else if commit_id.len() == 64 {
         IdentityScheme::Bonsai
@@ -240,30 +270,45 @@ pub async fn resolve_commit_ids(
         .into_iter()
         .map(|commit_id| async move {
             match commit_id {
-                CommitId::BonsaiId(bonsai) => {
-                    IdentityScheme::Bonsai
-                        .parse_commit_id(ctx, repo, std::str::from_utf8(bonsai)?)
-                        .await
-                }
+                CommitId::BonsaiId(bonsai) => ChangesetId::from_bytes(bonsai),
                 CommitId::HgId(hg) => {
-                    IdentityScheme::Hg
-                        .parse_commit_id(ctx, repo, std::str::from_utf8(hg)?)
-                        .await
+                    let hg_cs_id = HgChangesetId::from_bytes(hg)?;
+                    repo.bonsai_hg_mapping()
+                        .get_bonsai_from_hg(ctx, hg_cs_id)
+                        .await?
+                        .ok_or_else(|| anyhow!("hg-bonsai mapping not found for {hg_cs_id}"))
                 }
                 CommitId::GitSha1(hash) => {
-                    IdentityScheme::Git
-                        .parse_commit_id(ctx, repo, std::str::from_utf8(hash)?)
-                        .await
+                    let git_id = GitSha1::from_bytes(hash)?;
+                    repo.bonsai_git_mapping()
+                        .get_bonsai_from_git_sha1(ctx, git_id)
+                        .await?
+                        .ok_or_else(|| anyhow!("git-bonsai mapping not found for {git_id}"))
                 }
                 CommitId::Globalrev(rev) => {
-                    IdentityScheme::Globalrev
-                        .parse_commit_id(ctx, repo, &rev.to_string())
-                        .await
+                    let globalrev = Globalrev::new(*rev);
+                    repo.bonsai_globalrev_mapping()
+                        .get_bonsai_from_globalrev(ctx, globalrev)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!("globalrev-bonsai mapping not found for {globalrev}")
+                        })
                 }
                 CommitId::Svnrev(rev) => {
-                    IdentityScheme::Svnrev
-                        .parse_commit_id(ctx, repo, &rev.to_string())
-                        .await
+                    let svnrev = Svnrev::new(*rev);
+                    repo.bonsai_svnrev_mapping()
+                        .get_bonsai_from_svnrev(ctx, svnrev)
+                        .await?
+                        .ok_or_else(|| anyhow!("svnrev-bonsai mapping not found for {svnrev}"))
+                }
+                CommitId::P4Changelist(cl) => {
+                    let cl = P4ChangelistId::new(*cl);
+                    repo.bonsai_p4_mapping()
+                        .get_bonsai_from_p4_changelist_id(ctx, cl)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!("p4-bonsai mapping not found for changelist {}", cl.id())
+                        })
                 }
                 CommitId::Bookmark(bookmark) => repo
                     .bookmarks()
@@ -304,5 +349,177 @@ pub async fn resolve_optional_commit_id(
         Ok(Some(resolve_commit_id(ctx, repo, commit_id).await?))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bonsai_git_mapping::BonsaiGitMapping;
+    use bonsai_git_mapping::BonsaiGitMappingEntry;
+    use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
+    use bonsai_globalrev_mapping::BonsaiGlobalrevMappingEntry;
+    use bonsai_hg_mapping::BonsaiHgMapping;
+    use bonsai_hg_mapping::BonsaiHgMappingEntry;
+    use bonsai_p4_mapping::BonsaiP4Mapping;
+    use bonsai_p4_mapping::BonsaiP4MappingEntry;
+    use bonsai_svnrev_mapping::BonsaiSvnrevMapping;
+    use bonsai_svnrev_mapping::BonsaiSvnrevMappingEntry;
+    use bookmarks::Bookmarks;
+    use fbinit::FacebookInit;
+    use mononoke_macros::mononoke;
+
+    use super::*;
+
+    #[facet::container]
+    struct TestRepo {
+        #[facet]
+        bonsai_hg_mapping: dyn BonsaiHgMapping,
+
+        #[facet]
+        bonsai_git_mapping: dyn BonsaiGitMapping,
+
+        #[facet]
+        bonsai_globalrev_mapping: dyn BonsaiGlobalrevMapping,
+
+        #[facet]
+        bonsai_svnrev_mapping: dyn BonsaiSvnrevMapping,
+
+        #[facet]
+        bonsai_p4_mapping: dyn BonsaiP4Mapping,
+
+        #[facet]
+        bookmarks: dyn Bookmarks,
+    }
+
+    /// `--bonsai-id`, `--hg-commit-id` and `--git` parse to `CommitId::BonsaiId`, `HgId` and
+    /// `GitSha1` holding the raw id bytes. A bonsai id needs no lookup (the changeset id *is* those
+    /// bytes); hg and git ids resolve through their mappings, and an unmapped id reports the
+    /// missing mapping, as `parse_commit_id` does for the textual forms.
+    #[mononoke::fbinit_test]
+    async fn resolve_typed_commit_ids_from_their_bytes(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+        let bcs_id = ChangesetId::from_bytes([0x5a; 32])?;
+        let hg_cs_id = HgChangesetId::from_bytes(&[0x3c; 20])?;
+        let git_sha1 = GitSha1::from_bytes([0x7e; 20])?;
+        repo.bonsai_hg_mapping()
+            .add(&ctx, BonsaiHgMappingEntry { hg_cs_id, bcs_id })
+            .await?;
+        repo.bonsai_git_mapping()
+            .add(&ctx, BonsaiGitMappingEntry { git_sha1, bcs_id })
+            .await?;
+
+        assert_eq!(
+            resolve_commit_id(&ctx, &repo, &CommitId::BonsaiId([0x5a; 32])).await?,
+            bcs_id
+        );
+        assert_eq!(
+            resolve_commit_id(&ctx, &repo, &CommitId::HgId([0x3c; 20])).await?,
+            bcs_id
+        );
+        assert_eq!(
+            resolve_commit_id(&ctx, &repo, &CommitId::GitSha1([0x7e; 20])).await?,
+            bcs_id
+        );
+
+        let unmapped = HgChangesetId::from_bytes(&[0x11; 20])?;
+        let err = resolve_commit_id(&ctx, &repo, &CommitId::HgId([0x11; 20]))
+            .await
+            .expect_err("unmapped hg id");
+        assert_eq!(
+            err.to_string(),
+            format!("hg-bonsai mapping not found for {unmapped}")
+        );
+
+        Ok(())
+    }
+
+    /// `--globalrev` and `--svnrev` parse to `CommitId::Globalrev` and `Svnrev` holding the
+    /// number; both resolve through their mappings and an unmapped number reports the missing
+    /// mapping, as `parse_commit_id` does for the textual forms.
+    #[mononoke::fbinit_test]
+    async fn resolve_globalrev_and_svnrev_commit_ids(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+        let bcs_id = ChangesetId::from_bytes([0x5a; 32])?;
+        repo.bonsai_globalrev_mapping()
+            .bulk_import(
+                &ctx,
+                &[BonsaiGlobalrevMappingEntry::new(
+                    bcs_id,
+                    Globalrev::new(1000147971),
+                )],
+            )
+            .await?;
+        repo.bonsai_svnrev_mapping()
+            .bulk_import(
+                &ctx,
+                &[BonsaiSvnrevMappingEntry::new(bcs_id, Svnrev::new(42))],
+            )
+            .await?;
+
+        assert_eq!(
+            resolve_commit_id(&ctx, &repo, &CommitId::Globalrev(1000147971)).await?,
+            bcs_id
+        );
+        assert_eq!(
+            resolve_commit_id(&ctx, &repo, &CommitId::Svnrev(42)).await?,
+            bcs_id
+        );
+
+        let err = resolve_commit_id(&ctx, &repo, &CommitId::Globalrev(1000147972))
+            .await
+            .expect_err("unmapped globalrev");
+        assert_eq!(
+            err.to_string(),
+            "globalrev-bonsai mapping not found for 1000147972"
+        );
+        let err = resolve_commit_id(&ctx, &repo, &CommitId::Svnrev(43))
+            .await
+            .expect_err("unmapped svnrev");
+        assert_eq!(err.to_string(), "svnrev-bonsai mapping not found for 43");
+
+        Ok(())
+    }
+
+    /// `--p4-changelist 1515` and the bare `p1515` resolve through the p4 mapping; an unmapped
+    /// changelist reports the missing mapping like the other numeric schemes.
+    #[mononoke::fbinit_test]
+    async fn resolve_p4_changelist_commit_ids(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+        let bcs_id = ChangesetId::from_bytes([0x5b; 32])?;
+        repo.bonsai_p4_mapping()
+            .bulk_import(
+                &ctx,
+                &[BonsaiP4MappingEntry::new(bcs_id, P4ChangelistId::new(1515))],
+            )
+            .await?;
+
+        assert_eq!(
+            resolve_commit_id(&ctx, &repo, &CommitId::P4Changelist(1515)).await?,
+            bcs_id
+        );
+        assert_eq!(parse_commit_id(&ctx, &repo, "p1515").await?, bcs_id);
+        assert_eq!(
+            parse_commit_id(&ctx, &repo, "p4-changelist=1515").await?,
+            bcs_id
+        );
+        assert_eq!(
+            IdentityScheme::P4Changelist
+                .map_commit_id(&ctx, &repo, bcs_id)
+                .await?,
+            Some("1515".to_string())
+        );
+
+        let err = resolve_commit_id(&ctx, &repo, &CommitId::P4Changelist(1516))
+            .await
+            .expect_err("unmapped changelist");
+        assert_eq!(
+            err.to_string(),
+            "p4-bonsai mapping not found for changelist 1516"
+        );
+
+        Ok(())
     }
 }

@@ -131,6 +131,56 @@ Python hooks now work in Rust commands:
   repo is $TESTTMP/repo2. kwargs: {'args': ['debugtestcommand']}
   repo is $TESTTMP/repo2. kwargs: {'args': ['debugtestcommand'], 'result': 0}
 
+Python hooks in one command share one interpreter. Run `sl` as its own process,
+because the test runner's Python, like the always-on profiler, would keep the
+interpreter alive by itself:
+  $ newclientrepo hookcount
+  $ cat > count.py << 'EOF'
+  > import sys
+  > def main(io, repo, **kwargs):
+  >     sys.hook_calls = getattr(sys, "hook_calls", 0) + 1
+  >     io.write_err(b"hook call %d\n" % sys.hook_calls)
+  > EOF
+  $ setconfig profiling.always-on-enabled=false hooks.pre-debugtestcommand.first=python:count.py:main hooks.pre-debugtestcommand.second=python:count.py:main hooks.post-debugtestcommand.python=python:count.py:main
+  >>> import os, subprocess
+  >>> repo = os.path.join(os.environ["TESTTMP"], "hookcount")
+  >>> proc = subprocess.run([os.environ["HGEXECUTABLEPATH"], "debugtestcommand"], cwd=repo, capture_output=True)
+  >>> print(proc.stderr.decode(), end="")
+  hook call 1
+  hook call 2
+  hook call 3
+
+A hook that runs other hooks, here checkout hooks through `repo.goto()`, shares
+the interpreter too. (`repo.goto()` deadlocks unless the working copy is loaded
+first.)
+  $ newclientrepo nestedhooks
+  $ echo a > f
+  $ sl commit -qAm A
+  $ sl log -r . -T '{node}' > $TESTTMP/target
+  $ echo b > f
+  $ sl commit -qm B
+  $ cp $TESTTMP/hookcount/count.py .
+  $ cat > goto.py << 'EOF'
+  > import os, sys, bindings
+  > def main(io, repo, **kwargs):
+  >     sys.hook_calls = getattr(sys, "hook_calls", 0) + 1
+  >     io.write_err(b"hook call %d\n" % sys.hook_calls)
+  >     repo.workingcopy()
+  >     ctx = bindings.context.context().withconfig(repo.config)
+  >     target = bytes.fromhex(open(os.path.join(os.environ["TESTTMP"], "target")).read())
+  >     repo.goto(ctx=ctx, target=target, bookmark={"action": "none"}, mode="abort_if_conflicts", report_mode="quiet")
+  > EOF
+  $ setconfig profiling.always-on-enabled=false hooks.pre-debugtestcommand.goto=python:goto.py:main hooks.preupdate.count=python:count.py:main hooks.update.count=python:count.py:main hooks.post-debugtestcommand.first=python:count.py:main hooks.post-debugtestcommand.second=python:count.py:main
+  >>> import os, subprocess
+  >>> repo = os.path.join(os.environ["TESTTMP"], "nestedhooks")
+  >>> proc = subprocess.run([os.environ["HGEXECUTABLEPATH"], "debugtestcommand"], cwd=repo, capture_output=True)
+  >>> print(proc.stderr.decode(), end="")
+  hook call 1
+  hook call 2
+  hook call 3
+  hook call 4
+  hook call 5
+
 
 "pre" hooks abort on error:
   $ newclientrepo
@@ -155,3 +205,38 @@ Test client correlator:
   ENTRY POINT: sapling
   CORRELATOR: test-correlator
 #endif
+
+Python hooks share one interpreter even when a hook runs another command with
+`bindings.commands.run`:
+  $ newclientrepo nestedcmd
+  $ cp $TESTTMP/hookcount/count.py .
+  $ cat > cmd.py << 'EOF'
+  > import sys, bindings
+  > def main(io, repo, **kwargs):
+  >     sys.hook_calls = getattr(sys, "hook_calls", 0) + 1
+  >     io.write_err(b"hook call %d\n" % sys.hook_calls)
+  >     bindings.commands.run(["sl", "root"])
+  >     io.write_err(b"survived the nested command\n")
+  > EOF
+  $ setconfig profiling.always-on-enabled=false hooks.pre-debugtestcommand.first=python:count.py:main hooks.pre-debugtestcommand.second=python:count.py:main hooks.post-debugtestcommand.python=python:cmd.py:main
+  >>> import os, subprocess
+  >>> repo = os.path.join(os.environ["TESTTMP"], "nestedcmd")
+  >>> proc = subprocess.run([os.environ["HGEXECUTABLEPATH"], "debugtestcommand"], cwd=repo, capture_output=True)
+  >>> print(proc.stderr.decode(), end="")
+  hook call 1
+  hook call 2
+  hook call 3
+  survived the nested command
+
+A hook that runs another command with `bindings.commands.run` survives it:
+  $ newclientrepo nestedcmdcrash
+  $ cp $TESTTMP/nestedcmd/count.py $TESTTMP/nestedcmd/cmd.py .
+  $ setconfig profiling.always-on-enabled=false hooks.pre-debugtestcommand.python=python:count.py:main hooks.post-debugtestcommand.python=python:cmd.py:main
+  >>> repo = os.path.join(os.environ["TESTTMP"], "nestedcmdcrash")
+  >>> proc = subprocess.run([os.environ["HGEXECUTABLEPATH"], "debugtestcommand"], cwd=repo, capture_output=True)
+  >>> lines = [l for l in proc.stderr.decode().splitlines() if l.startswith(("hook call", "survived"))]
+  >>> print("\n".join(lines + ["exit 0" if proc.returncode == 0 else "crashed"]))
+  hook call 1
+  hook call 2
+  survived the nested command
+  exit 0

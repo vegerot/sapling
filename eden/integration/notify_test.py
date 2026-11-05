@@ -21,7 +21,6 @@ from .lib import testcase, util
 
 @testcase.eden_repo_test
 class NotifyTest(testcase.EdenRepoTest):
-    git_test_supported = False
     initial_commit: str = ""
 
     def populate_repo(self) -> None:
@@ -381,6 +380,83 @@ class NotifyTest(testcase.EdenRepoTest):
                 in changes,
                 msg=f"changes: {changes}",
             )
+
+    async def test_debug_subscribe_with_state_asserted_before_start(self) -> None:
+        # Assert the state first, then start the subscription with it deferred.
+        self.mkdir(".edenfs-notifications-state")
+        self.mkdir(".edenfs-notifications-state/hello")
+        state_process = await self.enter_state("hello")
+        await self.wait_for_state("hello")
+
+        subscription = await self.subscribe_with_states(["hello"])
+        event = await self.wait_for_next_event(subscription)
+        self.assertIsNotNone(event)
+        self.assertListEqual(event["changes"], [])
+
+        added_hello2 = {
+            "SmallChange": {
+                "Added": {
+                    "file_type": "Regular",
+                    "path": [104, 101, 108, 108, 111, 50],
+                }
+            }
+        }
+        self.write_file("hello2", "test")
+        time.sleep(1)
+
+        # Collect everything delivered while the state is still asserted.
+        changes_before_left = []
+        event = await self.wait_for_next_event(subscription, attempt=1)
+        while event is not None:
+            self.assertNotIn("event_type", event, msg=f"event: {event}")
+            changes_before_left.extend(event["changes"])
+            event = await self.wait_for_next_event(subscription, attempt=1)
+
+        # Exit the state; the stream reports it.
+        state_process.terminate()
+        event = await self.wait_for_next_event(subscription)
+        self.assertIsNotNone(event)
+        self.assertEqual(event["event_type"], "Left", msg=f"event: {event}")
+        self.assertEqual(event["state"], "hello", msg=f"event: {event}")
+
+        changes_after_left = []
+        event = await self.wait_for_next_event(subscription, attempt=1)
+        while event is not None:
+            if "changes" in event:
+                changes_after_left.extend(event["changes"])
+            event = await self.wait_for_next_event(subscription, attempt=1)
+
+        # The state was asserted before the stream started, so the change made
+        # while it was asserted is deferred until the state is left.
+        self.assertNotIn(
+            added_hello2, changes_before_left, msg=f"changes: {changes_before_left}"
+        )
+        self.assertIn(
+            added_hello2, changes_after_left, msg=f"changes: {changes_after_left}"
+        )
+
+    async def test_debug_subscribe_with_underscore_state(self) -> None:
+        # A state whose name contains an underscore is asserted under the lock
+        # name "my_state"; the journal reports that name back.
+        subscription = await self.subscribe_with_states(["my_state"])
+        event = await self.wait_for_next_event(subscription)
+        self.assertIsNotNone(event)
+        self.assertListEqual(event["changes"], [])
+
+        state_process = await self.enter_state("my_state")
+        await self.wait_for_state("my_state")
+        event = await self.wait_for_next_event(subscription)
+        self.assertIsNotNone(event)
+        self.assertEqual(event["event_type"], "Entered", msg=f"event: {event}")
+        self.assertEqual(event["state"], "my_state", msg=f"event: {event}")
+
+        # Kill the state holder; the timer check reports the state as left.
+        state_process.terminate()
+        await state_process.wait()
+        event = await self.wait_for_next_event(subscription)
+        self.assertIsNotNone(event)
+        self.assertEqual(event["event_type"], "Left", msg=f"event: {event}")
+        self.assertEqual(event["state"], "my_state", msg=f"event: {event}")
 
     async def test_debug_subscribe_with_multiple_states(self) -> None:
         subscription = await self.subscribe_with_states(["hello", "goodbye"])

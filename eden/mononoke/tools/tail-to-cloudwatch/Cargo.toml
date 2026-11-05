@@ -9,13 +9,16 @@ license = "GPLv2+"
 
 [dependencies]
 anyhow = "1.0.104"
-aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
+aws-config = { version = "1.13.0", features = ["behavior-version-latest"] }
 aws-sdk-cloudwatchlogs = "1.155.0"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 
 [dev-dependencies]
 assert_approx_eq = "1.1.0"
 mononoke_macros = { version = "0.1.0", path = "../../common/mononoke_macros" }
+
+[lints]
+workspace = true

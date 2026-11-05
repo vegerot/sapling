@@ -40,20 +40,18 @@ pub(crate) fn artillery_http_tracing_enabled() -> bool {
     )
 }
 
-pub(crate) fn has_artillery_trace_header(state: &State) -> bool {
-    HeaderMap::try_borrow_from(state)
-        .is_some_and(|headers| headers.contains_key(ARTILLERY_TRACE_IDS_HEADER))
-}
-
 #[derive(StateData)]
 pub(crate) struct ArtilleryTracingEnabled(pub(crate) bool);
 
 /// Holds the continued-trace guard for the lifetime of the request.
 #[derive(StateData)]
 struct ArtilleryTraceGuardState(
-    #[expect(
-        dead_code,
-        reason = "RAII guard — held for its Drop impl to keep the Artillery trace alive for the request lifetime"
+    #[cfg_attr(
+        fbcode_build,
+        expect(
+            dead_code,
+            reason = "RAII guard — held for its Drop impl to keep the Artillery trace alive for the request lifetime"
+        )
     )]
     ArtilleryTraceGuard,
 );

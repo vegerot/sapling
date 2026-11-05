@@ -7,7 +7,9 @@
 
 //! Unit tests for `multi_repo_land_lib`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use blobstore::Loadable;
@@ -30,6 +32,12 @@ use context::CoreContext;
 use dbbookmarks::store::SqlBookmarks;
 use fbinit::FacebookInit;
 use filestore::FilestoreConfig;
+use futures::FutureExt;
+use git_types::MappedGitCommitId;
+use git_types::fetch_non_blob_git_object;
+use justknobs::test_helpers::JustKnobsInMemory;
+use justknobs::test_helpers::KnobVal;
+use justknobs::test_helpers::with_just_knobs_async;
 use metaconfig_types::RepoConfig;
 use mononoke_macros::mononoke;
 use mononoke_repos::MononokeRepos;
@@ -37,6 +45,7 @@ use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
 use mononoke_types::hash::GitSha1;
 use multi_repo_land_lib::CasBaseline;
+use multi_repo_land_lib::GitIdDerivation;
 use multi_repo_land_lib::ManifestCommitSpec;
 use multi_repo_land_lib::RepinOptions;
 use multi_repo_land_lib::RepinOutcome;
@@ -49,12 +58,17 @@ use multi_repo_land_lib::bulk_read_git_sha1s;
 use multi_repo_land_lib::create_manifest_commit;
 use multi_repo_land_lib::log_scribe_bookmark_update;
 use multi_repo_land_lib::prepare_manifest_commit;
+use multi_repo_land_lib::prepare_manifest_commits;
+use multi_repo_land_lib::prepare_manifest_commits_timed;
 use multi_repo_land_lib::repin_manifest_branch;
 use multi_repo_land_lib::resolve_bookmarks_cross_repo;
+use multi_repo_land_lib::resolve_bookmarks_cross_repo_timed;
 use phases::Phases;
+use pushrebase_mutation_mapping::PushrebaseMutationMapping;
 use repo_blobstore::RepoBlobstore;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedData;
+use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentity;
 use repo_update_logger::BookmarkInfo;
 use repo_update_logger::BookmarkOperation;
@@ -62,6 +76,8 @@ use test_repo_factory::TestRepoFactory;
 use tests_utils::BasicTestRepo;
 use tests_utils::CreateCommitContext;
 use tests_utils::bookmark;
+
+mod predecessor_hop;
 
 #[mononoke::fbinit_test]
 async fn test_creates_commit_on_top_of_parent(fb: FacebookInit) -> Result<()> {
@@ -191,7 +207,7 @@ fn test_repo_provider_blanket_impl() {
 /// facet.
 #[facet::container]
 #[derive(Clone)]
-struct TestRepo {
+pub(crate) struct TestRepo {
     #[facet]
     repo_identity: RepoIdentity,
 
@@ -230,6 +246,9 @@ struct TestRepo {
 
     #[facet]
     phases: dyn Phases,
+
+    #[facet]
+    pushrebase_mutation_mapping: dyn PushrebaseMutationMapping,
 }
 
 /// A mixed batch exercises every outcome (unknown repo, invalid/missing
@@ -333,7 +352,19 @@ async fn test_resolve_bookmarks_cross_repo_mixed_batch(fb: FacebookInit) -> Resu
         },
     ];
 
-    let results = resolve_bookmarks_cross_repo(&ctx, &repos, &entries).await?;
+    let started = std::time::Instant::now();
+    let (results, timings) = resolve_bookmarks_cross_repo_timed(&ctx, &repos, &entries).await?;
+    let elapsed = started.elapsed();
+
+    // Six entries name two served repos; four valid pairs reach the bookmark
+    // read (the invalid name and the unknown repo never do).
+    assert_eq!(timings.entries, 6);
+    assert_eq!(timings.unique_repos, 2, "ghost is not served");
+    assert_eq!(timings.unique_pairs, 4, "the invalid name is not a pair");
+    assert!(
+        timings.lookup + timings.bookmarks + timings.mapping <= elapsed,
+        "phases are disjoint slices of the call: {timings:?} vs {elapsed:?}"
+    );
 
     // One result per input, in the same order.
     assert_eq!(results.len(), entries.len(), "one result per input entry");
@@ -348,7 +379,7 @@ async fn test_resolve_bookmarks_cross_repo_mixed_batch(fb: FacebookInit) -> Resu
     assert_eq!(results[0].outcome, ResolveOutcome::Resolved(sha_a));
     assert_eq!(
         results[1].outcome,
-        ResolveOutcome::Error("unknown repo: ghost".to_string()),
+        ResolveOutcome::UnknownRepo("unknown repo: ghost".to_string()),
     );
     assert_eq!(
         results[2].outcome,
@@ -376,6 +407,111 @@ async fn test_resolve_bookmarks_cross_repo_empty(fb: FacebookInit) -> Result<()>
     let results = resolve_bookmarks_cross_repo(&ctx, &repos, &[]).await?;
     assert!(results.is_empty(), "empty input yields empty output");
 
+    Ok(())
+}
+
+/// A provider that can load a served repo does so on the first miss; a load
+/// failure is that entry's error and leaves the rest of the batch intact.
+struct LateRepos {
+    loaded: MononokeRepos<TestRepo>,
+    pending: std::sync::Mutex<Option<(String, i32, TestRepo)>>,
+    failing: String,
+}
+
+impl RepoProvider<TestRepo> for LateRepos {
+    fn get_by_name(&self, name: &str) -> Option<Arc<TestRepo>> {
+        self.loaded.get_by_name(name)
+    }
+
+    fn get_or_load<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Option<Arc<TestRepo>>>>
+    where
+        TestRepo: 'a,
+    {
+        use futures::FutureExt;
+        async move {
+            if name == self.failing {
+                anyhow::bail!("storage is not provisioned");
+            }
+            let pending = self
+                .pending
+                .lock()
+                .unwrap()
+                .take_if(|(n, _, _)| n.as_str() == name);
+            if let Some((n, id, repo)) = pending {
+                self.loaded.add(&n, id, repo);
+            }
+            Ok(self.loaded.get_by_name(name))
+        }
+        .boxed()
+    }
+}
+
+#[mononoke::fbinit_test]
+async fn test_resolve_bookmarks_cross_repo_loads_a_served_repo_on_first_use(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let mut factory = TestRepoFactory::new(fb)?;
+    let repo_a: TestRepo = factory
+        .with_id(RepositoryId::new(0))
+        .with_name("repo_a")
+        .build()
+        .await?;
+    let late: TestRepo = factory
+        .with_id(RepositoryId::new(1))
+        .with_name("late")
+        .build()
+        .await?;
+    let head = CreateCommitContext::new_root(&ctx, &late)
+        .add_file("f", "late")
+        .commit()
+        .await?;
+    bookmark(&ctx, &late, "main")
+        .create_publishing(head)
+        .await?;
+    let sha = GitSha1::from_byte_array([0xCC; 20]);
+    late.bonsai_git_mapping()
+        .add(&ctx, BonsaiGitMappingEntry::new(sha, head))
+        .await?;
+
+    let loaded: MononokeRepos<TestRepo> = MononokeRepos::new();
+    loaded.add("repo_a", 0, repo_a);
+    let provider = LateRepos {
+        loaded,
+        pending: std::sync::Mutex::new(Some(("late".to_string(), 1, late))),
+        failing: "broken".to_string(),
+    };
+    let entries = vec![
+        ResolveEntry {
+            repo_name: "late".to_string(),
+            bookmark_name: "main".to_string(),
+        },
+        ResolveEntry {
+            repo_name: "broken".to_string(),
+            bookmark_name: "main".to_string(),
+        },
+        ResolveEntry {
+            repo_name: "ghost".to_string(),
+            bookmark_name: "main".to_string(),
+        },
+    ];
+
+    let results = resolve_bookmarks_cross_repo(&ctx, &provider, &entries).await?;
+    assert_eq!(results[0].outcome, ResolveOutcome::Resolved(sha));
+    assert_eq!(
+        results[1].outcome,
+        ResolveOutcome::LoadFailed(
+            "repo broken failed to load: storage is not provisioned".to_string()
+        ),
+    );
+    assert_eq!(
+        results[2].outcome,
+        ResolveOutcome::UnknownRepo("unknown repo: ghost".to_string()),
+    );
+    assert!(provider.get_by_name("late").is_some(), "the load stuck");
     Ok(())
 }
 
@@ -437,6 +573,279 @@ async fn test_prepare_manifest_commit_default_parent(fb: FacebookInit) -> Result
         "mapped git commit id should be a 20-byte SHA1",
     );
 
+    Ok(())
+}
+
+/// Several branches prepared at once come back in spec order, each saved and
+/// parented on its own head; a spec that cannot resolve fails the whole batch.
+#[mononoke::fbinit_test]
+async fn test_prepare_manifest_commits_keeps_spec_order(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let manifest_path = NonRootMPath::new("static/static.xml")?;
+
+    let mut heads = Vec::new();
+    let mut bms = Vec::new();
+    for name in ["c", "a", "b"] {
+        let head = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("base", name)
+            .commit()
+            .await?;
+        bms.push(bookmark(&ctx, &repo, name).create_publishing(head).await?);
+        heads.push(head);
+    }
+    let specs: Vec<ManifestCommitSpec<'_>> = bms
+        .iter()
+        .zip(&heads)
+        .map(|(bm, head)| ManifestCommitSpec {
+            bookmark: bm,
+            manifest_path: &manifest_path,
+            content: Bytes::from(format!("<manifest name=\"{bm}\"/>")),
+            service_identity: "svc",
+            message: None,
+            parent_override: None,
+            baseline: CasBaseline::GeneratedFrom(*head),
+        })
+        .collect();
+
+    let started = std::time::Instant::now();
+    let (prepared, timings) =
+        prepare_manifest_commits_timed(&ctx, &repo, specs, 2, GitIdDerivation::PerCommit).await?;
+    let elapsed = started.elapsed();
+
+    assert_eq!(timings.commits, 3);
+    assert!(
+        timings.build + timings.save + timings.derive <= elapsed,
+        "phases are disjoint slices of the call: {timings:?} vs {elapsed:?}"
+    );
+    assert!(
+        timings.derive_p50 <= timings.derive_max && timings.derive_max <= timings.derive,
+        "one derivation cannot outlast the derive phase: {timings:?}"
+    );
+    assert!(
+        timings.derive_max > Duration::ZERO,
+        "three derivations ran: {timings:?}"
+    );
+
+    assert_eq!(prepared.len(), 3);
+    for (i, (result, head)) in prepared.iter().zip(&heads).enumerate() {
+        assert_eq!(result.old_cs, *head, "result {i} keeps its spec's baseline");
+        let bcs = result.new_cs.load(&ctx, repo.repo_blobstore()).await?;
+        assert_eq!(
+            bcs.parents().collect::<Vec<_>>(),
+            vec![*head],
+            "result {i} is parented on its own head"
+        );
+        assert_eq!(result.mapped_git.oid().as_ref().len(), 20);
+    }
+
+    let missing = BookmarkKey::new("missing")?;
+    let err = prepare_manifest_commits(
+        &ctx,
+        &repo,
+        vec![
+            ManifestCommitSpec {
+                bookmark: &bms[0],
+                manifest_path: &manifest_path,
+                content: Bytes::from("<manifest/>"),
+                service_identity: "svc",
+                message: None,
+                parent_override: None,
+                baseline: CasBaseline::GeneratedFrom(heads[0]),
+            },
+            ManifestCommitSpec {
+                bookmark: &missing,
+                manifest_path: &manifest_path,
+                content: Bytes::from("<manifest/>"),
+                service_identity: "svc",
+                message: None,
+                parent_override: None,
+                baseline: CasBaseline::CurrentHead,
+            },
+        ],
+        2,
+        GitIdDerivation::PerCommit,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("manifest bookmark not found"),
+        "an unresolvable spec fails the batch: {err:#}"
+    );
+    Ok(())
+}
+
+/// One local batch derives every generated commit: each has its mapping row
+/// and a git commit object parented on the head's git commit, no commit falls
+/// back to per-commit derivation, and the batch's time is split evenly over
+/// its commits.
+#[mononoke::fbinit_test]
+async fn test_prepare_manifest_commits_local_batch_derives_git_ids(fb: FacebookInit) -> Result<()> {
+    local_batch_derives_git_ids(fb).await
+}
+
+/// The same with the mapping written in one `bulk_add` for the batch, as
+/// production has `derived_data_use_store_mapping_batch` set.
+#[mononoke::fbinit_test]
+async fn test_prepare_manifest_commits_local_batch_derives_git_ids_with_batched_mapping(
+    fb: FacebookInit,
+) -> Result<()> {
+    with_just_knobs_async(
+        JustKnobsInMemory::new(HashMap::from([(
+            "scm/mononoke:derived_data_use_store_mapping_batch".to_string(),
+            KnobVal::Bool(true),
+        )])),
+        local_batch_derives_git_ids(fb).boxed(),
+    )
+    .await
+}
+
+async fn local_batch_derives_git_ids(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let manifest_path = NonRootMPath::new("static/static.xml")?;
+
+    let mut heads = Vec::new();
+    let mut bms = Vec::new();
+    for name in ["a", "b", "c"] {
+        let head = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("base", name)
+            .commit()
+            .await?;
+        // A batch requires its parents' git ids, as live branch heads have.
+        repo.repo_derived_data()
+            .manager()
+            .derive_locally::<MappedGitCommitId>(&ctx, head, None)
+            .await?;
+        bms.push(bookmark(&ctx, &repo, name).create_publishing(head).await?);
+        heads.push(head);
+    }
+    let specs: Vec<ManifestCommitSpec<'_>> = bms
+        .iter()
+        .zip(&heads)
+        .map(|(bm, head)| ManifestCommitSpec {
+            bookmark: bm,
+            manifest_path: &manifest_path,
+            content: Bytes::from(format!("<manifest name=\"{bm}\"/>")),
+            service_identity: "svc",
+            message: None,
+            parent_override: None,
+            baseline: CasBaseline::GeneratedFrom(*head),
+        })
+        .collect();
+
+    let (prepared, timings) =
+        prepare_manifest_commits_timed(&ctx, &repo, specs, 2, GitIdDerivation::LocalBatch).await?;
+
+    assert_eq!(prepared.len(), 3);
+    assert_eq!(
+        timings.derive_unbatchable_commits, 0,
+        "every head has a git id"
+    );
+    assert_eq!(
+        timings.derive_fallback_commits, 0,
+        "the batch derived all three"
+    );
+    assert!(
+        timings.derive_p50 > Duration::ZERO && timings.derive_p50 == timings.derive_max,
+        "one batch's time is split evenly over its commits: {timings:?}"
+    );
+    for (result, head) in prepared.iter().zip(&heads) {
+        let mapped = repo
+            .bonsai_git_mapping()
+            .get_git_sha1_from_bonsai(&ctx, result.new_cs)
+            .await?;
+        assert_eq!(
+            mapped,
+            Some(*result.mapped_git.oid()),
+            "the mapping row is what the result reports"
+        );
+        let head_git = repo
+            .bonsai_git_mapping()
+            .get_git_sha1_from_bonsai(&ctx, *head)
+            .await?
+            .expect("the head has a git id");
+        let parents = fetch_non_blob_git_object(
+            &ctx,
+            repo.repo_blobstore(),
+            &result.mapped_git.oid().to_object_id()?,
+        )
+        .await?
+        .with_parsed_as_commit(|commit| commit.parents().collect::<Vec<_>>())
+        .expect("the derived object is a commit");
+        assert_eq!(
+            parents,
+            vec![head_git.to_object_id()?],
+            "the git commit is parented on the head's git commit"
+        );
+    }
+    Ok(())
+}
+
+/// A batch needs its ancestors derived, so a commit parented on a user edit
+/// with no git id yet is routed to per-commit derivation before any batch
+/// runs; that derives the parent too, and the land still gets its id.
+#[mononoke::fbinit_test]
+async fn test_prepare_manifest_commits_local_batch_falls_back_per_commit(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let manifest_path = NonRootMPath::new("static/static.xml")?;
+
+    let head = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("base", "v1")
+        .commit()
+        .await?;
+    repo.repo_derived_data()
+        .manager()
+        .derive_locally::<MappedGitCommitId>(&ctx, head, None)
+        .await?;
+    let bm = bookmark(&ctx, &repo, "manifest")
+        .create_publishing(head)
+        .await?;
+    let user_commit = CreateCommitContext::new(&ctx, &repo, vec![head])
+        .add_file("user", "change")
+        .commit()
+        .await?;
+
+    let (prepared, timings) = prepare_manifest_commits_timed(
+        &ctx,
+        &repo,
+        vec![ManifestCommitSpec {
+            bookmark: &bm,
+            manifest_path: &manifest_path,
+            content: Bytes::from("<manifest/>"),
+            service_identity: "svc",
+            message: None,
+            parent_override: Some(user_commit),
+            baseline: CasBaseline::CurrentHead,
+        }],
+        2,
+        GitIdDerivation::LocalBatch,
+    )
+    .await?;
+
+    assert_eq!(
+        timings.derive_unbatchable_commits, 1,
+        "the one commit was kept out of the batch"
+    );
+    assert_eq!(
+        timings.derive_fallback_commits, 0,
+        "no batch ran, so none failed"
+    );
+    let mapped = repo
+        .bonsai_git_mapping()
+        .get_git_sha1_from_bonsai(&ctx, prepared[0].new_cs)
+        .await?;
+    assert_eq!(mapped, Some(*prepared[0].mapped_git.oid()));
+    assert!(
+        repo.bonsai_git_mapping()
+            .get_git_sha1_from_bonsai(&ctx, user_commit)
+            .await?
+            .is_some(),
+        "the per-commit path derived the parent on the way"
+    );
     Ok(())
 }
 

@@ -14,10 +14,11 @@
 #include <folly/container/F14Map.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/Promise.h>
+#include <folly/portability/GTestProd.h>
 #include <folly/synchronization/CallOnce.h>
-#include <gtest/gtest_prod.h>
 #include <stdlib.h>
 #include <array>
+#include <atomic>
 #include <iosfwd>
 #include <memory>
 #include <optional>
@@ -54,7 +55,6 @@ namespace facebook::eden {
 class EdenFsEventsLogger;
 class ErrorLogger;
 class Notifier;
-class FsEventLogger;
 class FuseRequestContext;
 class FuseTransport;
 class PrivHelper;
@@ -198,6 +198,8 @@ class FuseChannel final : public FsChannel {
       return FuseChannelData{std::move(fuseDevice), fuseSettings};
     }
 
+    FsStopReason getStopReason() const override;
+
     /**
      * The reason why the FUSE channel was stopped.
      *
@@ -265,7 +267,7 @@ class FuseChannel final : public FsChannel {
    *      a logger to use for logging strace/syscall like events.
    * processInfoCache -
    *      a cache of client process information (pid, command line, parent,
-   * etc). fsEventLogger - legacy telemetry on filesystem access.
+   * etc).
    * structuredLogger -
    *      This is a logger for error events. Inside a Meta environment, these
    *      events are exported off the machine this EdenFS instance is running
@@ -328,7 +330,6 @@ class FuseChannel final : public FsChannel {
       std::unique_ptr<FuseDispatcher> dispatcher,
       const folly::Logger* straceLogger,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
-      std::shared_ptr<FsEventLogger> fsEventLogger,
       const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       ErrorLogger& errorLogger,
       folly::Duration requestTimeout,
@@ -761,6 +762,9 @@ class FuseChannel final : public FsChannel {
      * or running.
      */
     StopReason stopReason{StopReason::RUNNING};
+
+    // When requestSessionExit() was first called.
+    std::optional<std::chrono::steady_clock::time_point> stopRequestedAt;
   };
 
   /**
@@ -805,11 +809,15 @@ class FuseChannel final : public FsChannel {
   };
 
   friend struct fmt::formatter<facebook::eden::FuseChannel::InvalidationEntry>;
-  FRIEND_TEST(FuseChannelTest, formatting_inode);
-  FRIEND_TEST(FuseChannelTest, formatting_dir);
-  FRIEND_TEST(FuseChannelTest, formatting_unknown);
-  FRIEND_TEST(FuseChannelTest, zeroInvalidationThreadsUsesOneWorker);
-  FRIEND_TEST(FuseChannelTest, excessiveInvalidationThreadsAreCapped);
+  FOLLY_GTEST_FRIEND_TEST(FuseChannelTest, formatting_inode);
+  FOLLY_GTEST_FRIEND_TEST(FuseChannelTest, formatting_dir);
+  FOLLY_GTEST_FRIEND_TEST(FuseChannelTest, formatting_unknown);
+  FOLLY_GTEST_FRIEND_TEST(
+      FuseChannelTest,
+      zeroInvalidationThreadsUsesOneWorker);
+  FOLLY_GTEST_FRIEND_TEST(
+      FuseChannelTest,
+      excessiveInvalidationThreadsAreCapped);
   /**
    * Private destructor.
    *
@@ -875,12 +883,10 @@ class FuseChannel final : public FsChannel {
       FuseRequestContext& request,
       const fuse_in_header& header,
       folly::ByteRange arg);
-#ifdef __linux__
   ImmediateFuture<folly::Unit> fuseRename2(
       FuseRequestContext& request,
       const fuse_in_header& header,
       folly::ByteRange arg);
-#endif
   ImmediateFuture<folly::Unit> fuseLink(
       FuseRequestContext& request,
       const fuse_in_header& header,
@@ -1059,7 +1065,6 @@ class FuseChannel final : public FsChannel {
   std::unique_ptr<FuseDispatcher> dispatcher_;
   const folly::Logger* const straceLogger_;
   const std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
-  const std::shared_ptr<FsEventLogger> fsEventLogger_;
   ErrorLogger& errorLogger_;
   const AbsolutePath mountPath_;
   const folly::Duration requestTimeout_;
@@ -1131,6 +1136,11 @@ class FuseChannel final : public FsChannel {
    */
   folly::File fuseDevice_;
   std::unique_ptr<FuseTransport> transport_;
+
+  // Diagnostic snapshot for readers that can run while initialization replaces
+  // transport_. Transport names must have static lifetime. This publishes only
+  // the name, not access to the transport or its initialization state.
+  std::atomic<const char*> transportName_;
 
   /*
    * Mutable state that is accessed from the worker threads.

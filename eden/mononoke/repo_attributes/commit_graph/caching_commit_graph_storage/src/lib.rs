@@ -24,7 +24,6 @@ use caching_ext::McErrorKind;
 use caching_ext::McResult;
 use caching_ext::MemcacheEntity;
 use caching_ext::MemcacheHandler;
-use caching_ext::fill_cache;
 use caching_ext::fill_cachelib;
 use caching_ext::get_or_fill;
 use caching_ext::get_or_fill_chunked;
@@ -34,6 +33,7 @@ use commit_graph_types::edges::Parents;
 use commit_graph_types::storage::CommitGraphStorage;
 use commit_graph_types::storage::FetchedChangesetEdges;
 use commit_graph_types::storage::Prefetch;
+use commit_graph_types::storage::PrefetchScope;
 use commit_graph_types::storage::PrefetchTarget;
 use context::CoreContext;
 use fbthrift::compact_protocol;
@@ -376,20 +376,10 @@ impl KeyedEntityStore<ChangesetId, CachedPrefetchedChangesetEdges> for CacheRequ
         &self,
         values: impl IntoIterator<Item = (&'a ChangesetId, &'a mut CachedPrefetchedChangesetEdges)>,
     ) -> Result<()> {
-        let should_apply_fallback = self.caching_storage.should_apply_fallback();
         let mut fetched = 0;
         for (_cs_id, edges) in values {
             fetched += 1;
 
-            // Apply fallback if needed
-            if should_apply_fallback {
-                edges.inner.edges.apply_subtree_source_fallback();
-                for prefetched_edge in edges.prefetched_edges.values_mut() {
-                    prefetched_edge.apply_subtree_source_fallback();
-                }
-            }
-
-            // Existing logic for stats and cachelib filling
             if !edges.prefetched_edges.is_empty() {
                 let prefetched_edges = edges
                     .prefetched_edges
@@ -516,15 +506,6 @@ impl CachingCommitGraphStorage {
         }
         Ok(uncached)
     }
-
-    /// Check if fallback should be applied for this repository
-    fn should_apply_fallback(&self) -> bool {
-        !justknobs::eval(
-            "scm/mononoke:commit_graph_disable_subtree_source_fallback",
-            None,
-            Some(self.repo_name()),
-        )
-    }
 }
 
 #[async_trait]
@@ -605,20 +586,36 @@ impl CommitGraphStorage for CachingCommitGraphStorage {
         &self,
         ctx: &CoreContext,
         cs_ids: &[ChangesetId],
-        target: PrefetchTarget,
+        scope: PrefetchScope,
     ) -> Result<()> {
-        let request = self.request(ctx, Prefetch::Hint(target));
+        let request = self.request(ctx, Prefetch::Hint(scope.target()));
         if !request.prefetch.is_include() {
             return Ok(());
         }
-        let cs_ids = match target {
-            PrefetchTarget::LinearAncestors { generation, steps } => {
+        let cs_ids = match scope {
+            PrefetchScope::UncachedOnly(_) => cs_ids.to_vec(),
+            PrefetchScope::PastCached { generation, steps } => {
+                // A prefetch fills at most the step limit below each changeset
+                // it fetches, so the walk checks exactly that far.  Checking
+                // further would find the changesets beyond the last fill
+                // uncached and fetch them again on every call.
+                let steps = steps.min(justknobs::get_as::<u64>(
+                    "scm/mononoke:commit_graph_prefetch_step_limit",
+                    None,
+                ));
                 self.first_uncached_linear_ancestors(cs_ids, generation, steps)?
             }
-            PrefetchTarget::ExactSkipTreeAncestors { .. } => cs_ids.to_vec(),
         };
-        let fetched = request.get_from_db(cs_ids.into_iter().collect()).await?;
-        fill_cache(&request, fetched.iter()).await;
+        // Through the caches rather than straight to the backing store:
+        // another host may have fetched these already, and memcache holds
+        // the edges prefetched for them alongside them.
+        get_or_fill_chunked(
+            &request,
+            cs_ids.into_iter().collect(),
+            CHUNK_SIZE,
+            PARALLEL_CHUNKS,
+        )
+        .await?;
         Ok(())
     }
 

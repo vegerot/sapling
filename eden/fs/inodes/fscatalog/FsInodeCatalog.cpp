@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <new>
 
 #include <boost/filesystem.hpp>
 
@@ -24,6 +25,7 @@
 #include <folly/Range.h>
 #include <folly/String.h>
 #include <folly/Varint.h>
+#include <folly/container/F14Map.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/lang/ToAscii.h>
@@ -486,69 +488,135 @@ void loadOverlayEntriesFromData(
   reader.setInput(buf.get());
 
   std::string structName;
-  reader.readStructBegin(structName);
+  auto parse = [&](std::string_view stage, auto&& fn) {
+    try {
+      fn();
+    } catch (const std::bad_alloc&) {
+      // An allocation failure is transient, not evidence of on-disk
+      // corruption. Let it propagate so online fsck does not persistently
+      // replace valid data with a partially parsed prefix.
+      throw;
+    } catch (const OverlayDataCorruption&) {
+      throw;
+    } catch (const std::exception& ex) {
+      throw OverlayDataCorruption{
+          EIO,
+          EdenErrorType::POSIX_ERROR,
+          "corrupt overlay for inode ",
+          inodeNumber,
+          " at directory data offset ",
+          rawData.size() - reader.getCursor().totalLength(),
+          " while reading ",
+          stage,
+          ": ",
+          ex.what()};
+    }
+  };
+
+  parse("directory struct", [&] { reader.readStructBegin(structName); });
 
   std::string fieldName;
   TType fieldType;
   int16_t fieldId;
-  reader.readFieldBegin(fieldName, fieldType, fieldId);
+  parse("entries field", [&] {
+    reader.readFieldBegin(fieldName, fieldType, fieldId);
+  });
 
   if (fieldType != TType::T_MAP || fieldId != 1) {
-    throw_<std::runtime_error>(
+    throw OverlayDataCorruption{
+        EIO,
+        EdenErrorType::POSIX_ERROR,
         "corrupt overlay for inode ",
         inodeNumber,
+        " at directory data offset ",
+        rawData.size() - reader.getCursor().totalLength(),
         ": expected map field with id 1, got type=",
         static_cast<int>(fieldType),
         " id=",
-        fieldId);
+        fieldId};
   }
 
   TType keyType;
   TType valueType;
   uint32_t mapSize;
-  reader.readMapBegin(keyType, valueType, mapSize);
+  parse(
+      "entries map", [&] { reader.readMapBegin(keyType, valueType, mapSize); });
 
   // Compact protocol omits key/value types for empty maps, so only validate
   // types when there are entries.
   if (mapSize > 0) {
     if (keyType != TType::T_STRING || valueType != TType::T_STRUCT) {
-      throw_<std::runtime_error>(
+      throw OverlayDataCorruption{
+          EIO,
+          EdenErrorType::POSIX_ERROR,
           "corrupt overlay for inode ",
           inodeNumber,
+          " at directory data offset ",
+          rawData.size() - reader.getCursor().totalLength(),
           ": expected map<string,struct>, got key=",
           static_cast<int>(keyType),
           " value=",
-          static_cast<int>(valueType));
+          static_cast<int>(valueType)};
     }
   }
 
   // Each map entry is at least a few bytes (varint string length + struct
   // stop field), so mapSize cannot plausibly exceed the raw data size.
   if (mapSize > rawData.size()) {
-    throw_<std::runtime_error>(
+    throw OverlayDataCorruption{
+        EIO,
+        EdenErrorType::POSIX_ERROR,
         "corrupt overlay for inode ",
         inodeNumber,
+        " at directory data offset ",
+        rawData.size() - reader.getCursor().totalLength(),
         ": map size ",
         mapSize,
         " exceeds data size ",
-        rawData.size());
+        rawData.size()};
   }
 
   loader(mapSize, [&](InodeCatalog::OverlayEntryVisitor visitor) {
     std::string name;
     for (uint32_t i = 0; i < mapSize; ++i) {
-      reader.readString(name);
-
       overlay::OverlayEntry entry;
-      entry.read(&reader);
+      parse("entry name", [&] { reader.readString(name); });
+      parse("entry fields", [&] { entry.read(&reader); });
 
       visitor(name, entry);
     }
 
-    reader.readMapEnd();
-    reader.readFieldEnd();
-    reader.readFieldBegin(fieldName, fieldType, fieldId);
-    reader.readStructEnd();
+    parse("directory end", [&] {
+      reader.readMapEnd();
+      reader.readFieldEnd();
+      reader.readFieldBegin(fieldName, fieldType, fieldId);
+    });
+    if (fieldType != TType::T_STOP) {
+      throw OverlayDataCorruption{
+          EIO,
+          EdenErrorType::POSIX_ERROR,
+          "unexpected overlay field for inode ",
+          inodeNumber,
+          " at directory data offset ",
+          rawData.size() - reader.getCursor().totalLength(),
+          ": expected STOP, got type=",
+          static_cast<int>(fieldType),
+          " id=",
+          fieldId};
+    }
+    parse("directory struct end", [&] { reader.readStructEnd(); });
+    if (!reader.getCursor().isAtEnd()) {
+      throw OverlayDataCorruption{
+          EIO,
+          EdenErrorType::POSIX_ERROR,
+          "trailing overlay data for inode ",
+          inodeNumber,
+          " at directory data offset ",
+          rawData.size() - reader.getCursor().totalLength(),
+          ": ",
+          reader.getCursor().totalLength(),
+          " bytes remain"};
+    }
   });
 }
 
@@ -613,7 +681,23 @@ folly::File openFileNoVerifyWithFlags(
     InodeNumber inodeNumber,
     const InodePath& path,
     int flags) {
-  int fd = openat(dirFd, path.c_str(), flags | O_CLOEXEC | O_NOFOLLOW);
+  flags |= O_CLOEXEC | O_NOFOLLOW;
+#ifdef O_NOATIME
+  // Reading an overlay file can update atime and force a later fdatasync() to
+  // persist otherwise-clean metadata. Overlay files normally belong to the
+  // daemon user; retry without O_NOATIME if an overlay has different ownership.
+  int fd = openat(dirFd, path.c_str(), flags | O_NOATIME);
+  if (fd < 0 && errno == EPERM) {
+    XLOGF(
+        DBG3,
+        "O_NOATIME open returned EPERM for overlay inode {} in {}; retrying without O_NOATIME",
+        inodeNumber,
+        localDir.view());
+    fd = openat(dirFd, path.c_str(), flags);
+  }
+#else
+  int fd = openat(dirFd, path.c_str(), flags);
+#endif
   folly::checkUnixError(
       fd,
       fmt::format(
@@ -1225,6 +1309,21 @@ LoadWalResult FsFileContentStore::loadWalDelta(
     }
     delta.emplace(std::move(walName), std::move(walDelta));
   };
+  // The name each inode was last ADDed under. An ADD of an inode that an
+  // earlier ADD placed under another name is the destination of a rename, so
+  // the earlier name becomes a REMOVE, which is the record the daemon writes
+  // right after that ADD.
+  folly::F14FastMap<int64_t, std::string> lastAddedAs;
+  auto forgetAdd = [&](const std::string& name) {
+    auto it = delta.find(name);
+    if (it == delta.end() || it->second.type != WalOpType::ADD) {
+      return;
+    }
+    auto known = lastAddedAs.find(*it->second.entry.inodeNumber());
+    if (known != lastAddedAs.end() && known->second == it->first) {
+      lastAddedAs.erase(known);
+    }
+  };
 
   auto walPath = getWalPath(parent);
   // Mirror loadRawOverlayDir: open once, ENOENT means no WAL, anything
@@ -1383,6 +1482,15 @@ LoadWalResult FsFileContentStore::loadWalDelta(
             overlayEntry.aclRootState() = static_cast<int32_t>(aclRootState);
           }
 
+          forgetAdd(name);
+          if (auto stale = lastAddedAs.find(inodeNum); stale !=
+                  lastAddedAs.end() &&
+              !isPathPieceEqual(PathComponentPiece{stale->second},
+                                PathComponentPiece{name},
+                                caseSensitive)) {
+            assignDelta(stale->second, WalDelta{WalOpType::REMOVE, {}});
+          }
+          lastAddedAs[inodeNum] = name;
           assignDelta(
               std::move(name),
               WalDelta{WalOpType::ADD, std::move(overlayEntry)});
@@ -1390,11 +1498,20 @@ LoadWalResult FsFileContentStore::loadWalDelta(
         }
 
         case WalOpType::REMOVE: {
+          if (entryOffset != entryLen) {
+            valid = false;
+            break;
+          }
+          forgetAdd(name);
           assignDelta(std::move(name), WalDelta{WalOpType::REMOVE, {}});
           break;
         }
 
         case WalOpType::MATERIALIZE: {
+          if (entryOffset != entryLen) {
+            valid = false;
+            break;
+          }
           auto it = delta.find(name);
           if (it == delta.end()) {
             // No prior delta for this name — record the MATERIALIZE so the
@@ -1436,6 +1553,11 @@ LoadWalResult FsFileContentStore::loadWalDelta(
     offset += entryStart + entryLen;
   }
 
+  // This also catches a torn length prefix (one to three trailing bytes).
+  // Do not double-count corruption already reported while parsing a frame.
+  if (offset != data.size() && result.parseErrors == 0) {
+    ++result.parseErrors;
+  }
   return result;
 }
 
@@ -1458,6 +1580,38 @@ LoadWalResult FsFileContentStore::replayWal(
           caseSensitive);
     });
   };
+  // An ADD for an inode that the base holds under another name is the
+  // destination of a rename whose REMOVE never reached the WAL; that name
+  // goes. loadWalDelta already reconciled the ADDs within the WAL.
+  folly::F14FastMap<int64_t, const std::string*> addedAs;
+  for (const auto& [name, op] : result.delta) {
+    if (op.type == WalOpType::ADD) {
+      addedAs[*op.entry.inodeNumber()] = &name;
+    }
+  }
+  if (!addedAs.empty()) {
+    std::vector<std::string> stale;
+    for (const auto& [name, entry] : entries) {
+      auto added = addedAs.find(*entry.inodeNumber());
+      if (added != addedAs.end() &&
+          !isPathPieceEqual(
+              PathComponentPiece{name},
+              PathComponentPiece{*added->second},
+              caseSensitive)) {
+        XLOGF(
+            WARN,
+            "Overlay dir {}: dropping entry '{}' for inode {}, which the WAL names again as '{}'",
+            parent,
+            name,
+            *entry.inodeNumber(),
+            *added->second);
+        stale.push_back(name);
+      }
+    }
+    for (const auto& name : stale) {
+      entries.erase(name);
+    }
+  }
   for (auto& [name, op] : result.delta) {
     switch (op.type) {
       case WalOpType::ADD: {
@@ -1623,7 +1777,25 @@ std::optional<overlay::OverlayDir> FsFileContentStore::deserializeOverlayDir(
   if (!raw) {
     return std::nullopt;
   }
-  return CompactSerializer::deserialize<overlay::OverlayDir>(*raw);
+  overlay::OverlayDir dir;
+  loadOverlayEntriesFromData(
+      inodeNumber,
+      *raw,
+      [&](uint32_t, InodeCatalog::OverlayEntryIterator iterate) {
+        iterate([&](const std::string& name,
+                    const overlay::OverlayEntry& entry) {
+          auto [it, inserted] = dir.entries()->emplace(name, entry);
+          if (!inserted) {
+            throw OverlayDataCorruption{fmt::format(
+                "duplicate overlay name (hex \"{}\") for inode {}: first inode {}, duplicate inode {}",
+                folly::hexlify(name),
+                inodeNumber,
+                *it->second.inodeNumber(),
+                *entry.inodeNumber())};
+          }
+        });
+      });
+  return dir;
 }
 
 std::optional<std::string> FsFileContentStore::loadRawOverlayDir(
@@ -1694,11 +1866,11 @@ FsFileContentStore::createHeader(
   return headerStorage;
 }
 
-std::variant<folly::File, InodeNumber> FsFileContentStore::openFile(
+folly::File FsFileContentStore::openFile(
     InodeNumber inodeNumber,
     folly::StringPiece headerId) {
   // Open the overlay file
-  auto file = std::get<folly::File>(openFileNoVerify(inodeNumber));
+  auto file = openFileNoVerify(inodeNumber);
 
   // Read the contents
   std::string contents;
@@ -1715,8 +1887,7 @@ std::variant<folly::File, InodeNumber> FsFileContentStore::openFile(
   return file;
 }
 
-std::variant<folly::File, InodeNumber> FsFileContentStore::openFileNoVerify(
-    InodeNumber inodeNumber) {
+folly::File FsFileContentStore::openFileNoVerify(InodeNumber inodeNumber) {
   auto path = getFilePath(inodeNumber);
   return openFileNoVerifyWithFlags(
       dirFile_.fd(), localDir_, inodeNumber, path, O_RDWR);
@@ -1862,7 +2033,7 @@ folly::File FsFileContentStore::createOverlayFileImpl(
   return file;
 }
 
-std::variant<folly::File, InodeNumber> FsFileContentStore::createOverlayFile(
+folly::File FsFileContentStore::createOverlayFile(
     InodeNumber inodeNumber,
     ByteRange contents) {
   auto header = createHeader(kHeaderIdentifierFile, kHeaderVersion);
@@ -1880,7 +2051,7 @@ std::variant<folly::File, InodeNumber> FsFileContentStore::createOverlayFile(
       /*removeOnFailure=*/true);
 }
 
-std::variant<folly::File, InodeNumber> FsFileContentStore::createOverlayFile(
+folly::File FsFileContentStore::createOverlayFile(
     InodeNumber inodeNumber,
     const IOBuf& contents) {
   // In the common case where there is just one element in the chain, use the
@@ -1913,15 +2084,17 @@ void FsFileContentStore::validateHeader(
     folly::StringPiece headerId) {
   if (contents.size() < kHeaderLength) {
     // Something wrong with the file (may be corrupted)
-    throw newEdenError(
+    throw OverlayDataCorruption(
         EIO,
         EdenErrorType::POSIX_ERROR,
         "Overlay file (inode ",
         inodeNumber,
         ") is too short for header: size=",
         contents.size(),
-        " expected headerId=",
-        headerId);
+        " expected at least ",
+        kHeaderLength,
+        " bytes, expected headerId hex=",
+        folly::hexlify(headerId));
   }
 
   IOBuf buf(IOBuf::WRAP_BUFFER, ByteRange{contents});
@@ -1931,21 +2104,31 @@ void FsFileContentStore::validateHeader(
   auto id = cursor.readFixedString(kHeaderIdentifierDir.size());
   StringPiece identifier{id};
   if (identifier.compare(headerId) != 0) {
-    throw newEdenError(
+    throw OverlayDataCorruption(
         EINVAL,
         EdenErrorType::POSIX_ERROR,
-        "unexpected overlay header identifier : ",
-        folly::hexlify(ByteRange{identifier}));
+        "unexpected overlay header identifier for inode ",
+        inodeNumber,
+        " at offset 0: actual hex=",
+        folly::hexlify(ByteRange{identifier}),
+        " expected hex=",
+        folly::hexlify(headerId));
   }
 
   // Validate header version
   auto version = cursor.readBE<uint32_t>();
   if (version != kHeaderVersion) {
-    throw newEdenError(
+    throw OverlayDataCorruption(
         EINVAL,
         EdenErrorType::POSIX_ERROR,
-        "Unexpected overlay version :",
-        version);
+        "unexpected overlay version for inode ",
+        inodeNumber,
+        " at offset ",
+        kHeaderIdentifierDir.size(),
+        ": actual=",
+        version,
+        " expected=",
+        kHeaderVersion);
   }
 }
 
@@ -1985,7 +2168,7 @@ std::optional<fsck::InodeInfo> FsFileContentStore::loadInodeInfo(
     InodeNumber number) {
   folly::File file;
   try {
-    file = std::get<folly::File>(openFileNoVerify(number));
+    file = openFileNoVerify(number);
   } catch (const std::exception& ex) {
     return makeInodeError(
         number, "error opening file: ", folly::exceptionStr(ex));

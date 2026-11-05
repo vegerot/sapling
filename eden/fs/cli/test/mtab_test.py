@@ -6,15 +6,42 @@
 
 # pyre-strict
 
+import errno
+import multiprocessing.context
 import unittest
 from typing import Optional
+from unittest.mock import create_autospec
 
-from eden.fs.cli.mtab import MountInfo, parse_macos_mount_output, parse_mtab
+from eden.fs.cli.mtab import (
+    LinuxMountTable,
+    MountInfo,
+    parse_macos_mount_output,
+    parse_mtab,
+)
 
 
 class MTabTest(unittest.TestCase):
     # The diffs for what is written to stdout can be large.
     maxDiff: Optional[int] = None
+
+    def test_parse_mtab_with_escaped_mount_point(self) -> None:
+        contents = (
+            b"edenfs: /data/users/alice/my\\040repo fuse "
+            b"rw,nosuid,relatime,user_id=1000,group_id=100 0 0\n"
+            b"edenfs: /data/users/alice/tab\\011repo fuse "
+            b"rw,nosuid,relatime,user_id=1000,group_id=100 0 0\n"
+            b"edenfs: /data/users/alice/back\\134slash fuse "
+            b"rw,nosuid,relatime,user_id=1000,group_id=100 0 0\n"
+        )
+        mount_points = [mount.mount_point for mount in parse_mtab(contents)]
+        self.assertEqual(
+            mount_points,
+            [
+                b"/data/users/alice/my repo",
+                b"/data/users/alice/tab\trepo",
+                b"/data/users/alice/back\\slash",
+            ],
+        )
 
     def test_parse_mtab(self) -> None:
         contents = b"""\
@@ -51,3 +78,25 @@ map -fstab on /Network/Servers (autofs, automounted, nobrowse)
             ],
             parse_macos_mount_output(contents),
         )
+
+
+class CloseHangingProcessTest(unittest.TestCase):
+    def test_helper_that_survives_kill(self) -> None:
+        helper = create_autospec(multiprocessing.context.SpawnProcess, instance=True)
+        helper.is_alive.return_value = True
+        helper.close.side_effect = ValueError(
+            "Cannot close a process while it is still running. "
+            "You should first call join() or terminate()."
+        )
+        timeout_error = OSError(
+            errno.ETIMEDOUT, "Stating the mount timed out, mount point hangs"
+        )
+
+        with self.assertRaises(OSError) as raised:
+            LinuxMountTable().close_hanging_process(helper, timeout_error)
+
+        self.assertEqual(raised.exception.errno, errno.ETIMEDOUT)
+        helper.terminate.assert_called_once_with()
+        helper.kill.assert_called_once_with()
+        self.assertEqual(helper.join.call_count, 2)
+        helper.close.assert_not_called()

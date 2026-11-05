@@ -18,12 +18,16 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+#[cfg(fbcode_build)]
+use anyhow::Context;
 use anyhow::Error;
 #[cfg(fbcode_build)]
 use backend_if::RimBackend;
 use cached_config::ConfigStore;
 use clientinfo::ClientEntryPoint;
 use fbinit::FacebookInit;
+#[cfg(fbcode_build)]
+use fbwhoami::FbWhoAmI;
 use gotham::router::Router;
 use gotham_ext::handler::MononokeHttpHandler;
 use gotham_ext::middleware::ArtilleryMiddleware;
@@ -68,21 +72,53 @@ pub fn build<R: Send + Sync + Clone + 'static>(
     is_shadow_tier: bool,
     tls_ca_path: Option<&Path>,
     rim_backend: Option<i32>,
+    rim_regional_resources: bool,
 ) -> Result<SaplingRemoteApi, Error> {
     #[cfg(fbcode_build)]
-    let rim_backend = rim_backend
-        .map(RimBackend)
-        .inspect(|rim_backend| crate::utils::rim_rate_limiter::init(*rim_backend));
+    let rim = rim_backend
+        .map(|backend| -> Result<_, Error> {
+            let backend = RimBackend(backend);
+            let config = crate::utils::rim_rate_limiter::workload_config(config_store)
+                .context("Loading RIM workload config")?;
+            anyhow::ensure!(
+                config.get().allocation_backends.contains(&backend.0),
+                "RIM backend must use workload allocations"
+            );
+            let cpu_resource = if rim_regional_resources {
+                let region = FbWhoAmI::get()
+                    .context("Reading CPU capacity region")?
+                    .region_datacenter_prefix
+                    .clone()
+                    .filter(|region| !region.is_empty())
+                    .context("Regional resources require a serving region")?;
+                format!("cpu_{region}")
+            } else {
+                "cpu".to_owned()
+            };
+            crate::utils::rim_rate_limiter::init(backend);
+            Ok(crate::utils::rim_rate_limiter::RimRateLimiter {
+                backend,
+                config,
+                cpu_resource,
+            })
+        })
+        .transpose()?;
 
     #[cfg(not(fbcode_build))]
-    let _ = rim_backend;
+    let _ = (
+        config_store,
+        is_shadow_tier,
+        tls_ca_path,
+        rim_backend,
+        rim_regional_resources,
+    );
 
     let ctx = ServerContext::new(mononoke, will_exit);
 
     let log_middleware = if test_friendly_logging {
         LogMiddleware::test_friendly()
     } else {
-        LogMiddleware::tracing("scm/mononoke:request_log_enabled".to_string())
+        LogMiddleware::tracing()
     };
 
     // Set up the router and handler for serving HTTP requests, along with custom middleware.
@@ -134,7 +170,7 @@ pub fn build<R: Send + Sync + Clone + 'static>(
         .add(<ScubaMiddleware<SaplingRemoteApiScubaHandler>>::new(scuba))
         .add(ThrottleMiddleware::new(
             #[cfg(fbcode_build)]
-            rim_backend,
+            rim,
         ))
         .add(LoadMiddleware::new())
         .add(log_middleware)

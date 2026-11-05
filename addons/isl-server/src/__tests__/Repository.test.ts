@@ -21,8 +21,12 @@ import * as ejeca from 'shared/ejeca';
 import * as fsUtils from 'shared/fs';
 import {clone, mockLogger} from 'shared/testUtils';
 import {nextTick} from 'shared/utils';
-import {Internal} from '../Internal';
-import {absolutePathForFileInRepo, Repository} from '../Repository';
+import {
+  absolutePathForFileInRepo,
+  isIllegalOperationFlag,
+  Repository,
+  validateMergeToolArgs,
+} from '../Repository';
 import {makeServerSideTracker} from '../analytics/serverSideTracker';
 import {
   extractRepoInfoFromUrl,
@@ -514,6 +518,97 @@ describe('Repository', () => {
         expect.anything(),
       );
     });
+
+    it.each([
+      ['--config=hooks.pre-status=true'],
+      ['--configfile', '/tmp/x.rc'],
+      ['--configfile=/tmp/x.rc'],
+      ['--cwd=/tmp'],
+      ['--repo=/tmp'],
+      ['--repository=/tmp'],
+      ['-R/tmp'],
+    ])('disallows global flag %s in any form', async (...flag) => {
+      await runOperation({
+        args: ['status', ...flag],
+      });
+
+      expect(ejecaSpy).not.toHaveBeenCalledWith(
+        'sl',
+        expect.arrayContaining(flag),
+        expect.anything(),
+      );
+    });
+
+    it('allows free-text values that look like flags', async () => {
+      await runOperation({
+        args: ['commit', '--message', '-Refactor --config handling'],
+      });
+
+      expect(ejecaSpy).toHaveBeenCalledWith(
+        'sl',
+        ['commit', '--message', '-Refactor --config handling', '--noninteractive'],
+        expect.anything(),
+      );
+    });
+
+    it('disallows debugpython', async () => {
+      await runOperation({
+        args: ['debugpython', '-c', 'print(1)'],
+      });
+
+      expect(ejecaSpy).not.toHaveBeenCalledWith(
+        'sl',
+        expect.arrayContaining(['debugpython']),
+        expect.anything(),
+      );
+    });
+
+    it('allows built-in merge tools', async () => {
+      await runOperation({
+        args: ['resolve', '--tool', 'internal:union', '--all'],
+      });
+
+      expect(ejecaSpy).toHaveBeenCalledWith(
+        'sl',
+        ['resolve', '--tool', 'internal:union', '--all', '--noninteractive'],
+        expect.anything(),
+      );
+    });
+
+    it.each([[['--tool', 'sh']], [['--tool=sh']], [['-t', 'sh']]])(
+      'disallows arbitrary merge tool %j',
+      async toolArgs => {
+        await runOperation({
+          args: ['rebase', '-d', 'aaa', ...toolArgs],
+        });
+
+        expect(ejecaSpy).not.toHaveBeenCalledWith(
+          'sl',
+          expect.arrayContaining(toolArgs),
+          expect.anything(),
+        );
+      },
+    );
+  });
+
+  describe('validateMergeToolArgs', () => {
+    it('allows the configured ui.merge tool', () => {
+      expect(() => validateMergeToolArgs(['resolve', '--tool', 'mytool'], 'mytool')).not.toThrow();
+      expect(() => validateMergeToolArgs(['resolve', '--tool', 'other'], 'mytool')).toThrow();
+    });
+
+    it('ignores free-text values', () => {
+      expect(() => validateMergeToolArgs(['commit', '--message', '-tidy up'])).not.toThrow();
+    });
+  });
+
+  describe('isIllegalOperationFlag', () => {
+    it.each(['--rev', '--continue', '--interactive', '-r', '-T', '--', 'commit'])(
+      'allows %s',
+      arg => {
+        expect(isIllegalOperationFlag(arg)).toBe(false);
+      },
+    );
   });
 
   describe('fetchSloc', () => {
@@ -624,6 +719,7 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
     it('reports when smartlog finds too many commits to render', async () => {
       const repo = new Repository(repoInfo, ctx);
       const onChange = jest.fn();
+      const trackSpy = jest.spyOn(ctx.tracker, 'track').mockClear();
       repo.subscribeToSmartlogCommitsChanges(onChange);
       mockEjeca([
         [
@@ -644,6 +740,32 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
           commits: {error: expect.objectContaining({message: ErrorShortMessages.TooManyCommits})},
         }),
       );
+      expect(trackSpy).toHaveBeenCalledWith('SmartlogTooManyCommits', {
+        extras: {numCommits: 160811, visibleCommitDayRange: 14},
+      });
+    });
+
+    it('tracks too many commits once until a fetch no longer has too many commits', async () => {
+      const repo = new Repository(repoInfo, ctx);
+      const trackSpy = jest.spyOn(ctx.tracker, 'track').mockClear();
+      const tooManyCommits: [RegExp, {stdout: string; stderr: string}] = [
+        /^sl log/,
+        {stdout: '', stderr: 'smartlog: too many (2000) commits, not rendering all of them\n'},
+      ];
+      const countTracked = () =>
+        trackSpy.mock.calls.filter(([name]) => name === 'SmartlogTooManyCommits').length;
+
+      mockEjeca([tooManyCommits]);
+      await repo.fetchSmartlogCommits();
+      await repo.fetchSmartlogCommits();
+      expect(countTracked()).toEqual(1);
+
+      mockEjeca([[/^sl log/, {stdout: ''}]]);
+      await repo.fetchSmartlogCommits();
+
+      mockEjeca([tooManyCommits]);
+      await repo.fetchSmartlogCommits();
+      expect(countTracked()).toEqual(2);
     });
 
     it('updates revset when changing date range', async () => {
@@ -703,6 +825,7 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
           {path: '/path/to/other', role: 'linked', node: 'def456'},
           {path: '/path/to/no-hash', role: 'linked'},
         ],
+        supportsMutation: false,
       };
 
       const ejecaSpy = mockEjeca([]);
@@ -722,6 +845,7 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
           {path: '/path/to/other', role: 'linked', node: 'def456'},
           {path: '/path/to/other2', role: 'linked', node: 'def456'},
         ],
+        supportsMutation: false,
       };
 
       expect(repo.getOtherWorktreeDotHashes()).toEqual(['def456']);
@@ -1202,9 +1326,10 @@ describe('absolutePathForFileInRepo', () => {
 describe('getCwdInfo', () => {
   it('computes cwd path and labels', async () => {
     mockEjeca([[/^sl root/, {stdout: '/path/to/myRepo'}]]);
-    jest.spyOn(fs.promises, 'realpath').mockImplementation(async (path, _opts) => {
-      return path as string;
-    });
+    jest
+      .spyOn(fs, 'realpath')
+      .mockImplementation(((p: string, cb: (err: null, resolved: string) => void) =>
+        cb(null, p)) as unknown as typeof fs.realpath);
     await expect(
       Repository.getCwdInfo({
         cmd: 'sl',
@@ -1221,9 +1346,11 @@ describe('getCwdInfo', () => {
 
   it('uses realpath', async () => {
     mockEjeca([[/^sl root/, {stdout: '/data/users/name/myRepo'}]]);
-    jest.spyOn(fs.promises, 'realpath').mockImplementation(async (path, _opts) => {
-      return (path as string).replace(/^\/home\/name\//, '/data/users/name/');
-    });
+    const toRealPath = (p: string) => p.replace(/^\/home\/name\//, '/data/users/name/');
+    jest
+      .spyOn(fs, 'realpath')
+      .mockImplementation(((p: string, cb: (err: null, resolved: string) => void) =>
+        cb(null, toRealPath(p))) as unknown as typeof fs.realpath);
     await expect(
       Repository.getCwdInfo({
         cmd: 'sl',
@@ -1232,8 +1359,28 @@ describe('getCwdInfo', () => {
         tracker: mockTracker,
       }),
     ).resolves.toEqual({
-      cwd: '/home/name/myRepo/some/subdir', // cwd is not realpath'd
+      cwd: '/data/users/name/myRepo/some/subdir', // cwd is realpath'd to match the server's repoInfo cwd
       repoRoot: '/data/users/name/myRepo', // repo root is realpath'd
+      repoRelativeCwdLabel: 'myRepo/some/subdir',
+    });
+  });
+
+  it('falls back to raw paths when realpath fails', async () => {
+    mockEjeca([[/^sl root/, {stdout: '/path/to/myRepo'}]]);
+    jest
+      .spyOn(fs, 'realpath')
+      .mockImplementation(((_p: string, cb: (err: Error) => void) =>
+        cb(new Error('ENOENT'))) as unknown as typeof fs.realpath);
+    await expect(
+      Repository.getCwdInfo({
+        cmd: 'sl',
+        cwd: '/path/to/myRepo/some/subdir',
+        logger: mockLogger,
+        tracker: mockTracker,
+      }),
+    ).resolves.toEqual({
+      cwd: '/path/to/myRepo/some/subdir',
+      repoRoot: '/path/to/myRepo',
       repoRelativeCwdLabel: 'myRepo/some/subdir',
     });
   });
@@ -1377,12 +1524,6 @@ describe('fetchSubmoduleMap', () => {
   describe('worktree discovery', () => {
     beforeEach(() => {
       setConfigOverrideForTests([['paths.default', 'https://github.com/owner/repo.git']]);
-      Internal.fetchFeatureFlag = jest.fn().mockImplementation((_ctx, flag) => {
-        if (flag === 'isl_worktrees') {
-          return Promise.resolve(true);
-        }
-        return Promise.resolve(undefined);
-      });
     });
 
     it('populates worktreeInfo when multiple worktrees exist', async () => {
@@ -1414,6 +1555,7 @@ describe('fetchSubmoduleMap', () => {
           {path: '/repo/main', role: 'main'},
           {path: '/repo/feature', label: 'feature-x', role: 'linked', node: 'bbb'},
         ],
+        supportsMutation: false,
       });
     });
 
@@ -1437,6 +1579,7 @@ describe('fetchSubmoduleMap', () => {
       expect(repo.getWorktreeInfo()).toEqual({
         sharedRoot: '/repo/main',
         worktrees: [{path: '/repo/main', role: 'main'}],
+        supportsMutation: false,
       });
     });
 
@@ -1458,6 +1601,7 @@ describe('fetchSubmoduleMap', () => {
       expect(repo.getWorktreeInfo()).toEqual({
         sharedRoot: '/repo/main',
         worktrees: [{path: '/repo/main', role: 'main'}],
+        supportsMutation: false,
       });
     });
 
@@ -1519,7 +1663,30 @@ describe('fetchSubmoduleMap', () => {
           {path: '/repo/main', role: 'main'},
           {path: '/repo/feature', label: 'feature-x', role: 'linked'},
         ],
+        supportsMutation: false,
       });
+    });
+
+    it('reports worktree mutations as supported only for EdenFS repos', async () => {
+      mockEjeca([
+        [/^sl root --dotdir/, {stdout: '/repo/main/.sl'}],
+        [/^sl root --shared/, {stdout: '/repo/main'}],
+        [/^sl root/, {stdout: '/repo/main'}],
+        [/^sl debugroots/, {stdout: '/repo/main'}],
+        [
+          /^sl --config worktree\.enabled=true worktree list/,
+          {stdout: JSON.stringify([{path: '/repo/main', role: 'main'}])},
+        ],
+      ]);
+
+      const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
+      const edenRepo = new Repository({...info, isEdenFs: true}, ctx);
+      await edenRepo.refreshWorktreeInfo();
+      expect(edenRepo.getWorktreeInfo()?.supportsMutation).toBe(true);
+
+      const gitRepo = new Repository({...info, isEdenFs: false}, ctx);
+      await gitRepo.refreshWorktreeInfo();
+      expect(gitRepo.getWorktreeInfo()?.supportsMutation).toBe(false);
     });
 
     it('leaves worktreeInfo undefined when sharedRoot is unavailable', async () => {

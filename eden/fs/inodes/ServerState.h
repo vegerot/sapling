@@ -39,9 +39,7 @@ class EdenErrorInfoBuilder;
 class EdenStats;
 class ErrorLogger;
 class FaultInjector;
-class FsEventLogger;
 class IXplatLogger;
-class IScribeLogger;
 class InodeAccessLogger;
 class NfsServer;
 class Notifier;
@@ -80,7 +78,6 @@ class ServerState {
       std::shared_ptr<StructuredLogger> structuredLogger,
       std::shared_ptr<StructuredLogger> notificationsStructuredLogger,
       std::shared_ptr<ErrorLogger> errorLogger,
-      std::shared_ptr<IScribeLogger> scribeLogger,
       std::shared_ptr<ReloadableConfig> reloadableConfig,
       const EdenConfig& initialConfig,
       folly::EventBase* nfsEventBase,
@@ -177,9 +174,25 @@ class ServerState {
     return clock_;
   }
 
+  /**
+   * The NfsServer, or null when experimental:enable-nfs-server is false and
+   * no graceful restart handed NFS mounts over (see
+   * createNfsServerForTakeover).
+   */
   const std::shared_ptr<NfsServer>& getNfsServer() const& {
     return nfs_;
   }
+
+  /**
+   * Build the NfsServer although experimental:enable-nfs-server is false.
+   *
+   * A graceful restart hands NFS mounts over whatever the new daemon's config
+   * says, and only an NfsServer in this process can serve them. EdenServer
+   * calls this while it prepares the takeover, before any mount exists and
+   * before anything reads getNfsServer(). New mounts still follow the config;
+   * a full restart mounts everything the way the config says.
+   */
+  void createNfsServerForTakeover();
 
   const std::shared_ptr<ProcessInfoCache>& getProcessInfoCache() const {
     return processInfoCache_;
@@ -203,16 +216,6 @@ class ServerState {
   }
 
   /**
-   * Returns a ScribeLogger that can be used to send log events to external
-   * long term storage for offline consumption. Prefer this method if the
-   * caller needs to own a reference due to lifetime mismatch with the
-   * ServerState
-   */
-  const std::shared_ptr<IScribeLogger>& getScribeLogger() const {
-    return scribeLogger_;
-  }
-
-  /**
    * Returns a InodeAccessLogger that can be used to send log events to external
    * long term storage for offline consumption. Prefer this method if the
    * caller needs to own a reference due to lifetime mismatch with the
@@ -220,15 +223,6 @@ class ServerState {
    */
   const std::shared_ptr<InodeAccessLogger>& getInodeAccessLogger() const {
     return inodeAccessLogger_;
-  }
-
-  /**
-   * Returns a pointer to the FsEventLogger for logging FS event samples, if the
-   * platform supports it. Otherwise, returns nullptr. The caller is responsible
-   * for null checking.
-   */
-  const std::shared_ptr<FsEventLogger>& getFsEventLogger() const {
-    return fsEventLogger_;
   }
 
   FaultInjector& getFaultInjector() {
@@ -279,6 +273,7 @@ class ServerState {
 
  private:
   void shutdownPreloadCleanup();
+  std::shared_ptr<NfsServer> makeNfsServer(const EdenConfig& config) const;
 
   AbsolutePath socketPath_;
   UserInfo userInfo_;
@@ -292,8 +287,8 @@ class ServerState {
   std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
   std::shared_ptr<StructuredLogger> notificationsStructuredLogger_;
   std::shared_ptr<ErrorLogger> errorLogger_;
-  std::shared_ptr<IScribeLogger> scribeLogger_;
   std::unique_ptr<FaultInjector> const faultInjector_;
+  folly::EventBase* const nfsEventBase_;
   std::shared_ptr<NfsServer> nfs_;
 
   std::shared_ptr<ReloadableConfig> config_;
@@ -303,7 +298,6 @@ class ServerState {
       systemIgnoreFileMonitor_;
   std::shared_ptr<Notifier> notifier_;
   std::shared_ptr<InodeAccessLogger> inodeAccessLogger_;
-  std::shared_ptr<FsEventLogger> fsEventLogger_;
 
   // Map of active page cache preload operations, keyed by a unique operation
   // ID.

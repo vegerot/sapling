@@ -5,18 +5,7 @@ oncall("sapling")
 sl_rust_library(
     name = "storemodel",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {
-        "cargo_toml_config": {
-            "lib": {"name": "storemodel"},
-            "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
-                "license": "MIT",
-                "name": "sapling-storemodel",
-                "repository": "https://github.com/facebook/sapling",
-            },
-        },
-    },
+    autocargo = {},
     crate_root = "src/lib.rs",
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -30,6 +19,7 @@ sl_rust_library(
         "//eden/scm/lib/edenapi/types:edenapi_types",
         "//eden/scm/lib/metalog:metalog",
         "//eden/scm/lib/minibytes:minibytes",
+        "//eden/scm/lib/repo/repo-minimal-info:repo-minimal-info",
         "//eden/scm/lib/slex/items:slex_items",
         "//eden/scm/lib/types:types",
         "//eden/scm/lib/util/factory:factory",

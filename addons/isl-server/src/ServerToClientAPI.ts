@@ -25,7 +25,7 @@ import type {
   SubmodulesByRoot,
   WorktreeInfo,
 } from 'isl/src/types';
-import type {EjecaError, EjecaReturn} from 'shared/ejeca';
+import type {EjecaError} from 'shared/ejeca';
 import type {ExportStack, ImportedStack} from 'shared/types/stack';
 import type {ClientConnection} from '.';
 import type {RepositoryReference} from './RepositoryCache';
@@ -36,7 +36,6 @@ import type {RepositoryContext} from './serverTypes';
 
 import type {InternalTypes} from 'isl/src/InternalTypes';
 import {deserializeFromString, serializeToString} from 'isl/src/serialize';
-import type {PartiallySelectedDiffCommit} from 'isl/src/stackEdit/diffSplitTypes';
 import {Readable} from 'node:stream';
 import path from 'path';
 import {beforeRevsetForComparison} from 'shared/Comparison';
@@ -645,6 +644,8 @@ export default class ServerToClientAPI {
               type: 'comparisonContextLines',
               lines: {value: content.split('\n').slice(start - 1, start - 1 + numLines)},
               path: relativePath,
+              start,
+              numLines,
             }),
           )
           .catch((error: Error) =>
@@ -652,6 +653,8 @@ export default class ServerToClientAPI {
               type: 'comparisonContextLines',
               lines: {error},
               path: relativePath,
+              start,
+              numLines,
             }),
           );
         break;
@@ -662,7 +665,7 @@ export default class ServerToClientAPI {
         break;
       }
       case 'refresh': {
-        logger?.log('refresh requested');
+        logger?.info('refresh requested');
         repo.fetchAndSetRecommendedBookmarks(bookmarks => {
           this.postMessage({
             type: 'fetchedRecommendedBookmarks',
@@ -885,8 +888,8 @@ export default class ServerToClientAPI {
         // would leave the server with nothing recorded to refetch after a submit.
         repo.codeReviewProvider?.triggerDiffSummariesFetch(
           data.diffIds ?? repo.getAllDiffIds(),
-          /* force */ false,
-          /* partial */ data.partial === true,
+          data.force === true,
+          data.partial === true,
         );
         break;
       }
@@ -1132,18 +1135,6 @@ export default class ServerToClientAPI {
           });
         break;
       }
-      case 'splitCommitWithAI': {
-        Internal.splitCommitWithAI?.(ctx, data.diffCommit, data.args).then(
-          (result: Result<ReadonlyArray<PartiallySelectedDiffCommit>>) => {
-            this.postMessage({
-              type: 'splitCommitWithAI',
-              id: data.id,
-              result,
-            });
-          },
-        );
-        break;
-      }
       case 'fetchActiveAlerts': {
         repo
           .getActiveAlerts(ctx)
@@ -1289,22 +1280,6 @@ export default class ServerToClientAPI {
             this.postMessage({type: 'fetchedTaskDetails', id: data.id, result: {value: task}});
           },
         );
-        break;
-      }
-      case 'runDevmateCommand': {
-        Internal.runDevmateCommand?.(data.args, data.cwd)
-          .then((result: EjecaReturn) => {
-            this.postMessage({
-              type: 'devmateCommandResult',
-              result: {type: 'value', stdout: result.stdout, requestId: data.requestId},
-            });
-          })
-          .catch((error: EjecaError) => {
-            this.postMessage({
-              type: 'devmateCommandResult',
-              result: {type: 'error', stderr: error.stderr, requestId: data.requestId},
-            });
-          });
         break;
       }
       case 'fetchSubscribedFullRepoBranches': {

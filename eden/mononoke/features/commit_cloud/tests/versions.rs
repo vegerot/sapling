@@ -126,3 +126,55 @@ async fn test_versions(fb: FacebookInit) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[mononoke::fbinit_test]
+async fn version_prefix_with_underscore_matches_literally(fb: FacebookInit) -> anyhow::Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let sql = SqlCommitCloudBuilder::with_sqlite_in_memory()?.new();
+    let reponame = "test_repo".to_owned();
+    let workspace = "user/test_user/default".to_owned();
+    let args = WorkspaceVersion {
+        workspace: workspace.clone(),
+        reponame: reponame.clone(),
+        version: 1,
+        timestamp: Timestamp::now_as_secs(),
+        archived: false,
+    };
+    let txn = sql
+        .connections
+        .write_connection
+        .start_transaction(ctx.sql_query_telemetry())
+        .await?;
+    let txn = sql
+        .insert(txn, reponame.clone(), workspace.clone(), args.clone())
+        .await?;
+    txn.commit().await?;
+
+    let plain = get_version_by_prefix(
+        &ctx,
+        &sql.connections,
+        reponame.clone(),
+        "user/test".to_string(),
+    )
+    .await?;
+    assert_eq!(plain, vec![args.clone()]);
+
+    let wildcard = get_version_by_prefix(
+        &ctx,
+        &sql.connections,
+        reponame.clone(),
+        "user/tes_".to_string(),
+    )
+    .await?;
+    assert_eq!(wildcard, vec![]);
+
+    let underscore = get_version_by_prefix(
+        &ctx,
+        &sql.connections,
+        reponame,
+        "user/test_user".to_string(),
+    )
+    .await?;
+    assert_eq!(underscore, vec![args]);
+    Ok(())
+}

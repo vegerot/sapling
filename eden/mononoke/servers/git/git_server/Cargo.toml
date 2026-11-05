@@ -14,13 +14,14 @@ async-trait = "0.1.92"
 bonsai_git_mapping = { version = "0.1.0", path = "../../../repo_attributes/bonsai_git_mapping" }
 bonsai_tag_mapping = { version = "0.1.0", path = "../../../repo_attributes/bonsai_tag_mapping" }
 bookmarks = { version = "0.1.0", path = "../../../repo_attributes/bookmarks" }
+bookmarks_movement = { version = "0.1.0", path = "../../../repo_attributes/bookmarks/bookmarks_movement" }
 bytes = { version = "1.12.1", features = ["serde"] }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cmdlib_caching = { version = "0.1.0", path = "../../../cmdlib/caching" }
 connection_security_checker = { version = "0.1.0", path = "../../../common/connection_security_checker" }
 context = { version = "0.1.0", path = "../../slapi/slapi_server/context" }
-either = "1.18.0"
+either = "1.19.0"
 environment = { version = "0.1.0", path = "../../../cmdlib/environment" }
 executor_lib = { version = "0.1.0", path = "../../../cmdlib/sharding" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -31,10 +32,10 @@ git_env = { version = "0.1.0", path = "../../../git/git_env" }
 git_source_of_truth = { version = "0.1.0", path = "../../../repo_attributes/git_source_of_truth" }
 git_symbolic_refs = { version = "0.1.0", path = "../../../repo_attributes/git_symbolic_refs" }
 git_types = { version = "0.1.0", path = "../../../git/git_types" }
-gix-hash = { version = "0.25.1", features = ["sha1"] }
-gix-object = "0.60.0"
-gix-packetline = { version = "0.21.5", features = ["blocking-io"] }
-gix-transport = "0.57.2"
+gix-hash = { version = "0.26.2", features = ["sha1"] }
+gix-object = "0.64.1"
+gix-packetline = { version = "0.22.2", features = ["blocking-io"] }
+gix-transport = "0.59.2"
 gotham = "0.8.1"
 gotham_derive = "0.8.1"
 gotham_ext = { version = "0.1.0", path = "../../../common/gotham_ext" }
@@ -57,6 +58,7 @@ ods_counters = { version = "0.1.0", path = "../../../common/ods_counters" }
 packetline = { version = "0.1.0", path = "../../../git/packetline" }
 packfile = { version = "0.1.0", path = "../../../git/packfile" }
 permission_checker = { version = "0.1.0", path = "../../../common/permission_checker" }
+pin-project = "1.1.13"
 protocol = { version = "0.1.0", path = "../../../git/protocol" }
 rate_limiting = { version = "0.1.0", path = "../../../common/rate_limiting" }
 repo_authorization = { version = "0.1.0", path = "../../../repo_authorization" }
@@ -71,7 +73,7 @@ sapling-repourl = { version = "0.1.0", path = "../../../../scm/lib/repo/url" }
 scuba_ext = { version = "0.1.0", path = "../../../common/scuba_ext" }
 secure_utils = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 sharding_ext = { version = "0.1.0", path = "../../../cmdlib/sharding_ext" }
 sharding_observability = { version = "0.1.0", path = "../../../cmdlib/sharding_observability" }
 slapi_service = { version = "0.1.0", path = "../../slapi/slapi_service" }
@@ -79,8 +81,12 @@ source_control = { version = "0.1.0", path = "../../../scs/if" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.21"
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tokio-stream = { version = "0.1.19", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.20", features = ["full"] }
 topo_sort = { version = "0.1.0", path = "../../../common/topo_sort" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 weight_observer = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+
+[lints]
+workspace = true

@@ -48,6 +48,7 @@
 #include "eden/fs/store/StatsFetchContext.h"
 #include "eden/fs/store/sl/SaplingImportRequest.h"
 #include "eden/fs/store/sl/SaplingObjectId.h"
+#include "eden/fs/store/sl/SaplingWalkDetector.h"
 #include "eden/fs/telemetry/EdenErrorInfoBuilder.h"
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
@@ -57,17 +58,10 @@
 #ifdef EDEN_HAVE_SERVER_OBSERVER
 #include "common/fb303/cpp/ThreadPoolExecutorCounters.h" // @manual
 #endif
-#ifdef EDEN_HAVE_OBC
-#include "common/network/Hostname.h"
-#include "eden/fs/facebook/NormalizedHostname.h"
-#endif
 
-DEFINE_bool(
-    hg_fetch_missing_trees,
-    true,
-    "Set this parameter to \"no\" to disable fetching missing treemanifest "
-    "trees from the remote mercurial server.  This is generally only useful "
-    "for testing/debugging purposes");
+// Still passed by out-of-tree test fixtures (musecode); has had no effect for
+// years.
+DEFINE_bool(hg_fetch_missing_trees, true, "DEPRECATED - has no effect.");
 
 namespace facebook::eden {
 
@@ -169,8 +163,6 @@ HgImportTraceEvent::HgImportTraceEvent(
 
 SaplingBackingStore::SaplingBackingStore(
     AbsolutePathPiece repository,
-    AbsolutePathPiece mount,
-    AbsolutePathPiece clientDirectory,
     CaseSensitivity caseSensitive,
     EdenStatsPtr stats,
     UnboundedQueueExecutor* serverThreadPool,
@@ -197,10 +189,6 @@ SaplingBackingStore::SaplingBackingStore(
       store_{
           sapling::sapling_backingstore_new(
               rust::Str{repository.view().data(), repository.view().size()},
-              rust::Str{mount.view().data(), mount.view().size()},
-              rust::Str{
-                  clientDirectory.view().data(),
-                  clientDirectory.view().size()},
               config_->getEdenConfig()->backingstoreWalkMode.getValue(),
               edenFsEventsLogger_)
               .into_raw(),
@@ -232,12 +220,6 @@ SaplingBackingStore::SaplingBackingStore(
   hgTraceHandle_ = traceBus_->subscribeFunction(
       folly::to<std::string>("hg-activitybuffer-", getRepoName().value_or("")),
       [this](const HgImportTraceEvent& event) { this->processHgEvent(event); });
-
-#ifdef EDEN_HAVE_OBC
-  if (config_->getEdenConfig()->enableOBCOnEden.getValue()) {
-    initializeOBCCounters();
-  }
-#endif
 }
 
 /**
@@ -247,8 +229,6 @@ SaplingBackingStore::SaplingBackingStore(
  */
 SaplingBackingStore::SaplingBackingStore(
     AbsolutePathPiece repository,
-    AbsolutePathPiece mount,
-    AbsolutePathPiece clientDirectory,
     CaseSensitivity caseSensitive,
     EdenStatsPtr stats,
     folly::Executor* executor,
@@ -275,10 +255,6 @@ SaplingBackingStore::SaplingBackingStore(
       store_{
           sapling::sapling_backingstore_new(
               rust::Str{repository.view().data(), repository.view().size()},
-              rust::Str{mount.view().data(), mount.view().size()},
-              rust::Str{
-                  clientDirectory.view().data(),
-                  clientDirectory.view().size()},
               config_->getEdenConfig()->backingstoreWalkMode.getValue(),
               edenFsEventsLogger_)
               .into_raw(),
@@ -310,12 +286,6 @@ SaplingBackingStore::SaplingBackingStore(
   hgTraceHandle_ = traceBus_->subscribeFunction(
       folly::to<std::string>("hg-activitybuffer-", getRepoName().value_or("")),
       [this](const HgImportTraceEvent& event) { this->processHgEvent(event); });
-
-#ifdef EDEN_HAVE_OBC
-  if (config_->getEdenConfig()->enableOBCOnEden.getValue()) {
-    initializeOBCCounters();
-  }
-#endif
 }
 
 SaplingBackingStore::~SaplingBackingStore() {
@@ -324,25 +294,6 @@ SaplingBackingStore::~SaplingBackingStore() {
     thread.join();
   }
 }
-
-#ifdef EDEN_HAVE_OBC
-void SaplingBackingStore::initializeOBCCounters() {
-  // Get the hostname without the ".facebook.com" suffix
-  auto hostname = facebook::network::getLocalHost(/*stripFbDomain=*/true);
-  if (config_->getEdenConfig()->aggregateContainerOdsHostnames.getValue()) {
-    hostname = detail::getOdsHostname(hostname);
-  }
-  getBlobPerRepoLatencies_ = monitoring::OBCP99P95P50(
-      monitoring::OdsCategoryId::ODS_EDEN,
-      fmt::format("eden.store.sapling.fetch_blob_{}_us", repoName_),
-      {hostname});
-  getTreePerRepoLatencies_ = monitoring::OBCP99P95P50(
-      monitoring::OdsCategoryId::ODS_EDEN,
-      fmt::format("eden.store.sapling.fetch_tree_{}_us", repoName_),
-      {std::move(hostname)});
-  isOBCEnabled_ = true;
-}
-#endif
 
 void SaplingBackingStore::processHgEvent(const HgImportTraceEvent& event) {
   switch (event.eventType) {
@@ -398,11 +349,6 @@ void SaplingBackingStore::setFetchBlobCounters(
     return;
   }
 
-#ifdef EDEN_HAVE_OBC
-  if (isOBCEnabled_) {
-    getBlobPerRepoLatencies_ += watch.elapsed().count();
-  }
-#endif
   stats_->addDuration(&SaplingBackingStoreStats::fetchBlob, watch.elapsed());
 
   if (fetchResult == ObjectFetchContext::FetchResult::Success) {
@@ -533,12 +479,24 @@ void SaplingBackingStore::getBlobBatch(
       });
 }
 
+std::shared_ptr<WalkDetector> SaplingBackingStore::createWalkDetector(
+    AbsolutePathPiece mountPath) {
+  // The detector passes the Rust store back on every report. Aliasing it to
+  // this object keeps the store alive for as long as the detector exists.
+  std::shared_ptr<sapling::BackingStore> store{
+      shared_from_this(), store_.get()};
+  return std::make_shared<SaplingWalkDetector>(
+      std::move(store),
+      sapling::sapling_backingstore_walk_detector(
+          *store_.get(),
+          rust::Str{mountPath.view().data(), mountPath.view().size()}));
+}
+
 folly::Try<BlobPtr> SaplingBackingStore::getBlobFromBackingStore(
     SlOidView slOid,
-    const ObjectFetchContextPtr& context,
+    const ObjectFetchContextPtr& /*context*/,
     sapling::FetchMode fetchMode) {
   auto node = slOid.node();
-  auto path = slOid.path();
 
   using GetBlobResult = folly::Try<BlobPtr>;
 
@@ -553,14 +511,6 @@ folly::Try<BlobPtr> SaplingBackingStore::getBlobFromBackingStore(
   }
 
   if (result.data != nullptr) {
-    if (ObjectFetchContext::shouldTriggerWalkDetection(context->getCause())) {
-      sapling_backingstore_witness_file_read(
-          *store_.get(),
-          rust::Str{path.view().data(), path.view().size()},
-          fetchMode == sapling::FetchMode::LocalOnly,
-          context->getClientPid().valueOrZero().get());
-    }
-
     return GetBlobResult{
         std::make_shared<BlobPtr::element_type>(std::move(*result.data))};
   } else {
@@ -617,7 +567,6 @@ void SaplingBackingStore::getTreeBatch(
         sapling::Request{
             request.oid.rustData(),
             request.cause,
-            request.context->getClientPid().valueOrZero().get(),
         });
   }
 
@@ -655,11 +604,6 @@ void SaplingBackingStore::getTreeBatch(
       }
     }
 
-#ifdef EDEN_HAVE_OBC
-    if (isOBCEnabled_) {
-      getTreePerRepoLatencies_ += batchWatch.elapsed().count();
-    }
-#endif
     stats_->addDuration(
         &SaplingBackingStoreStats::fetchTree, batchWatch.elapsed());
 
@@ -789,7 +733,7 @@ SaplingBackingStore::prepareRequests(
 }
 
 // The priority is defined in ObjectFetchContext::Cause
-// FS -> Thrift -> Prefetch -> Unknown
+// FS -> Thrift -> Glob -> Prefetch -> InodeGc -> Unknown
 ObjectFetchContext::Cause SaplingBackingStore::getHighestPriorityFetchCause(
     const ImportRequestsList& importRequestsForId) const {
   ObjectFetchContext::Cause highestPriorityCause =
@@ -904,7 +848,6 @@ void SaplingBackingStore::getTreeAuxDataBatch(
         sapling::Request{
             request.oid.rustData(),
             request.cause,
-            request.context->getClientPid().valueOrZero().get(),
         });
   }
 
@@ -992,7 +935,6 @@ void SaplingBackingStore::getBlobAuxDataBatch(
         sapling::Request{
             request.oid.rustData(),
             request.cause,
-            request.context->getClientPid().valueOrZero().get(),
         });
   }
   // store_.getBlobAuxDataBatch is blocking, hence we can take these by
@@ -1095,12 +1037,6 @@ ObjectComparison SaplingBackingStore::compareObjectsById(
   // This is by far the common case, so check it first:
   if (one.bytesEqual(two)) {
     return ObjectComparison::Identical;
-  }
-
-  if (config_->getEdenConfig()->hgBijectiveBlobIds.getValue()) {
-    // If one and two differ, and hg bijective blob IDs is enabled, then we know
-    // the blob contents differ.
-    return ObjectComparison::Different;
   }
 
   // Now parse the object IDs and read their rev hashes.
@@ -1521,7 +1457,7 @@ SaplingBackingStore::convertPermissionDeniedToRestrictedTree(
 
 folly::Try<facebook::eden::TreePtr> SaplingBackingStore::getNativeTree(
     SlOidView slOid,
-    const ObjectFetchContextPtr& context,
+    const ObjectFetchContextPtr& /*context*/,
     sapling::FetchMode fetch_mode) {
   XLOGF(DBG7, "Importing tree {} from hgcache", slOid);
   return folly::makeTryWith([&] {
@@ -1544,22 +1480,7 @@ folly::Try<facebook::eden::TreePtr> SaplingBackingStore::getNativeTree(
       throw std::move(*result.error);
     }
 
-    facebook::eden::TreePtr tree = tb.build();
-
-    if (tree &&
-        ObjectFetchContext::shouldTriggerWalkDetection(context->getCause())) {
-      sapling_backingstore_witness_dir_read(
-          *store_.get(),
-          rust::Slice<const uint8_t>{
-              reinterpret_cast<const uint8_t*>(slOid.path().view().data()),
-              slOid.path().view().size()},
-          tb.num_files(),
-          tb.num_dirs(),
-          fetch_mode == sapling::FetchMode::LocalOnly,
-          context->getClientPid().valueOrZero().get());
-    }
-
-    return tree;
+    return tb.build();
   });
 }
 
@@ -1621,58 +1542,77 @@ SaplingBackingStore::getBlobEnqueue(
     const ObjectFetchContextPtr& context,
     const SaplingImportRequest::FetchType fetch_type) {
   auto self = shared_from_this();
-  auto getBlobFuture = makeImmediateFutureWith([&] {
-    XLOGF(DBG4, "making blob import request for {}", slOid);
-    auto requestContext = context.copy();
-    auto request =
-        SaplingImportRequest::makeBlobImportRequest(slOid, requestContext);
-    request->setFetchType(fetch_type);
-    auto unique = request->getUnique();
-    std::unique_ptr<RequestMetricsScope> importTracker;
-    switch (fetch_type) {
-      case SaplingImportRequest::FetchType::Fetch:
-        importTracker = std::make_unique<RequestMetricsScope>(
-            &self->pendingImportBlobWatches_);
-        break;
-      case SaplingImportRequest::FetchType::Prefetch:
-        importTracker = std::make_unique<RequestMetricsScope>(
-            &self->pendingImportPrefetchWatches_);
-        break;
-    }
-    self->traceBus_->publish(
-        HgImportTraceEvent::queue(
-            unique,
-            HgImportTraceEvent::BLOB,
-            slOid,
-            context->getPriority().getClass(),
-            context->getCause(),
-            context->getClientPid()));
+  auto enqueue = [](const std::shared_ptr<SaplingBackingStore>& self,
+                    const SlOid& slOid,
+                    const ObjectFetchContextPtr& context,
+                    SaplingImportRequest::FetchType fetch_type) {
+    auto getBlobFuture = makeImmediateFutureWith([&] {
+      XLOGF(DBG4, "making blob import request for {}", slOid);
+      auto requestContext = context.copy();
+      auto request =
+          SaplingImportRequest::makeBlobImportRequest(slOid, requestContext);
+      request->setFetchType(fetch_type);
+      auto unique = request->getUnique();
+      std::unique_ptr<RequestMetricsScope> importTracker;
+      switch (fetch_type) {
+        case SaplingImportRequest::FetchType::Fetch:
+          importTracker = std::make_unique<RequestMetricsScope>(
+              &self->pendingImportBlobWatches_);
+          break;
+        case SaplingImportRequest::FetchType::Prefetch:
+          importTracker = std::make_unique<RequestMetricsScope>(
+              &self->pendingImportPrefetchWatches_);
+          break;
+      }
+      self->traceBus_->publish(
+          HgImportTraceEvent::queue(
+              unique,
+              HgImportTraceEvent::BLOB,
+              slOid,
+              context->getPriority().getClass(),
+              context->getCause(),
+              context->getClientPid()));
 
-    return self->queue_.enqueueBlob(std::move(request))
-        .ensure([self,
-                 unique,
-                 slOid,
-                 context = context.copy(),
-                 importTracker = std::move(importTracker)]() {
-          self->traceBus_->publish(
-              HgImportTraceEvent::finish(
-                  unique,
-                  HgImportTraceEvent::BLOB,
-                  slOid,
-                  context->getPriority().getClass(),
-                  context->getCause(),
-                  context->getClientPid(),
-                  context->getFetchedSource()));
+      return self->queue_.enqueueBlob(std::move(request))
+          .ensure([self,
+                   unique,
+                   slOid,
+                   context = context.copy(),
+                   importTracker = std::move(importTracker)]() {
+            self->traceBus_->publish(
+                HgImportTraceEvent::finish(
+                    unique,
+                    HgImportTraceEvent::BLOB,
+                    slOid,
+                    context->getPriority().getClass(),
+                    context->getCause(),
+                    context->getClientPid(),
+                    context->getFetchedSource()));
+          });
+    });
+
+    return std::move(getBlobFuture)
+        .thenTry([self, slOid](folly::Try<BlobPtr>&& result) {
+          self->queue_.markImportAsFinished<BlobPtr::element_type>(
+              slOid, result);
+          auto blob = std::move(result).value();
+          return GetBlobResult{
+              std::move(blob), ObjectFetchContext::Origin::FromNetworkFetch};
         });
-  });
+  };
 
-  return std::move(getBlobFuture)
-      .thenTry([self, slOid](folly::Try<BlobPtr>&& result) {
-        self->queue_.markImportAsFinished<BlobPtr::element_type>(slOid, result);
-        auto blob = std::move(result).value();
-        return GetBlobResult{
-            std::move(blob), ObjectFetchContext::Origin::FromNetworkFetch};
-      });
+  // Enqueue eagerly unless fault injection is enabled. Under
+  // kImmediateFutureAlwaysDefer (debug/sanitized builds) even a disabled
+  // checkAsync() is not ready, so chaining on it would defer the enqueue until
+  // the caller consumes the future.
+  if (LIKELY(!faultInjector_.isEnabled())) {
+    return enqueue(self, slOid, context, fetch_type);
+  }
+  return faultInjector_
+      .checkAsync("SaplingBackingStore::getBlobEnqueue", slOid.node())
+      .thenValue(
+          [enqueue, self, slOid = slOid, context = context.copy(), fetch_type](
+              auto&&) { return enqueue(self, slOid, context, fetch_type); });
 }
 
 folly::coro::now_task<BackingStore::GetBlobResult>
@@ -1681,6 +1621,10 @@ SaplingBackingStore::co_getBlobEnqueue(
     const ObjectFetchContextPtr& context,
     const SaplingImportRequest::FetchType fetch_type) {
   auto self = shared_from_this();
+  if (UNLIKELY(self->faultInjector_.isEnabled())) {
+    co_await self->faultInjector_.co_checkAsync(
+        "SaplingBackingStore::co_getBlobEnqueue", slOid.node());
+  }
   XLOGF(DBG4, "making blob import request for {}", slOid);
   auto requestContext = context.copy();
   auto request =
@@ -2163,18 +2107,7 @@ sapling::BatchFetchStats SaplingBackingStore::nativeGetBlobBatch(
         sapling::Request{
             request.oid.rustData(),
             request.cause,
-            request.context->getClientPid().valueOrZero().get(),
         });
-
-    if (ObjectFetchContext::shouldTriggerWalkDetection(request.cause)) {
-      sapling_backingstore_witness_file_read(
-          *store_.get(),
-          rust::Str{
-              request.oid.path().view().data(),
-              request.oid.path().view().size()},
-          fetch_mode == sapling::FetchMode::LocalOnly,
-          request.context->getClientPid().valueOrZero().get());
-    }
   }
 
   return sapling_backingstore_get_blob_batch(
@@ -2276,7 +2209,10 @@ void SaplingBackingStore::logBackingStoreFetch(
     folly::Range<SlOidView*> slOids,
 
     ObjectFetchContext::ObjectType type) {
-  const auto& logFetchPathRegex =
+  // Copy the value out of the snapshot: a reference into it would dangle as
+  // soon as the temporary snapshot is destroyed, and a config reload frees
+  // the RE2 it points at.
+  const auto logFetchPathRegex =
       config_->getEdenConfig()->logObjectFetchPathRegex.getValue();
 
   if (logFetchPathRegex) {
@@ -2468,17 +2404,9 @@ void SaplingBackingStore::periodicManagementTask() {
 }
 
 namespace {
-void dropBlobImportRequest(std::shared_ptr<SaplingImportRequest>& request) {
-  auto* promise = request->getPromise<BlobPtr>();
-  if (promise != nullptr) {
-    if (!promise->isFulfilled()) {
-      promise->setException(std::runtime_error("Request forcibly dropped"));
-    }
-  }
-}
-
-void dropTreeImportRequest(std::shared_ptr<SaplingImportRequest>& request) {
-  auto* promise = request->getPromise<TreePtr>();
+template <typename ResponseType>
+void dropImportRequest(std::shared_ptr<SaplingImportRequest>& request) {
+  auto* promise = request->getPromise<ResponseType>();
   if (promise != nullptr) {
     if (!promise->isFulfilled()) {
       promise->setException(std::runtime_error("Request forcibly dropped"));
@@ -2492,10 +2420,16 @@ int64_t SaplingBackingStore::dropAllPendingRequestsFromQueue() {
   for (auto& request : requestVec) {
     if (request->isType<SaplingImportRequest::BlobImport>()) {
       XLOG(DBG7, "Dropping blob request");
-      dropBlobImportRequest(request);
+      dropImportRequest<BlobPtr>(request);
     } else if (request->isType<SaplingImportRequest::TreeImport>()) {
       XLOG(DBG7, "Dropping tree request");
-      dropTreeImportRequest(request);
+      dropImportRequest<TreePtr>(request);
+    } else if (request->isType<SaplingImportRequest::BlobAuxImport>()) {
+      XLOG(DBG7, "Dropping blob aux data request");
+      dropImportRequest<BlobAuxDataPtr>(request);
+    } else if (request->isType<SaplingImportRequest::TreeAuxImport>()) {
+      XLOG(DBG7, "Dropping tree aux data request");
+      dropImportRequest<TreeAuxDataPtr>(request);
     }
   }
   return requestVec.size();

@@ -20,8 +20,6 @@
 
 #include <thrift/lib/cpp/concurrency/ThreadManager.h>
 
-#include "common/rust/shed/hostcaps/hostcaps.h"
-
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/config/ConfigSetting.h"
 #include "eden/fs/config/ConfigSource.h"
@@ -30,7 +28,6 @@
 #include "eden/fs/config/InodeCatalogType.h"
 #include "eden/fs/config/MountProtocol.h"
 #include "eden/fs/config/NfsAccessMode.h"
-#include "eden/fs/config/ReaddirPrefetch.h"
 #include "eden/fs/config/RestrictedContentMode.h"
 #include "eden/fs/eden-config.h"
 
@@ -225,25 +222,6 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * If EdenFS should auto migrate FUSE repos to NFS on Ventura.
-   * only used in the CLI, including here to get rid of warnings.
-   */
-  ConfigSetting<bool> migrateToNFSVentura{
-      "core:migrate_existing_to_nfs",
-      true,
-      this};
-
-  /**
-   * If EdenFS should force a non-graceful restart, if necessary, to auto
-   * migrate FUSE repos to NFS on all versions of macOS.  Only used in the CLI
-   * and edenfs_restarter, including here to get rid of warnings.
-   */
-  ConfigSetting<bool> migrateToNFSAllMacOS{
-      "core:migrate_existing_to_nfs_all_macos",
-      true,
-      this};
-
-  /**
    * How many threads to use for the misc EdenCPUThreadPool.
    */
   ConfigSetting<uint8_t> edenCpuPoolNumThreads{
@@ -274,12 +252,44 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * If EdenFS should auto migrate non inmemory inode catalogs to inmemory on
-   * Windows.
+   * How long a graceful restart that is not forced lets the Thrift requests
+   * in flight finish. It waits up to this long for the requests that were
+   * running when it was asked and refuses if they have not finished; a
+   * request that has already been running longer than this is refused
+   * without waiting. Once the Thrift server has stopped, whatever is still
+   * running after this long again is cancelled, so that no request can hold
+   * the stop to its deadline.
    */
-  ConfigSetting<bool> migrateToInMemoryCatalog{
-      "core:migrate_existing_to_in_memory_catalog",
+  ConfigSetting<std::chrono::nanoseconds> takeoverRequestGrace{
+      "core:takeover-request-grace",
+      std::chrono::seconds(30),
+      this};
+
+  /**
+   * Whether a graceful restart that is not forced waits for the Thrift
+   * requests in flight, see core:takeover-request-grace. When off, it stops
+   * the Thrift server at once and leaves the requests to the stop deadline,
+   * as EdenFS did before the grace period existed, and it does not refuse
+   * for recent activity either. The open trace streams are ended either way,
+   * since a stream holds its connection until its client leaves.
+   */
+  ConfigSetting<bool> takeoverWaitsForRequests{
+      "experimental:takeover-waits-for-requests",
       true,
+      this};
+
+  /**
+   * How long after a checkout, a reset of the parent commits, a mount or an
+   * unmount EdenFS counts as in use. A graceful restart that asks to proceed
+   * only if EdenFS is idle, as the hourly restarter does, is refused while
+   * one of those ran within this window: a checkout is several Thrift calls
+   * in a row, and a takeover between two of them lands in the middle of it.
+   * `eden restart --graceful` run by hand does not ask, so it is only held
+   * back by the requests in flight.
+   */
+  ConfigSetting<std::chrono::nanoseconds> takeoverRecentActivityWindow{
+      "core:takeover-recent-activity-window",
+      std::chrono::minutes(10),
       this};
 
   /**
@@ -463,11 +473,6 @@ class EdenConfig : private ConfigSettingManager {
 
   // [thrift]
 
-  ConfigSetting<bool> allowUnixGroupRequests{
-      "thrift:allow-unix-group-requests",
-      false,
-      this};
-
   /**
    * Whether Eden should implement its own unix domain socket permission checks
    * or rely on filesystem permissions.
@@ -542,24 +547,23 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Whether Eden should use a dedicated executor for checkout requests. This is
-   * meant to help with checkoutRevision performance while using serial
-   * execution for other Thrift requests. This feature can be used even if not
-   * using serial execution for other Thrift requests, but if serial execution
-   * is being used, its a good idea to turn on this config as well.
+   * Number of threads in the diff work executor, which runs the inode loads
+   * and file hashing that a diff of the working copy entails.
    */
-  ConfigSetting<bool> thriftUseCheckoutExecutor{
-      "thrift:use-checkout-executor",
-      true,
+  ConfigSetting<uint64_t> numDiffWorkThreads{
+      "thrift:checkout-revision-num-servicing-threads",
+      folly::available_concurrency(),
       this};
 
   /**
-   * Number of threads that will service the checkoutRevision Thrift endpoint
-   * when using its own executor.
+   * Whether status runs the overlay reads and content hashing it needs for
+   * materialized files on the diff work executor, in parallel, instead of
+   * inline on the Thrift worker handling the request. Checkout uses the same
+   * executor; see EdenServer::getDiffWorkExecutor().
    */
-  ConfigSetting<uint64_t> numCheckoutThreads{
-      "thrift:checkout-revision-num-servicing-threads",
-      folly::available_concurrency(),
+  ConfigSetting<bool> thriftUseStatusExecutor{
+      "thrift:use-status-executor",
+      true,
       this};
 
   /**
@@ -618,15 +622,6 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Whether the Thrift server should be configured to leak outstanding requests
-   * when the server is stopped during shutdown/restart.
-   */
-  ConfigSetting<bool> thriftLeakOutstandingRequestsWhenServerStops{
-      "thrift:leak-outstanding-requests-when-server-stops",
-      false,
-      this};
-
-  /**
    * Enable use of MiniTracer to collect checkout timing info.
    */
   ConfigSetting<bool> thriftCheckoutTimeTracing{
@@ -634,12 +629,8 @@ class EdenConfig : private ConfigSettingManager {
       true,
       this};
   /**
-   * Configures the amount of time workers should spend completing outstanding
-   * requests during Thrift server shutdown. If the timeout is reached, the
-   * server exits immediately (i.e. crashes).
-   *
-   * Must be used with thriftLeakOutstandingRequestsWhenServerStops to have any
-   * effect.
+   * How long the Thrift server waits for in-flight requests to finish when it
+   * stops. A request that outlives the wait makes the daemon abort.
    */
   ConfigSetting<std::chrono::nanoseconds> thriftWorkersJoinTimeout{
       "thrift:workers-join-timeout",
@@ -657,8 +648,6 @@ class EdenConfig : private ConfigSettingManager {
       "ssl:client-certificate-locations",
       std::vector<std::string>{},
       this};
-
-  ConfigSetting<bool> useMononoke{"mononoke:use-mononoke", false, this};
 
   // [mount]
 
@@ -728,6 +717,17 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint64_t> pressureBasedGcMinReclaimPercent{
       "mount:pressure-gc-min-reclaim-percent",
       10,
+      this};
+
+  /**
+   * Whether the sweep that follows an inode GC run's invalidation phase
+   * applies the run's cutoff to inodes without a filesystem reference, so
+   * one that a status or Thrift request referenced recently is kept. When
+   * off, every inode without a filesystem reference is unloaded on each run.
+   */
+  ConfigSetting<bool> gcSweepHonorsCutoff{
+      "mount:gc-sweep-honors-cutoff",
+      true,
       this};
 
   /**
@@ -881,22 +881,6 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Deprecated no-op retained for compatibility with existing configs.
-   */
-  ConfigSetting<std::chrono::nanoseconds> pressureBasedGcCollapseGrace{
-      "mount:pressure-gc-collapse-grace",
-      std::chrono::seconds{5},
-      this};
-
-  /**
-   * Specifies which directory children will be prefetched upon readdir.
-   */
-  ConfigSetting<ReaddirPrefetch> readdirPrefetch{
-      "mount:readdir-prefetch",
-      ReaddirPrefetch::None,
-      this};
-
-  /**
    * Keep the inode-number-ordered index that readdir builds for a directory
    * across the requests of one listing, instead of rebuilding it for every
    * request. The index is dropped once the listing ends or the directory
@@ -908,23 +892,55 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Specify the interval of periodic accidental unmount recovery.
-   */
-  ConfigSetting<std::chrono::nanoseconds> accidentalUnmountRecoveryInterval{
-      "mount:accidental-unmount-recovery-interval",
-      std::chrono::minutes(0),
-      this};
-
-  /**
    * Specify the interval of periodic mount health checks.
    *
-   * Health checks only observe and report; they never mount or unmount
-   * anything. They are therefore safe to enable independently of
-   * accidental-unmount-recovery-interval, which admits remounts.
+   * Health checks only observe and report unless mount-health-check-recovery
+   * is set; they never unmount anything.
    */
   ConfigSetting<std::chrono::nanoseconds> mountHealthCheckInterval{
       "mount:mount-health-check-interval",
       std::chrono::minutes(0),
+      this};
+
+  /**
+   * When set, the mount health check remounts the configured checkouts it
+   * finds not served, instead of only reporting them.
+   */
+  ConfigSetting<bool> mountHealthCheckRecovery{
+      "mount:mount-health-check-recovery",
+      false,
+      this};
+
+  /**
+   * When set, a checkout whose FUSE or NFS channel stops without anyone asking
+   * (ENODEV, EOF, read errors) is remounted right away, without waiting for
+   * the next mount health check.
+   */
+  ConfigSetting<bool> recoverOnChannelStop{
+      "mount:recover-on-channel-stop",
+      false,
+      this};
+
+  /**
+   * Have the mount health check confirm that a checkout is still mounted with
+   * statx(2) on its root, which takes no mount-namespace lock, instead of
+   * reading the kernel mount table. It falls back to the mount table when the
+   * mount's device is not known yet or does not match. Linux only.
+   */
+  ConfigSetting<bool> mountHealthCheckStatx{
+      "mount:mount-health-check-statx",
+      false,
+      this};
+
+  /**
+   * How long a mount health check probe may run before the checkout is
+   * reported as hung (`daemon_running_mount_hung`). At or below the 5 s probe
+   * timeout, including the default of 0, a probe that runs past 5 s is
+   * reported as timed out instead.
+   */
+  ConfigSetting<std::chrono::nanoseconds> mountHealthCheckHangThreshold{
+      "mount:mount-health-check-hang-threshold",
+      std::chrono::seconds(0),
       this};
 
   /**
@@ -963,15 +979,6 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint32_t> fetchHeavyThreshold{
       "store:fetch-heavy-threshold",
       100000,
-      this};
-
-  /**
-   * The maximum number of tree prefetch operations to allow in parallel for any
-   * checkout.  Setting this to 0 will disable prefetch operations.
-   */
-  ConfigSetting<uint64_t> maxTreePrefetches{
-      "store:max-tree-prefetches",
-      5,
       this};
 
   /**
@@ -1041,15 +1048,6 @@ class EdenConfig : private ConfigSettingManager {
       "fuse:request-timeout",
       std::chrono::minutes(1),
       this};
-
-  /**
-   * The maximum number of concurrent requests allowed into userspace from the
-   * kernel. This corresponds to fuse_init_out::max_background. The
-   * documentation this applies to only readaheads and async direct IO, but
-   * empirically we have observed the number of concurrent requests is limited
-   * to 12 (FUSE_DEFAULT_MAX_BACKGROUND) unless this is set high.
-   */
-  ConfigSetting<uint32_t> maximumFuseRequests{"fuse:max-requests", 1000, this};
 
   /**
    * The string we use in the vfs type when mounting the fuse mount. Others will
@@ -1201,30 +1199,6 @@ class EdenConfig : private ConfigSettingManager {
   // [nfs]
 
   /**
-   * Controls whether Eden will run its own rpcbind/portmapper server. On
-   * Linux there is one built into the kernel that is always running, and on
-   * mac there is one built into the kernel you just have to poke into running.
-   * There is not one built into Windows and no good (and discoverable by
-   * kmancini) external option to use. So we built our own.
-   *
-   * Rpcbind/portmapper runs on a fixed port (111), so two port mappers will
-   * conflict with each other. Thus we don't want to run rpcbind if there is
-   * already one running.
-   *
-   * Long story short, you never want to set this to true on Linux or mac,
-   * but do on windows (with care).
-   */
-  ConfigSetting<bool> runInternalRpcbind{
-      "nfs:run-internal-rpcbind",
-      false,
-      this};
-
-  /**
-   * Controls whether Mountd will register itself against rpcbind.
-   */
-  ConfigSetting<bool> registerMountd{"nfs:register-mountd", false, this};
-
-  /**
    * Whether EdenFS should unload NFS inodes. NFSv3 does not notify us when
    * file handles are closed. We have no definitive info from NFS on how many
    * open handles there are for already removed inodes.
@@ -1306,6 +1280,16 @@ class EdenConfig : private ConfigSettingManager {
    * some internal error (like buffer being too small).
    */
   ConfigSetting<bool> useUnixSocket{"nfs:use-uds", false, this};
+
+  /**
+   * Whether the privhelper overrides the filesystem type that statfs reports
+   * for an NFS mount served over a Unix domain socket to "edenfs:". The
+   * override is a private fsctl that macOS 27 answers with a crash report on
+   * every call. Mount table consumers now recognize these mounts by the name
+   * of the nfsd socket, so this can be turned off once the Sapling and
+   * watchman builds that know that name are deployed. Read at daemon start.
+   */
+  ConfigSetting<bool> nfsOverrideFstype{"nfs:override-fstype", true, this};
 
   /**
    * Send and receive buffer size of the nfsd socket when it is a Unix domain
@@ -1533,17 +1517,6 @@ class EdenConfig : private ConfigSettingManager {
   // [prjfs]
 
   /**
-   * The maximum time duration allowed for a ProjectedFS callback. If a request
-   * exceeds this amount of time, the request will fail to avoid blocking
-   * forever. A notification will also be shown to alert the user of the
-   * timeout.
-   */
-  ConfigSetting<std::chrono::nanoseconds> prjfsRequestTimeout{
-      "prjfs:request-timeout",
-      std::chrono::minutes(1),
-      this};
-
-  /**
    * Enable ProjectedFS's negative path caching to reduce the number of
    * requests non existent files.
    * Only applicable on Windows
@@ -1665,13 +1638,6 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<bool> enforceParents{"hg:enforce-parents", true, this};
 
   /**
-   * Controls whether EdenFS reads blob metadata directly from hg
-   *
-   * TODO: Delete once this config is no longer written.
-   */
-  ConfigSetting<bool> useAuxMetadata{"hg:use-aux-metadata", true, this};
-
-  /**
    * Controls whether EdenFS will attempt to fetch aux metadata or always
    * fallback to fetching blobs when the metadata is not present in local
    * caches.
@@ -1684,19 +1650,6 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<HgObjectIdFormat> hgObjectIdFormat{
       "hg:object-id-format",
       HgObjectIdFormat::WithPath,
-      this};
-
-  /**
-   * In general, hg does not guarantee that blob IDs and contents are 1:1 [1].
-   * EdenFS can be slightly faster if they are, so this switch exists for the
-   * future possibility that they are, or if someone wants to live dangerously
-   * for the sake of performance.
-   *
-   * [1] hg blob IDs sometimes include file history.
-   */
-  ConfigSetting<bool> hgBijectiveBlobIds{
-      "hg:has-bijective-blob-ids",
-      false,
       this};
 
   /**
@@ -1794,6 +1747,27 @@ class EdenConfig : private ConfigSettingManager {
       "",
       this};
 
+  /**
+   * Whether a mount gets a walk detector at all. Off means the mount creates
+   * none, so its reads are never reported to the backing store's walk
+   * detection, whatever `backingstore:walk-mode` says. Read when the mount is
+   * created.
+   */
+  ConfigSetting<bool> enableWalkDetector{
+      "experimental:enable-walk-detector",
+      true,
+      this};
+
+  /**
+   * Whether a file load tells the walk detector how many entries the file's
+   * directory had when its inode was loaded, so small and large directories
+   * are recognized even when their trees were already cached.
+   */
+  ConfigSetting<bool> walkDirSizeHints{
+      "experimental:walk-dir-size-hints",
+      true,
+      this};
+
   // [telemetry]
 
   /**
@@ -1889,83 +1863,12 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Controls sample denominator for each request sampling group.
-   * We assign request types into sampling groups based on their usage and
-   * set a sample denominator for each sampling group so that we have the
-   * flexibility of up/down-sampling different requests but also avoid having to
-   * set a sampling rate for each of the dozens of request types. For example,
-   * `mkdir` and `rmdir` can be assigned to a sampling group that have a high
-   * sampling rate while `getattr` and `getxattr` to another sampling group with
-   * low sampling rate as they happen very frequently.
-   *
-   * Sampling rates are calculated from sampling denominators. A denominator of
-   * 0 indicates dropping all requests in the group. Group 0's value is ignored
-   * as it's always considered as having denominator of 0. A positive
-   * denominator means that the requests in the group are sampled at 1/x (so
-   * denominator of 1 drops no events).
-   *
-   * We use sampling group as indexes into this vector to look
-   * up their denominators. Thus, the size of this vector should match the
-   * number of sampling groups defined by the enum `SamplingGroup`. If the
-   * vector has fewer elements than the number of sampling groups, look-ups will
-   * fail for the higher sampling groups and we will consider them having
-   * denominator of 0. For example, if the vector has size of 3, all requests of
-   * sampling group 4 will be dropped.
-   * Keeping this vector in ascending order is recommended but not required.
-   * e.g. {0, 10, 100, 1000, 10000}
-   */
-  ConfigSetting<std::vector<uint32_t>> requestSamplingGroupDenominators{
-      "telemetry:request-sampling-group-denominators",
-      std::vector<uint32_t>{0, 0, 0, 0, 0},
-      this};
-
-  /**
-   * Controls the max number of requests per minute per mount that can be sent
-   * for logging.
-   * A request is first sampled based on its sampling group denominators. Then
-   * if we have not reached this cap, the request is sent for logging.
-   */
-  ConfigSetting<uint32_t> requestSamplesPerMinute{
-      "telemetry:request-samples-per-minute",
-      0,
-      this};
-
-  /**
    * Minimum interval between NFS stats updates in seconds. NFS stat collection
    * only happens on macOS. Change this to 0 to disable NFS stat collection.
    */
   ConfigSetting<std::chrono::nanoseconds> updateNFSStatsInterval{
       "telemetry:update-nfs-stats-interval",
       std::chrono::seconds{0},
-      this};
-
-  /**
-   * OBC API is used for a few counters on EdenFS to make them enable on
-   * sandcastle. For now, OBC API is only works on prod/Linux. Then this config
-   * should only be set to true on prod/Linux.
-   * TODO: change this config when EngEnv team enable OBC API on macOS and
-   * Windows.
-   */
-  ConfigSetting<bool> enableOBCOnEden{
-      "telemetry:enable-obc-on-eden",
-      false,
-      this};
-
-  ConfigSetting<bool> aggregateContainerOdsHostnames{
-      "telemetry:aggregate-container-ods-hostnames",
-      true,
-      this};
-
-  /**
-   * Controls which configs we want to send with the request logging.
-   * The elements are full config keys, e.g. "hg:import-batch-size".
-   * Elements not valid or not present in the config map are silently ignored.
-   * This is only intended for facilitating A/B testing and should be empty if
-   * there is no active experiment.
-   */
-  ConfigSetting<std::vector<std::string>> requestSamplingConfigAllowlist{
-      "telemetry:request-sampling-config-allowlist",
-      std::vector<std::string>{},
       this};
 
   /**
@@ -2051,59 +1954,11 @@ class EdenConfig : private ConfigSettingManager {
   // [experimental]
 
   /**
-   * Controls whether EdenFS detects processes that crawl an NFS checkout. Only
-   * affects EdenFS if experimental:enable-nfs-server is also true. When NFS
-   * crawl detection is enabled, EdenFS will perioically check
-   * (experimental:nfs-crawl-interval) whether NFS read or readdir counters
-   * exceed the configured thresholds (experimental:nfs-crawl-read-threshold and
-   * experimental:nfs-crawl-readdir-threshold, respectively). If they do exceed,
-   * EdenFS will determine which processes appear to be performing the crawl and
-   * record their information to the log file and structured logging. Currently,
-   * this information is expected to be useful in diagnosing slowness when using
-   * NFS. Future, work in this area may provided more immediate feedback to
-   * users initiating these processes.
-   */
-  ConfigSetting<bool> enableNfsCrawlDetection{
-      "experimental:enable-nfs-crawl-detection",
-      false,
-      this};
-
-  /**
-   * Sets the interval at which EdenFS detects NFS crawling.
-   */
-  ConfigSetting<std::chrono::nanoseconds> nfsCrawlInterval{
-      "experimental:nfs-crawl-interval",
-      std::chrono::minutes(1),
-      this};
-
-  /**
-   * Sets the read threshold at which EdenFS determines NFS crawling is
-   * occurring.
-   */
-  ConfigSetting<uint32_t> nfsCrawlReadThreshold{
-      "experimental:nfs-crawl-read-threshold",
-      1000,
-      this};
-
-  /**
-   * Sets the readdir threshold at which EdenFS determines NFS crawling is
-   * occurring.
-   */
-  ConfigSetting<uint32_t> nfsCrawlReadDirThreshold{
-      "experimental:nfs-crawl-readdir-threshold",
-      250,
-      this};
-
-  /**
-   * Sets the process name exclusions NFS crawling to ignore.
-   */
-  ConfigSetting<std::unordered_set<std::string>> nfsCrawlExcludedProcessNames{
-      "experimental:nfs-crawl-excluded-process-names",
-      {},
-      this};
-
-  /**
    * Controls whether EdenFS exports itself as an NFS server.
+   *
+   * A graceful restart hands NFS mounts over whatever this setting says in
+   * the new daemon, and the new daemon then runs an NFS server for them until
+   * the next full restart. New mounts follow this setting.
    */
   ConfigSetting<bool> enableNfsServer{
       "experimental:enable-nfs-server",
@@ -2176,39 +2031,6 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> enableCoroutinesInDebugGetBlob{
       "experimental:enable-coroutines-debug-get-blob",
-      false,
-      this};
-
-  /**
-   * Controls whether EdenFS symlinks are enabled on Windows.
-   */
-  ConfigSetting<bool> windowsSymlinksEnabled{
-      "experimental:windows-symlinks",
-      folly::kIsWindows,
-      this};
-
-  /**
-   * Controls whether EdenFS propagates errors during the core checkout
-   * operation. The old behavior was to "propagate" as conflict errors (which
-   * Sapling might ignore). The new behavior is to propagate errors as top-level
-   * command errors.
-   *
-   * Once the new behavior is validated, this flag (and the old code) should be
-   * removed.
-   */
-  ConfigSetting<bool> propagateCheckoutErrors{
-      "experimental:propagate-checkout-errors",
-      true,
-      this};
-
-  /**
-   * When true, EdenFS will convert the backing store to a FilteredBackingStore
-   * with the "null" filter when it restarts. The real filter info will be
-   * written to a special file under .hg folder and will be applied next time
-   * when we checkout the repo.
-   */
-  ConfigSetting<bool> attemptEdensparseMigration{
-      "experimental:attempt-edensparse-migration",
       false,
       this};
 
@@ -2291,15 +2113,6 @@ class EdenConfig : private ConfigSettingManager {
    * Default is true to allow individual feature flags to work.
    */
   ConfigSetting<bool> enableCoroutines{"coroutines:enabled", true, this};
-
-  /**
-   * Controls whether EdenFS uses phase 8 coroutine implementations
-   * (getEntryInformation).
-   */
-  ConfigSetting<bool> enableCoroutinesPhase8{
-      "coroutines:enable-phase8",
-      false,
-      this};
 
   /**
    * Controls whether EdenFS uses phase 9 coroutine implementations
@@ -2475,11 +2288,6 @@ class EdenConfig : private ConfigSettingManager {
       false,
       this};
 
-  // [log]
-
-  ConfigSetting<uint64_t> maxLogFileSize{"log:max-file-size", 50000000, this};
-  ConfigSetting<uint64_t> maxRotatedLogFiles{"log:num-rotated-logs", 3, this};
-
   // [prefetch-profiles]
 
   /**
@@ -2534,50 +2342,6 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * DANGER: this option will put overlay into memory and skip persisting any
-   * actual data to disk. This will guarantee to cause EdenFS corruption after
-   * restart. Use with caution.
-   */
-  ConfigSetting<bool> unsafeInMemoryOverlay{
-      "overlay:unsafe-in-memory-overlay",
-      false,
-      this};
-
-  /**
-   * The synchronous mode used when using a SQLite backed overlay. Currently it
-   * only supports "off" or "normal". Setting this to off may cause data loss.
-   */
-  ConfigSetting<std::string> overlaySynchronousMode{
-      "overlay:synchronous-mode",
-      folly::kIsWindows ? "off" : "normal",
-      this};
-
-  /**
-   * This option controls how often we run SQLite WAL checkpoint in a SQLite
-   * backed overlay. This option is ignored in other overlay types.
-   */
-  ConfigSetting<std::chrono::nanoseconds> overlayMaintenanceInterval{
-      "overlay:maintenance-interval",
-      std::chrono::minutes(1),
-      this};
-
-  /**
-   * Determines if EdenFS should enable the option to buffer overlay writes.
-   * This only works with SQLite backed overlays.
-   */
-  ConfigSetting<bool> overlayBuffered{"overlay:buffered", true, this};
-
-  /**
-   * Number of bytes worth of Overlay data to keep in memory before pausing
-   * enqueues to the BufferedSqliteInodeCatalog's worker thread. This is a per
-   * overlay setting.
-   */
-  ConfigSetting<size_t> overlayBufferSize{
-      "overlay:buffer-size",
-      64 * 1024 * 1024,
-      this};
-
-  /**
    * Number of OverlayFile and metadata cached in memory.
    */
   ConfigSetting<size_t> overlayFileAccessCacheSize{
@@ -2601,8 +2365,8 @@ class EdenConfig : private ConfigSettingManager {
    * leaves a partial file, which is safe here because an inode is only
    * recorded as materialized after its contents are written: on crash the
    * partial file is an fsck orphan and the contents still come from source
-   * control. Covers file inodes only; `overlay:direct-file-writes` is the
-   * equivalent for directory records.
+   * control. Covers file inodes only; non-materialized directory records are
+   * always written directly.
    */
   ConfigSetting<bool> experimentalOverlayDirectFileCreate{
       "experimental:overlay-direct-file-create",
@@ -2667,20 +2431,8 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * When true, write non-materialized directories directly to their overlay
-   * file instead of creating a temporary file and renaming. This avoids
-   * filesystem metadata overhead (rename) at the cost of leaving a
-   * partially-written file on crash, which might be okay for non-materialized
-   * directories.
-   */
-  ConfigSetting<bool> overlayDirectFileWrites{
-      "overlay:direct-file-writes",
-      false,
-      this};
-
-  /**
    * Determines if EdenFS should use Write-Ahead Logging (WAL) for overlay
-   * directory writes. Only applies to Legacy and LegacyDev catalog types.
+   * directory writes. Only applies to the Legacy catalog type.
    */
   ConfigSetting<bool> overlayUseWal{"overlay:use-wal", true, this};
 
@@ -2700,8 +2452,8 @@ class EdenConfig : private ConfigSettingManager {
 
   /**
    * Persist an upper bound on allocated inode numbers so an unclean startup
-   * can eventually avoid discovering the next inode number by scanning the
-   * overlay. Only applies to Legacy and LegacyDev catalog types.
+   * can skip startup fsck when online-fsck is enabled and the reservation is
+   * available. Reservation applies to the Legacy catalog type.
    */
   ConfigSetting<bool> overlayInodeReservation{
       "overlay:inode-reservation",
@@ -2718,13 +2470,21 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Validate and recover overlay data on access instead of running startup
+   * fsck. Requires inode reservation and the Legacy catalog. Unvisited
+   * orphan subtrees are left for offline fsck. Disabled by default.
+   */
+  ConfigSetting<bool> overlayOnlineFsck{"overlay:online-fsck", false, this};
+
+  /**
    * Multiplier applied to a directory's base size when computing the
    * inline-compaction threshold. A compaction is triggered when the WAL
    * entry count for a parent exceeds `multiplier * max(baseSize, 10)`,
    * capped by `overlay:wal-compaction-cap`. Larger values let the WAL
    * absorb more appends before paying the rewrite cost; smaller values
    * keep load-time replay shorter at the cost of more frequent
-   * compactions. Snapshot at Overlay construction.
+   * compactions. A multiplier of 0 compacts on every append. Snapshot at
+   * Overlay construction.
    */
   ConfigSetting<size_t> overlayWalCompactionMultiplier{
       "overlay:wal-compaction-multiplier",
@@ -2789,7 +2549,7 @@ class EdenConfig : private ConfigSettingManager {
    * Controls the timeout (in seconds) that is set when calling the Thrift mount
    * endpoint from the CLI during clone. A value of 0 means no timeout.
    */
-  ConfigSetting<size_t> cloneMountTimeout{"clone:mount-timeout", 20, this};
+  ConfigSetting<size_t> cloneMountTimeout{"clone:mount-timeout", 30, this};
 
   /**
    * Maximum number of Eden checkouts allowed on this host. When the count of
@@ -2907,14 +2667,6 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<std::vector<std::string>> doctorIgnoredProblemClassNames{
       "doctor:ignored-problem-class-names",
       {},
-      this};
-
-  /**
-   * Whether edenfsctl doctor should check for Kerberos certificate issues.
-   */
-  ConfigSetting<bool> doctorEnableKerberosCheck{
-      "doctor:enable-kerberos-check",
-      false,
       this};
 
   /**
@@ -3125,24 +2877,6 @@ class EdenConfig : private ConfigSettingManager {
       "acl:restricted-content-mode",
       RestrictedContentMode::Restricted,
       this};
-
-// [facebook]
-// Facebook internal
-
-/**
- * (Facebook Internal) Determines if EdenFS should use ServiceRouter.
- */
-#ifdef EDEN_HAVE_SERVICEROUTER
-  ConfigSetting<bool> enableServiceRouter{
-      "facebook:enable-service-router",
-      fb_has_servicerouter(),
-      this};
-#else
-  ConfigSetting<bool> enableServiceRouter{
-      "facebook:enable-service-router",
-      false,
-      this};
-#endif
 };
 
 } // namespace facebook::eden

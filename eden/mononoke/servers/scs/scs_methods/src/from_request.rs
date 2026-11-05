@@ -37,9 +37,11 @@ use mononoke_api::FileId;
 use mononoke_api::FileType;
 use mononoke_api::HgChangesetId;
 use mononoke_api::HgChangesetIdPrefix;
+use mononoke_api::repo::rebase_stack::RebaseStackMergeResolution;
 use mononoke_api::specifiers::GitSha1;
 use mononoke_api::specifiers::GitSha1Prefix;
 use mononoke_api::specifiers::Globalrev;
+use mononoke_api::specifiers::P4ChangelistId;
 use mononoke_api::specifiers::Svnrev;
 use mononoke_types::ContentManifestId;
 use mononoke_types::hash::Sha1;
@@ -160,6 +162,12 @@ impl FromRequest<thrift::CommitId> for ChangesetSpecifier {
                     scs_errors::invalid_request(format!("cannot parse svn revision {rev} to u64"))
                 })?);
                 Ok(ChangesetSpecifier::Svnrev(rev))
+            }
+            thrift::CommitId::p4_changelist(cl) => {
+                let cl = P4ChangelistId::new((*cl).try_into().map_err(|_| {
+                    scs_errors::invalid_request(format!("cannot parse p4 changelist {cl} to u64"))
+                })?);
+                Ok(ChangesetSpecifier::P4Changelist(cl))
             }
             thrift::CommitId::ephemeral_bonsai(ephemeral) => {
                 let cs_id = ChangesetId::from_bytes(&ephemeral.bonsai_id).map_err(|e| {
@@ -432,10 +440,26 @@ impl FromRequest<thrift::CreateCommitCheckMode> for CreateChangesetCheckMode {
 
 impl FromRequest<thrift::DateTime> for DateTime<FixedOffset> {
     fn from_request(date: &thrift::DateTime) -> Result<Self, thrift::RequestError> {
-        Ok(FixedOffset::east_opt(date.tz)
-            .unwrap()
-            .timestamp_opt(date.timestamp, 0)
-            .unwrap())
+        let tz = FixedOffset::east_opt(date.tz).ok_or_else(|| {
+            scs_errors::invalid_request(format!("invalid timezone offset ({})", date.tz))
+        })?;
+        tz.timestamp_opt(date.timestamp, 0).single().ok_or_else(|| {
+            scs_errors::invalid_request(format!("invalid timestamp ({})", date.timestamp))
+        })
+    }
+}
+
+impl FromRequest<thrift::RepoRebaseStackMergeResolution> for RebaseStackMergeResolution {
+    fn from_request(
+        merge_resolution: &thrift::RepoRebaseStackMergeResolution,
+    ) -> Result<Self, thrift::RequestError> {
+        match *merge_resolution {
+            thrift::RepoRebaseStackMergeResolution::DEFAULT => Ok(Self::Default),
+            thrift::RepoRebaseStackMergeResolution::DISABLED => Ok(Self::Disabled),
+            other => Err(scs_errors::invalid_request(format!(
+                "unknown merge_resolution {other:?}"
+            ))),
+        }
     }
 }
 
@@ -542,5 +566,55 @@ mod tests {
             };
             assert!(ContentManifestId::from_request(&specifier).is_err());
         }
+    }
+
+    #[mononoke::test]
+    fn datetime_from_request_rejects_out_of_range_tz_and_timestamp() {
+        let valid = thrift::DateTime {
+            timestamp: 1_700_000_000,
+            tz: 3_600,
+            ..Default::default()
+        };
+        let date = <DateTime<FixedOffset>>::from_request(&valid).unwrap();
+        assert_eq!(date.timestamp(), 1_700_000_000);
+        assert_eq!(date.offset().local_minus_utc(), 3_600);
+
+        let out_of_range_tz = thrift::DateTime {
+            timestamp: 0,
+            tz: 86_400,
+            ..Default::default()
+        };
+        let out_of_range_timestamp = thrift::DateTime {
+            timestamp: i64::MAX,
+            tz: 0,
+            ..Default::default()
+        };
+        for invalid in [out_of_range_tz, out_of_range_timestamp] {
+            let err = <DateTime<FixedOffset>>::from_request(&invalid).unwrap_err();
+            assert_eq!(err.kind, thrift::RequestErrorKind::INVALID_REQUEST);
+        }
+    }
+
+    /// What it tests: thrift merge resolutions map onto the API's.
+    /// Expected: DEFAULT and DISABLED map to their counterparts; an unknown
+    /// value from a newer client is an invalid request.
+    #[mononoke::test]
+    fn merge_resolution_from_request() {
+        assert!(matches!(
+            RebaseStackMergeResolution::from_request(
+                &thrift::RepoRebaseStackMergeResolution::DEFAULT
+            ),
+            Ok(RebaseStackMergeResolution::Default)
+        ));
+        assert!(matches!(
+            RebaseStackMergeResolution::from_request(
+                &thrift::RepoRebaseStackMergeResolution::DISABLED
+            ),
+            Ok(RebaseStackMergeResolution::Disabled)
+        ));
+        let err =
+            RebaseStackMergeResolution::from_request(&thrift::RepoRebaseStackMergeResolution(7))
+                .unwrap_err();
+        assert_eq!(err.kind, thrift::RequestErrorKind::INVALID_REQUEST);
     }
 }

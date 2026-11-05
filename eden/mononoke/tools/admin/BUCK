@@ -2,7 +2,7 @@ load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/target_determinator/macros:ci.bzl", "ci")
 
-oncall("scm_server_treehugger")
+oncall("scm_server_infra")
 
 rust_binary(
     name = "admin",
@@ -33,16 +33,27 @@ rust_binary(
     ],
     test_deps = [
         "fbsource//third-party/rust:maplit",
+        "fbsource//third-party/rust:tracing-subscriber",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/blobstore:memblob",
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
         "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/repo_factory:test_repo_factory",
         "//eden/mononoke/tests/fixtures:fixtures",
         "//eden/mononoke/tests/utils:tests_utils",
-    ],
+    ]
+    + (
+        []
+        if rust_oss.is_oss_build()
+        else [
+            "fbsource//xplat/folly/rust/request_context:request_context",
+            "//eden/mononoke/common/rust/request_context_ext:request_context_ext",
+        ]
+    ),
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-stream",
+        "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:bytes",
         "fbsource//third-party/rust:chrono",
         "fbsource//third-party/rust:clap",
@@ -125,6 +136,7 @@ rust_binary(
         "//eden/mononoke/features/commit_rewriting/synced_commit_mapping:synced_commit_mapping",
         "//eden/mononoke/features/commit_transformation:commit_transformation",
         "//eden/mononoke/features/cross_repo_sync:cross_repo_sync",
+        "//eden/mononoke/features/hooks:hooks",
         "//eden/mononoke/features/pushrebase:pushrebase",
         "//eden/mononoke/features/pushrebase:pushrebase_client",
         "//eden/mononoke/features/pushrebase:pushrebase_hooks",
@@ -146,6 +158,7 @@ rust_binary(
         "//eden/mononoke/repo_attributes/bonsai_git_mapping:bonsai_git_mapping",
         "//eden/mononoke/repo_attributes/bonsai_globalrev_mapping:bonsai_globalrev_mapping",
         "//eden/mononoke/repo_attributes/bonsai_hg_mapping:bonsai_hg_mapping",
+        "//eden/mononoke/repo_attributes/bonsai_p4_mapping:bonsai_p4_mapping",
         "//eden/mononoke/repo_attributes/bonsai_svnrev_mapping:bonsai_svnrev_mapping",
         "//eden/mononoke/repo_attributes/bonsai_tag_mapping:bonsai_tag_mapping",
         "//eden/mononoke/repo_attributes/bookmarks:bookmarks",

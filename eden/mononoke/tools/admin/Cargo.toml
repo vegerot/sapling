@@ -12,6 +12,7 @@ acl_manifest = { version = "0.1.0", path = "../../derived_data/acl_manifest" }
 anyhow = "1.0.104"
 arg_extensions = { version = "0.1.0", path = "../../cmdlib/extensions" }
 async-stream = "0.3"
+async-trait = "0.1.92"
 async_requests = { version = "0.1.0", path = "../../features/async_requests" }
 async_requests_client = { version = "0.1.0", path = "../../features/async_requests/client" }
 backsyncer = { version = "0.1.0", path = "../../features/commit_rewriting/backsyncer" }
@@ -23,6 +24,7 @@ blobstore_factory = { version = "0.1.0", path = "../../blobstore/factory" }
 bonsai_git_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_git_mapping" }
 bonsai_globalrev_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_globalrev_mapping" }
 bonsai_hg_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_hg_mapping" }
+bonsai_p4_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_p4_mapping" }
 bonsai_svnrev_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_svnrev_mapping" }
 bonsai_tag_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_tag_mapping" }
 bookmarks = { version = "0.1.0", path = "../../repo_attributes/bookmarks" }
@@ -73,11 +75,12 @@ git_ref_content_mapping = { version = "0.1.0", path = "../../repo_attributes/git
 git_source_of_truth = { version = "0.1.0", path = "../../repo_attributes/git_source_of_truth" }
 git_symbolic_refs = { version = "0.1.0", path = "../../repo_attributes/git_symbolic_refs" }
 git_types = { version = "0.1.0", path = "../../git/git_types" }
-gix-hash = { version = "0.25.1", features = ["sha1"] }
-gix-object = "0.60.0"
+gix-hash = { version = "0.26.2", features = ["sha1"] }
+gix-object = "0.64.1"
 hex = { version = "0.4.3", features = ["alloc"] }
 history_manifest = { version = "0.1.0", path = "../../derived_data/history_manifest" }
 hook_manager = { version = "0.1.0", path = "../../repo_attributes/hook_manager/hook_manager" }
+hooks = { version = "0.1.0", path = "../../features/hooks" }
 hostname = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 itertools = "0.15.0"
 k8s-openapi = { version = "0.27.1", features = ["latest", "schemars"] }
@@ -133,15 +136,15 @@ repos = { version = "0.1.0", path = "../../../../configerator/structs/scm/monono
 requests_table = { version = "0.1.0", path = "../../features/async_requests/requests_table" }
 restricted_paths = { version = "0.1.0", path = "../../repo_attributes/restricted_paths" }
 restricted_paths_common = { version = "0.1.0", path = "../../repo_attributes/restricted_paths_common" }
-sapling-dag = { version = "0.1.0", path = "../../../scm/lib/dag" }
-sapling-dag-types = { version = "0.1.0", path = "../../../scm/lib/dag/dag-types", features = ["for-tests"] }
-sapling-renderdag = { version = "0.1.0", path = "../../../scm/lib/renderdag" }
+sapling-dag = { version = "0.2.0", path = "../../../scm/lib/dag" }
+sapling-dag-types = { version = "0.2.0", path = "../../../scm/lib/dag/dag-types", features = ["for-tests"] }
+sapling-renderdag = { version = "0.2.0", path = "../../../scm/lib/renderdag" }
 scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 skeleton_manifest = { version = "0.1.0", path = "../../derived_data/skeleton_manifest" }
 skeleton_manifest_v2 = { version = "0.1.0", path = "../../derived_data/skeleton_manifest_v2" }
-smallvec = { version = "1.16.2", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
+smallvec = { version = "1.16.4", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 source_control = { version = "0.1.0", path = "../../scs/if" }
 sql_commit_graph_storage = { version = "0.1.0", path = "../../repo_attributes/commit_graph/sql_commit_graph_storage" }
@@ -152,18 +155,24 @@ strum = { version = "0.28.0", features = ["derive"] }
 synced_commit_mapping = { version = "0.1.0", path = "../../features/commit_rewriting/synced_commit_mapping" }
 thiserror = "2.0.21"
 time_measuring = { version = "0.1.0", path = "../../common/time_measuring" }
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tokio-stream = { version = "0.1.19", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
-tokio-util = { version = "0.7.19", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["full"] }
 topo_sort = { version = "0.1.0", path = "../../common/topo_sort" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 unodes = { version = "0.1.0", path = "../../derived_data/unodes" }
-uuid = { version = "1.26.1", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
+uuid = { version = "1.28.0", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
 walkdir = "2.3"
 
 [dev-dependencies]
 fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fixtures = { version = "0.1.0", path = "../../tests/fixtures" }
 justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
+memblob = { version = "0.1.0", path = "../../blobstore/memblob" }
+request_context_ext = { version = "0.1.0", path = "../../common/rust/request_context_ext" }
 test_repo_factory = { version = "0.1.0", path = "../../repo_factory/test_repo_factory" }
 tests_utils = { version = "0.1.0", path = "../../tests/utils" }
+tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
+
+[lints]
+workspace = true

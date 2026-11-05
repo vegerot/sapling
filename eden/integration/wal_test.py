@@ -12,7 +12,7 @@ These tests exercise crash-recovery, fsck, and concurrency scenarios that
 unit tests cannot cover end-to-end. WAL is enabled per-class via the
 edenfs_extra_config override below — not as a global default — so other
 integration tests keep their non-WAL coverage. The tests depend on the
-Legacy / LegacyDev inode catalog; on platforms that don't use that
+Legacy inode catalog; on platforms that don't use that
 catalog the tests skip.
 """
 
@@ -90,9 +90,9 @@ def _encode_wal_add(name: str, inode: int, mode: int = 0o100644) -> bytes:
 @testcase.eden_nfs_repo_test
 @unittest.skipIf(
     sys.platform == "win32",
-    "WAL is only implemented for the Legacy/LegacyDev FsInodeCatalog "
-    "(Linux/macOS). Windows uses the Sqlite catalog which has its own "
-    "semantic addChild/removeChild path and does not produce .wal files.",
+    "WAL is only implemented for the Legacy FsInodeCatalog "
+    "(Linux/macOS). Windows uses the InMemory catalog, which does not "
+    "produce .wal files.",
 )
 class WalTest(testcase.HgRepoTestMixin, testcase.EdenRepoTest):
     """End-to-end WAL recovery tests.
@@ -323,9 +323,6 @@ class WalWithPathRenameTest(
     # The encoded ID has a 20-byte node, a separator, and "src/" plus this
     # 231-byte name, yielding 256 bytes.
     source_name: str = "f" * 231
-
-    def select_storage_engine(self) -> str:
-        return "sqlite"
 
     def edenfs_extra_config(self) -> dict[str, list[str]] | None:
         configs = super().edenfs_extra_config() or {}

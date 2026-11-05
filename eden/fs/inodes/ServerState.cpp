@@ -25,7 +25,6 @@
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
-#include "eden/fs/telemetry/FsEventLogger.h"
 #include "eden/fs/telemetry/IXplatLogger.h"
 #include "eden/fs/utils/Clock.h"
 
@@ -33,12 +32,6 @@ DEFINE_bool(
     fault_injection_block_mounts,
     false,
     "Block mount attempts via the fault injection framework.  "
-    "Requires --enable_fault_injection.");
-
-DEFINE_bool(
-    fault_injection_fail_opening_local_store,
-    false,
-    "Causes the local store to fail to open on startup. "
     "Requires --enable_fault_injection.");
 
 namespace facebook::eden {
@@ -77,10 +70,9 @@ ServerState::ServerState(
     std::shared_ptr<StructuredLogger> structuredLogger,
     std::shared_ptr<StructuredLogger> notificationsStructuredLogger,
     std::shared_ptr<ErrorLogger> errorLogger,
-    std::shared_ptr<IScribeLogger> scribeLogger,
     std::shared_ptr<ReloadableConfig> reloadableConfig,
     const EdenConfig& initialConfig,
-    [[maybe_unused]] folly::EventBase* nfsEventBase,
+    folly::EventBase* nfsEventBase,
     std::shared_ptr<Notifier> notifier,
     bool enableFaultDetection,
     std::shared_ptr<InodeAccessLogger> inodeAccessLogger,
@@ -96,19 +88,11 @@ ServerState::ServerState(
       edenFsEventsLogger_{std::make_shared<EdenFsEventsLogger>(xplatLogger)},
       notificationsStructuredLogger_{std::move(notificationsStructuredLogger)},
       errorLogger_{std::move(errorLogger)},
-      scribeLogger_{std::move(scribeLogger)},
       faultInjector_{std::make_unique<FaultInjector>(enableFaultDetection)},
+      nfsEventBase_{nfsEventBase},
       nfs_{
           initialConfig.enableNfsServer.getValue()
-              ? std::make_shared<NfsServer>(
-                    privHelper_.get(),
-                    nfsEventBase,
-                    fsChannelThreadPool_,
-                    initialConfig.runInternalRpcbind.getValue(),
-                    edenFsEventsLogger_,
-                    initialConfig.maxFsChannelInflightRequests.getValue(),
-                    initialConfig.highFsRequestsLogInterval.getValue(),
-                    initialConfig.longRunningFSRequestThreshold.getValue())
+              ? makeNfsServer(initialConfig)
               : nullptr},
       config_{std::move(reloadableConfig)},
       userIgnoreFileMonitor_{CachedParsedFileMonitor<GitIgnoreFileParser>{
@@ -123,11 +107,7 @@ ServerState::ServerState(
                             : std::make_shared<InodeAccessLogger>(
                                   config_,
                                   edenStats_.copy(),
-                                  std::move(xplatLogger))},
-      fsEventLogger_{
-          initialConfig.requestSamplesPerMinute.getValue()
-              ? std::make_shared<FsEventLogger>(config_, scribeLogger_)
-              : nullptr} {
+                                  std::move(xplatLogger))} {
   // It would be nice if we eventually built a more generic mechanism for
   // defining faults to be configured on start up.  (e.g., loading this from
   // the EdenConfig).
@@ -179,6 +159,25 @@ void ServerState::shutdown() {
     }
     threadPool_->join();
   });
+}
+
+std::shared_ptr<NfsServer> ServerState::makeNfsServer(
+    const EdenConfig& config) const {
+  return std::make_shared<NfsServer>(
+      privHelper_.get(),
+      nfsEventBase_,
+      fsChannelThreadPool_,
+      edenFsEventsLogger_,
+      config.maxFsChannelInflightRequests.getValue(),
+      config.highFsRequestsLogInterval.getValue(),
+      config.longRunningFSRequestThreshold.getValue());
+}
+
+void ServerState::createNfsServerForTakeover() {
+  if (nfs_) {
+    return;
+  }
+  nfs_ = makeNfsServer(*getEdenConfig());
 }
 
 GlobMatchOptions ServerState::getGlobMatchOptions() {

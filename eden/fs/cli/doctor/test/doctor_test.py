@@ -51,7 +51,11 @@ from eden.fs.cli.doctor.test.lib.fake_vscode_extensions_checker import (
 )
 from eden.fs.cli.doctor.test.lib.problem_collector import ProblemCollector
 from eden.fs.cli.doctor.test.lib.testcase import DoctorTestBase
-from eden.fs.cli.doctor.util import CheckoutInfo
+from eden.fs.cli.doctor.util import (
+    CheckoutInfo,
+    get_checkouts_info,
+    get_dependent_repos,
+)
 from eden.fs.cli.prjfs import PRJ_FILE_STATE
 from eden.fs.cli.redirect import Redirection, RedirectionState, RedirectionType
 from eden.fs.cli.test.lib.output import TestOutput
@@ -769,6 +773,39 @@ Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if yo
         self.assert_results(fixer, num_problems=1, num_fixed_problems=1)
 
     @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
+    def test_watchman_error_response(self, mock_watchman: MagicMock) -> None:
+        edenfs_path = "/path/to/eden-mount"
+        mock_watchman.side_effect = [{"error": "watch-project timed out"}]
+        fixer, out = self.create_fixer(dry_run=False)
+        watchman_info = check_watchman.WatchmanCheckInfo({edenfs_path})
+        check_watchman.check_active_mount(fixer, edenfs_path, watchman_info)
+        mock_watchman.assert_called_once_with(["watch-project", edenfs_path])
+        self.assertEqual("", out.getvalue())
+        self.assert_results(fixer, num_problems=0)
+
+    @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
+    def test_watchman_response_without_watcher(self, mock_watchman: MagicMock) -> None:
+        edenfs_path = "/path/to/eden-mount"
+        mock_watchman.side_effect = [{"version": "2026.10.20.00", "watch": edenfs_path}]
+        fixer, out = self.create_fixer(dry_run=False)
+        watchman_info = check_watchman.WatchmanCheckInfo({edenfs_path})
+        check_watchman.check_active_mount(fixer, edenfs_path, watchman_info)
+        mock_watchman.assert_called_once_with(["watch-project", edenfs_path])
+        self.assertEqual(
+            (
+                "<yellow>- Found problem:<reset>\n"
+                "Watchman returned an unexpected reply for "
+                "`watch-project /path/to/eden-mount`, with no watcher: "
+                '{"version": "2026.10.20.00", "watch": "/path/to/eden-mount"}\n'
+                'Try running "watchman watch-del /path/to/eden-mount" and then '
+                '"watchman watch-project /path/to/eden-mount"\n'
+                "\n"
+            ),
+            out.getvalue(),
+        )
+        self.assert_results(fixer, num_problems=1, num_manual_fixes=1)
+
+    @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
     # pyre-fixme[2]: Parameter must be annotated.
     def test_dry_run_identifies_inotify_watcher_issue(self, mock_watchman) -> None:
         fixer, out = self._test_watchman_watcher_check(
@@ -1267,6 +1304,167 @@ Would remount {mounts[1]}
         )
         return exit_code, out.getvalue(), mounts
 
+    def _run_doctor_with_unreadable_config_json(
+        self, instance: FakeEdenInstance
+    ) -> Tuple[int, str]:
+        # The error EdenInstance._get_directory_map() raises for a truncated
+        # config.json.
+        error = Exception(
+            f"invalid JSON data found in {instance.state_dir}/config.json"
+        )
+        out = TestOutput()
+        with (
+            patch.object(instance, "get_mount_paths", side_effect=error),
+            patch.object(instance, "get_checkouts", side_effect=error),
+        ):
+            exit_code = doctor.cure_what_ails_you(
+                typing.cast(EdenInstance, instance),
+                dry_run=True,
+                min_severity_to_report=ProblemSeverity.ALL,
+                mount_table=instance.mount_table,
+                fs_util=FakeFsUtil(),
+                proc_utils=self.make_proc_utils(),
+                vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+                network_checker=FakeNetworkChecker(),
+                out=out,
+            )
+        return exit_code, out.getvalue()
+
+    @patch("eden.fs.cli.doctor.check_filesystems.check_disk_usage")
+    @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
+    def test_unreadable_config_json_with_edenfs_running(
+        self, mock_watchman: MagicMock, mock_check_disk_usage: MagicMock
+    ) -> None:
+        mock_watchman.return_value = {"roots": []}
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        instance.create_test_mount("path1")
+
+        exit_code, out = self._run_doctor_with_unreadable_config_json(instance)
+
+        self.assertIn("Could not read the list of configured EdenFS checkouts", out)
+        self.assertIn(f"invalid JSON data found in {instance.state_dir}", out)
+        self.assertIn(
+            f"Make sure {instance.state_dir / 'config.json'} can be read and holds",
+            out,
+        )
+        # The disk usage check still covers the state and temp directories.
+        mock_check_disk_usage.assert_called_once()
+        self.assertEqual(mock_check_disk_usage.call_args.args[1], [])
+        self.assertEqual(exit_code, 1)
+
+    @patch("eden.fs.cli.doctor.check_filesystems.check_disk_usage")
+    @patch("eden.fs.cli.doctor.check_stale_mounts.check_for_stale_mounts")
+    @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
+    def test_unreadable_config_json_with_edenfs_not_running(
+        self,
+        mock_watchman: MagicMock,
+        mock_check_for_stale_mounts: MagicMock,
+        mock_check_disk_usage: MagicMock,
+    ) -> None:
+        mock_watchman.return_value = {"roots": []}
+        instance = FakeEdenInstance(
+            self.make_temporary_directory(), status=fb303_status.DEAD
+        )
+        instance.create_test_mount("path1", active=False)
+
+        exit_code, out = self._run_doctor_with_unreadable_config_json(instance)
+
+        self.assertIn("Could not read the list of configured EdenFS checkouts", out)
+        self.assertIn(f"invalid JSON data found in {instance.state_dir}", out)
+        # Without the list, doctor cannot tell whether EdenFS is in use, so it
+        # does not ask for EdenFS to be started; checks that do not need the
+        # list still run.
+        self.assertNotIn("EdenFS is not running", out)
+        mock_check_for_stale_mounts.assert_called_once()
+        mock_check_disk_usage.assert_called_once()
+        self.assertEqual(mock_check_disk_usage.call_args.args[1], [])
+        self.assertEqual(exit_code, 1)
+
+    def test_unmounted_checkout_missing_config_dry_run(self) -> None:
+        exit_code, out, instance, checkout = (
+            self._test_unmounted_checkout_missing_config(dry_run=True)
+        )
+        self.assertIn(
+            f"{checkout.path} is configured, but EdenFS cannot mount it because "
+            "its checkout config could not be read:\n",
+            out,
+        )
+        self.assertIn(f"{checkout.state_dir / 'config.toml'} does not exist", out)
+        self.assertIn(f"To remove it, run: `eden rm {checkout.path}`", out)
+        self.assertNotIn("unexpected error", out)
+        self.assertNotIn("AssertionError", out)
+        self.assertNotIn("Would remount", out)
+        self.assertEqual(exit_code, 1)
+
+    def test_unmounted_checkout_missing_config_is_not_remounted(self) -> None:
+        exit_code, out, instance, checkout = (
+            self._test_unmounted_checkout_missing_config(dry_run=False)
+        )
+        self.assertIn(f"{checkout.path} is configured, but EdenFS cannot mount it", out)
+        self.assertIn("1 issue requires manual attention.", out)
+        self.assertNotIn("unexpected error", out)
+        self.assertEqual(instance.mount_calls, [])
+        self.assertEqual(exit_code, 1)
+
+    @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
+    def _test_unmounted_checkout_missing_config(
+        self,
+        mock_watchman: MagicMock,
+        dry_run: bool,
+    ) -> Tuple[int, str, FakeEdenInstance, EdenCheckout]:
+        """A checkout listed in config.json whose client directory has lost its
+        config.toml (e.g. after an interrupted `eden rm`). EdenFS skips it on
+        startup, so it is configured but not mounted, and its backing repo is
+        unknown.
+        """
+        tmp_dir = self.make_temporary_directory()
+        instance = FakeEdenInstance(tmp_dir)
+        instance.create_test_mount("path1")
+        checkout = instance.create_test_mount("path2", active=False)
+        os.unlink(checkout.state_dir / "config.toml")
+
+        out = TestOutput()
+        exit_code = doctor.cure_what_ails_you(
+            typing.cast(EdenInstance, instance),
+            dry_run,
+            min_severity_to_report=ProblemSeverity.ALL,
+            mount_table=instance.mount_table,
+            fs_util=FakeFsUtil(),
+            proc_utils=self.make_proc_utils(),
+            vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
+            out=out,
+        )
+        return exit_code, out.getvalue(), instance, checkout
+
+    def test_get_dependent_repos_skips_checkout_with_unreadable_config(self) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        healthy = instance.create_test_mount("path1", active=False)
+        broken = instance.create_test_mount("path2", active=False)
+        os.unlink(broken.state_dir / "config.toml")
+        checkouts = get_checkouts_info(typing.cast(EdenInstance, instance))
+
+        self.assertEqual(
+            get_dependent_repos(
+                instance.default_backing_repo, list(checkouts.values())
+            ),
+            [healthy.path],
+        )
+
+    def test_get_checkouts_info_keeps_checkout_with_unreadable_config(self) -> None:
+        # `eden health-report` relies on such checkouts still being listed so
+        # it can report them as not mounted.
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1", active=False)
+        os.unlink(checkout.state_dir / "config.toml")
+
+        checkouts = get_checkouts_info(typing.cast(EdenInstance, instance))
+
+        info = checkouts[checkout.path]
+        self.assertIsNone(info.state)
+        self.assertIsNone(info.backing_repo)
+        self.assertIn("config.toml does not exist", str(info.config_error))
+
     @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
     # pyre-fixme[2]: Parameter must be annotated.
     def test_watchman_fails(self, mock_watchman) -> None:
@@ -1647,6 +1845,100 @@ Fixing mismatched files/directories in {Path(mount)}...<green>fixed<reset>
             output.getvalue(),
         )
         self.assert_results(fixer, num_problems=1, num_fixed_problems=1)
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.debugInodeStatus")
+    def test_materialized_directory_that_is_a_symlink_on_disk(
+        self, mock_debugInodeStatus: MagicMock
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        mount: Path = checkout.path
+
+        os.makedirs(mount / "p")
+        os.makedirs(mount / "real")
+        os.symlink(mount / "real", mount / "p" / "a")
+
+        mock_debugInodeStatus.return_value = [
+            TreeInodeDebugInfo(
+                inodeNumber=1,
+                path=b"p",
+                materialized=True,
+                treeHash=b"abcd",
+                entries=[
+                    TreeInodeEntryDebugInfo(
+                        name=b"a",
+                        inodeNumber=2,
+                        mode=stat.S_IFDIR,
+                        loaded=True,
+                        materialized=True,
+                        hash=b"dcba",
+                    ),
+                ],
+                refcount=1,
+            ),
+            TreeInodeDebugInfo(
+                inodeNumber=2,
+                path=b"p/a",
+                materialized=True,
+                treeHash=b"abcd",
+                entries=[],
+                refcount=1,
+            ),
+        ]
+
+        fixer, output = self.create_fixer(dry_run=False)
+        check_materialized_are_accessible(
+            fixer,
+            typing.cast(EdenInstance, instance),
+            checkout,
+            lambda p: os.lstat(p).st_mode,
+        )
+
+        self.assertRegex(
+            output.getvalue(),
+            r"""<yellow>- Found problem:<reset>
+.* has an unexpected file type: known to EdenFS as a directory, but is a symlink on disk
+Fixing mismatched files/directories in .*...<red>error<reset>
+Failed to fix or verify fix for problem MaterializedInodesHaveDifferentModeOnDisk: RemediationError: Failed check for MaterializedInodesHaveDifferentModeOnDisk failed:
+Path .* is a symlink on disk but directory in eden
+(.|\n)*""",
+        )
+        self.assert_results(fixer, num_problems=1, num_failed_fixes=1)
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.debugInodeStatus")
+    def test_materialized_directory_that_is_a_file_on_disk(
+        self, mock_debugInodeStatus: MagicMock
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        mount: Path = checkout.path
+
+        (mount / "f").touch()
+
+        mock_debugInodeStatus.return_value = [
+            TreeInodeDebugInfo(
+                inodeNumber=1,
+                path=b"f",
+                materialized=True,
+                treeHash=b"abcd",
+                entries=[],
+                refcount=1,
+            ),
+        ]
+
+        tracker = ProblemCollector(instance)
+        check_materialized_are_accessible(
+            tracker,
+            typing.cast(EdenInstance, instance),
+            checkout,
+            lambda p: os.lstat(p).st_mode,
+        )
+        self.assertEqual(
+            [problem.description() for problem in tracker.problems],
+            [
+                f"{Path('f')} has an unexpected file type: known to EdenFS as a directory, but is a file on disk"
+            ],
+        )
 
     @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.debugInodeStatus")
     def test_materialized_different_mode_fixer_fail(

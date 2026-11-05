@@ -59,7 +59,7 @@ constexpr auto kTimeout = 1s;
 constexpr size_t kTraceBusCapacity = 25000;
 
 fuse_entry_out genRandomLookupResponse(uint64_t nodeid) {
-  fuse_entry_out response;
+  fuse_entry_out response{};
   response.nodeid = nodeid;
   response.generation = Random::rand64();
   response.entry_valid = Random::rand64();
@@ -187,7 +187,6 @@ class FuseChannelTest : public ::testing::Test {
         std::move(testDispatcher),
         &straceLogger,
         std::make_shared<ProcessInfoCache>(),
-        /*fsEventLogger=*/nullptr,
         /*edenFsEventsLogger=*/nullptr,
         /*errorLogger=*/
         errorLoggerOverride_ ? *errorLoggerOverride_ : noopErrorLogger_,
@@ -297,7 +296,7 @@ class FuseChannelTest : public ::testing::Test {
       std::make_shared<ReloadableConfig>(edenConfig_);
   ErrorLogger capturingErrorLogger_{reloadableConfig_, &xplatLogger_};
   ErrorLogger* errorLoggerOverride_ = nullptr;
-  ForgetRecordingDispatcher* dispatcher_;
+  ForgetRecordingDispatcher* dispatcher_{};
   AbsolutePath mountPath_{canonicalPath("/fake/mount/path")};
 };
 
@@ -424,6 +423,49 @@ TEST_F(FuseChannelTest, testTakeoverStop) {
   EXPECT_EQ(flags, fuseStopData->fuseSettings.flags);
 }
 
+TEST_F(FuseChannelTest, unmountAfterTakeoverStop) {
+  auto channel = createChannel();
+  auto completeFuture = performInit(channel.get());
+
+  auto lookupId = fuse_.sendLookup(FUSE_ROOT_ID, "pending");
+  auto lookup = dispatcher_->waitForLookup(lookupId, kTimeout);
+
+  channel->takeoverStop();
+  channel->logUnmountEventAndExit();
+
+  lookup.promise.setValue(genRandomLookupResponse(9));
+  auto response = fuse_.recvResponse();
+  EXPECT_EQ(lookupId, response.header.unique);
+
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  ASSERT_NE(nullptr, fuseStopData);
+  EXPECT_EQ(FuseChannel::StopReason::UNMOUNTED, fuseStopData->reason);
+  EXPECT_FALSE(fuseStopData->fuseDevice);
+  EXPECT_TRUE(fuseStopData->isUnmounted());
+}
+
+TEST_F(FuseChannelTest, stopTimeIsWhenTheUnmountArrived) {
+  auto channel = createChannel();
+  auto completeFuture = performInit(channel.get());
+  auto lookupId = fuse_.sendLookup(FUSE_ROOT_ID, "pending");
+  auto lookup = dispatcher_->waitForLookup(lookupId, kTimeout);
+
+  const auto beforeUnmount = std::chrono::steady_clock::now();
+  channel->logUnmountEventAndExit();
+  const auto afterUnmount = std::chrono::steady_clock::now();
+  // The channel stops only once the pending lookup is answered.
+  lookup.promise.setValue(genRandomLookupResponse(9));
+  EXPECT_EQ(lookupId, fuse_.recvResponse().header.unique);
+
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  ASSERT_TRUE(stopData->stopRequestedAt.has_value());
+  EXPECT_GE(*stopData->stopRequestedAt, beforeUnmount);
+  EXPECT_LE(*stopData->stopRequestedAt, afterUnmount);
+  EXPECT_EQ("fuse_unmounted", stopData->getStopReason().name);
+  EXPECT_TRUE(stopData->getStopReason().unexpected);
+}
+
 TEST_F(FuseChannelTest, testTakeoverBufferSizeFollowsNegotiatedMaxWrite) {
   // fuse:max-pages is 0, so a fresh mount would get the minimum buffer, but
   // the inherited connection lets the kernel send 1 MB writes.
@@ -481,6 +523,56 @@ TEST_F(FuseChannelTest, testInitNegotiatesIoUringOnlyOnAllowedKernel) {
   EXPECT_TRUE(
       fuseStopData->fuseSettings.flags2 &
       static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
+}
+
+TEST_F(FuseChannelTest, transportNameDuringInitialization) {
+  auto channel = createChannel(
+      /*numThreads=*/2,
+      /*fuseMaxPages=*/0,
+      /*useIoUring=*/true,
+      /*ioUringKernelReleaseRegex=*/"^" + getRunningKernelReleaseForTest());
+  if (folly::StringPiece{channel->getDesiredTransportName()} !=
+      kIoUringFuseTransportName) {
+    GTEST_SKIP()
+        << "FUSE io_uring transport is not available in this test environment";
+  }
+
+  std::atomic<bool> keepPolling{true};
+  std::atomic<const char*> observedName{nullptr};
+  std::thread statusThread{[&] {
+    // Do not synchronize initialization with this reader: listMounts() can
+    // query the name without waiting for the FUSE INIT handshake to finish.
+    while (keepPolling.load(std::memory_order_relaxed)) {
+      observedName.store(
+          channel->getTransportName(), std::memory_order_release);
+    }
+  }};
+  SCOPE_EXIT {
+    keepPolling.store(false, std::memory_order_relaxed);
+    statusThread.join();
+  };
+  const auto waitForName = [&](const char* expected) {
+    const auto deadline = std::chrono::steady_clock::now() + kTimeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto* name = observedName.load(std::memory_order_acquire);
+      if (name && folly::StringPiece{name} == expected) {
+        return true;
+      }
+      std::this_thread::yield();
+    }
+    return false;
+  };
+  ASSERT_TRUE(waitForName(kDevFuseTransportName));
+
+  performInit(
+      channel.get(),
+      FUSE_KERNEL_VERSION,
+      FUSE_KERNEL_MINOR_VERSION,
+      0,
+      FUSE_INIT_EXT,
+      static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
+
+  ASSERT_TRUE(waitForName(kIoUringFuseTransportName));
 }
 
 TEST_F(FuseChannelTest, testInitDoesNotNegotiateIoUringOnDisallowedKernel) {
@@ -574,6 +666,7 @@ TEST_F(FuseChannelTest, testInitFallsBackToDevFuseWhenQueuesDoNotFit) {
       static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
 
   EXPECT_FALSE(channel->usesIoUringTransport());
+  EXPECT_STREQ(kDevFuseTransportName, channel->getTransportName());
 
   channel->takeoverStop();
   auto stopData = std::move(completeFuture).get(kTimeout);
@@ -620,6 +713,7 @@ TEST_F(FuseChannelTest, testInitNegotiatesIoUringWhenQueuesArePreCreated) {
       static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
 
   EXPECT_TRUE(channel->usesIoUringTransport());
+  EXPECT_STREQ(kIoUringFuseTransportName, channel->getTransportName());
 
   channel->takeoverStop();
   auto stopData = std::move(completeFuture).get(kTimeout);
@@ -639,6 +733,7 @@ TEST_F(FuseChannelTest, testTakeoverKeepsDevFuseWithoutNegotiatedIoUring) {
   auto completeFuture = channel->initializeFromTakeover(connInfo);
 
   EXPECT_FALSE(channel->usesIoUringTransport());
+  EXPECT_STREQ(kDevFuseTransportName, channel->getTransportName());
 
   channel->takeoverStop();
   auto stopData = std::move(completeFuture).get(kTimeout);
@@ -658,6 +753,7 @@ TEST_F(FuseChannelTest, testTakeoverRestoresNegotiatedIoUringTransport) {
   auto completeFuture = channel->initializeFromTakeover(connInfo);
 
   EXPECT_TRUE(channel->usesIoUringTransport());
+  EXPECT_STREQ(kIoUringFuseTransportName, channel->getTransportName());
 
   channel->takeoverStop();
   auto stopData = std::move(completeFuture).get(kTimeout);
@@ -1105,7 +1201,7 @@ TEST_F(FuseChannelTest, interruptLookups) {
   for (int i = 0; i < 5000; ++i) {
     auto requestId = fuse_.sendLookup(FUSE_ROOT_ID, "foo");
 
-    fuse_interrupt_in interruptData;
+    fuse_interrupt_in interruptData{};
     interruptData.unique = requestId;
 
     (void)fuse_.sendRequest(FUSE_INTERRUPT, FUSE_ROOT_ID, interruptData);
@@ -1138,10 +1234,11 @@ TEST_F(FuseChannelTest, formatting_dir) {
 
 TEST_F(FuseChannelTest, formatting_unknown) {
   FuseChannel::InvalidationEntry entry(InodeNumber(20), 10, 100);
+  const auto originalType = entry.type;
   entry.type = static_cast<FuseChannel::InvalidationType>(11);
   EXPECT_EQ("(unknown invalidation type 11 inode 20)", fmt::to_string(entry));
   // change the type back so the destructor doesn't throw
-  entry.type = FuseChannel::InvalidationType::DIR_ENTRY;
+  entry.type = originalType;
 }
 
 #ifdef FUSE_MAX_PAGES
@@ -1271,12 +1368,10 @@ TEST_F(FuseChannelTest, testAllowIdmapNegotiation) {
   EXPECT_EQ(fuseStopData->reason, FuseChannel::StopReason::TAKEOVER);
   EXPECT_TRUE(fuseStopData->fuseDevice);
 
-#ifdef __linux__
   EXPECT_TRUE(
       fuseStopData->fuseSettings.flags2 &
       static_cast<uint32_t>(FUSE_ALLOW_IDMAP >> 32))
       << "FUSE_ALLOW_IDMAP should be set when kernel advertises it";
-#endif
 }
 
 TEST_F(FuseChannelTest, testAllowIdmapNotSetWhenKernelLacksSupport) {
@@ -1292,16 +1387,14 @@ TEST_F(FuseChannelTest, testAllowIdmapNotSetWhenKernelLacksSupport) {
   EXPECT_EQ(fuseStopData->reason, FuseChannel::StopReason::TAKEOVER);
   EXPECT_TRUE(fuseStopData->fuseDevice);
 
-#ifdef __linux__
   EXPECT_FALSE(
       fuseStopData->fuseSettings.flags2 &
       static_cast<uint32_t>(FUSE_ALLOW_IDMAP >> 32))
       << "FUSE_ALLOW_IDMAP should not be set when kernel doesn't support it";
-#endif
 }
 #endif
 
-#if defined(__linux__) && defined(FUSE_HANDLE_KILLPRIV_V2)
+#ifdef FUSE_HANDLE_KILLPRIV_V2
 TEST_F(FuseChannelTest, testHandleKillPrivV2Negotiation) {
   auto channel = createChannel();
 

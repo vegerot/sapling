@@ -27,7 +27,7 @@ from eden.fs.cli import (
     util as util_mod,
     version,
 )
-from eden.fs.cli.config import EdenInstance
+from eden.fs.cli.config import CLIENTS_DIR, CONFIG_JSON, EdenInstance
 from eden.fs.cli.doctor.util import (
     CheckoutInfo,
     format_approx_duration,
@@ -276,7 +276,9 @@ class EdenDoctorChecker:
             self.tracker.add_problem(problem)
 
     def run_edenfs_not_healthy_checks(self) -> None:
-        configured_mounts = self.instance.get_mount_paths()
+        # None means the list could not be read, so whether EdenFS is in use
+        # is unknown: skip the checks that depend on it.
+        configured_mounts = self._get_configured_mount_paths()
         if configured_mounts:
             if not self.fast and not is_asic():
                 # Run network checks without a backing repo
@@ -293,7 +295,7 @@ class EdenDoctorChecker:
                     raise RuntimeError("Failed to check network for mount") from ex
 
             self.tracker.add_problem(EdenfsNotHealthy(self.instance, self.out))
-        else:
+        elif configured_mounts is not None:
             self.tracker.using_edenfs = False
             return
 
@@ -303,13 +305,22 @@ class EdenDoctorChecker:
             )
             check_filesystems.check_disk_usage(
                 self.tracker,
-                list(configured_mounts),
+                configured_mounts or [],
                 self.instance,
                 fs_util=self.fs_util,
             )
 
     def _get_checkouts_info(self) -> Dict[Path, CheckoutInfo]:
         return get_checkouts_info(self.instance)
+
+    def _get_configured_mount_paths(self) -> Optional[List[str]]:
+        try:
+            return list(self.instance.get_mount_paths())
+        except Exception as ex:
+            self.tracker.add_problem(
+                ConfiguredCheckoutsUnreadable(self.instance.state_dir, ex)
+            )
+            return None
 
     def check_privhelper(self) -> None:
         try:
@@ -369,7 +380,7 @@ class EdenDoctorChecker:
             )
             check_filesystems.check_disk_usage(
                 self.tracker,
-                list(self.instance.get_mount_paths()),
+                self._get_configured_mount_paths() or [],
                 self.instance,
                 fs_util=self.fs_util,
             )
@@ -745,6 +756,17 @@ class EdenCheckoutCorruption(Problem):
         )
 
 
+class CheckoutConfigUnreadable(Problem):
+    def __init__(self, checkout: CheckoutInfo, ex: Exception) -> None:
+        super().__init__(
+            f"{checkout.path} is configured, but EdenFS cannot mount it because "
+            f"its checkout config could not be read:\n{ex}\n"
+            "EdenFS skips this checkout on startup, so it will stay unmounted.",
+            remediation=f"To remove it, run: `eden rm {checkout.path}`\n"
+            "Then clone it again if you still need it.",
+        )
+
+
 class EdenCheckoutConfigCorruption(FixableProblem):
     _checkout_info: CheckoutInfo
     _ex: Exception
@@ -877,6 +899,19 @@ class EdenCheckoutInfosCorruption(Problem):
         )
 
 
+class ConfiguredCheckoutsUnreadable(Problem):
+    def __init__(self, state_dir: Path, ex: Exception) -> None:
+        super().__init__(
+            "Could not read the list of configured EdenFS checkouts",
+            remediation=(
+                f"Make sure {state_dir / CONFIG_JSON} can be read and holds a JSON "
+                "object that maps each checkout path to the name of its directory "
+                f"in {state_dir / CLIENTS_DIR}."
+            ),
+            exception=ex,
+        )
+
+
 def check_mount(
     out: ui.Output,
     tracker: ProblemTracker,
@@ -891,7 +926,10 @@ def check_mount(
     debug: bool,
     fast: bool,
 ) -> None:
-    if checkout.state is None:
+    if checkout.state is None and checkout.config_error is not None:
+        # Remounting would fail the same way, so don't offer it as a fix.
+        tracker.add_problem(CheckoutConfigUnreadable(checkout, checkout.config_error))
+    elif checkout.state is None:
         # This checkout is configured but not currently running.
         tracker.add_problem(
             CheckoutNotMounted(out, checkout, all_checkouts, checked_backing_repos)

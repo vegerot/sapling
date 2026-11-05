@@ -7,13 +7,9 @@ sl_rust_library(
     srcs = glob(["src/**/*.rs"]),
     autocargo = {
         "cargo_toml_config": {
-            "lib": {"name": "worktree"},
             "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
                 "license": "GPL-2.0-only",
                 "name": "sapling-worktree-registry",
-                "repository": "https://github.com/facebook/sapling",
             },
         },
     },
@@ -28,9 +24,14 @@ sl_rust_library(
         "fbsource//third-party/rust:fs-err",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:tracing",
+        "//eden/scm/lib/atomicfile:atomicfile",
         "//eden/scm/lib/config/model:configmodel",
+        "//eden/scm/lib/fsinfo:fsinfo",
         "//eden/scm/lib/gitcompat:gitcompat",
+        "//eden/scm/lib/identity:identity",
         "//eden/scm/lib/repo/repo-minimal-info:repo-minimal-info",
+        "//eden/scm/lib/repolock:repolock",
         "//eden/scm/lib/util:util",
     ],
 )

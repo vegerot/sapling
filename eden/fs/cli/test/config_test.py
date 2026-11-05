@@ -8,8 +8,10 @@
 
 import configparser
 import io
+import json
 import os
 import re
+import struct
 import sys
 import unittest
 from collections import namedtuple
@@ -23,7 +25,7 @@ from eden.fs.cli import configinterpolator
 from eden.fs.cli.config import EdenInstance
 from eden.test_support.testcase import EdenTestCaseBase
 
-from .. import config as config_mod, configutil
+from .. import config as config_mod, configutil, util
 from ..configinterpolator import EdenConfigInterpolator
 from ..configutil import EdenConfigParser, UnexpectedType
 
@@ -354,6 +356,69 @@ prefetching-enable = true
         with self.assertRaises(config_mod.CheckoutConfigCorruptedError):
             config_mod.EdenInstance._combine_mount_info([], [checkout])
 
+    def test_retry_removes_client_dir_after_failed_remove(self) -> None:
+        client_dir = self._state_dir / "clients" / "half-removed"
+        (client_dir / "local").mkdir(parents=True)
+        (client_dir / "config.toml").write_text("")
+        (client_dir / "SNAPSHOT").write_text("")
+
+        with patch("shutil.rmtree", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                config_mod._remove_client_dir(client_dir)
+
+        self.assertFalse((client_dir / "SNAPSHOT").exists())
+        self.assertTrue((client_dir / "config.toml").exists())
+
+        config_mod._remove_client_dir(client_dir)
+        self.assertFalse(client_dir.exists())
+
+    def test_remove_client_dir_removes_all_entries(self) -> None:
+        client_dir = self._state_dir / "clients" / "removed"
+        (client_dir / "local").mkdir(parents=True)
+        (client_dir / "local" / "file").write_text("")
+        (client_dir / "config.toml").write_text("")
+        (client_dir / "SNAPSHOT").write_text("")
+
+        config_mod._remove_client_dir(client_dir)
+
+        self.assertFalse(client_dir.exists())
+
+    def test_register_running_mount_accepts_only_an_unused_client_dir_of_this_instance(
+        self,
+    ) -> None:
+        clients_dir = self._state_dir / "clients"
+        orphan = clients_dir / "orphan"
+        orphan.mkdir(parents=True)
+        (orphan / "config.toml").write_text("")
+        registered = clients_dir / "registered"
+        registered.mkdir()
+        (registered / "config.toml").write_text("")
+        no_config = clients_dir / "no-config"
+        no_config.mkdir()
+        outside = self.tmp_dir / "outside"
+        outside.mkdir()
+        (outside / "config.toml").write_text("")
+        registered_mount = self.tmp_dir / "mount"
+        (self._state_dir / "config.json").write_text(
+            json.dumps({str(registered_mount): "registered"})
+        )
+        cfg = self.get_config()
+        mount = self.tmp_dir / "orphan-mount"
+
+        self.assertFalse(cfg.can_register_running_mount(mount, registered))
+        self.assertFalse(cfg.can_register_running_mount(mount, no_config))
+        self.assertFalse(cfg.can_register_running_mount(mount, outside))
+        self.assertFalse(cfg.can_register_running_mount(registered_mount, orphan))
+        with self.assertRaises(ValueError):
+            cfg.register_running_mount(mount, outside)
+
+        self.assertTrue(cfg.can_register_running_mount(mount, orphan))
+        cfg.register_running_mount(mount, orphan)
+        self.assertEqual(
+            {str(registered_mount): "registered", str(mount): "orphan"},
+            json.loads((self._state_dir / "config.json").read_text()),
+        )
+
     def test_checkout_without_protocol_defaults_to_nfs_on_macos(self) -> None:
         client_dir = self._state_dir / "clients" / "legacy-client"
         client_dir.mkdir(parents=True)
@@ -372,6 +437,65 @@ type = "hg"
                 client_dir,
             )
             self.assertEqual("nfs", checkout.get_config().mount_protocol)
+
+    def test_checkout_with_unknown_catalog_type_is_readable(self) -> None:
+        client_dir = self._state_dir / "clients" / "sqlite-client"
+        client_dir.mkdir(parents=True)
+        (client_dir / "config.toml").write_text(
+            """
+[repository]
+path = "/backing-repo"
+type = "hg"
+inode-catalog-type = "Sqlite"
+"""
+        )
+
+        checkout = config_mod.EdenCheckout(
+            self.get_config(),
+            self.tmp_dir / "sqlite-mount",
+            client_dir,
+        )
+        self.assertEqual("sqlite", checkout.get_config().inode_catalog_type)
+
+
+class SnapshotFileTest(EdenTestCaseBase):
+    def write_in_progress_snapshot(
+        self, from_component: bytes, to_component: bytes, pid: int
+    ) -> Path:
+        snapshot_path = self.tmp_dir / "SNAPSHOT"
+        snapshot_path.write_bytes(
+            util.SNAPSHOT_MAGIC_3
+            + struct.pack(">L", pid)
+            + struct.pack(">L", len(from_component))
+            + from_component
+            + struct.pack(">L", len(to_component))
+            + to_component
+        )
+        return snapshot_path
+
+    def test_in_progress_snapshot_with_equal_component_lengths(self) -> None:
+        snapshot_path = self.write_in_progress_snapshot(
+            util.create_filtered_rootid("a" * 40, b"null"),
+            util.create_filtered_rootid("b" * 40, b"null"),
+            4242,
+        )
+        with self.assertRaises(config_mod.InProgressCheckoutError) as context:
+            config_mod.get_snapshot(snapshot_path, "filteredhg")
+        self.assertEqual("a" * 40, context.exception.from_commit)
+        self.assertEqual("b" * 40, context.exception.to_commit)
+        self.assertEqual(4242, context.exception.pid)
+
+    def test_in_progress_snapshot_with_different_component_lengths(self) -> None:
+        snapshot_path = self.write_in_progress_snapshot(
+            util.create_filtered_rootid("a" * 40, b"null"),
+            util.create_filtered_rootid("b" * 40, b"V1:filter2"),
+            4242,
+        )
+        with self.assertRaises(config_mod.InProgressCheckoutError) as context:
+            config_mod.get_snapshot(snapshot_path, "filteredhg")
+        self.assertEqual("a" * 40, context.exception.from_commit)
+        self.assertEqual("b" * 40, context.exception.to_commit)
+        self.assertEqual(4242, context.exception.pid)
 
 
 class EdenConfigParserTest(unittest.TestCase):

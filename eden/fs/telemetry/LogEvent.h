@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 
 #include "eden/common/os/ProcessId.h"
 #include "eden/common/telemetry/DynamicEvent.h"
@@ -261,6 +263,28 @@ struct DaemonStop : public EdenFSEvent {
 
   const char* getType() const override {
     return "daemon_stop";
+  }
+};
+
+/**
+ * A graceful restart was refused because Thrift requests were still running
+ * after core:takeover-request-grace. `requests` names them.
+ */
+struct TakeoverRefused : public EdenFSEvent {
+  std::string requests;
+  double oldest_request_age_s = 0.0;
+
+  TakeoverRefused(std::string requests, double oldest_request_age_s)
+      : requests(std::move(requests)),
+        oldest_request_age_s(oldest_request_age_s) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addString("reason", requests);
+    event.addDouble("duration", oldest_request_age_s);
+  }
+
+  const char* getType() const override {
+    return "takeover_refused";
   }
 };
 
@@ -534,7 +558,7 @@ struct NfsParsingError : public EdenFSEvent {
   std::string reason;
 
   NfsParsingError(std::string proc, std::string reason)
-      : proc(proc), reason(reason) {}
+      : proc(std::move(proc)), reason(std::move(reason)) {}
 
   void populate(DynamicEvent& event) const override {
     event.addString("interface", proc);
@@ -809,7 +833,7 @@ struct SilentDaemonExit : public EdenFSEvent {
         daemon_exit_signal(daemon_exit_signal),
         system_boot_timestamp(system_boot_timestamp),
         is_memory_pressure_kill(is_memory_pressure_kill),
-        system_log_check_error_str(system_log_check_error_str),
+        system_log_check_error_str(std::move(system_log_check_error_str)),
         daemon_downtime_s(daemon_downtime_s) {}
 
   void populate(DynamicEvent& event) const override {
@@ -846,23 +870,80 @@ struct PrivHelperExit : public EdenFSEvent {
   }
 };
 
+// What started a checkout recovery attempt. Its name is logged in the
+// `source` column of accidental_unmount_recovery events.
+enum class CheckoutRecoveryTrigger : uint8_t {
+  HealthCheckTick,
+  ChannelStop,
+};
+
+constexpr std::string_view checkoutRecoveryTriggerName(
+    CheckoutRecoveryTrigger trigger) {
+  switch (trigger) {
+    case CheckoutRecoveryTrigger::HealthCheckTick:
+      return "health_check_tick";
+    case CheckoutRecoveryTrigger::ChannelStop:
+      return "channel_stop";
+  }
+  return "unknown";
+}
+
 struct AccidentalUnmountRecovery : public EdenFSEvent {
   std::string error;
   bool success = false;
   std::string repo_source;
+  std::string mount_path;
+  CheckoutRecoveryTrigger trigger;
+  // 1 for the first attempt.
+  int64_t attempt = 0;
+  double duration = 0.0;
+  std::string mount_protocol;
+  // Set on the failed attempt after which recovery gave up on the checkout.
+  bool gave_up = false;
+  // Why the daemon stopped serving the checkout.
+  std::string stop_reason;
+  // Time from that stop until this attempt ended. Unset when this daemon never
+  // served the checkout.
+  std::optional<int64_t> outage_age_ms;
 
   AccidentalUnmountRecovery(
       std::string error,
       bool success,
-      std::string repo_source)
+      std::string repo_source,
+      std::string mount_path,
+      CheckoutRecoveryTrigger trigger,
+      int64_t attempt,
+      double duration,
+      std::string mount_protocol,
+      std::string stop_reason)
       : error(std::move(error)),
         success(success),
-        repo_source(std::move(repo_source)) {}
+        repo_source(std::move(repo_source)),
+        mount_path(std::move(mount_path)),
+        trigger(trigger),
+        attempt(attempt),
+        duration(duration),
+        mount_protocol(std::move(mount_protocol)),
+        stop_reason(std::move(stop_reason)) {}
 
   void populate(DynamicEvent& event) const override {
     event.addString("remount_error", error);
     event.addBool("success", success);
     event.addString("repo_source", repo_source);
+    event.addString("mount_path", mount_path);
+    event.addString(
+        "source", std::string{checkoutRecoveryTriggerName(trigger)});
+    event.addInt("retry", attempt);
+    event.addDouble("duration", duration);
+    event.addString("mount_protocol", mount_protocol);
+    event.addString("reason", stop_reason);
+    event.addString(
+        "causeDetail",
+        outage_age_ms ? fmt::format(
+                            "{{\"gave_up\":{},\"outage_age_ms\":{}}}",
+                            gave_up,
+                            *outage_age_ms)
+                      : fmt::format("{{\"gave_up\":{}}}", gave_up));
   }
 
   const char* getType() const override {
@@ -880,6 +961,9 @@ struct EdenMountHealthIssue : public EdenFSEvent {
   std::string error;
   bool attempted_repair = false;
   bool success = false;
+  // JSON details of a probe that ran too long, set after construction.
+  std::string cause_detail;
+  std::optional<double> duration_s;
 
   EdenMountHealthIssue(
       std::string source,
@@ -915,61 +999,16 @@ struct EdenMountHealthIssue : public EdenFSEvent {
     }
     event.addBool("attempted_repair", attempted_repair);
     event.addBool("success", success);
+    if (!cause_detail.empty()) {
+      event.addString(std::string{xplat_keys::kCauseDetail}, cause_detail);
+    }
+    if (duration_s.has_value()) {
+      event.addDouble(std::string{xplat_keys::kDuration}, *duration_s);
+    }
   }
 
   const char* getType() const override {
     return "eden_mount_health_issue";
-  }
-};
-
-struct SqliteIntegrityCheck : public EdenFSEvent {
-  double duration = 0.0;
-  int64_t numErrors = 0;
-
-  SqliteIntegrityCheck(double duration, int64_t numErrors)
-      : duration(duration), numErrors(numErrors) {}
-
-  void populate(DynamicEvent& event) const override {
-    event.addDouble("duration", duration);
-    event.addInt("num_errors", numErrors);
-  }
-
-  const char* getType() const override {
-    return "sqlite_integrity_check";
-  }
-};
-
-struct NfsCrawlDetected : public EdenFSEvent {
-  int64_t readCount = 0;
-  int64_t readThreshold = 0;
-  int64_t readDirCount = 0;
-  int64_t readDirThreshold = 0;
-  // root->leaf formatted as:
-  //   "[simple_name (pid): full_name] -> [simple_name (pid): full_name] -> ..."
-  std::string processHierarchy;
-
-  NfsCrawlDetected(
-      int64_t readCount,
-      int64_t readThreshold,
-      int64_t readDirCount,
-      int64_t readDirThreshold,
-      std::string processHierarchy)
-      : readCount(readCount),
-        readThreshold(readThreshold),
-        readDirCount(readDirCount),
-        readDirThreshold(readDirThreshold),
-        processHierarchy(std::move(processHierarchy)) {}
-
-  void populate(DynamicEvent& event) const override {
-    event.addInt("read_count", readCount);
-    event.addInt("read_threshold", readThreshold);
-    event.addInt("readdir_count", readDirCount);
-    event.addInt("readdir_threshold", readDirThreshold);
-    event.addString("process_hierarchy", processHierarchy);
-  }
-
-  const char* getType() const override {
-    return "nfs_crawl_detected";
   }
 };
 

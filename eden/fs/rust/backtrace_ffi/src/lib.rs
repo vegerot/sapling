@@ -39,26 +39,37 @@ struct CapturingGuard;
 
 impl CapturingGuard {
     fn new() -> Option<Self> {
-        CAPTURING.with(|c| {
-            if c.get() {
-                return None;
-            }
-            c.set(true);
-            Some(CapturingGuard)
-        })
+        CAPTURING
+            .try_with(|c| {
+                if c.get() {
+                    return None;
+                }
+                c.set(true);
+                Some(CapturingGuard)
+            })
+            .ok()
+            .flatten()
     }
 }
 
 impl Drop for CapturingGuard {
     fn drop(&mut self) {
-        CAPTURING.with(|c| c.set(false));
+        let _ = CAPTURING.try_with(|c| c.set(false));
     }
 }
 
+// These run inside the C++ throw hook, so they must never panic: a panic in
+// a cxx bridge function aborts the process. `LocalKey::with` panics once the
+// thread's TLS destructors have run, which is exactly when C++ destructors
+// still throw (thread exit, process exit), so every access goes through
+// `try_with` and treats a destroyed slot as "no trace".
 fn capture_backtrace(max_depth: usize) {
     let Some(_guard) = CapturingGuard::new() else {
         return;
     };
+    if CAPTURED.try_with(|_| ()).is_err() {
+        return;
+    }
     let mut frames = Vec::with_capacity(max_depth);
     backtrace::trace(|frame| {
         if frames.len() >= max_depth {
@@ -68,15 +79,17 @@ fn capture_backtrace(max_depth: usize) {
         true
     });
     let bt = backtrace::Backtrace::from(frames);
-    CAPTURED.with(|slot| *slot.borrow_mut() = Some(bt));
+    let _ = CAPTURED.try_with(|slot| *slot.borrow_mut() = Some(bt));
 }
 
 fn has_captured_trace() -> bool {
-    CAPTURED.with(|slot| slot.borrow().is_some())
+    CAPTURED
+        .try_with(|slot| slot.borrow().is_some())
+        .unwrap_or(false)
 }
 
 fn clear_captured_trace() {
-    CAPTURED.with(|slot| *slot.borrow_mut() = None);
+    let _ = CAPTURED.try_with(|slot| *slot.borrow_mut() = None);
 }
 
 // Each platform uses a different function to throw C++ exceptions.
@@ -100,7 +113,11 @@ fn is_throw_hook(name: &[u8]) -> bool {
 // Symbolize captured frames, strip infrastructure frames above the throw
 // hook, format remaining frames, and clear the stored trace.
 fn symbolize_captured_trace() -> String {
-    let Some(mut bt) = CAPTURED.with(|slot| slot.borrow_mut().take()) else {
+    let Some(mut bt) = CAPTURED
+        .try_with(|slot| slot.borrow_mut().take())
+        .ok()
+        .flatten()
+    else {
         return String::new();
     };
 
@@ -147,6 +164,9 @@ fn symbolize_captured_trace() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
     use super::*;
 
     #[test]
@@ -179,5 +199,38 @@ mod tests {
         assert!(has_captured_trace());
         let trace = symbolize_captured_trace();
         assert!(trace.is_empty());
+    }
+
+    // A C++ exception thrown while a thread runs its TLS destructors reaches
+    // the throw hook after CAPTURED is gone. Without `try_with` this panics,
+    // and a panic in a cxx bridge function aborts the process.
+    #[test]
+    fn test_capture_after_tls_destruction() {
+        static PANICKED: AtomicBool = AtomicBool::new(false);
+        struct CaptureOnDrop;
+        impl Drop for CaptureOnDrop {
+            fn drop(&mut self) {
+                let result = std::panic::catch_unwind(|| {
+                    capture_backtrace(8);
+                    let _ = has_captured_trace();
+                    let _ = symbolize_captured_trace();
+                    clear_captured_trace();
+                });
+                PANICKED.store(result.is_err(), Ordering::SeqCst);
+            }
+        }
+        thread_local! {
+            static ON_DROP: RefCell<Option<CaptureOnDrop>> = const { RefCell::new(None) };
+        }
+        std::thread::spawn(|| {
+            // TLS destructors run in reverse registration order: register
+            // ON_DROP first so CAPTURED is destroyed before it runs.
+            ON_DROP.with(|slot| *slot.borrow_mut() = Some(CaptureOnDrop));
+            capture_backtrace(8);
+            assert!(has_captured_trace());
+        })
+        .join()
+        .expect("thread should exit cleanly");
+        assert!(!PANICKED.load(Ordering::SeqCst));
     }
 }

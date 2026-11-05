@@ -37,11 +37,11 @@ use mononoke_types::MPath;
 use mononoke_types::SubtreeChange;
 use mononoke_types::content_manifest::ContentManifestEntry;
 use mononoke_types::content_manifest::ContentManifestRollupData;
-use mononoke_types::subtree_change::SubtreeCopy;
 use mononoke_types::subtree_change::SubtreeCrossRepoMerge;
 use mononoke_types::subtree_change::SubtreeDeepCopy;
 use mononoke_types::subtree_change::SubtreeImport;
 use mononoke_types::subtree_change::SubtreeMerge;
+use pushrebase::PushrebaseConflict;
 use sorted_vector_map::SortedVectorMap;
 use source_control as thrift;
 
@@ -253,6 +253,16 @@ impl IntoResponse<thrift::Diff> for HeaderlessUnifiedDiff {
             is_binary: self.is_binary,
             ..Default::default()
         })
+    }
+}
+
+impl IntoResponse<thrift::PushrebaseConflict> for PushrebaseConflict {
+    fn into_response(self) -> thrift::PushrebaseConflict {
+        thrift::PushrebaseConflict {
+            left: self.left.to_string(),
+            right: self.right.to_string(),
+            ..Default::default()
+        }
     }
 }
 
@@ -534,11 +544,7 @@ impl AsyncIntoResponseWith<BTreeMap<String, thrift::SubtreeChange>>
         self.into_iter()
             .map(|(path, change)| {
                 let change = match change {
-                    SubtreeChange::SubtreeCopy(SubtreeCopy {
-                        from_cs_id,
-                        from_path,
-                    })
-                    | SubtreeChange::SubtreeDeepCopy(SubtreeDeepCopy {
+                    SubtreeChange::SubtreeDeepCopy(SubtreeDeepCopy {
                         from_cs_id,
                         from_path,
                     }) => thrift::SubtreeChange::subtree_copy(thrift::SubtreeCopy {

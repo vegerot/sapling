@@ -57,6 +57,9 @@ sl.draft=brightyellow bold
 sl.folded=brightblack:none
 sl.hiddenlabel=brightblack:none
 sl.hiddennode=brightblack:none
+sl.divergentnode=red
+sl.mutatedfrom=cyan
+sl.desc.divergentnode=red
 sl.histedited=brightblack:none
 sl.highlighted = cyan_background
 sl.landed=brightblack:none
@@ -233,10 +236,6 @@ rename.default=remote
 resolvenodes=False
 selectivepulldefault=master
 
-[server]
-preferuncompressed=True
-uncompressed=True
-
 [sigtrace]
 interval=30
 
@@ -326,7 +325,7 @@ github_sl_difflabel="{case(github_pr_state,
     )}"
 
 phab_sl_diffstatus="{phabstatus}{case(phabstatus, 'Waiting For Author', '*', 'Needs Revision', '*')}"
-phab_sl_difflabel="{case(phabstatus,
+phab_sl_difflabel="{if(phabbadgestatus, phab_sl_badgelabel, case(phabstatus,
  'Landing', 'ssl.landing',
  'Accepted', 'ssl.accepted',
  'Waiting For Author', 'ssl.revision',
@@ -350,6 +349,44 @@ phab_sl_difflabel="{case(phabstatus,
  'Needs CRS Review', 'ssl.review',
  'AI Approved', 'ssl.aiapproved',
  'sl.diff'
+ ))}"
+# Keyed on the badge state: its label can embed counts, like the number of
+# AI review findings.
+phab_sl_badgelabel="{case(phabbadgestatus,
+ 'ACCEPTED', 'ssl.accepted',
+ 'NEEDS_REVIEW', 'ssl.review',
+ 'AI_REVIEWING', 'ssl.review',
+ 'AI_REVIEWED', 'ssl.review',
+ 'AWAITING_STEWARD_REVIEW', 'ssl.review',
+ 'AWAITING_ACL_REVIEWER', 'ssl.review',
+ 'AWAITING_OWNER_REVIEW', 'ssl.review',
+ 'AWAITING_CRS_REVIEWER', 'ssl.review',
+ 'AWAITING_DRS_REVIEW', 'ssl.review',
+ 'NEEDS_EXTRA_REVIEW', 'ssl.review',
+ 'NEEDS_SECOND_REVIEW', 'ssl.review',
+ 'CHANGES_PLANNED', 'ssl.revision',
+ 'WAITING_FOR_AUTHOR', 'ssl.revision',
+ 'WAITING_FOR_AGENT', 'ssl.revision',
+ 'WAITING_FOR_CODEMOD_AUTHOR', 'ssl.revision',
+ 'LANDING', 'ssl.landing',
+ 'PARSING_COMMIT', 'ssl.landing',
+ 'LAND_ENQUEUED', 'ssl.landenqueued',
+ 'LAND_SCHEDULED', 'ssl.landscheduled',
+ 'RECENTLY_FAILED_TO_LAND', 'ssl.landfailed',
+ 'COMMITTED', 'ssl.committed',
+ 'NEEDS_FINAL_REVIEW', 'ssl.finalreview',
+ 'POST_LAND_NEEDS_REVIEW', 'ssl.finalreview',
+ 'NEEDS_STEWARD_REVIEW', 'ssl.finalreview',
+ 'NEEDS_OWNER_REVIEW', 'ssl.finalreview',
+ 'NEEDS_PRESCREENER', 'ssl.finalreview',
+ 'NEEDS_CONFIRMATION', 'ssl.finalreview',
+ 'DEFERRED_REVIEW', 'ssl.aiapproved',
+ 'ABANDONED', 'ssl.abandoned',
+ 'UNPUBLISHED', 'ssl.unpublished',
+ 'PUBLISH_PENDING', 'ssl.unpublished',
+ 'PUBLISH_FAILED', 'ssl.unpublished',
+ 'FAILED_TESTS', 'ssl.unpublished',
+ 'sl.diff'
  )}"
 
 sl_date = "{label('sl.date', '{smartdate(sl_date_timestamp, sl_date_threshold, age(sl_date_timestamp), simpledate(sl_date_timestamp, sl_date_timezone))}')}"
@@ -370,16 +407,17 @@ sl_undone = "{if(undosuccessors, label('sl.undone', '(Undone to {join(undosucces
 sl_mutation_names = dict(amend="Amended as", rebase="Rebased to", split="Split into", fold="Folded into", histedit="Histedited to", land="Landed as", pushrebase="Landed as")
 sl_mutations = "{join(mutations % '[{get(sl_mutation_names, operation, \'Rewritten into\')} {join(successors % \'{node|short}\', \', \')}]', ' ')}"
 sl_hidden = "{ifcontains(rev, revset('hidden()'), label('sl.hiddenlabel', '(hidden)'))}"
-sl_label="{ifeq(highlighted_node, node, 'sl.highlighted', ifeq(graphnode, '@', 'sl.current', ifeq(graphnode, 'x', 'sl.hiddennode', ifeq(graphnode, 's', 'sl.snapshotnode'))))}"
-sl_desclabel = "{ifeq(graphnode, '@', 'sl.desc.current', ifeq(graphnode, 'x', 'sl.desc.hiddennode', ifeq(phase, 'public', 'sl.desc.public', 'sl.desc')))}"
+sl_label="{ifeq(highlighted_node, node, 'sl.highlighted', case(graphnode, '@', 'sl.current', 'x', 'sl.hiddennode', 'v', 'sl.divergentnode', 's', 'sl.snapshotnode'))}"
+sl_desclabel = "{case(graphnode, '@', 'sl.desc.current', 'x', 'sl.desc.hiddennode', 'v', 'sl.desc.divergentnode', ifeq(phase, 'public', 'sl.desc.public', 'sl.desc'))}"
 sl_shelved = "{if(shelveenabled, ifcontains(rev, revset('shelved()'), label('sl.shelvedlabel', '(shelved)')), '')}"
 ssl_unsync = "{label('ssl.unsync', ifeq(syncstatus, 'unsync', '(local changes)'))}"
 ssl_diffversion = if(diffversion,ifcontains("+",diffversion,label("ssl.unsync","{diffversion}"),ifcontains(".",diffversion,label("ssl.syncdraft","{diffversion}"),label("ssl.sync","{diffversion}"))))
 ssl_unsync_or_diffversion = ifeq(ssl_show_diffversion,"true",ssl_diffversion,ssl_unsync)
-ssl_show_diffversion = ifeq(verbosity, "verbose", "true")
+# Whether `ssl` shows the diff version each commit was submitted as: with -v, and in the mutation history (`sl ssl -t`).
+ssl_show_diffversion = ifeq(verbosity, "verbose", "true", sl_show_mutatedfrom)
 sl_stablecommit = "{label('sl.stablecommit', smallcommitmeta('arcpull_stable'))}"
 
-sl_node_info = "{separate(' ', sl_node, sl_mutations, sl_backup, sl_shelved)}"
+sl_node_info = "{separate(' ', sl_node, ifeq(sl_show_mutatedfrom, 'true', sl_mutatedinto, sl_mutations), sl_backup, sl_shelved)}"
 sl_node_info_debug = "{separate(' ', sl_node_debug, sl_mutations, sl_hidden, sl_backup, sl_shelved, sl_phase_debug)}"
 sl_diff_super = "{ifeq(graphnode, 's', '', if(sl_diff, separate(' ', label(sl_difflabel, separate(' ', sl_difflink, sl_diffstatus)), label(sl_diffsignallabel, sl_diffsignal), ssl_unsync_or_diffversion)))}"
 sl_diff_colors = "{if(sl_diff, label(sl_difflabel, '{phabdiff}'))}"
@@ -413,14 +451,24 @@ sl_revision_separator = "\n"
 # Additional lines to be rendered after the commit summary
 sl_extra = "{sl_file_info}{ifeq(sl_file_count,0,sl_file_change_summary)}"
 
+# How a commit was created, shown before it by `sl sl -t` (smartlog --mutation).
+sl_show_mutatedfrom = 'false'
+sl_mutatedfrom_split = "{if(split, ' {splitpart} of {count(split)}')}"
+sl_mutatedfrom_preds = "{join(predecessors % '{node|short}', ', ')}"
+sl_mutatedfrom_info = "{separate('  ', '{operation}{sl_mutatedfrom_split} from {sl_mutatedfrom_preds}', label('sl.user', user|emailuser), label('sl.date', smartdate(date, sl_date_threshold, age(date), simpledate(date, sl_date_timezone))))}"
+sl_mutatedfrom = "{mutatedfrom % '{sl_mutatedfrom_info}'}"
+sl_mutatedfrom_line = "{ifeq(sl_show_mutatedfrom, 'true', if(mutatedfrom, label('sl.mutatedfrom', '{sl_mutatedfrom}\n')))}"
+# What a commit became next, shown by `sl sl -t` in place of sl_mutations.
+sl_mutatedinto = "{join(mutatedinto % '[{get(sl_mutation_names, operation, \'Rewritten into\')} {join(successors % \'{node|short}\', \', \')}]', ' ')}"
+
 # Normal smartlog
-sl = "{label(sl_label, if(sl_use_short_header, sl_header_short, separate('\n', sl_header_normal, sl_desc, sl_revision_separator)))}{sl_extra}"
+sl = "{sl_mutatedfrom_line}{label(sl_label, if(sl_use_short_header, sl_header_short, separate('\n', sl_header_normal, sl_desc, sl_revision_separator)))}{sl_extra}"
 
 # Super-smartlog.  Includes phabricator information.
-ssl = "{label(sl_label, if(sl_use_short_header, sl_header_short, separate('\n', sl_header_super, sl_desc, sl_revision_separator)))}{sl_extra}"
+ssl = "{sl_mutatedfrom_line}{label(sl_label, if(sl_use_short_header, sl_header_short, separate('\n', sl_header_super, sl_desc, sl_revision_separator)))}{sl_extra}"
 
 # Like super-smartlog, but only colorizes the diff number.
-csl = "{label(sl_label, if(sl_use_short_header, sl_header_short, separate('\n', sl_header_colors, sl_desc, sl_revision_separator)))}{sl_extra}"
+csl = "{sl_mutatedfrom_line}{label(sl_label, if(sl_use_short_header, sl_header_short, separate('\n', sl_header_colors, sl_desc, sl_revision_separator)))}{sl_extra}"
 
 # Smartlog with debug information.  Used by hg rage.
 sl_debug = "{label(sl_label, separate('\n', sl_header_debug, sl_desc, '\n'))}"

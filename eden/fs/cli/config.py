@@ -54,7 +54,7 @@ from eden.fs.service.eden.thrift_types import (
 from eden.thrift import client
 from eden.thrift.client import EdenNotRunningError
 from filelock import BaseFileLock, FileLock
-from thrift.python.exceptions import ApplicationError, ApplicationErrorType
+from thrift.python.exceptions import TransportError
 
 from . import configinterpolator, configutil, telemetry, util, version
 
@@ -109,6 +109,8 @@ CONFIG_JSON_LOCK = "config.json.lock"
 # in the Rust CLI at fs/cli_rs/edenfs-client/src/checkout.rs and the list in
 # the Daemon's CheckoutConfig at fs/config/CheckoutConfig.h.
 DEFAULT_REVISION = {  # supported repo name -> default bookmark
+    # The daemon no longer mounts "git" checkouts; the CLI keeps recognising
+    # the type so existing ones can still be listed and removed.
     "git": "refs/heads/master",
     "hg": "first(present(master) + .)",
     "filteredhg": "first(present(master) + .)",
@@ -128,10 +130,7 @@ SUPPORTED_MOUNT_PROTOCOLS: Set[str] = {
 
 SUPPORTED_INODE_CATALOG_TYPES: Set[str] = {
     "legacy",
-    "sqlite",
     "inmemory",
-    "lmdb",
-    "legacydev",
     "legacyephemeral",
 }
 
@@ -157,7 +156,7 @@ automatically remount your checkouts.
 
 # Default Thrift client timeout values (in seconds). Some of these might be
 # overridden or turned off by configs.
-MOUNT_TIMEOUT_SECONDS = 20
+MOUNT_TIMEOUT_SECONDS = 30
 UNMOUNT_TIMEOUT_SECONDS = 60
 
 
@@ -226,7 +225,6 @@ class CheckoutConfig(typing.NamedTuple):
     redirections: Dict[str, "RedirectionType"]
     redirection_targets: Dict[str, str]
     active_prefetch_profiles: List[str]
-    enable_sqlite_overlay: bool
     use_write_back_cache: bool
     re_use_case: str
     inode_catalog_type: Optional[str]
@@ -297,6 +295,21 @@ class AbstractEdenInstance:
     def get_checkouts(self) -> List["EdenCheckout"]: ...
 
     def get_mounts(self) -> Dict[Path, ListMountInfo]: ...
+
+
+def _remove_client_dir(client_dir: Path) -> None:
+    # EdenFS does not mount a client directory that has no SNAPSHOT.
+    # edenfsctl reads config.toml to remove a partly deleted checkout.
+    (client_dir / SNAPSHOT).unlink(missing_ok=True)
+    for entry in client_dir.iterdir():
+        if entry.name == MOUNT_CONFIG:
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+    (client_dir / MOUNT_CONFIG).unlink(missing_ok=True)
+    client_dir.rmdir()
 
 
 class EdenInstance(AbstractEdenInstance):
@@ -632,7 +645,7 @@ class EdenInstance(AbstractEdenInstance):
         try:
             with self.get_thrift_client() as client:
                 thrift_mounts: List[MountInfo] = list(client.listMounts())
-        except EdenNotRunningError:
+        except (EdenNotRunningError, TransportError):
             thrift_mounts = []
 
         config_mounts = self.get_checkouts()
@@ -715,7 +728,7 @@ class EdenInstance(AbstractEdenInstance):
         snapshot_id: str,
         filter_paths: Optional[List[str]] = None,
     ) -> None:
-        if path in self._get_directory_map():
+        if Path(path) in self._get_directory_map():
             raise Exception(
                 """\
 mount path %s is already configured (see `eden list`). \
@@ -1006,43 +1019,43 @@ Do you want to run `eden mount %s` instead?"""
             useForce=use_force,
         )
 
-        with self.get_thrift_client(timeout=UNMOUNT_TIMEOUT_SECONDS) as client:
-            try:
+        try:
+            with self.get_thrift_client(timeout=UNMOUNT_TIMEOUT_SECONDS) as client:
                 client.unmountV2(unmount_arg)
-            except ApplicationError as e:
-                # Fallback to old unmount in the case that this is running
-                # against an older version of EdenFS in which unmountV2 is
-                # not known
-                if e.type == ApplicationErrorType.UNKNOWN_METHOD:
-                    client.unmount(mount_point)
-                else:
-                    raise e
+        finally:
+            if unintentional_unmount:
+                # Used by `eden unmount --debug-mark-unintentional` (tests and
+                # debugging) and by doctor's unmount-and-remount repair. Leave
+                # no marker, even if the call failed, so that unmount recovery
+                # treats this unmount as accidental.
+                self._clear_intentionally_unmounted(path)
 
         if not unintentional_unmount:
-            # If the unmount succeeded, create a file in the client directory
-            # to indicate that the unmount was intentional. This will prevent
-            # periodic unmount recovery from remount this repo.
-            self._set_intentionally_unmounted(path)
+            # The daemon writes this marker before it starts the unmount, but
+            # only best-effort, so write it again now that the unmount
+            # succeeded. It stops unmount recovery from remounting the checkout.
+            # The marker lives in the client directory that config.json names,
+            # which a mounted-but-unregistered checkout does not have. The
+            # unmount itself already succeeded, so a missing marker is a
+            # warning, not a failure.
+            try:
+                self._set_intentionally_unmounted(path)
+            except Exception as ex:
+                log.warning(
+                    f"unmounted {path}, but could not mark it intentionally "
+                    f"unmounted: {ex}"
+                )
 
-    def _set_intentionally_unmounted(self, path: str) -> None:
+    def _intentionally_unmounted_file(self, path: str) -> Path:
         mount_path = Path(path).resolve(strict=False)
         client_dir = self._get_client_dir_for_mount_point(mount_path)
-        intentionally_unmounted_file = client_dir / INTENTIONALLY_UNMOUNTED
-        intentionally_unmounted_file.touch()
+        return client_dir / INTENTIONALLY_UNMOUNTED
 
-    def set_intentionally_unmounted_for_all_mounts(self) -> None:
-        clients_dir = self._get_clients_dir()
-        intentionally_unmounted_files = [
-            p / INTENTIONALLY_UNMOUNTED for p in clients_dir.glob("*") if p.is_dir()
-        ]
-        for f in intentionally_unmounted_files:
-            f.touch()
+    def _set_intentionally_unmounted(self, path: str) -> None:
+        self._intentionally_unmounted_file(path).touch()
 
-    def clear_intentionally_unmounted_for_all_mounts(self) -> None:
-        clients_dir = self._get_clients_dir()
-        intentionally_unmounted_files = clients_dir.glob(f"*/{INTENTIONALLY_UNMOUNTED}")
-        for f in intentionally_unmounted_files:
-            f.unlink(missing_ok=True)
+    def _clear_intentionally_unmounted(self, path: str) -> None:
+        self._intentionally_unmounted_file(path).unlink(missing_ok=True)
 
     def destroy_mount(
         self, path: Union[Path, str], preserve_mount_point: bool = False
@@ -1121,7 +1134,7 @@ Do you want to run `eden mount %s` instead?"""
             )
 
             path = Path(path)
-            shutil.rmtree(self._get_client_dir_for_mount_point(path))
+            _remove_client_dir(self._get_client_dir_for_mount_point(path))
             self._remove_path_from_directory_map(path)
 
         # Restore the original rmtree
@@ -1129,6 +1142,35 @@ Do you want to run `eden mount %s` instead?"""
         shutil._rmtree_unsafe = old_rmtree_unsafe
         # pyrefly: ignore [missing-attribute]
         shutil._rmtree_safe_fd = old_rmtree_safe_fd
+
+    def can_register_running_mount(self, path: Path, client_dir: Path) -> bool:
+        """True when `register_running_mount(path, client_dir)` would accept the
+        pair: the client directory is one of this instance's and holds a
+        checkout config, and neither the path nor the directory is registered."""
+        clients_dir = self._get_clients_dir().resolve(strict=False)
+        resolved = client_dir.resolve(strict=False)
+        directory_map = self._get_directory_map()
+        return (
+            resolved.parent == clients_dir
+            and (resolved / MOUNT_CONFIG).is_file()
+            and Path(path) not in directory_map
+            and resolved.name not in directory_map.values()
+        )
+
+    def register_running_mount(self, path: Path, client_dir: Path) -> None:
+        """Add a checkout the daemon serves but config.json does not list, so
+        that EdenFS remounts it after a restart and `eden rm` can remove it.
+
+        `client_dir` is the client directory the running mount uses (its
+        `.eden/client` link or the daemon's `edenClientPath`)."""
+        if not self.can_register_running_mount(path, client_dir):
+            raise ValueError(
+                f"cannot register {path}: {client_dir} is not an unused client "
+                f"directory of {self._get_clients_dir()} with a checkout config"
+            )
+        self._add_path_to_directory_map(
+            Path(path), client_dir.resolve(strict=False).name
+        )
 
     def _cleanup_unix_mount(self, path: Path, preserve_mount_point: bool) -> None:
         # Previous versions of EdenFS made the mount point directory read-only
@@ -1149,6 +1191,8 @@ Do you want to run `eden mount %s` instead?"""
     def cleanup_mount(
         self, path: Path, preserve_mount_point: bool = False, debug: bool = False
     ) -> None:
+        if not path.exists():
+            return
         if sys.platform != "win32":
             self._cleanup_unix_mount(path, preserve_mount_point)
         else:
@@ -1510,7 +1554,6 @@ class EdenCheckout:
                 "protocol": checkout_config.mount_protocol,
                 "case-sensitive": checkout_config.case_sensitive,
                 "require-utf8-path": checkout_config.require_utf8_path,
-                "enable-sqlite-overlay": checkout_config.enable_sqlite_overlay,
                 "use-write-back-cache": checkout_config.use_write_back_cache,
                 "inode-catalog-type": checkout_config.inode_catalog_type,
                 "off-mount-repo-dir": checkout_config.off_mount_repo_dir,
@@ -1641,14 +1684,6 @@ class EdenCheckout:
 
                     prefetch_profiles.append(profile)
 
-        enable_sqlite_overlay = repository.get("enable-sqlite-overlay")
-        # SqliteOverlay is default on Windows
-        if not isinstance(enable_sqlite_overlay, bool):
-            enable_sqlite_overlay = sys.platform == "win32"
-        elif sys.platform == "win32":
-            # SqliteOverlay is always enabled on Windows
-            enable_sqlite_overlay = True
-
         use_write_back_cache = repository.get("use-write-back-cache")
         if not isinstance(use_write_back_cache, bool):
             use_write_back_cache = False
@@ -1663,31 +1698,30 @@ class EdenCheckout:
         if not isinstance(off_mount_repo_dir, bool):
             off_mount_repo_dir = False
 
+        # A type this CLI does not know is kept as written rather than
+        # rejected: the daemon refuses to mount such a checkout, and the user
+        # still needs `eden rm`, `eden list` and `eden doctor` to work on it.
+        # `eden clone` validates the type for new checkouts.
         inode_catalog_type = repository.get("inode-catalog-type")
         if inode_catalog_type is not None:
-            if (
-                not isinstance(inode_catalog_type, str)
-                or inode_catalog_type.lower() not in SUPPORTED_INODE_CATALOG_TYPES
-            ):
+            if not isinstance(inode_catalog_type, str):
                 raise CheckoutConfigCorruptedError(
-                    f'repository "{config_path}" has unsupported inode catalog (overlay) type '
-                    f'"{inode_catalog_type}". Supported inode catalog (overlay) types are: '
-                    f"{', '.join(sorted(SUPPORTED_INODE_CATALOG_TYPES))}."
+                    f'repository "{config_path}" has a non-string inode catalog '
+                    f'(overlay) type "{inode_catalog_type}".'
                 )
             inode_catalog_type = inode_catalog_type.lower()
             if sys.platform == "win32" and inode_catalog_type in [
                 "legacy",
-                "legacydev",
                 "legacyephemeral",
             ]:
                 raise CheckoutConfigCorruptedError(
                     "Legacy inode catalog (overlay) type not supported on Windows. "
-                    "Use Sqlite or InMemory on Windows."
+                    "Use InMemory on Windows."
                 )
             elif sys.platform != "win32" and inode_catalog_type == "inmemory":
                 raise CheckoutConfigCorruptedError(
                     "InMemory inode catalog (overlay) type is only supported on Windows. "
-                    "Use Legacy or Sqlite on Linux and MacOS."
+                    "Use Legacy on Linux and MacOS."
                 )
 
         return CheckoutConfig(
@@ -1703,7 +1737,6 @@ class EdenCheckout:
                 repository.get("default-revision") or DEFAULT_REVISION[scm_type]
             ),
             active_prefetch_profiles=prefetch_profiles,
-            enable_sqlite_overlay=enable_sqlite_overlay,
             use_write_back_cache=use_write_back_cache,
             re_use_case=re_use_case,
             inode_catalog_type=inode_catalog_type,
@@ -1741,19 +1774,6 @@ class EdenCheckout:
         old_config = self.get_config()
 
         new_config = old_config._replace(mount_protocol=new_mount_protocol)
-
-        self.save_config(new_config)
-
-    def migrate_inode_catalog(self, new_inode_catalog_type: str) -> None:
-        """
-        Migrate this checkout to the new_inode_catalog_type. This will only take
-        effect if EdenFS is restarted. It is recommended to only run this while
-        EdenFS is stopped.
-        """
-
-        old_config = self.get_config()
-
-        new_config = old_config._replace(inode_catalog_type=new_inode_catalog_type)
 
         self.save_config(new_config)
 
@@ -1806,7 +1826,7 @@ def get_snapshot(snapshot_path: Path, scm_type: str) -> SnapshotState:
                 raise RuntimeError("SNAPSHOT file too short")
             (toLength,) = struct.unpack(">L", f.read(4))
             toParent = f.read(toLength)
-            if len(fromParent) != toLength:
+            if len(toParent) != toLength:
                 raise RuntimeError("SNAPSHOT file too short")
 
             decoded_to, _ = parse_snapshot_component(toParent, scm_type)
@@ -1997,54 +2017,6 @@ def get_transport_mismatches(
     if is_nfs_transport_mismatch_restart_enabled(instance):
         mismatches.extend(get_nfs_transport_mismatches(instance))
     return mismatches
-
-
-_MIGRATE_EXISTING_TO_IN_MEMORY_CATALOG = "core.migrate_existing_to_in_memory_catalog"
-
-
-def should_migrate_inode_catalog_to_in_memory(instance: AbstractEdenInstance) -> bool:
-    if sys.platform != "win32":
-        return False
-
-    if util.is_sandcastle():
-        return False
-
-    # default to migration, allow override in Eden config
-    if instance.get_config_bool(_MIGRATE_EXISTING_TO_IN_MEMORY_CATALOG, default=True):
-        return True
-
-    return False
-
-
-def count_non_in_memory_inode_catalogs(instance: AbstractEdenInstance) -> int:
-    count = 0
-    for checkout in instance.get_checkouts():
-        if (
-            checkout.get_config().inode_catalog_type
-            != util.INODE_CATALOG_TYPE_IN_MEMORY_STRING
-        ):
-            count += 1
-    return count
-
-
-# Checks for any non in memory catalogs and migrates them to in memory.
-def _do_in_memory_inode_catalog_migration(instance: EdenInstance) -> None:
-    if count_non_in_memory_inode_catalogs(instance) == 0:
-        # most the time this should be the case. we only need to migrate catalogs
-        # once, and then we should just be able to skip this all other times.
-        return
-
-    print("migrating mounts to inmemory inode catalog...")
-
-    for checkout in instance.get_checkouts():
-        if (
-            checkout.get_config().inode_catalog_type
-            != util.INODE_CATALOG_TYPE_IN_MEMORY_STRING
-        ):
-            checkout.migrate_inode_catalog(util.INODE_CATALOG_TYPE_IN_MEMORY_STRING)
-
-    instance.log_sample("migrate_existing_clones_to_in_memory")
-    print("Successfully migrated all your mounts to inmemory inode catalog.\n")
 
 
 def _do_manual_migration(
@@ -2368,14 +2340,11 @@ def create_checkout_config(
 ) -> CheckoutConfig:
     mount_protocol = util.get_protocol(nfs)
 
-    enable_sqlite_overlay = util.get_enable_sqlite_overlay(overlay_type)
-
     if overlay_type is None:
         # Not specified - read from EdenConfig, fallback to default.
         overlay_type = instance.get_config_value(
             "overlay.inode-catalog-type",
-            # SqliteOverlay is default on Windows
-            "sqlite" if sys.platform == "win32" else "legacy",
+            "inmemory" if sys.platform == "win32" else "legacy",
         )
         if overlay_type not in SUPPORTED_INODE_CATALOG_TYPES:
             raise Exception(
@@ -2386,17 +2355,16 @@ def create_checkout_config(
     overlay_type = overlay_type.lower()
     if sys.platform == "win32" and overlay_type in [
         "legacy",
-        "legacydev",
         "legacyephemeral",
     ]:
         raise Exception(
             "Legacy overlay (inode catalog) type not supported on Windows. "
-            "Use Sqlite or InMemory on Windows."
+            "Use InMemory on Windows."
         )
     elif sys.platform != "win32" and overlay_type == "inmemory":
         raise Exception(
             "InMemory overlay (inode catalog) type is only supported on Windows. "
-            "Use Legacy or Sqlite on Linux and MacOS."
+            "Use Legacy on Linux and MacOS."
         )
 
     # This is a valid repository path.
@@ -2412,7 +2380,6 @@ def create_checkout_config(
         redirections={},
         redirection_targets={},
         active_prefetch_profiles=[],
-        enable_sqlite_overlay=enable_sqlite_overlay,
         use_write_back_cache=False,
         re_use_case=re_use_case or "buck2-default",
         inode_catalog_type=overlay_type,

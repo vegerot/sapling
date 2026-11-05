@@ -11,46 +11,142 @@ use std::io::BufRead;
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::Error;
+use anyhow::Context;
 use clidispatch::ReqCtx;
 use clidispatch::abort;
+use cmdutil::ConfigExt;
 use cmdutil::Result;
 use repo::repo::Repo;
-use workingcopy::workingcopy::WorkingCopy;
-use worktree::dissolve_group_if_empty;
-use worktree::load_registry;
+use worktree::Worktrees;
 use worktree::lock_worktree_path_op;
-use worktree::with_registry_lock;
-use worktree::with_worktree_path_op_lock;
 
-use crate::CurrentGroup;
 use crate::WorktreeOpts;
-use crate::require_group;
+use crate::checkout::Checkouts;
 
-pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) -> Result<u8> {
-    let current_group = require_group(repo)?;
+pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, worktrees: &Worktrees) -> Result<u8> {
+    let logger = ctx.logger();
 
-    if ctx.opts.all {
-        return run_remove_all(ctx, repo, &current_group);
+    let (main, mut targets) = if ctx.opts.all {
+        let Some(main) = worktrees.main_for_remove()? else {
+            abort!("this worktree is not part of a group");
+        };
+        let targets = worktrees.linked_worktrees(&main)?;
+        (main, targets)
+    } else {
+        let path_args = &ctx.opts.args[1..];
+        if path_args.is_empty() {
+            abort!("usage: sl worktree remove PATH [PATH...]");
+        }
+        let targets = path_args
+            .iter()
+            .map(|s| -> Result<PathBuf> {
+                Ok(util::path::strip_unc_prefix(
+                    util::path::canonical_path_allow_missing(s)?,
+                ))
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let Some(main) = worktrees.main_for_remove()? else {
+            let names: Vec<String> = targets.iter().map(|p| p.display().to_string()).collect();
+            abort!(
+                "cannot remove {}: {} has no linked worktrees",
+                names.join(", "),
+                repo.path().display()
+            );
+        };
+        for target in &targets {
+            worktrees.validate_removal(&main, target)?;
+        }
+        (main, targets.into_iter().collect())
+    };
+    if targets.is_empty() {
+        logger.info("no linked worktrees to remove");
+        return Ok(0);
     }
 
-    let path_args = &ctx.opts.args[1..];
-    if path_args.is_empty() {
-        abort!("usage: sl worktree remove PATH [PATH...]");
-    }
-
-    let targets: BTreeSet<PathBuf> = path_args
-        .iter()
-        .map(|s| -> Result<PathBuf> {
-            Ok(util::path::strip_unc_prefix(
-                util::path::canonical_path_allow_missing(s)?,
-            ))
-        })
-        .collect::<Result<_>>()?;
+    // Later removals still run from the invoking checkout, so remove it last.
+    let current = util::path::strip_unc_prefix(util::path::canonicalize_best_effort(repo.path())?);
+    targets.sort_by_key(|target| *target == current);
     let target_refs: Vec<&Path> = targets.iter().map(|p| p.as_path()).collect();
-    validate_targets(&current_group, &target_refs)?;
+    confirm_remove(ctx, &target_refs)?;
 
-    remove_and_update_registry(ctx, repo, &current_group, &target_refs)?;
+    // Own every target before running hooks, so no other worktree command can
+    // act on one until this removal is done with it. Lock in path order so
+    // overlapping removals cannot deadlock.
+    let shared_store_path = worktrees.shared_store_path();
+    let mut lock_order = targets.clone();
+    lock_order.sort();
+    let mut path_locks = lock_order
+        .into_iter()
+        .map(|target| {
+            let lock = lock_worktree_path_op(repo.config().as_ref(), &shared_store_path, &target)?;
+            Ok((target, lock))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+
+    // Targets may have been removed while this command waited for their locks.
+    // `--all` skips them silently; explicit targets fail validation below.
+    // A target removed and re-added at the same path in that window is not
+    // detected, since the registry tracks worktrees by path.
+    if ctx.opts.all {
+        let linked = worktrees.linked_worktrees(&main)?;
+        targets.retain(|target| linked.contains(target));
+        if targets.is_empty() {
+            logger.info("no linked worktrees to remove");
+            return Ok(0);
+        }
+    }
+
+    let checkouts = Checkouts::new(repo, worktrees)?;
+    let pre_hooks = hook::Hooks::from_config(repo.config(), ctx.io(), "pre-worktree-remove");
+    let multi_target = ctx.opts.all || targets.len() > 1;
+    let mut remove_error = None;
+    let mut failed = 0;
+    for target in &targets {
+        let result = worktrees
+            .validate_removal(&main, target)
+            .and_then(|()| {
+                if !ctx.opts.force {
+                    ensure_clean(ctx, &checkouts, target)?;
+                    ensure_no_shelves(repo, &checkouts, target)?;
+                }
+                pre_hooks.run_hooks(
+                    Some(repo),
+                    false,
+                    Some(&HashMap::from([(
+                        "path".to_string(),
+                        target.display().to_string(),
+                    )])),
+                )
+            })
+            .and_then(|()| {
+                if !checkouts.remove(&logger, target, ctx.opts.force)? {
+                    logger.warn(format!(
+                        "eden checkout {} not found on disk, continuing to remove from registry",
+                        target.display()
+                    ));
+                }
+                worktrees.forget_removed(&main, target)
+            });
+        path_locks.remove(target);
+        match result {
+            Ok(()) => logger.info(format!("removed {}", target.display())),
+            Err(err) if multi_target => {
+                logger.warn(format!("failed to remove {}: {:#}", target.display(), err));
+                failed += 1;
+                remove_error.get_or_insert(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if let Some(err) = remove_error {
+        logger.warn(format!(
+            "removed {} of {} worktrees; {} failed",
+            targets.len() - failed,
+            targets.len(),
+            failed
+        ));
+        return Err(err);
+    }
 
     // NOTE: Add post-worktree-remove hook if the need arises. Note that the
     // hook's cwd (repo.path()) may not exist if the user removed the worktree
@@ -59,224 +155,59 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) ->
     Ok(0)
 }
 
-/// Validate that all user-specified paths are removable linked worktrees.
-fn validate_targets(current_group: &CurrentGroup, targets: &[&Path]) -> Result<()> {
-    let registry = load_registry(&current_group.shared_store_path)?;
-    let grp = match registry.groups.get(&current_group.group_id) {
-        Some(group) => group,
-        None => abort!("group '{}' not found in registry", current_group.group_id),
-    };
-    for target in targets {
-        if !grp.worktrees.contains_key(*target) {
-            if let Some(parent_wt) = grp.worktrees.keys().find(|wt| target.starts_with(wt)) {
-                abort!(
-                    "{} is not the root of checkout {}, not removing",
-                    target.display(),
-                    parent_wt.display()
-                );
-            }
-            abort!(
-                "{} is not in this worktree group, use `eden rm` instead",
-                target.display()
-            );
-        }
-        if *target == grp.main {
-            abort!("cannot remove a main worktree with linked worktrees");
-        }
-    }
-    Ok(())
-}
-
-/// Confirm, run hooks, tear down EdenFS mounts, and update the worktree registry.
-fn remove_and_update_registry(
-    ctx: &ReqCtx<WorktreeOpts>,
-    repo: &Repo,
-    current_group: &CurrentGroup,
-    targets: &[&Path],
-) -> Result<()> {
-    if targets.is_empty() {
+/// Refuse to remove a checkout with modified or untracked files.
+fn ensure_clean(ctx: &ReqCtx<WorktreeOpts>, checkouts: &Checkouts, target: &Path) -> Result<()> {
+    if !target.exists() {
         return Ok(());
     }
-
-    let logger = ctx.logger();
-
-    confirm_remove(ctx, targets)?;
-
-    let pre_hooks = hook::Hooks::from_config(repo.config(), ctx.io(), "pre-worktree-remove");
-    let multi_target = targets.len() > 1;
-    let mut removed_paths = Vec::new();
-    let mut remove_error: Option<Error> = None;
-    for &target in targets {
-        let result = with_worktree_path_op_lock(&current_group.shared_store_path, target, || {
-            pre_hooks.run_hooks(
-                Some(repo),
-                false,
-                Some(&HashMap::from([(
-                    "path".to_string(),
-                    target.display().to_string(),
-                )])),
-            )?;
-            run_eden_remove(ctx, repo, target)?;
-            Ok(())
-        });
-        match result {
-            Ok(()) => {
-                removed_paths.push(target);
-                logger.info(format!("removed {}", target.display()));
-            }
-            Err(err) if multi_target => {
-                logger.warn(format!("failed to remove {}: {}", target.display(), err));
-                if remove_error.is_none() {
-                    remove_error = Some(err);
-                }
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    finalize_registry_removal(current_group, &removed_paths)?;
-
-    if let Some(err) = remove_error {
-        return Err(err);
-    }
-
-    Ok(())
-}
-
-fn finalize_registry_removal(current_group: &CurrentGroup, removed_paths: &[&Path]) -> Result<()> {
-    if removed_paths.is_empty() {
-        return Ok(());
-    }
-
-    with_registry_lock(&current_group.shared_store_path, |registry| {
-        if let Some(grp) = registry.groups.get_mut(&current_group.group_id) {
-            for path in removed_paths {
-                grp.worktrees.remove(*path);
-            }
-        }
-        dissolve_group_if_empty(registry, &current_group.group_id);
-        Ok(())
+    let has_changes = checkouts.has_changes(ctx, target).with_context(|| {
+        format!(
+            "cannot check {} for modified or untracked files, use --force to remove it anyway",
+            target.display()
+        )
     })?;
-
+    if has_changes {
+        anyhow::bail!(
+            "{} contains modified or untracked files, use --force to remove it",
+            target.display()
+        );
+    }
     Ok(())
 }
 
-fn run_remove_all(
-    ctx: &ReqCtx<WorktreeOpts>,
-    repo: &Repo,
-    current_group: &CurrentGroup,
-) -> Result<u8> {
-    let logger = ctx.logger();
-    let registry = load_registry(&current_group.shared_store_path)?;
-    let grp = match registry.groups.get(&current_group.group_id) {
-        Some(group) => group,
-        None => abort!("group '{}' not found in registry", current_group.group_id),
-    };
-    let candidate_paths: Vec<PathBuf> = grp
-        .worktrees
-        .keys()
-        .filter(|p| **p != grp.main)
-        .cloned()
-        .collect();
-    if candidate_paths.is_empty() {
-        logger.info("no linked worktrees to remove");
-        return Ok(0);
-    }
-
-    // Lock all target worktrees in a stable order so overlapping bulk removes
-    // cannot deadlock and no target can change underneath this operation.
-    let mut sorted_paths = candidate_paths.clone();
-    sorted_paths.sort();
-    let _path_locks = sorted_paths
-        .iter()
-        .map(|path| lock_worktree_path_op(&current_group.shared_store_path, path))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Some selected paths may have been removed while this command waited for
-    // their path locks. Filter those stale candidates out before prompting.
-    // There is still a possible race if a worktree is quickly removed and
-    // re-added at the same path before we acquire the path lock; the registry
-    // currently tracks worktrees by path, not by per-entry generation.
-    let linked_paths = with_registry_lock(&current_group.shared_store_path, |registry| {
-        let Some(grp) = registry.groups.get(&current_group.group_id) else {
-            return Ok(Vec::new());
-        };
-        Ok(candidate_paths
-            .into_iter()
-            .filter(|path| path.as_path() != grp.main.as_path() && grp.worktrees.contains_key(path))
-            .collect())
-    })?;
-    if linked_paths.is_empty() {
-        logger.info("no linked worktrees to remove");
-        return Ok(0);
-    }
-
-    let path_refs: Vec<&Path> = linked_paths.iter().map(|p| p.as_path()).collect();
-    confirm_remove(ctx, &path_refs)?;
-
-    let pre_hooks = hook::Hooks::from_config(repo.config(), ctx.io(), "pre-worktree-remove");
-    let mut removed_paths = Vec::new();
-    let mut remove_error: Option<Error> = None;
-    for path in &linked_paths {
-        pre_hooks.run_hooks(
-            Some(repo),
-            false,
-            Some(&HashMap::from([(
-                "path".to_string(),
-                path.display().to_string(),
-            )])),
-        )?;
-        match run_eden_remove(ctx, repo, path) {
-            Ok(()) => {}
-            Err(err) => {
-                logger.warn(format!("failed to remove {}: {}", path.display(), err));
-                if remove_error.is_none() {
-                    remove_error = Some(err);
-                }
-                continue;
-            }
-        }
-        removed_paths.push(path.clone());
-    }
-
-    let removed_path_refs: Vec<&Path> = removed_paths.iter().map(|p| p.as_path()).collect();
-    finalize_registry_removal(current_group, &removed_path_refs)?;
-    for path in &removed_paths {
-        logger.info(format!("removed {}", path.display()));
-    }
-
-    if let Some(err) = remove_error {
-        return Err(err);
-    }
-
-    // NOTE: Add post-worktree-remove hook if the need arises. See single-remove
-    // path above for cwd caveat.
-
-    Ok(0)
-}
-
-/// Run `eden remove` for `path`. If the checkout directory is already gone
-/// (e.g., removed externally via `eden rm`), skips the call and returns Ok
-/// so the caller can proceed to clean the worktree registry.
-fn run_eden_remove(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, path: &Path) -> Result<()> {
-    if !path.exists() {
-        ctx.logger().warn(format!(
-            "eden checkout {} not found on disk, continuing to remove from registry",
-            path.display()
-        ));
+/// Refuse to remove a checkout with shelved changes, which do not count as
+/// modified or untracked files.
+fn ensure_no_shelves(repo: &Repo, checkouts: &Checkouts, target: &Path) -> Result<()> {
+    if !target.exists()
+        || !repo
+            .config()
+            .get_or("worktree", "check-shelves-on-remove", || true)?
+    {
         return Ok(());
     }
-    edenfs_client::run_eden_remove(repo.config().as_ref(), path)
+    let has_shelves = checkouts.has_shelves(target).with_context(|| {
+        format!(
+            "cannot check {} for shelved changes, use --force to remove it anyway",
+            target.display()
+        )
+    })?;
+    if has_shelves {
+        anyhow::bail!(
+            "{} has shelved changes, use --force to remove it",
+            target.display()
+        );
+    }
+    Ok(())
 }
 
 fn confirm_remove(ctx: &ReqCtx<WorktreeOpts>, paths: &[&Path]) -> Result<()> {
-    if ctx.global_opts().noninteractive {
+    // Don't prompt without a terminal. The checks for modified or untracked files
+    // and shelved changes still apply.
+    if ctx.global_opts().noninteractive
+        || ctx.opts.force
+        || !ctx.io().with_input(|input| input.is_tty())
+    {
         return Ok(());
-    }
-
-    let is_interactive = ctx.io().with_input(|input| input.is_tty());
-    if !is_interactive {
-        abort!("running non-interactively, use -y instead");
     }
 
     if paths.len() == 1 {

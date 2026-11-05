@@ -8,19 +8,20 @@ edition = "2024"
 homepage = "https://sapling-scm.com/"
 repository = "https://github.com/facebook/sapling"
 license = "MIT"
+exclude = ["BUCK"]
 
 [lib]
 name = "sigbus_memops"
 
 [build-dependencies]
-cc = "1.5.1"
+cc = "1.10.0"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2.186"
-memmap2 = "0.9.11"
+memmap2 = "0.9.12"
 tempfile = "3.27.0"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 libc = "0.2.186"
-memmap2 = "0.9.11"
+memmap2 = "0.9.12"
 tempfile = "3.27.0"

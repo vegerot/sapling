@@ -21,6 +21,7 @@ use manifest::FileMetadata;
 use manifest::FileType;
 use manifest::Manifest;
 use manifest_tree::TreeManifest;
+use manifest_tree::TreeResolver;
 use manifest_tree::TreeStore;
 use manifest_tree::testutil::TestStore;
 use storemodel::BoxIterator;
@@ -39,6 +40,7 @@ use crate::CopyTrace;
 use crate::DagCopyTrace;
 use crate::MetadataRenameFinder;
 use crate::TraceResult;
+use crate::trace_renames;
 
 #[derive(Clone)]
 struct CopyTraceTestCase {
@@ -78,7 +80,7 @@ impl CopyTraceTestCase {
         let mut copies: HashMap<Key, Key> = Default::default();
         let tree_store = Arc::new(TestStore::new().with_format(SerializationFormat::Git));
         let changes = Change::build_changes(changes);
-        let config: BTreeMap<&'static str, &'static str> = Default::default();
+        let config = BTreeMap::from([("experimental.pathhistory-treemanifest", "true")]);
 
         // iterate through the commit graph to build trees in topo order (ascending)
         let set = mem_dag.all().await.unwrap();
@@ -115,10 +117,17 @@ impl CopyTraceTestCase {
         let root_tree_reader = Arc::new(self.clone());
         let tree_store = self.inner.tree_store.clone();
         let dagalgo = self.inner.dagalgo.clone();
+        let tree_resolver = Arc::new(self.clone());
 
-        let copy_trace =
-            DagCopyTrace::new(root_tree_reader, tree_store, rename_finder, dagalgo, config)
-                .unwrap();
+        let copy_trace = DagCopyTrace::new(
+            root_tree_reader,
+            tree_store,
+            tree_resolver,
+            rename_finder,
+            dagalgo,
+            config,
+        )
+        .unwrap();
         Arc::new(copy_trace)
     }
 
@@ -174,15 +183,34 @@ impl CopyTraceTestCase {
 #[async_trait]
 impl ReadRootTreeIds for CopyTraceTestCase {
     async fn read_root_tree_ids(&self, commits: Vec<HgId>) -> Result<Vec<(HgId, HgId)>> {
-        let result = commits
+        commits
             .into_iter()
-            .map(|commit_id| {
-                let commit = Vertex::copy_from(commit_id.as_ref());
-                let tree_id = self.inner.commit_to_tree.get(&commit).unwrap().clone();
-                (commit_id, tree_id)
-            })
-            .collect();
-        Ok(result)
+            .map(|commit_id| Ok((commit_id, self.get_root_id(&commit_id)?)))
+            .collect()
+    }
+}
+
+impl TreeResolver for CopyTraceTestCase {
+    fn get(&self, commit_id: &HgId) -> Result<TreeManifest> {
+        self.get_by_root_id(&self.get_root_id(commit_id)?)
+    }
+
+    fn get_root_id(&self, commit_id: &HgId) -> Result<HgId> {
+        if commit_id.is_null() {
+            return Ok(*HgId::null_id());
+        }
+        let commit = Vertex::copy_from(commit_id.as_ref());
+        Ok(*self.inner.commit_to_tree.get(&commit).unwrap())
+    }
+
+    fn get_by_root_id(&self, root_id: &HgId) -> Result<TreeManifest> {
+        if root_id.is_null() {
+            return Ok(TreeManifest::ephemeral(self.inner.tree_store.clone()));
+        }
+        Ok(TreeManifest::durable(
+            self.inner.tree_store.clone(),
+            *root_id,
+        ))
     }
 }
 
@@ -309,6 +337,23 @@ macro_rules! assert_path_copies {
 
         assert_eq!(result, expected);
     }};
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_null_commit_is_empty_not_an_error() {
+    let ascii = r#"
+    A
+    "#;
+    let changes = HashMap::from([("A", vec!["+ a 1"])]);
+    let t = CopyTraceTestCase::new(ascii, changes).await;
+    let c = t.copy_trace().await;
+
+    let null = Vertex::copy_from(HgId::null_id().as_ref());
+    let a = vertex_from_str("A");
+    let path = RepoPath::from_str("a").unwrap().to_owned();
+
+    let res = c.trace_rename(null, a, path).await.unwrap();
+    assert_eq!(res, TraceResult::NotFound);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -596,4 +641,79 @@ async fn test_forward_copy_then_rename() {
     assert_trace_rename!(c B C, b -> c);
     // should not found, since `b` is not in src commit `A`
     assert_trace_rename!(c A C, b -> !);
+}
+
+/// Renames each path to `<path>.renamed`. The path `fail` returns an error.
+struct FailOnePathCopyTrace;
+
+#[async_trait]
+impl CopyTrace for FailOnePathCopyTrace {
+    async fn trace_rename(
+        &self,
+        _src: Vertex,
+        _dst: Vertex,
+        src_path: RepoPathBuf,
+    ) -> Result<TraceResult> {
+        if src_path.as_str() == "fail" {
+            anyhow::bail!("trace failed");
+        }
+        let dst_path = RepoPathBuf::from_string(format!("{src_path}.renamed"))?;
+        Ok(TraceResult::Renamed(dst_path))
+    }
+
+    async fn trace_rename_backward(
+        &self,
+        _src: Vertex,
+        _dst: Vertex,
+        _dst_path: RepoPathBuf,
+    ) -> Result<TraceResult> {
+        unimplemented!()
+    }
+
+    async fn trace_rename_forward(
+        &self,
+        _src: Vertex,
+        _dst: Vertex,
+        _src_path: RepoPathBuf,
+    ) -> Result<TraceResult> {
+        unimplemented!()
+    }
+
+    async fn path_copies(
+        &self,
+        _src: Vertex,
+        _dst: Vertex,
+        _matcher: Option<Arc<dyn pathmatcher::Matcher + Send + Sync>>,
+    ) -> Result<HashMap<RepoPathBuf, RepoPathBuf>> {
+        unimplemented!()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_trace_renames_skips_and_counts_failed_paths() {
+    let counter = || {
+        hg_metrics::summarize()
+            .get("copytrace_trace_rename_error")
+            .copied()
+            .unwrap_or(0)
+    };
+    let path = |s: &str| RepoPath::from_str(s).unwrap().to_owned();
+    let before = counter();
+
+    let renames = trace_renames(
+        &FailOnePathCopyTrace,
+        vertex_from_str("A"),
+        vertex_from_str("B"),
+        vec![path("a"), path("fail"), path("b")],
+    )
+    .await;
+
+    assert_eq!(
+        renames,
+        HashMap::from([
+            (path("a.renamed"), path("a")),
+            (path("b.renamed"), path("b")),
+        ])
+    );
+    assert_eq!(counter() - before, 1);
 }

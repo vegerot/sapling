@@ -27,10 +27,263 @@ use permission_checker::MononokeIdentitySet;
 use super::AccessEnforcementOutcome;
 use super::AuthorizationCheckResult;
 use super::EnforcementDecision;
+use super::FactorResult;
+use super::ManifestRestrictionCheckResult;
 use super::PathRestrictionCheckResult;
 use super::SharedFetchHandle;
+use super::SourceRestrictionCheck;
 use super::SourceRestrictionSummary;
+use crate::DenyingRestriction;
+use crate::restriction_info::ManifestRestrictionInfo;
 use crate::restriction_info::PathRestrictionInfo;
+
+/// What it tests: tri-state factor observations preserve the distinction
+/// between an absent policy and a configured policy that denies the caller.
+/// Expected: only `Authorized` converts to the legacy `true` value, while the
+/// three states remain pairwise distinct.
+#[mononoke::test]
+fn test_factor_result_preserves_not_set() -> Result<()> {
+    let cases = [
+        (FactorResult::NotSet, false),
+        (FactorResult::Authorized, true),
+        (FactorResult::Unauthorized, false),
+    ];
+
+    for (result, expected_authorized) in cases {
+        assert_eq!(
+            result.is_authorized(),
+            expected_authorized,
+            "factor result {result:#?}",
+        );
+    }
+    assert_ne!(
+        FactorResult::NotSet,
+        FactorResult::Unauthorized,
+        "absent policy and configured denial must remain distinct",
+    );
+
+    let optional_cases = [
+        (false, false, FactorResult::NotSet),
+        (false, true, FactorResult::NotSet),
+        (true, false, FactorResult::Unauthorized),
+        (true, true, FactorResult::Authorized),
+    ];
+    for (configured, authorized, expected) in optional_cases {
+        assert_eq!(
+            FactorResult::from_optional_authorized(configured, authorized),
+            expected,
+            "configured={configured}, authorized={authorized}",
+        );
+    }
+    Ok(())
+}
+
+/// What it tests: the existing authorization formula derives its public
+/// booleans from tri-state factor observations.
+/// Expected: each authorized factor grants independently, while `NotSet` and
+/// `Unauthorized` do not grant.
+#[mononoke::test]
+fn test_authorization_check_result_tri_state_formula() -> Result<()> {
+    let cases = [
+        (FactorResult::NotSet, false),
+        (FactorResult::Authorized, true),
+        (FactorResult::Unauthorized, false),
+    ];
+    for (factor, expected) in cases {
+        let acl = AuthorizationCheckResult {
+            has_acl_access: factor,
+            is_allowlisted_tooling: FactorResult::NotSet,
+            is_rollout_allowlisted: FactorResult::NotSet,
+            is_admin_bypass: FactorResult::NotSet,
+        };
+        let tooling = AuthorizationCheckResult {
+            has_acl_access: FactorResult::NotSet,
+            is_allowlisted_tooling: factor,
+            is_rollout_allowlisted: FactorResult::NotSet,
+            is_admin_bypass: FactorResult::NotSet,
+        };
+        let rollout = AuthorizationCheckResult {
+            has_acl_access: FactorResult::NotSet,
+            is_allowlisted_tooling: FactorResult::NotSet,
+            is_rollout_allowlisted: factor,
+            is_admin_bypass: FactorResult::NotSet,
+        };
+        let admin = AuthorizationCheckResult {
+            has_acl_access: FactorResult::NotSet,
+            is_allowlisted_tooling: FactorResult::NotSet,
+            is_rollout_allowlisted: FactorResult::NotSet,
+            is_admin_bypass: factor,
+        };
+
+        assert_eq!(acl.has_acl_access(), expected, "ACL factor {factor:#?}");
+        assert_eq!(
+            tooling.is_allowlisted_tooling(),
+            expected,
+            "tooling factor {factor:#?}",
+        );
+        assert_eq!(
+            rollout.is_rollout_allowlisted(),
+            expected,
+            "rollout factor {factor:#?}",
+        );
+        assert_eq!(
+            admin.is_admin_bypass(),
+            expected,
+            "admin factor {factor:#?}",
+        );
+        assert_eq!(acl.has_authorization(), expected, "ACL factor {factor:#?}");
+        assert_eq!(
+            tooling.has_authorization(),
+            expected,
+            "tooling factor {factor:#?}",
+        );
+        assert_eq!(
+            rollout.has_authorization(),
+            expected,
+            "rollout factor {factor:#?}",
+        );
+        assert_eq!(
+            admin.has_authorization(),
+            expected,
+            "admin factor {factor:#?}",
+        );
+    }
+    Ok(())
+}
+
+/// What it tests: the authorization producer preserves absent optional policy
+/// separately from policy that is configured but denies the caller.
+/// Expected: absent tooling, rollout, and admin policies produce `NotSet`,
+/// while configured groups that exclude the caller produce `Unauthorized`.
+#[mononoke::fbinit_test]
+async fn test_authorization_producer_preserves_absent_and_denied_factors(
+    fb: FacebookInit,
+) -> Result<()> {
+    let acl_provider = rollout_allowlist_acl_provider()?;
+    let ctx = ctx_with_identities(fb, &["USER:bob"])?;
+    let acl = MononokeIdentity::from_str("REPO_REGION:repos/hg/fbsource/=tent_a")?;
+    let group = MononokeIdentity::from_str("GROUP:tent_a_rollout")?;
+
+    let absent =
+        super::check_authorization(&ctx, &acl_provider, &[(&acl, None)], None, None).await?;
+    assert_eq!(
+        absent.has_acl_access,
+        FactorResult::Unauthorized,
+        "configured ACL policy that excludes the caller",
+    );
+    assert_eq!(
+        absent.is_allowlisted_tooling,
+        FactorResult::NotSet,
+        "absent tooling policy",
+    );
+    assert_eq!(
+        absent.is_rollout_allowlisted,
+        FactorResult::NotSet,
+        "absent rollout policy",
+    );
+    assert_eq!(
+        absent.is_admin_bypass,
+        FactorResult::NotSet,
+        "absent admin policy",
+    );
+
+    let denied = super::check_authorization(
+        &ctx,
+        &acl_provider,
+        &[(&acl, Some(&group))],
+        Some("tent_a_rollout"),
+        Some(&group),
+    )
+    .await?;
+    assert_eq!(
+        denied.has_acl_access,
+        FactorResult::Unauthorized,
+        "configured ACL policy that excludes the caller",
+    );
+    assert_eq!(
+        denied.is_allowlisted_tooling,
+        FactorResult::Unauthorized,
+        "configured tooling policy that excludes the caller",
+    );
+    assert_eq!(
+        denied.is_rollout_allowlisted,
+        FactorResult::Unauthorized,
+        "configured rollout policy that excludes the caller",
+    );
+    assert_eq!(
+        denied.is_admin_bypass,
+        FactorResult::Unauthorized,
+        "configured admin policy that excludes the caller",
+    );
+    Ok(())
+}
+
+/// What it tests: path and manifest checks expose the same factor facts through
+/// the common aggregation interface, while manifest roots remain optional.
+/// Expected: both checks expose identical ACL and rollout observations; the
+/// path has a root and the rootless manifest does not.
+#[mononoke::test]
+fn test_source_restriction_check_exposes_common_facts() -> Result<()> {
+    let acl = MononokeIdentity::from_str("REPO_REGION:test_acl")?;
+    let permission_group = MononokeIdentity::from_str("GROUP:request_access")?;
+    let rollout_group = MononokeIdentity::from_str("GROUP:rollout")?;
+    let authorization = AuthorizationCheckResult {
+        has_acl_access: FactorResult::Authorized,
+        is_allowlisted_tooling: FactorResult::NotSet,
+        is_rollout_allowlisted: FactorResult::Unauthorized,
+        is_admin_bypass: FactorResult::Authorized,
+    };
+    let path = PathRestrictionCheckResult::new(
+        PathRestrictionInfo {
+            restriction_root: NonRootMPath::new("restricted")?,
+            repo_region_acl: acl.to_string(),
+            permission_request_group: permission_group.clone(),
+            rollout_allowlist_group: Some(rollout_group.clone()),
+        },
+        authorization,
+        acl.clone(),
+    );
+    let manifest = super::ManifestRestrictionCheckResult::new(
+        ManifestRestrictionInfo {
+            restriction_root: None,
+            repo_region_acl: acl.to_string(),
+            permission_request_group: permission_group,
+            rollout_allowlist_group: Some(rollout_group),
+        },
+        authorization,
+        acl,
+    );
+
+    assert_eq!(path.authorization().acl_result(), FactorResult::Authorized);
+    assert_eq!(path.authorization().tooling_result(), FactorResult::NotSet);
+    assert_eq!(
+        path.authorization().rollout_result(),
+        FactorResult::Unauthorized,
+    );
+    assert_eq!(
+        path.authorization().admin_result(),
+        FactorResult::Authorized
+    );
+    assert_eq!(
+        manifest.authorization().acl_result(),
+        FactorResult::Authorized
+    );
+    assert_eq!(
+        manifest.authorization().tooling_result(),
+        FactorResult::NotSet,
+    );
+    assert_eq!(
+        manifest.authorization().rollout_result(),
+        FactorResult::Unauthorized,
+    );
+    assert_eq!(
+        manifest.authorization().admin_result(),
+        FactorResult::Authorized,
+    );
+    assert!(path.restriction_root().is_some());
+    assert!(manifest.restriction_root().is_none());
+    Ok(())
+}
 
 // What it tests: cloned source fetch handles share one spawned fetch result.
 // Expected: the underlying task runs once and all awaiters receive the shared
@@ -69,13 +322,12 @@ async fn test_shared_fetch_handle_awaits_one_spawned_fetch() -> Result<()> {
     Ok(())
 }
 
-// What it tests: denied checks select a stable permission request group independent of the
-// source's original result order.
-// Expected: the permission request group for the lexicographically first known
-// restriction root is returned.
+// What it tests: denied checks select a stable denying restriction independent
+// of the source's original result order.
+// Expected: the lexicographically first known restriction root
+// is returned, carrying its root, ACL, and permission request group.
 #[tokio::test]
-async fn test_source_enforcement_outcome_denial_permission_request_group_is_deterministic()
--> Result<()> {
+async fn test_source_enforcement_outcome_denying_restriction_is_deterministic() -> Result<()> {
     let handle = SharedFetchHandle::from_result(Ok(vec![
         path_restriction_check_with("restricted/z", "REPO_REGION:z_acl", false)?,
         path_restriction_check_with("restricted/a", "REPO_REGION:a_acl", false)?,
@@ -85,10 +337,55 @@ async fn test_source_enforcement_outcome_denial_permission_request_group_is_dete
         super::source_enforcement_outcome(&handle, &[], &super::PreFilterVariant::Definite).await?;
 
     assert_eq!(
-        outcome.denial_permission_request_group(),
-        Some(&MononokeIdentity::from_str("REPO_REGION:a_acl")?)
+        outcome.denial(),
+        Some(&DenyingRestriction {
+            restriction_root: Some(NonRootMPath::new("restricted/a")?),
+            repo_region_acl: MononokeIdentity::from_str("REPO_REGION:a_acl")?,
+            permission_request_group: MononokeIdentity::from_str("REPO_REGION:a_acl")?,
+        }),
     );
     Ok(())
+}
+
+// What it tests: a manifest denial whose source reports no restriction root
+// still produces a denying restriction carrying the ACL and group.
+// Expected: `restriction_root` is None; ACL and group are populated.
+#[tokio::test]
+async fn test_source_enforcement_outcome_manifest_denial_without_root() -> Result<()> {
+    let acl = MononokeIdentity::from_str("REPO_REGION:manifest_acl")?;
+    let handle = SharedFetchHandle::from_result(Ok(vec![ManifestRestrictionCheckResult::new(
+        ManifestRestrictionInfo {
+            restriction_root: None,
+            repo_region_acl: acl.to_string(),
+            permission_request_group: acl.clone(),
+            rollout_allowlist_group: None,
+        },
+        AuthorizationCheckResult::new(false, false, false, false),
+        acl.clone(),
+    )]));
+
+    let outcome =
+        super::source_enforcement_outcome(&handle, &[], &super::PreFilterVariant::Definite).await?;
+
+    assert_eq!(
+        outcome.denial(),
+        Some(&DenyingRestriction {
+            restriction_root: None,
+            repo_region_acl: acl.clone(),
+            permission_request_group: acl,
+        }),
+    );
+    Ok(())
+}
+
+/// A denying restriction for a `restricted` root denied under `REPO_REGION:deny_acl`.
+fn denying_restriction() -> Result<DenyingRestriction> {
+    let acl = MononokeIdentity::from_str("REPO_REGION:deny_acl")?;
+    Ok(DenyingRestriction {
+        restriction_root: Some(NonRootMPath::new("restricted")?),
+        repo_region_acl: acl.clone(),
+        permission_request_group: acl,
+    })
 }
 
 // What it tests: a matching exemption only changes an enforced outcome.
@@ -96,13 +393,10 @@ async fn test_source_enforcement_outcome_denial_permission_request_group_is_dete
 // `NotEnforced` is unchanged and nothing changes when no exemption matched.
 #[mononoke::test]
 fn test_access_enforcement_outcome_exempt_if() -> Result<()> {
-    let denial_group = MononokeIdentity::from_str("REPO_REGION:deny_acl")?;
     let denied = AccessEnforcementOutcome::Enforced {
-        denial_permission_request_group: Some(denial_group),
+        denial: Some(denying_restriction()?),
     };
-    let allowed = AccessEnforcementOutcome::Enforced {
-        denial_permission_request_group: None,
-    };
+    let allowed = AccessEnforcementOutcome::Enforced { denial: None };
 
     assert_eq!(
         denied.clone().exempt_if(true),
@@ -130,7 +424,7 @@ fn test_access_enforcement_outcome_exempt_if() -> Result<()> {
         "without an exemption an enforced allow should be unchanged",
     );
     assert_eq!(
-        AccessEnforcementOutcome::Exempted.denial_permission_request_group(),
+        AccessEnforcementOutcome::Exempted.denial(),
         None,
         "an exempted access should carry no denial",
     );
@@ -138,22 +432,19 @@ fn test_access_enforcement_outcome_exempt_if() -> Result<()> {
 }
 
 // What it tests: authoritative source aggregation keeps deny-over-error
-// semantics after carrying the permission request group through the denial.
+// semantics after carrying the denying restriction through.
 // Expected: any denial wins over sibling source errors, while a no-deny error
 // is propagated.
 #[tokio::test]
 async fn test_authoritative_source_enforcement_outcome_preserves_error_semantics() -> Result<()> {
-    let permission_request_group = MononokeIdentity::from_str("REPO_REGION:deny_acl")?;
+    let denial = denying_restriction()?;
     let denied = super::authoritative_sources_enforcement_outcome(vec![
         Err(anyhow::anyhow!("source failed")),
         Ok(AccessEnforcementOutcome::Enforced {
-            denial_permission_request_group: Some(permission_request_group.clone()),
+            denial: Some(denial.clone()),
         }),
     ])?;
-    assert_eq!(
-        denied.denial_permission_request_group(),
-        Some(&permission_request_group)
-    );
+    assert_eq!(denied.denial(), Some(&denial));
 
     let no_denial = super::authoritative_sources_enforcement_outcome(vec![
         Ok(AccessEnforcementOutcome::NotEnforced),
@@ -467,6 +758,11 @@ async fn test_absent_rollout_group_never_allowlists(fb: FacebookInit) -> Result<
         !authorization.is_rollout_allowlisted(),
         "a tent with no rollout group must never report the caller as allowlisted",
     );
+    assert_eq!(
+        authorization.is_rollout_allowlisted,
+        FactorResult::NotSet,
+        "an absent rollout group is not a configured denial",
+    );
     assert!(
         !authorization.has_authorization(),
         "caller has neither ACL access nor an applicable allowlist",
@@ -497,9 +793,7 @@ fn test_enforcement_decision_from_outcome() {
             },
         ),
         (
-            Ok(AccessEnforcementOutcome::Enforced {
-                denial_permission_request_group: None,
-            }),
+            Ok(AccessEnforcementOutcome::Enforced { denial: None }),
             false,
             EnforcementDecision::Enforced,
         ),

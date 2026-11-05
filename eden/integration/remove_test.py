@@ -9,6 +9,7 @@
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -117,21 +118,24 @@ class RemoveTest(RemoveTestBase):
     def test_remove_aux_process_timeout(self, impl: str, env: dict) -> None:
         """Test that eden rm correctly handles aux process timeout.
 
-        Uses two mounts with an injected 2-second delay and a 1s timeout
-        to verify that:
+        Uses two mounts with an injected delay that is much longer than the
+        timeout to verify that:
         1. Each mount gets its own full timeout
         2. The timeout message includes the step name to help identify what was stuck
         3. Both mounts are removed despite the timeouts
         """
-        self.skipTest("flakiness")
         # Create a second mount
         mount2 = os.path.join(self.tmp_dir, "mount2")
         self.eden.clone(self.repo.path, mount2)
 
+        timeout_secs = 1
+        # On Windows, eden rm has a fixed cost of more than 1 second.
+        # The delay is much longer than this cost.
+        # Thus the test can see a run that waits for the delay.
+        delay_secs = 30
         full_env = {
             **env,
-            # Inject a 2-second delay to simulate slow aux process stopping
-            "TEST_ONLY_AUX_PROCESSES_STOP_DELAY_SECS": "2",
+            "TEST_ONLY_AUX_PROCESSES_STOP_DELAY_SECS": str(delay_secs),
         }
 
         start_time = time.time()
@@ -139,7 +143,7 @@ class RemoveTest(RemoveTestBase):
             "remove",
             "--yes",
             "--timeout",
-            "1",
+            str(timeout_secs),
             self.mount,
             mount2,
             env=full_env,
@@ -148,17 +152,15 @@ class RemoveTest(RemoveTestBase):
         )
         elapsed_time = time.time() - start_time
 
-        # With per-mount timeout, each mount gets 1s timeout independently.
-        # Total time: 2 mounts × 1s timeout + overhead = ~2-3s
         self.assertGreater(
             elapsed_time,
-            2.0,
-            f"eden rm ({impl}) should use per-mount timeout (expected >2s, got {elapsed_time:.1f}s)",
+            2 * timeout_secs,
+            f"eden rm ({impl}) should use per-mount timeout (expected >{2 * timeout_secs}s, got {elapsed_time:.1f}s)",
         )
         self.assertLess(
             elapsed_time,
-            3.0,
-            f"eden rm ({impl}) should not wait for the full delay (expected <3s, got {elapsed_time:.1f}s)",
+            delay_secs,
+            f"eden rm ({impl}) should not wait for the full delay (expected <{delay_secs}s, got {elapsed_time:.1f}s)",
         )
 
         output = result.stderr or ""
@@ -325,3 +327,168 @@ class RemoveTest(RemoveTestBase):
             self.eden.get_mount_state(mount_path),
             "successful remove should leave the checkout unmounted",
         )
+
+    @parameterized.expand(
+        [
+            ("python", {"EDENFSCTL_SKIP_RUST": "1"}),
+        ]
+    )
+    def test_remove_succeeds_when_mount_is_not_registered(
+        self, impl: str, env: dict
+    ) -> None:
+        """A clone interrupted between the mount and the directory-map write
+        leaves a mount the daemon serves but config.json does not list."""
+        mount_path = pathlib.Path(self.mount)
+        client_dir = self.eden.client_dir_for_mount(mount_path)
+        directory_map = self.load_directory_map()
+        del directory_map[self.mount]
+        self.write_directory_map(directory_map)
+        self.assertIn("(unconfigured)", self.eden.run_cmd("list"))
+
+        result = self.eden.run_unchecked(
+            "remove",
+            "--yes",
+            self.mount,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            0,
+            result.returncode,
+            f"eden remove ({impl}) should succeed on an unregistered mount. stderr={result.stderr}",
+        )
+        self.assertIsNone(
+            self.eden.get_mount_state(mount_path),
+            "successful remove should leave the checkout unmounted",
+        )
+        self.assertFalse(
+            client_dir.exists(),
+            "successful remove should delete the client directory the mount used",
+        )
+        self.assertFalse(
+            os.path.exists(self.mount),
+            "successful remove should delete the checkout path",
+        )
+
+    def test_remove_without_the_config_dir_of_the_serving_instance(self) -> None:
+        """Run without `--config-dir`, `eden rm` classifies the checkout against
+        the default instance, which does not list it, and then finds the
+        instance that serves it through the checkout's `.eden` links. That
+        instance lists the checkout, so it is removed from there whole."""
+        mount_path = pathlib.Path(self.mount)
+        client_dir = self.eden.client_dir_for_mount(mount_path)
+        cmd, env = self.eden.get_edenfsctl_cmd_env(
+            "remove", "--yes", self.mount, config_dir=False
+        )
+
+        result = subprocess.run(
+            cmd,
+            env=env | {"EDENFSCTL_SKIP_RUST": "1"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            0,
+            result.returncode,
+            f"eden remove without --config-dir should succeed. stderr={result.stderr}",
+        )
+        self.assertIsNone(
+            self.eden.get_mount_state(mount_path),
+            "successful remove should leave the checkout unmounted",
+        )
+        self.assertNotIn(
+            self.mount,
+            self.load_directory_map(),
+            "successful remove should unregister the checkout from the instance that served it",
+        )
+        self.assertFalse(
+            client_dir.exists(),
+            "successful remove should delete the client directory",
+        )
+        self.assertFalse(
+            os.path.exists(self.mount),
+            "successful remove should delete the checkout path",
+        )
+
+    @parameterized.expand(
+        [
+            ("python", {"EDENFSCTL_SKIP_RUST": "1"}),
+        ]
+    )
+    def test_remove_of_a_non_checkout_exits_ex_noinput(
+        self, impl: str, env: dict
+    ) -> None:
+        inside = os.path.join(self.mount, "adir")
+        for path in [os.path.join(self.tmp_dir, "missing"), inside, str(self.tmp_dir)]:
+            result = self.eden.run_unchecked(
+                "remove", "--yes", path, env=env, capture_output=True, text=True
+            )
+            self.assertEqual(
+                66,
+                result.returncode,
+                f"eden remove ({impl}) {path} should exit EX_NOINPUT. stderr={result.stderr}",
+            )
+        self.assertTrue(os.path.isdir(inside), "the checkout must be untouched")
+
+    @parameterized.expand(
+        [
+            ("rust", {"EDENFSCTL_ONLY_RUST": "1"}),
+            ("python", {"EDENFSCTL_SKIP_RUST": "1"}),
+        ]
+    )
+    def test_remove_succeeds_when_config_toml_is_missing(
+        self, impl: str, env: dict
+    ) -> None:
+        if sys.platform == "win32":
+            self.skipTest(
+                "On Windows, .eden\\config stays after `eden unmount`, so `eden rm` "
+                "takes the checkout for a mounted one and fails to unmount it"
+            )
+        mount_path = pathlib.Path(self.mount)
+        self.eden.unmount(mount_path)
+        (self.eden.client_dir_for_mount(mount_path) / "config.toml").unlink()
+
+        result = self.eden.run_unchecked(
+            "remove",
+            "--yes",
+            self.mount,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            0,
+            result.returncode,
+            f"{impl} eden remove should succeed when config.toml is missing. stderr={result.stderr}",
+        )
+        self.assertNotIn(self.mount, self.load_directory_map())
+        self.assertFalse(os.path.exists(self.mount))
+
+    @parameterized.expand(
+        [
+            ("rust", {"EDENFSCTL_ONLY_RUST": "1"}),
+            ("python", {"EDENFSCTL_SKIP_RUST": "1"}),
+        ]
+    )
+    def test_remove_succeeds_when_folder_is_missing(self, impl: str, env: dict) -> None:
+        mount_path = pathlib.Path(self.mount)
+        client_dir = self.eden.client_dir_for_mount(mount_path)
+        self.eden.unmount(mount_path)
+        shutil.rmtree(mount_path)
+
+        result = self.eden.run_unchecked(
+            "remove",
+            "--yes",
+            self.mount,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            0,
+            result.returncode,
+            f"{impl} eden remove should succeed when the folder is missing. stderr={result.stderr}",
+        )
+        self.assertNotIn(self.mount, self.load_directory_map())
+        self.assertFalse(client_dir.exists())

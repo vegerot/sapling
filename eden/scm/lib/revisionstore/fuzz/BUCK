@@ -1,0 +1,143 @@
+load(
+    "@fbsource//xplat/security/lionhead:defs.bzl",
+    "EXTERNAL_USERS",
+    "Metadata",
+    "Severity",
+    "lh",
+)
+load(
+    "@fbsource//xplat/security/lionhead/build_defs:harness_rust.bzl",
+    "rust_lionhead_harness",
+)
+
+oncall("sapling")
+
+REVISIONSTORE_PATH_GLOBS = [
+    "**/eden/scm/lib/revisionstore/src/**",
+    "**/eden/scm/lib/revisionstore/types/**",
+]
+
+# Lionhead matches each target_symbols entry as a regex against the function's
+# demangled name, with `.?` standing in for the `>` of the `<Type>::method`
+# form. The manifest genrule passes these on a command line that cmd.exe
+# splits on unquoted `|` and `>`, so neither may appear.
+
+REVISIONSTORE_FUZZ_DEPS = [
+    "fbsource//third-party/rust:tempfile",
+    "//eden/scm/lib/fuzzutil:fuzzutil",
+    "//eden/scm/lib/indexedlog:indexedlog",
+    "//eden/scm/lib/minibytes:minibytes",
+    "//eden/scm/lib/revisionstore:revisionstore",
+    "//eden/scm/lib/types:types",
+]
+
+# For the targets that compile fuzz_targets/corrupt.rs.
+CORRUPT_FUZZ_DEPS = REVISIONSTORE_FUZZ_DEPS + [
+    "//eden/scm/lib/storemodel:storemodel",
+]
+
+# Smoke test these with: buck2 test :entry_decode-smoke-test
+rust_lionhead_harness(
+    name = "entry_decode",
+    srcs = [
+        "fuzz_targets/corrupt.rs",
+        "fuzz_targets/entry_decode.rs",
+    ],
+    annotations = [
+        lh.PathAnnotation(
+            alert = True,
+            include_path_globs = REVISIONSTORE_PATH_GLOBS,
+            target_symbols = [
+                "revisionstore::indexedlogdatastore::Entry.?::from_bytes$",
+                "revisionstore::indexedlogdatastore::Entry.?::from_log$",
+                "revisionstore::indexedlogdatastore::Entry.?::calculate_content$",
+                "revisionstore_types::datastore::InternalMetadata.?::read$",
+            ],
+        ),
+    ],
+    crate_root = "fuzz_targets/entry_decode.rs",
+    metadata = Metadata(
+        exposure = EXTERNAL_USERS,
+        project = "oncall_dynamic_analysis",
+        severity_denial_of_service = Severity.FILE_SECURITY_TASK,
+        severity_service_takeover = Severity.FILE_SECURITY_TASK,
+    ),
+    deps = CORRUPT_FUZZ_DEPS,
+)
+
+rust_lionhead_harness(
+    name = "store_open_get",
+    srcs = [
+        "fuzz_targets/corrupt.rs",
+        "fuzz_targets/store_open_get.rs",
+    ],
+    annotations = [
+        lh.PathAnnotation(
+            alert = True,
+            include_path_globs = REVISIONSTORE_PATH_GLOBS,
+            target_symbols = [
+                "revisionstore::indexedlogdatastore::IndexedLogHgIdDataStore.?::get_raw_entry$",
+                "revisionstore::indexedlogdatastore::Entry.?::from_log$",
+                "revisionstore::indexedlogdatastore::Entry.?::from_bytes$",
+                "revisionstore::indexedlogutil::Store.?::read$",
+            ],
+        ),
+    ],
+    crate_root = "fuzz_targets/store_open_get.rs",
+    metadata = Metadata(
+        exposure = EXTERNAL_USERS,
+        project = "oncall_dynamic_analysis",
+        severity_denial_of_service = Severity.FILE_SECURITY_TASK,
+        severity_service_takeover = Severity.FILE_SECURITY_TASK,
+    ),
+    deps = CORRUPT_FUZZ_DEPS,
+)
+
+rust_lionhead_harness(
+    name = "aux_entry_decode",
+    srcs = [
+        "fuzz_targets/aux_entry_decode.rs",
+        "fuzz_targets/corrupt.rs",
+    ],
+    annotations = [
+        lh.PathAnnotation(
+            alert = True,
+            include_path_globs = REVISIONSTORE_PATH_GLOBS,
+            target_symbols = [
+                "revisionstore::indexedlogauxstore::deserialize$",
+                "revisionstore::indexedlogauxstore::AuxStore.?::get$",
+            ],
+        ),
+    ],
+    crate_root = "fuzz_targets/aux_entry_decode.rs",
+    metadata = Metadata(
+        exposure = EXTERNAL_USERS,
+        project = "oncall_dynamic_analysis",
+        severity_denial_of_service = Severity.FILE_SECURITY_TASK,
+        severity_service_takeover = Severity.FILE_SECURITY_TASK,
+    ),
+    deps = CORRUPT_FUZZ_DEPS,
+)
+
+rust_lionhead_harness(
+    name = "lfs_blob_decode",
+    srcs = ["fuzz_targets/lfs_blob_decode.rs"],
+    annotations = [
+        lh.PathAnnotation(
+            alert = True,
+            include_path_globs = REVISIONSTORE_PATH_GLOBS,
+            target_symbols = [
+                "revisionstore::lfs::LfsIndexedLogBlobsStore.?::get$",
+                "revisionstore::lfs::LfsStore.?::get_blob$",
+            ],
+        ),
+    ],
+    crate_root = "fuzz_targets/lfs_blob_decode.rs",
+    metadata = Metadata(
+        exposure = EXTERNAL_USERS,
+        project = "oncall_dynamic_analysis",
+        severity_denial_of_service = Severity.FILE_SECURITY_TASK,
+        severity_service_takeover = Severity.FILE_SECURITY_TASK,
+    ),
+    deps = REVISIONSTORE_FUZZ_DEPS,
+)

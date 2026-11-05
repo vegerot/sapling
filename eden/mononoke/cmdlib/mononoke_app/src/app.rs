@@ -125,7 +125,7 @@ impl MononokeApp {
         let configs = ConfigArgs::from_arg_matches(&args)?
             .create_mononoke_configs(runtime.handle().clone(), &env.as_ref().config_store)?;
 
-        let repo_factory = Arc::new(RepoFactory::new(env.clone()));
+        let repo_factory = Arc::new(RepoFactory::new(env.clone(), configs.clone()));
 
         Ok(MononokeApp {
             fb,
@@ -759,12 +759,14 @@ impl MononokeApp {
                 None
             }
         });
-        self.open_named_managed_repos_with_redaction_disabled(
-            repo_names,
-            service_name,
-            redaction_disabled,
-        )
-        .await
+        let mgr = self
+            .open_named_managed_repos_with_redaction_disabled(
+                repo_names,
+                service_name,
+                redaction_disabled,
+            )
+            .await?;
+        Ok(mgr.with_repo_filter(repo_filter))
     }
 
     /// Enforce or log per-repo config parse failures seen at startup. When the

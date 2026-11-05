@@ -29,6 +29,12 @@ bool shouldUseProcMountInfo(int error) {
   return error == ENOSYS || error == EOPNOTSUPP || error == EOVERFLOW;
 }
 
+// statmount(2) fails with ENOENT for a mount unmounted after listmount(2)
+// returned its id.
+bool isUnmountedSinceListing(int error) {
+  return error == ENOENT;
+}
+
 folly::Expected<std::vector<MountTableEntry>, int> readProcMountInfo(
     MountInfoOptions options) {
   std::string contents;
@@ -41,6 +47,9 @@ folly::Expected<std::vector<MountTableEntry>, int> readProcMountInfo(
 uint64_t getStatmountMask(MountInfoOptions options) {
   auto mask = STATMOUNT_SB_BASIC | STATMOUNT_MNT_ROOT | STATMOUNT_MNT_POINT |
       STATMOUNT_FS_TYPE;
+  if (options.includeMountId) {
+    mask |= STATMOUNT_MNT_BASIC;
+  }
   if (options.includeMountSource) {
     mask |= STATMOUNT_SB_SOURCE;
   }
@@ -135,6 +144,7 @@ folly::Expected<MountTableEntry, int> parseStatmount(
   }
 
   MountTableEntry info;
+  info.mountId = options.includeMountId ? sm.mnt_id_old : 0;
   info.devMajor = sm.sb_dev_major;
   info.devMinor = sm.sb_dev_minor;
   info.mountRoot = sm.str + sm.mnt_root;
@@ -181,6 +191,9 @@ folly::Expected<std::optional<MountTableEntry>, int> getMountInfoForPath(
   for (auto id : idsResult.value()) {
     auto infoResult = statmountById(id, options);
     if (infoResult.hasError()) {
+      if (isUnmountedSinceListing(infoResult.error())) {
+        continue;
+      }
       if (shouldUseProcMountInfo(infoResult.error())) {
         return fromProc();
       }
@@ -209,6 +222,9 @@ folly::Expected<std::vector<MountTableEntry>, int> getAllMounts(
   for (auto id : idsResult.value()) {
     auto infoResult = statmountById(id, options);
     if (infoResult.hasError()) {
+      if (isUnmountedSinceListing(infoResult.error())) {
+        continue;
+      }
       if (shouldUseProcMountInfo(infoResult.error())) {
         return readProcMountInfo(options);
       }

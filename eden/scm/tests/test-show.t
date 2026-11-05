@@ -232,7 +232,10 @@ Check behavior with nonsensical integers.
   diff -r fd78c1ae39e0 -r 8e33115c1596 file
   --- a/file	Thu Jan 01 00:00:00 1970 +0000
   +++ b/file	Thu Jan 01 00:00:00 1970 +0000
-  @@ -13,-14 +13,-9 @@
+  @@ -3,3 +3,8 @@
+   line3
+   line4
+   line5
   +line6
   +line7
   +line8
@@ -469,6 +472,7 @@ Confirm that --help works (it didn't when we used an alias)
    -g --git                 use git extended diff format
    -U --unified VALUE       number of lines of diff context to show (default: 3)
    -r --rev VALUE [+]       show the specified revision
+   -t --mutation            diff against the mutation predecessor
    -w --ignore-all-space    ignore white space when comparing lines
    -b --ignore-space-change ignore changes in the amount of white space
    -B --ignore-blank-lines  ignore changes whose lines are all blank
@@ -508,7 +512,7 @@ Confirm that --help works (it didn't when we used an alias)
    -g --git                 use git extended diff format
    -U --unified VALUE       number of lines of diff context to show (default: 3)
    -r --rev VALUE [+]       show the specified revision
-   -t --mutation            use mutation history for diffs (EXPERIMENTAL)
+   -t --mutation            diff against the mutation predecessor
    -w --ignore-all-space    ignore white space when comparing lines
    -b --ignore-space-change ignore changes in the amount of white space
    -B --ignore-blank-lines  ignore changes whose lines are all blank
@@ -523,8 +527,8 @@ Confirm that --help works (it didn't when we used an alias)
    -R --repository REPO       repository root directory or name of overlay
                               bundle file
       --cwd DIR               change working directory
-   -y --noninteractive        do not prompt, automatically pick the first choice
-                              for all prompts
+   -y --noninteractive        do not prompt, use the default answer for all
+                              prompts
    -q --quiet                 suppress output
    -v --verbose               enable additional output
       --color TYPE            when to colorize (boolean, always, auto, never, or

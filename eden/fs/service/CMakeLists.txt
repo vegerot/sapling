@@ -3,86 +3,45 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-add_fbthrift_library(
-  eden_service_thrift
+thrift_add_library(
+  eden_service_thrift_cpp
   eden.thrift
-  LANGUAGES cpp py
-  PY_NAMESPACE facebook.eden
+  LANGUAGE cpp2
   SERVICES
     EdenService
   DEPENDS
-    eden_config_thrift
-    fb303::fb303_thrift
+    eden_config_thrift_cpp
+    fb303::fb303_thrift_cpp
 )
-add_fbthrift_library(
-  streamingeden_thrift
+# eden.thrift's GlobPath adapter is in edencommon.
+target_link_libraries(eden_service_thrift_cpp PUBLIC edencommon::edencommon_utils)
+
+if (EDEN_HAVE_THRIFT_PYTHON)
+  add_fbthrift_python_library(
+    eden_service_thrift_python
+    eden.thrift
+    NAMESPACE eden.fs.service
+    SERVICES
+      EdenService
+    DEPENDS
+      eden_config_thrift_python
+      fb303::fb303_core_thrift_python
+  )
+endif()
+
+thrift_add_library(
+  streamingeden_thrift_cpp
   streamingeden.thrift
-  LANGUAGES cpp
+  LANGUAGE cpp2
   SERVICES
     StreamingEdenService
   DEPENDS
-    eden_service_thrift
+    eden_service_thrift_cpp
 )
 
-file(GLOB SERVICE_SRCS "*.cpp")
+include(generated_targets.cmake)
+eden_add_directory_library(eden_service)
 
-# A couple utility files our split out into a separate lower-level library
-# This also effectively includes ThriftUtil.h, which has no corresponding .cpp
-# file.
-# TODO: In the future it would perhaps be nicer to move these to a separate
-# eden/fs/thrift/ subdirectory, perhaps along with eden.thrift too.
-list(
-  REMOVE_ITEM SERVICE_SRCS
-  ${CMAKE_CURRENT_SOURCE_DIR}/PrettyPrinters.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/PrivHelperMain.cpp
-)
-add_library(
-  eden_service_thrift_util STATIC
-  PrettyPrinters.cpp
-)
-target_link_libraries(
-  eden_service_thrift_util
-  PUBLIC
-    eden_model
-    Folly::folly
-)
-
-list(APPEND EDEN_STORE_IMPLEMENTATIONS eden_store_hg)
-
-if(EDEN_HAVE_GIT)
-  list(APPEND EDEN_STORE_IMPLEMENTATIONS eden_store_git)
-endif()
-
-add_library(
-  eden_service STATIC
-  ${SERVICE_SRCS}
-)
-target_link_libraries(
-  eden_service
-  PUBLIC
-    eden_service_thrift_util
-    streamingeden_thrift_cpp
-    eden_build_config
-    eden_config
-    eden_fuse_privhelper
-    eden_inodes
-    eden_model
-    eden_nfs_server
-    eden_store
-    eden_takeover
-    eden_telemetry
-    ${EDEN_STORE_IMPLEMENTATIONS}
-    ${YARPL_LIBRARIES}
-    Folly::folly
-    cpptoml
-    edencommon::edencommon_utils
-)
-
-if (NOT WIN32)
-  target_link_libraries(
-    eden_service
-    PUBLIC
-      eden_fuse
-      eden_notifications
-  )
+if(BUILD_TESTS)
+  add_subdirectory(test)
 endif()

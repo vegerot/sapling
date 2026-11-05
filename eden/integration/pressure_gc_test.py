@@ -105,9 +105,6 @@ class ActiveFuseInvalidationTest(testcase.EdenRepoTest):
     num_files: int = 10
     deep_file_count: int = 20
 
-    def select_storage_engine(self) -> str:
-        return "sqlite"
-
     def edenfs_extra_config(self) -> dict[str, list[str]] | None:
         result = super().edenfs_extra_config() or {}
         result.setdefault("experimental", []).append("enable-pressure-based-gc = true")
@@ -240,8 +237,12 @@ class ActiveFuseInvalidationTest(testcase.EdenRepoTest):
         # invalidateChildrenNotAccessedRecentlyFuse which sends
         # FUSE_NOTIFY_INVAL_ENTRY, then unloadChildrenUnreferencedByFs.
         if sys.platform == "linux":
+            # The kernel can drop its dentries without an invalidation, for
+            # example under memory pressure. Read the files again before each
+            # GC attempt. Then each file has a kernel reference to invalidate.
             invalidated, loaded_after = await self.invalidate_until_unloaded(
                 loaded_before=loaded_after_read,
+                before_invalidate=self.read_all,
             )
             self.assertLess(loaded_after, loaded_after_read)
         else:
@@ -415,8 +416,8 @@ class ActiveFuseInvalidationTest(testcase.EdenRepoTest):
         """With pin information available, GC invalidates directory entries
         outside the pinned chain, so unpinned directories are forgotten by the
         kernel and unloaded while the pinned cwd keeps working."""
-        if sys.platform != "linux":
-            self.skipTest("active FUSE invalidation is Linux-only")
+        if sys.platform not in ("linux", "darwin"):
+            self.skipTest("active invalidation needs FUSE or NFS")
         if not privhelper_supports_scan_pins():
             self.skipTest("privhelper does not support --scan-pins")
 

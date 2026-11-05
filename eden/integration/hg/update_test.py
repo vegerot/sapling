@@ -16,7 +16,6 @@ import sys
 import threading
 from contextlib import asynccontextmanager
 from enum import Enum
-from itertools import product
 from textwrap import dedent
 from threading import Thread
 from typing import AsyncGenerator, Awaitable, Dict, List, Optional, Set
@@ -889,6 +888,40 @@ class UpdateTest(EdenHgTestCase):
         self.eden = self.init_eden_client()
         self.eden.start()
 
+    async def test_checkout_failure_before_start_preserves_status(self) -> None:
+        self.repo.update(self.commit3)
+        snapshot_path = (
+            self.eden.client_dir_for_mount(pathlib.Path(self.mount)) / "SNAPSHOT"
+        )
+        snapshot_before = snapshot_path.read_bytes()
+
+        async with self.eden.get_async_thrift_client() as client:
+            await client.injectFault(
+                FaultDefinition(
+                    keyClass="waitForPendingWrites",
+                    keyValueRegex=".*",
+                    errorType="runtime_error",
+                    errorMessage="checkout not started",
+                    count=1,
+                )
+            )
+            with self.assertRaisesRegex(EdenError, "checkout not started"):
+                await client.checkOutRevision(
+                    mountPoint=self.mount_path_bytes,
+                    snapshotHash=self.commit1.encode(),
+                    checkoutMode=CheckoutMode.NORMAL,
+                    params=CheckOutRevisionParams(),
+                )
+
+        self.assertEqual(snapshot_before, snapshot_path.read_bytes())
+        self.assertEqual("updated in commit 3\n", self.read_file("foo/bar.txt"))
+        # FIXME: Status should succeed because checkout never changed the tree.
+        with self.assertRaisesRegex(hgrepo.HgError, "checkout was interrupted"):
+            self.assert_status_empty()
+
+        self.repo.update(self.commit1)
+        self.assert_status_empty()
+
     async def test_resume_interrupted_update(self) -> None:
         """
         Test resuming a hg checkout after Eden was killed mid-checkout
@@ -1121,45 +1154,6 @@ class UpdateTest(EdenHgTestCase):
         # Setting the experimental.repair-eden-dirstate config option to true (the default) will fix the issue
         self.hg("config", "--local", "experimental.repair-eden-dirstate", "True")
         self.repo.status()
-
-    async def test_update_reports_checkout_error(self) -> None:
-        self.write_configs(
-            {"experimental": ["propagate-checkout-errors = false"]},
-            self.eden.user_rc_path,
-        )
-        async with self.eden.get_async_thrift_client() as client:
-            await client.reloadConfig()
-            for use_rust, clean in product((False, True), repeat=2):
-                with self.subTest(use_rust=use_rust, clean=clean):
-                    self.hg("config", "--local", "checkout.use-rust", str(use_rust))
-                    self.repo.update(self.commit3, clean=True)
-                    # Materialized files are applied after the fault point.
-                    self.write_file("foo/bar.txt", "updated in commit 3\n")
-                    await client.injectFault(
-                        FaultDefinition(
-                            keyClass="TreeInode::checkout",
-                            keyValueRegex="foo, false",
-                            errorType="runtime_error",
-                            errorMessage="intentional checkout error",
-                            count=1,
-                        )
-                    )
-                    with self.assertRaisesRegex(
-                        hgrepo.HgError, "intentional checkout error"
-                    ):
-                        self.repo.update(self.commit2, clean=clean)
-                    self.assertEqual(
-                        "updated in commit 3\n", self.read_file("foo/bar.txt")
-                    )
-                    # Eden already moved to the destination before reporting
-                    # the error. The dirstate parent stays behind, status is
-                    # computed against Eden's parent, and rerunning the update
-                    # resynchronizes the two.
-                    self.assertEqual(self.commit3, self.repo.get_head_hash())
-                    self.assertEqual({"foo/bar.txt": "M"}, self.repo.status())
-                    self.assertEqual(self.commit3, self.repo.get_head_hash())
-                    self.repo.update(self.commit2, clean=clean)
-                    self.assertEqual(self.commit2, self.repo.get_head_hash())
 
 
 class PrjFsState(Enum):
@@ -1751,17 +1745,6 @@ class UpdateDedicatedExecutorTest(EdenHgTestCase):
             "eden.fs.inodes.CheckoutAction": "DBG5",
             "eden.fs.inodes.CheckoutContext": "DBG5",
         }
-
-    def edenfs_extra_config(self) -> Optional[Dict[str, List[str]]]:
-        parent_config = super().edenfs_extra_config()
-        if parent_config is None:
-            parent_config = {}
-        if "thrift" not in parent_config:
-            parent_config["thrift"] = []
-
-        parent_config["thrift"].append("use-checkout-executor = true")
-
-        return parent_config
 
     def populate_backing_repo(self, repo: hgrepo.HgRepository) -> None:
         repo.write_file("hello.txt", "hola")

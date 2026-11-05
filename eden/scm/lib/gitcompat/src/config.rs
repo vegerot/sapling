@@ -12,10 +12,10 @@ use anyhow::Result;
 use hgrc_parser::format::format_config_item;
 use hgrc_parser::format::validate_config_item_name;
 
+use crate::rungit::BareGit;
 use crate::rungit::GitCmd;
-use crate::rungit::GlobalGit;
 
-impl GlobalGit {
+impl BareGit {
     /// Translate Git config to Sapling config. Includes remotes, and username.
     /// Return (system-user-level-config, repo-level-config).
     pub fn translate_git_config(&self) -> Result<(String, String)> {
@@ -63,6 +63,7 @@ fn translate_git_config_output(out: &str) -> (String, String) {
     //  local   user.email foo@example.net
     //  local   submodule.active .
     //  local   submodule.sub.url submodule-url
+    //  worktree user.email worktree@example.net
 
     let mut global_user = "";
     let mut global_email = "";
@@ -79,8 +80,8 @@ fn translate_git_config_output(out: &str) -> (String, String) {
     for line in out.lines() {
         if let Some((scope, name, value)) = parse_git_config_output_line(line) {
             match (scope, name) {
-                ("local", "user.name") => local_user = value,
-                ("local", "user.email") => local_email = value,
+                ("local" | "worktree", "user.name") => local_user = value,
+                ("local" | "worktree", "user.email") => local_email = value,
                 (_, "user.name") => global_user = value,
                 (_, "user.email") => global_email = value,
                 _ => {
@@ -258,6 +259,8 @@ local	remote.origin.url https://example.com/foo/repo
 local	remote.origin.pushurl git@example.com:foo/repo
 local	remote.upstream.url https://example.com/upstream/repo
 local	user.email foo@bar.net
+worktree	user.name Worktree User
+worktree	user.email worktree@example.com
         "#;
         let (user, repo) = translate_git_config_output(out);
         assert_eq!(
@@ -279,7 +282,7 @@ upstream = https://example.com/upstream/repo
 
 [ui]
 # from git config: user.name and user.email
-username = Foo Bar <foo@bar.net>
+username = Worktree User <worktree@example.com>
 [submodule]
 active = false
 "#

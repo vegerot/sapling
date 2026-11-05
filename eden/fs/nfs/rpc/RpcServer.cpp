@@ -13,6 +13,7 @@
 #include <folly/futures/Future.h>
 #include <folly/io/IOBufQueue.h>
 #include <folly/io/async/AsyncSocket.h>
+#include <folly/logging/xlog.h>
 #include <folly/portability/Sockets.h>
 
 #include "eden/common/utils/Throw.h"
@@ -35,6 +36,18 @@ bool RpcStopData::isUnmounted() {
 
 FsChannelInfo RpcStopData::extractTakeoverInfo() {
   return NfsChannelData{std::move(socketToKernel)};
+}
+
+FsStopReason RpcStopData::getStopReason() const {
+  switch (reason) {
+    case RpcStopReason::UNMOUNT:
+      return {"nfs_eof", true};
+    case RpcStopReason::ERROR:
+      return {"nfs_read_error", true};
+    case RpcStopReason::TAKEOVER:
+      return {"takeover", false};
+  }
+  return {"unknown", false};
 }
 
 void RpcConnectionHandler::getReadBuffer(void** bufP, size_t* lenP) {
@@ -136,6 +149,14 @@ RpcConnectionHandler::RpcConnectionHandler(
   proc_->clientConnected();
 }
 
+RpcConnectionHandler::~RpcConnectionHandler() {
+  // Destroying sock_ closes it, and closing a socket calls its read callback's
+  // readEOF(), which would run on this partly destroyed handler.
+  if (sock_) {
+    sock_->setReadCB(nullptr);
+  }
+}
+
 folly::SemiFuture<folly::Unit> RpcConnectionHandler::takeoverStop() {
   XLOG(DBG4, "Takeover requested: locking state to change the status");
   // note its essential that this runs inline with the pending requests
@@ -177,6 +198,7 @@ folly::SemiFuture<folly::Unit> RpcConnectionHandler::resetReader(
   // callbacks under EOF or error conditions, and `this` must stay alive for the
   // duration of this callback.
   DestructorGuard dg{this};
+  const auto stopRequestedAt = std::chrono::steady_clock::now();
 
   {
     auto& state = state_.get();
@@ -205,7 +227,7 @@ folly::SemiFuture<folly::Unit> RpcConnectionHandler::resetReader(
 
   XLOG(DBG4, "waiting for pending requests to complete");
   return pendingRequestsComplete_.getFuture().ensure(
-      [this, proc = proc_, dg = std::move(dg), stopReason]() {
+      [this, proc = proc_, dg = std::move(dg), stopReason, stopRequestedAt]() {
         XLOG(
             DBG4,
             "Pending requests complete; finishing destroying this RPC handler");
@@ -216,6 +238,7 @@ folly::SemiFuture<folly::Unit> RpcConnectionHandler::resetReader(
 
         RpcStopData data{};
         data.reason = stopReason;
+        data.stopRequestedAt = stopRequestedAt;
         if (stopReason == RpcStopReason::TAKEOVER) {
           // We've already set readCB to nullptr, so detach the
           // network socket and transfer it to the process taking over
@@ -292,6 +315,40 @@ std::unique_ptr<folly::IOBuf> finalizeFragment(
       DBG8,
       "Sending:\n{}",
       folly::hexDump(resultBuffer->data(), resultBuffer->length()));
+  return resultBuffer;
+}
+
+/**
+ * Rebuild a record received as several fragments into a single fragment, so
+ * that the rest of the server only ever sees one fragment header followed by
+ * the whole call. The payload buffers move from the record into the result;
+ * only a buffer that holds a fragment boundary is shared, nothing is copied.
+ */
+std::unique_ptr<folly::IOBuf> coalesceFragments(
+    std::unique_ptr<folly::IOBuf> record) {
+  folly::IOBufQueue fragments{folly::IOBufQueue::cacheChainLength()};
+  fragments.append(std::move(record));
+
+  folly::IOBufQueue result{folly::IOBufQueue::cacheChainLength()};
+  folly::io::QueueAppender appender(&result, sizeof(uint32_t));
+  XdrTrait<uint32_t>::serialize(appender, 0); // fragment header placeholder
+
+  while (true) {
+    const auto fragmentHeader =
+        folly::io::Cursor(fragments.front()).readBE<uint32_t>();
+    fragments.trimStart(sizeof(uint32_t));
+    if (const auto len = fragmentHeader & 0x7fffffff; len != 0) {
+      result.append(fragments.split(len));
+    }
+    if ((fragmentHeader & 0x80000000) != 0) {
+      break;
+    }
+  }
+
+  auto len = uint32_t(result.chainLength() - sizeof(uint32_t));
+  auto resultBuffer = result.move();
+  auto fragment = (uint32_t*)resultBuffer->writableData();
+  *fragment = folly::Endian::big(len | 0x80000000);
   return resultBuffer;
 }
 } // namespace
@@ -404,10 +461,8 @@ void RpcConnectionHandler::tryConsumeReadBuffer() noexcept {
         uint32_t fragmentHeader = c.readBE<uint32_t>();
         bool isLast = (fragmentHeader & 0x80000000) != 0;
 
-        // Supporting multiple fragments is expensive and requires playing
-        // with IOBuf to avoid copying data. Since neither macOS nor Linux
-        // are sending requests spanning multiple segments, let's not
-        // support these.
+        // readOneRequest() rebuilds multi-fragment records into a single
+        // fragment, so the worker only ever sees the last fragment.
         XCHECK(isLast);
       }
 
@@ -438,6 +493,7 @@ std::unique_ptr<folly::IOBuf> RpcConnectionHandler::readOneRequest() noexcept {
     return nullptr;
   }
   folly::io::Cursor c(readBuf_.front());
+  size_t fragmentCount = 0;
   while (true) {
     uint32_t fragmentHeader;
     if (!c.tryReadBE<uint32_t>(fragmentHeader)) {
@@ -451,11 +507,16 @@ std::unique_ptr<folly::IOBuf> RpcConnectionHandler::readOneRequest() noexcept {
       return nullptr;
     }
     c.skip(len);
+    fragmentCount++;
     if (isLast) {
       break;
     }
   }
-  return readBuf_.split(c.getCurrentPosition());
+  auto record = readBuf_.split(c.getCurrentPosition());
+  if (fragmentCount == 1) {
+    return record;
+  }
+  return coalesceFragments(std::move(record));
 }
 
 void RpcConnectionHandler::recordParsingError(
@@ -956,55 +1017,7 @@ folly::SemiFuture<folly::File> RpcServer::takeoverStop() {
       });
 }
 
-RpcServer::~RpcServer() {
-  auto& ebstate = state_.get();
-  if (ebstate.portmapState) {
-    auto& state = ebstate.portmapState.value();
-    for (const auto& mapping : state.mappedPorts) {
-      state.portMap.unsetMapping(mapping);
-    }
-  }
-}
-
-namespace {
-
-std::pair<std::string, std::string> getNetIdAndAddr(const SocketAddress& addr) {
-  if (addr.isFamilyInet()) {
-    auto netid = addr.getFamily() == AF_INET6 ? PortmapMapping4::kTcp6NetId
-                                              : PortmapMapping4::kTcpNetId;
-    auto port = addr.getPort();
-    // The port format is a bit odd, reversed from looking at rpcinfo output.
-    return {
-        netid,
-        fmt::format(
-            "{}.{}.{}", addr.getAddressStr(), (port >> 8) & 0xff, port & 0xff)};
-  } else {
-    return {PortmapMapping4::kLocalNetId, addr.getPath()};
-  }
-}
-
-} // namespace
-
-void RpcServer::registerService(uint32_t progNumber, uint32_t progVersion) {
-  auto& ebstate = state_.get();
-  auto& pmstate = ebstate.portmapState;
-  if (!pmstate.has_value()) {
-    // The rpcbind client was never initialized, do it now.
-    pmstate.emplace();
-  }
-  auto& state = pmstate.value();
-
-  // Enumerate the addresses (in practice, just the loopback) and use the
-  // port number we got from the kernel to register the mapping for
-  // this program/version pair with rpcbind/portmap.
-  auto addrs = serverSocket_->getAddresses();
-  for (auto& addr : addrs) {
-    auto [netid, addrStr] = getNetIdAndAddr(addr);
-    PortmapMapping4 mapping{progNumber, progVersion, netid, addrStr, "edenfs"};
-    state.portMap.setMapping(mapping);
-    state.mappedPorts.push_back(std::move(mapping));
-  }
-}
+RpcServer::~RpcServer() = default;
 
 folly::SocketAddress RpcServer::getAddr() const {
   return serverSocket_->getAddress();

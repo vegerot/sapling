@@ -3,8 +3,9 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# The add_fbthrift_library() calls require CMake 3.8+
-cmake_minimum_required(VERSION 3.8 FATAL_ERROR)
+# Policy CMP0099, which passes link options such as throw_trace_capture's --wrap
+# through the private dependencies of static libraries, requires CMake 3.17.
+cmake_minimum_required(VERSION 3.17 FATAL_ERROR)
 
 # We use the GoogleTest module if it is available (only in CMake 3.9+)
 # It requires CMP0054 and CMP0057 to be enabled.
@@ -15,6 +16,10 @@ if (POLICY CMP0057)
   cmake_policy(SET CMP0057 NEW)
 endif()
 cmake_policy(SET CMP0079 NEW)
+# URL downloads timestamp extracted files at extraction time.
+if (POLICY CMP0135)
+  cmake_policy(SET CMP0135 NEW)
+endif()
 
 # Project information
 project("eden" LANGUAGES CXX C)
@@ -74,20 +79,11 @@ else()
 endif()
 string(TIMESTAMP EDEN_BUILD_TIME_UNIX "%s")
 
-# Tell CMake to also look in the directories where getdeps.py installs
-# our third-party dependencies.
-list(APPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/external/install")
-
 # CMake include directories
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake"
   # For shipit-transformed builds
   "${CMAKE_CURRENT_SOURCE_DIR}/build/fbcode_builder/CMake"
   ${CMAKE_MODULE_PATH})
-
-include_directories(
-  ${CMAKE_SOURCE_DIR}
-  ${CMAKE_BINARY_DIR}
-)
 
 if (IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/external/osxfuse")
   include_directories("${CMAKE_CURRENT_SOURCE_DIR}/external/osxfuse/common")
@@ -113,14 +109,23 @@ endif()
 # Configuration options
 set(ENABLE_EDENSCM AUTO CACHE STRING "Enable support for Eden SCM repositories")
 set_property(CACHE ENABLE_EDENSCM PROPERTY STRINGS AUTO ON OFF)
-set(ENABLE_GIT AUTO CACHE STRING "Enable support for Git repositories")
-set_property(CACHE ENABLE_GIT PROPERTY STRINGS AUTO ON OFF)
+set(ENABLE_THRIFT_PYTHON AUTO CACHE STRING
+  "Build the Python CLI, which needs thrift-python")
+set_property(CACHE ENABLE_THRIFT_PYTHON PROPERTY STRINGS AUTO ON OFF)
+option(BUILD_TESTS "If enabled, compile the tests." OFF)
 
 include(FBCompilerSettings)
 include(EdenCompilerSettings)
 include(EdenConfigChecks)
+# After EdenConfigChecks, so that the projects it fetches don't search eden's
+# tree, which can have its own copy of eden/common.
+include_directories(
+  BEFORE
+  ${CMAKE_SOURCE_DIR}
+  ${CMAKE_BINARY_DIR}
+)
+include(EdenFunctions)
 include(FBPythonBinary)
-include(FBThriftLibrary)
 include(RustStaticLibrary)
 
 include_directories(BEFORE ${CMAKE_CURRENT_BINARY_DIR})
@@ -134,11 +139,13 @@ set_property(
   "FOLLY_XLOG_STRIP_PREFIXES=\"${CMAKE_SOURCE_DIR}:${CMAKE_BINARY_DIR}\""
 )
 add_subdirectory(eden/fs)
-add_subdirectory(eden/integration)
 add_subdirectory(eden/scm)
 add_subdirectory(eden/scm/lib)
-add_subdirectory(eden/test_support)
 add_subdirectory(eden/scm/exec/eden_apfs_mount_helper)
+if(EDEN_BUILD_INTEGRATION_TESTS)
+  add_subdirectory(eden/integration)
+  add_subdirectory(eden/test_support)
+endif()
 
 if(WIN32)
   # On Windows our Python binaries are compiled into executables which depend
@@ -158,14 +165,6 @@ if(WIN32)
     get_target_property(python_dll Python3::Python LOCATION)
     install(FILES "${python_dll}" DESTINATION bin)
   endif()
-
-  # Also a emit a file listing additional directories containing runtime
-  # library dependencies.  On Windows this is needed to help figure out runtime
-  # dependencies needed to run the generated build artifacts.  This file can be
-  # processed by getdeps.py
-  get_filename_component(python_dll_dir "${python_dll}" DIRECTORY)
-  file(TO_NATIVE_PATH "${python_dll_dir}" python_dll_dir)
-  file(WRITE "${CMAKE_BINARY_DIR}/LIBRARY_DEP_DIRS.txt" "${python_dll_dir}\n")
 endif()
 
 configure_file(
@@ -176,12 +175,6 @@ configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/CMake/eden-config.cpp.in
   ${CMAKE_CURRENT_BINARY_DIR}/eden/fs/eden-config.cpp
 )
-
-if(EDEN_HAVE_GIT)
-  set(EDEN_HAVE_GIT_PY "True")
-else()
-  set(EDEN_HAVE_GIT_PY "False")
-endif()
 
 if(LINUX)
   set(EDEN_HAVE_NFS_PY "True")

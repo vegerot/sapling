@@ -12,6 +12,7 @@ import type {MessageBus} from './MessageBus';
 import type {ThemeColor} from './theme';
 import type {
   AbsolutePath,
+  AgentPrompt,
   Disposable,
   OneIndexedLineNumber,
   PageVisibility,
@@ -20,10 +21,18 @@ import type {
   ServerToClientMessage,
 } from './types';
 
-import type {CodeReviewIssue} from './firstPassCodeReview/types';
 import {makeBrowserLikePlatformImpl} from './platform/browserPlatformImpl';
 
 export type InitialParamKeys = 'token' | string;
+
+/** What `localStorageBackedAtom` tells a platform about a setting it stores. */
+export type PersistedStateOptions = {
+  /** A preference that means the same on every machine, which a platform may keep elsewhere too. */
+  portable: true;
+  defaultValue: Json;
+  /** Whether a value kept elsewhere is acceptable here, beyond having the default's JSON type. */
+  validate?: (value: Json) => boolean;
+};
 
 export interface PlatformVisibility {
   getVisibility(): PageVisibility;
@@ -57,9 +66,13 @@ export interface Platform {
    * Note: Some platforms may not support this (e.g. browser with localStorage disabled),
    * or it may not be persisted indefinitely---usual localStorage caveats apply.
    */
-  getPersistedState<T extends Json>(key: string): T | null;
+  getPersistedState<T extends Json>(key: string, options?: PersistedStateOptions): T | null;
   /** see getPersistedState  */
-  setPersistedState<T extends Json>(key: string, value: T | undefined): void;
+  setPersistedState<T extends Json>(
+    key: string,
+    value: T | undefined,
+    options?: PersistedStateOptions,
+  ): void;
   /** see getPersistedState  */
   clearPersistedState(): void;
   /** see getPersistedState  */
@@ -103,13 +116,16 @@ export interface Platform {
   /** In browser-like platforms, some ISL parameters are passed via URL query params */
   initialUrlParams?: Map<InitialParamKeys, string>;
 
-  /** If the platform has a notion of AI code review, methods for listening to them. */
-  aiCodeReview?: {
-    /** listen for new comments so ISL can render them */
-    onDidChangeAIReviewComments(
-      callback: (aiReviewComments: Array<CodeReviewIssue>) => void,
-    ): Disposable;
-  };
+  /**
+   * Whether `promptAgent` is available. This may change whenever the connection to the host opens.
+   * When true, AI smart actions send their prompts to the host's agent instead of Devmate.
+   */
+  supportsAgentPrompts?(): boolean;
+  /**
+   * Send a prompt to the embedding host's AI agent, which decides how to run it.
+   * With `awaitResponse`, resolves with the agent's final response; otherwise once it is sent.
+   */
+  promptAgent?(prompt: AgentPrompt): Promise<string | undefined>;
 }
 
 declare global {

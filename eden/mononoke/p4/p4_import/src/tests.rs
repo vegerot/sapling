@@ -1,0 +1,2179 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This software may be used and distributed according to the terms of the
+ * GNU General Public License version 2.
+ */
+
+use std::collections::BTreeSet;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Poll;
+
+use anyhow::anyhow;
+use async_trait::async_trait;
+use bonsai_git_mapping::BonsaiGitMapping;
+use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
+use bonsai_p4_mapping::AddP4MappingErrorKind;
+use bookmarks::Bookmarks;
+use bulk_derivation::BulkDerivation;
+use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
+use context::SessionContainer;
+use fbinit::FacebookInit;
+use filestore::FilestoreConfig;
+use futures::StreamExt;
+use futures::stream;
+use futures::stream::BoxStream;
+use metaconfig_types::FilestoreParams;
+use metaconfig_types::LoggingDestination;
+use metaconfig_types::RepoConfig;
+use metaconfig_types::UpdateLoggingConfig;
+use mononoke_macros::mononoke;
+use mononoke_types::BonsaiChangesetMut;
+use mononoke_types::DerivableType;
+use mononoke_types::FileChange;
+use mononoke_types::GitLfs;
+use mononoke_types::P4ChangelistId;
+use mononoke_types_mocks::changesetid::ONES_CSID;
+use mononoke_types_mocks::contentid::ONES_CTID;
+use p4_types::Action;
+use p4_types::CaseHandling;
+use p4_types::Depot;
+use p4_types::DepotType;
+use p4_types::FileRevision;
+use p4_types::Integration;
+use p4_types::IntegrationHow;
+use p4_types::ServerInfo;
+use repo_blobstore::RepoBlobstore;
+use repo_derived_data::RepoDerivedData;
+use repo_identity::RepoIdentity;
+use scribe_ext::Scribe;
+use scuba_ext::MononokeScubaSampleBuilder;
+use serde_json::Value;
+use tempfile::TempDir;
+use test_repo_factory::TestRepoFactory;
+use unodes::RootUnodeManifestId;
+
+use super::*;
+
+#[facet::container]
+struct TestRepo {
+    #[facet]
+    bonsai_git_mapping: dyn BonsaiGitMapping,
+    #[facet]
+    bonsai_globalrev_mapping: dyn BonsaiGlobalrevMapping,
+    #[facet]
+    bonsai_p4_mapping: dyn BonsaiP4Mapping,
+    #[facet]
+    bookmarks: dyn Bookmarks,
+    #[facet]
+    commit_graph: CommitGraph,
+    #[facet]
+    commit_graph_writer: dyn CommitGraphWriter,
+    #[facet]
+    filestore_config: FilestoreConfig,
+    #[facet]
+    repo_blobstore: RepoBlobstore,
+    #[facet]
+    repo_config: RepoConfig,
+    #[facet]
+    repo_derived_data: RepoDerivedData,
+    #[facet]
+    repo_identity: RepoIdentity,
+}
+
+fn chunks(chunks: &[&[u8]]) -> impl Stream<Item = Result<Bytes>> + Send + use<> {
+    let chunks: Vec<_> = chunks
+        .iter()
+        .map(|c| Ok(Bytes::copy_from_slice(c)))
+        .collect();
+    stream::iter(chunks)
+}
+
+async fn upload_and_fetch(
+    ctx: &CoreContext,
+    repo: &TestRepo,
+    content: &[&[u8]],
+) -> Result<(ContentMetadataV2, Bytes)> {
+    let size = content.iter().map(|c| c.len() as u64).sum();
+    let metadata = upload_content(ctx, repo, size, chunks(content)).await?;
+    let fetched = filestore::fetch_concat(repo.repo_blobstore(), ctx, metadata.content_id).await?;
+    Ok((metadata, fetched))
+}
+
+#[mononoke::fbinit_test]
+async fn test_content_reads_back_byte_identical(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let (metadata, fetched) = upload_and_fetch(&ctx, &repo, &[b"hello\nworld\n"]).await?;
+
+    assert_eq!(&b"hello\nworld\n"[..], fetched);
+    assert_eq!(12, metadata.total_size);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_content_stored_in_filestore_chunks_reads_back_byte_identical(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = TestRepoFactory::new(fb)?
+        .with_config_override(|config| {
+            config.filestore = Some(FilestoreParams {
+                chunk_size: 1024 * 1024,
+                concurrency: 2,
+            })
+        })
+        .build()
+        .await?;
+    let content: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 1024 * 1024 + 7]).collect();
+    let content: Vec<&[u8]> = content.iter().map(Vec::as_slice).collect();
+
+    let (metadata, fetched) = upload_and_fetch(&ctx, &repo, &content).await?;
+
+    assert_eq!(content.concat(), fetched);
+    assert_eq!(5 * (1024 * 1024 + 7), metadata.total_size);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_empty_content(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let (metadata, fetched) = upload_and_fetch(&ctx, &repo, &[]).await?;
+
+    assert!(fetched.is_empty());
+    assert_eq!(0, metadata.total_size);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_content_longer_than_size_is_rejected(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let error = upload_content(&ctx, &repo, 3, chunks(&[b"abcd"]))
+        .await
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("Invalid size"), "{error:?}");
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_content_shorter_than_size_is_rejected(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let error = upload_content(&ctx, &repo, 5, chunks(&[b"abcd"]))
+        .await
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("Invalid size"), "{error:?}");
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_same_content_gets_the_same_content_id(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let (first, _) = upload_and_fetch(&ctx, &repo, &[b"same bytes"]).await?;
+    let (second, _) = upload_and_fetch(&ctx, &repo, &[b"same ", b"bytes"]).await?;
+
+    assert_eq!(first.content_id, second.content_id);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_symlink_target_loses_one_trailing_newline(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let metadata = upload_file_content(
+        &ctx,
+        &repo,
+        FileType::Symlink,
+        19,
+        chunks(&[b"UPPERCASE-", b"TEST.TXT\n"]),
+    )
+    .await?;
+    let fetched = filestore::fetch_concat(repo.repo_blobstore(), &ctx, metadata.content_id).await?;
+
+    assert_eq!(&b"UPPERCASE-TEST.TXT"[..], fetched);
+    assert_eq!(18, metadata.total_size);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_symlink_without_trailing_newline_is_rejected(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let error = upload_file_content(&ctx, &repo, FileType::Symlink, 6, chunks(&[b"target"]))
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("does not end with a newline"),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_symlink_with_two_trailing_newlines_is_rejected(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let error = upload_file_content(&ctx, &repo, FileType::Symlink, 8, chunks(&[b"target\n\n"]))
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("more than one newline"),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_symlink_shorter_than_size_is_rejected(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let error = upload_file_content(&ctx, &repo, FileType::Symlink, 8, chunks(&[b"target\n"]))
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("symlink content is 7 bytes but Perforce reports 8"),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_symlink_longer_than_size_is_rejected(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let error = upload_file_content(
+        &ctx,
+        &repo,
+        FileType::Symlink,
+        6,
+        chunks(&[b"targ", b"et\n", b"never read"]),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("longer than Perforce reports (6 bytes)"),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_symlink_over_64_kib_is_rejected(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let unreadable =
+        stream::poll_fn(|_| -> Poll<Option<Result<Bytes>>> { panic!("content was read") });
+
+    let error = upload_file_content(&ctx, &repo, FileType::Symlink, 64 * 1024 + 1, unreadable)
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("symlink of 65537 bytes is larger than we support"),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_regular_file_keeps_its_trailing_newline(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let metadata =
+        upload_file_content(&ctx, &repo, FileType::Regular, 7, chunks(&[b"target\n"])).await?;
+    let fetched = filestore::fetch_concat(repo.repo_blobstore(), &ctx, metadata.content_id).await?;
+
+    assert_eq!(&b"target\n"[..], fetched);
+    assert_eq!(7, metadata.total_size);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_regular_file_of_the_wrong_size_is_rejected(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let error = upload_file_content(&ctx, &repo, FileType::Regular, 6, chunks(&[b"target\n"]))
+        .await
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("Invalid size"), "{error:?}");
+    Ok(())
+}
+
+/// Knows only what it is given: anything else fails the test.
+#[derive(Default)]
+struct FakeSource {
+    changelists: HashMap<u64, Changelist>,
+    /// Keyed by `path#rev`.
+    contents: HashMap<String, &'static [u8]>,
+    /// Keyed by `path#rev`.
+    integrations: HashMap<String, Vec<Integration>>,
+    /// The server's latest changelist, if not its newest one here.
+    latest: Option<u64>,
+    /// Each call's method, in order.
+    calls: Mutex<Vec<&'static str>>,
+    /// Each listing's `(after, upto, limit)`.
+    listed: Mutex<Vec<(Option<u64>, u64, usize)>>,
+    describes: InFlight,
+    prints: InFlight,
+    filelogs: InFlight,
+    server: FakeServer,
+}
+
+const REPLICA_ID: &str = "standby-1";
+const COMMIT_SERVER_ID: &str = "commit-1";
+const FAKE_ADDRESS: &str = "fake:1666";
+
+/// What `p4 info` reports: by default the replica `REPLICA_ID` of `COMMIT_SERVER_ID`.
+struct FakeServer {
+    server_id: Option<&'static str>,
+    commit_server_id: Option<&'static str>,
+}
+
+impl Default for FakeServer {
+    fn default() -> Self {
+        Self {
+            server_id: Some(REPLICA_ID),
+            commit_server_id: Some(COMMIT_SERVER_ID),
+        }
+    }
+}
+
+/// Counts the calls in flight at once.
+#[derive(Default)]
+struct InFlight {
+    now: AtomicUsize,
+    max: AtomicUsize,
+}
+
+impl InFlight {
+    /// Lets other calls start before this one returns.
+    async fn call(&self) {
+        let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max.fetch_max(now, Ordering::SeqCst);
+        let mut yielded = false;
+        futures::future::poll_fn(|cx| {
+            if yielded {
+                return Poll::Ready(());
+            }
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await;
+        self.now.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn max(&self) -> usize {
+        self.max.load(Ordering::SeqCst)
+    }
+}
+
+fn key(file: &FileRevision) -> String {
+    format!("{}#{}", file.depot_path, file.revision)
+}
+
+#[async_trait]
+impl ChangeSource for FakeSource {
+    async fn server_info(&self) -> Result<ServerInfo> {
+        self.record("server_info");
+        Ok(ServerInfo {
+            server_id: self.server.server_id.map(str::to_owned),
+            commit_server_id: self.server.commit_server_id.map(str::to_owned),
+            address: FAKE_ADDRESS.to_owned(),
+            version: "P4D/FAKE".to_owned(),
+            case_handling: CaseHandling::Sensitive,
+            unicode: false,
+            services: "standard".to_owned(),
+        })
+    }
+
+    async fn latest_change(&self) -> Result<u64> {
+        self.record("latest_change");
+        let newest = self.changelists.keys().max().copied().unwrap_or(0);
+        Ok(self.latest.unwrap_or(newest))
+    }
+
+    async fn depots(&self) -> Result<Vec<Depot>> {
+        self.record("depots");
+        let depots = [
+            ("test1", DepotType::Local),
+            ("other", DepotType::Local),
+            ("streams", DepotType::Stream),
+            ("spec", DepotType::Spec),
+            ("graph", DepotType::Graph),
+            ("remote", DepotType::Remote),
+        ];
+        Ok(depots
+            .into_iter()
+            .map(|(name, depot_type)| Depot {
+                name: name.to_owned(),
+                depot_type,
+                map: format!("{name}/..."),
+                stream_depth: None,
+            })
+            .collect())
+    }
+
+    /// The first `limit` changelists it has in the range, whatever their depot.
+    async fn submitted_changes(
+        &self,
+        _depot_root: &str,
+        after: Option<u64>,
+        upto: u64,
+        limit: usize,
+    ) -> Result<Vec<u64>> {
+        self.record("submitted_changes");
+        self.listed.lock().unwrap().push((after, upto, limit));
+        let mut changes: Vec<_> = self
+            .changelists
+            .keys()
+            .copied()
+            .filter(|&change| after.is_none_or(|after| change > after) && change <= upto)
+            .collect();
+        changes.sort();
+        changes.truncate(limit);
+        Ok(changes)
+    }
+
+    async fn describe(&self, change: u64) -> Result<Changelist> {
+        self.record("describe");
+        self.describes.call().await;
+        self.changelists
+            .get(&change)
+            .cloned()
+            .ok_or_else(|| anyhow!("unexpected describe of {change}"))
+    }
+
+    async fn print(&self, file: &FileRevision) -> Result<BoxStream<'static, Result<Bytes>>> {
+        self.record("print");
+        self.prints.call().await;
+        let content = self
+            .contents
+            .get(&key(file))
+            .ok_or_else(|| anyhow!("unexpected print of {}", key(file)))?;
+        Ok(chunks(&[content]).boxed())
+    }
+
+    async fn integrations(
+        &self,
+        files: &[&FileRevision],
+    ) -> Result<HashMap<String, Vec<Integration>>> {
+        self.record("integrations");
+        self.filelogs.call().await;
+        files
+            .iter()
+            .map(|file| {
+                let integrations = self.integrations.get(&key(file)).cloned();
+                let integrations =
+                    integrations.ok_or_else(|| anyhow!("unexpected filelog of {}", key(file)))?;
+                Ok((file.depot_path.clone(), integrations))
+            })
+            .collect()
+    }
+}
+
+type FileSpec = (&'static str, u32, Action, Option<&'static [u8]>);
+
+impl FakeSource {
+    fn record(&self, call: &'static str) {
+        self.calls.lock().unwrap().push(call);
+    }
+
+    fn with_changelist(mut self, number: u64, files: &[FileSpec]) -> Self {
+        let files = files
+            .iter()
+            .map(|&(depot_path, rev, action, content)| {
+                let file = FileRevision {
+                    revision: rev,
+                    size: content.map(|content| content.len() as u64),
+                    ..revision(depot_path, action, "text", None)
+                };
+                if let Some(content) = content {
+                    self.contents.insert(key(&file), content);
+                }
+                file
+            })
+            .collect();
+        let changelist = Changelist {
+            number,
+            user: "alice".to_owned(),
+            time: 1_760_000_000 + number,
+            description: format!("change {number}\n"),
+            description_bytes: None,
+            files,
+        };
+        self.changelists.insert(number, changelist);
+        self
+    }
+
+    fn with_server(
+        mut self,
+        server_id: Option<&'static str>,
+        commit_server_id: Option<&'static str>,
+    ) -> Self {
+        self.server = FakeServer {
+            server_id,
+            commit_server_id,
+        };
+        self
+    }
+
+    fn with_branch(mut self, target: &str, source: &str) -> Self {
+        let integration = Integration {
+            how: IntegrationHow::BranchFrom,
+            file: source.to_owned(),
+            start_rev: None,
+            end_rev: 1,
+        };
+        self.integrations
+            .insert(format!("{target}#1"), vec![integration]);
+        self
+    }
+}
+
+fn revision(depot_path: &str, action: Action, file_type: &str, size: Option<u64>) -> FileRevision {
+    FileRevision {
+        depot_path: depot_path.to_owned(),
+        action,
+        file_type: file_type.to_owned(),
+        revision: 1,
+        size,
+        digest: None,
+    }
+}
+
+#[mononoke::fbinit_test]
+async fn test_changelist_contents_are_stored_by_depot_path(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let source = FakeSource {
+        contents: HashMap::from([
+            ("//test1/add.txt#1".to_owned(), &b"hello\n"[..]),
+            ("//test1/run.sh#1".to_owned(), &b"#!/bin/sh\n"[..]),
+            ("//test1/link#1".to_owned(), &b"add.txt\n"[..]),
+        ]),
+        ..Default::default()
+    };
+    let changelist = Changelist {
+        number: 42,
+        user: "alice".to_owned(),
+        time: 0,
+        description: "mixed".to_owned(),
+        description_bytes: None,
+        files: vec![
+            revision("//test1/add.txt", Action::Add, "text", Some(6)),
+            revision("//test1/run.sh", Action::Edit, "text+x", Some(10)),
+            revision("//test1/gone.txt", Action::Delete, "text", None),
+            revision("//test1/link", Action::Add, "symlink", Some(8)),
+            revision("//other/add.txt", Action::Add, "text", Some(6)),
+        ],
+    };
+
+    let contents = upload_changelist_contents(
+        &ctx,
+        &repo,
+        &source,
+        "//test1/",
+        &changelist,
+        ImportOptions::default().file_concurrency,
+    )
+    .await?;
+
+    let mut stored = Vec::new();
+    for (path, metadata) in &contents {
+        let content =
+            filestore::fetch_concat(repo.repo_blobstore(), &ctx, metadata.content_id).await?;
+        stored.push((path.as_str(), content));
+    }
+    stored.sort();
+    assert_eq!(
+        vec![
+            ("//test1/add.txt", Bytes::from_static(b"hello\n")),
+            ("//test1/link", Bytes::from_static(b"add.txt")),
+            ("//test1/run.sh", Bytes::from_static(b"#!/bin/sh\n")),
+        ],
+        stored
+    );
+    Ok(())
+}
+
+/// An add, an edit, a branch copy and a delete over two changelists.
+fn two_changelists() -> FakeSource {
+    FakeSource::default()
+        .with_changelist(
+            7,
+            &[
+                ("//test1/a.txt", 1, Action::Add, Some(b"one\n")),
+                ("//test1/gone.txt", 1, Action::Add, Some(b"bye\n")),
+            ],
+        )
+        .with_changelist(
+            9,
+            &[
+                ("//test1/a.txt", 2, Action::Edit, Some(b"two\n")),
+                ("//test1/b.txt", 1, Action::Branch, Some(b"one\n")),
+                ("//test1/gone.txt", 2, Action::Delete, None),
+            ],
+        )
+        .with_branch("//test1/b.txt", "//test1/a.txt")
+}
+
+fn path(path: &str) -> NonRootMPath {
+    NonRootMPath::new(path).unwrap()
+}
+
+/// The files `changeset` changes: content for a change, `None` for a deletion.
+async fn files(
+    ctx: &CoreContext,
+    repo: &TestRepo,
+    changeset: &BonsaiChangeset,
+) -> Result<Vec<(String, Option<Bytes>, Option<(NonRootMPath, ChangesetId)>)>> {
+    let mut files = Vec::new();
+    for (path, change) in changeset.file_changes() {
+        let content = match change.content_id() {
+            Some(id) => Some(filestore::fetch_concat(repo.repo_blobstore(), ctx, id).await?),
+            None => None,
+        };
+        files.push((path.to_string(), content, change.copy_from().cloned()));
+    }
+    Ok(files)
+}
+
+#[mononoke::fbinit_test]
+async fn test_changelists_build_a_linear_history(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let built = build_changesets(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        "//test1/",
+        None,
+        &[7, 9],
+        &ImportOptions::default(),
+    )
+    .await?;
+
+    let [first, second] = &built[..] else {
+        panic!("two changesets expected: {built:?}");
+    };
+    assert_eq!((7, 9), (first.change, second.change));
+    assert_eq!(0, second.dropped_copy_sources);
+    let (first, second) = (&first.changeset, &second.changeset);
+    let first_id = first.get_changeset_id();
+    assert_eq!(0, first.parents().count());
+    assert_eq!(vec![first_id], second.parents().collect::<Vec<_>>());
+    assert_eq!(P4ChangelistId::new(7), P4ChangelistId::from_bcs(first)?);
+    assert_eq!(P4ChangelistId::new(9), P4ChangelistId::from_bcs(second)?);
+    assert_eq!(
+        vec![
+            ("a.txt".to_owned(), Some(Bytes::from_static(b"one\n")), None),
+            (
+                "gone.txt".to_owned(),
+                Some(Bytes::from_static(b"bye\n")),
+                None
+            ),
+        ],
+        files(&ctx, &repo, first).await?
+    );
+    assert_eq!(
+        vec![
+            ("a.txt".to_owned(), Some(Bytes::from_static(b"two\n")), None),
+            (
+                "b.txt".to_owned(),
+                Some(Bytes::from_static(b"one\n")),
+                Some((path("a.txt"), first_id))
+            ),
+            ("gone.txt".to_owned(), None, None),
+        ],
+        files(&ctx, &repo, second).await?
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_failure_names_the_changelist(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let error = build_changesets(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        "//test1/",
+        None,
+        &[7, 8],
+        &ImportOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("building changelist 8: unexpected describe of 8"),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+/// A changeset adding (`true`) or deleting (`false`) each path.
+fn changeset_of(changes: &[(&str, bool)]) -> BonsaiChangeset {
+    let change = |added| match added {
+        true => FileChange::tracked(ONES_CTID, FileType::Regular, 1, None, GitLfs::FullContent),
+        false => FileChange::Deletion,
+    };
+    BonsaiChangesetMut {
+        file_changes: changes
+            .iter()
+            .map(|&(p, added)| (path(p), change(added)))
+            .collect(),
+        ..Default::default()
+    }
+    .freeze()
+    .unwrap()
+}
+
+#[mononoke::test]
+fn test_file_replacing_a_directory_or_becoming_one_is_not_a_file() {
+    let history = [
+        changeset_of(&[("a/b", true), ("d", true)]),
+        changeset_of(&[("a", true), ("d/e", true)]),
+    ];
+
+    let regular = Some(Some((ONES_CTID, FileType::Regular)));
+    assert_eq!(Some(None), file_after(history.iter(), &path("a/b")));
+    assert_eq!(regular, file_after(history.iter(), &path("a")));
+    assert_eq!(Some(None), file_after(history[..1].iter(), &path("a")));
+    assert_eq!(Some(None), file_after(history.iter(), &path("d")));
+    assert_eq!(None, file_after(history.iter(), &path("c")));
+}
+
+#[mononoke::fbinit_test]
+async fn test_saved_parent_gives_the_file_content_and_type(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+    let imported = import_changelists(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        DEPOT,
+        &master,
+        &[7, 9],
+        &ImportOptions::default(),
+    )
+    .await?
+    .changelists;
+    let base = Some(imported[1].cs_id);
+    let head = imported[1].cs_id.load(&ctx, repo.repo_blobstore()).await?;
+    let a = head
+        .file_changes()
+        .find_map(|(p, change)| (*p == path("a.txt")).then(|| change.content_id()))
+        .flatten();
+
+    let paths = [path("a.txt"), path("gone.txt")];
+    let base_root = base_root_for(&ctx, &repo, base, &[], paths.iter()).await?;
+    assert!(base_root.is_some());
+    let no_copies = base_root_for(&ctx, &repo, base, &[], std::iter::empty()).await?;
+    assert_eq!(None, no_copies);
+
+    let file = file_in_parent(&ctx, &repo, base_root, &[], &paths[0]).await?;
+    let gone = file_in_parent(&ctx, &repo, base_root, &[], &paths[1]).await?;
+
+    assert_eq!(a.map(|id| (id, FileType::Regular)), file);
+    assert_eq!(None, gone);
+    Ok(())
+}
+
+/// `c.txt` branched from `source` on top of `two_changelists`.
+fn branch_after_two_changelists(source: &str) -> FakeSource {
+    two_changelists()
+        .with_changelist(11, &[("//test1/c.txt", 1, Action::Branch, Some(b"x\n"))])
+        .with_branch("//test1/c.txt", source)
+}
+
+async fn copy_from_of_c(
+    ctx: &CoreContext,
+    repo: &TestRepo,
+    base: Option<ChangesetId>,
+    changes: &[u64],
+    source: &str,
+) -> Result<(Option<(NonRootMPath, ChangesetId)>, usize)> {
+    let source = branch_after_two_changelists(source);
+    let built = build_changesets(
+        ctx,
+        repo,
+        &source,
+        "//test1/",
+        base,
+        changes,
+        &ImportOptions::default(),
+    )
+    .await?;
+    let last = built.last().unwrap();
+    let copy_from = files(ctx, repo, &last.changeset).await?[0].2.clone();
+    Ok((copy_from, last.dropped_copy_sources))
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_copy_source_must_be_a_file_in_the_unsaved_parent(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let (copy_from, dropped) =
+        copy_from_of_c(&ctx, &repo, None, &[7, 9, 11], "//test1/b.txt").await?;
+    assert!(copy_from.is_some_and(|(path, _)| path == self::path("b.txt")));
+    assert_eq!(0, dropped);
+    for missing in ["//test1/gone.txt", "//test1/never.txt"] {
+        let (copy_from, dropped) = copy_from_of_c(&ctx, &repo, None, &[7, 9, 11], missing).await?;
+        assert_eq!((None, 1), (copy_from, dropped), "{missing}");
+    }
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_copy_source_must_be_a_file_in_the_saved_parent(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+    let source = two_changelists();
+    let imported = import_changelists(
+        &ctx,
+        &repo,
+        &source,
+        DEPOT,
+        &master,
+        &[7, 9],
+        &ImportOptions::default(),
+    )
+    .await?
+    .changelists;
+    let base = Some(imported[1].cs_id);
+
+    let (copy_from, dropped) = copy_from_of_c(&ctx, &repo, base, &[11], "//test1/a.txt").await?;
+    assert_eq!(
+        (Some((path("a.txt"), imported[1].cs_id)), 0),
+        (copy_from, dropped)
+    );
+    let (copy_from, dropped) = copy_from_of_c(&ctx, &repo, base, &[11], "//test1/gone.txt").await?;
+    assert_eq!((None, 1), (copy_from, dropped));
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_copy_with_several_sources_is_counted_as_ambiguous(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let mut source = branch_after_two_changelists("//test1/a.txt");
+    let branch_from = |file: &str| Integration {
+        how: IntegrationHow::BranchFrom,
+        file: file.to_owned(),
+        start_rev: None,
+        end_rev: 1,
+    };
+    source.integrations.insert(
+        "//test1/c.txt#1".to_owned(),
+        vec![branch_from("//test1/a.txt"), branch_from("//test1/b.txt")],
+    );
+
+    let built = build_changesets(
+        &ctx,
+        &repo,
+        &source,
+        DEPOT,
+        None,
+        &[7, 9, 11],
+        &ImportOptions::default(),
+    )
+    .await?;
+
+    let last = built.last().unwrap();
+    assert_eq!(None, files(&ctx, &repo, &last.changeset).await?[0].2);
+    assert_eq!(
+        (1, 0),
+        (last.ambiguous_copy_sources, last.dropped_copy_sources)
+    );
+    assert_eq!(0, built[1].ambiguous_copy_sources);
+    Ok(())
+}
+
+const DEPOT: &str = "//test1/";
+
+async fn bookmark_target(
+    ctx: &CoreContext,
+    repo: &TestRepo,
+    bookmark: &BookmarkKey,
+) -> Result<Option<ChangesetId>> {
+    repo.bookmarks()
+        .get(ctx.clone(), bookmark, Freshness::MostRecent)
+        .await
+}
+
+async fn mapped(ctx: &CoreContext, repo: &TestRepo, change: u64) -> Result<Option<ChangesetId>> {
+    repo.bonsai_p4_mapping
+        .get_bonsai_from_p4_changelist_id(ctx, P4ChangelistId::new(change))
+        .await
+}
+
+#[mononoke::fbinit_test]
+async fn test_import_moves_the_bookmark_and_maps_each_changelist(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+    let options = ImportOptions {
+        backfill_derivation: BackfillDerivation::OnlySpecificTypes(vec![DerivableType::Fsnodes]),
+        ..Default::default()
+    };
+
+    let imported = import_changelists(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        DEPOT,
+        &master,
+        &[7, 9],
+        &options,
+    )
+    .await?
+    .changelists;
+
+    let built = build_changesets(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        DEPOT,
+        None,
+        &[7, 9],
+        &ImportOptions::default(),
+    )
+    .await?;
+    let expected: Vec<_> = built
+        .iter()
+        .map(|built| (built.change, built.changeset.get_changeset_id()))
+        .collect();
+    let ids: Vec<_> = imported.iter().map(|i| (i.change, i.cs_id)).collect();
+    assert_eq!(expected, ids);
+    assert_eq!(
+        Some(imported[1].cs_id),
+        bookmark_target(&ctx, &repo, &master).await?
+    );
+    assert_eq!(Some(9), resume_point(&ctx, &repo, &master).await?);
+    for (change, cs_id) in ids {
+        assert_eq!(Some(cs_id), mapped(&ctx, &repo, change).await?);
+        assert_eq!(
+            Some(P4ChangelistId::new(change)),
+            repo.bonsai_p4_mapping
+                .get_p4_changelist_id_from_bonsai(&ctx, cs_id)
+                .await?
+        );
+    }
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_next_batch_continues_from_the_bookmark(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+    let source = two_changelists();
+    assert_eq!(None, resume_point(&ctx, &repo, &master).await?);
+
+    let first = import_changelists(
+        &ctx,
+        &repo,
+        &source,
+        DEPOT,
+        &master,
+        &[7],
+        &ImportOptions::default(),
+    )
+    .await?
+    .changelists;
+    let second = import_changelists(
+        &ctx,
+        &repo,
+        &source,
+        DEPOT,
+        &master,
+        &[9],
+        &ImportOptions::default(),
+    )
+    .await?
+    .changelists;
+
+    let head = second[0].cs_id.load(&ctx, repo.repo_blobstore()).await?;
+    assert_eq!(vec![first[0].cs_id], head.parents().collect::<Vec<_>>());
+    assert_eq!(
+        Some(second[0].cs_id),
+        bookmark_target(&ctx, &repo, &master).await?
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_batch_not_after_the_checkpoint_is_rejected(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+    let source = two_changelists();
+    import_changelists(
+        &ctx,
+        &repo,
+        &source,
+        DEPOT,
+        &master,
+        &[7, 9],
+        &ImportOptions::default(),
+    )
+    .await?;
+    let head = bookmark_target(&ctx, &repo, &master).await?;
+
+    for batch in [&[9, 11][..], &[8]] {
+        let error = import_changelists(
+            &ctx,
+            &repo,
+            &source,
+            DEPOT,
+            &master,
+            batch,
+            &ImportOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("already at changelist 9"),
+            "{error:?}"
+        );
+    }
+    let error = import_changelists(
+        &ctx,
+        &repo,
+        &source,
+        DEPOT,
+        &master,
+        &[11, 10],
+        &ImportOptions::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not in increasing order"),
+        "{error:?}"
+    );
+    assert_eq!(head, bookmark_target(&ctx, &repo, &master).await?);
+    Ok(())
+}
+
+/// The mapping and the bookmark commit together: a mapping conflict leaves neither.
+#[mononoke::fbinit_test]
+async fn test_failed_mapping_write_leaves_the_bookmark(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+    let elsewhere = BonsaiP4MappingEntry::new(ONES_CSID, P4ChangelistId::new(9));
+    repo.bonsai_p4_mapping
+        .bulk_import(&ctx, &[elsewhere])
+        .await?;
+
+    let error = import_changelists(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        DEPOT,
+        &master,
+        &[7, 9],
+        &ImportOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            error.downcast_ref(),
+            Some(AddP4MappingErrorKind::Conflict {
+                conflicting: 1,
+                total: 2
+            })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(None, bookmark_target(&ctx, &repo, &master).await?);
+    assert_eq!(None, mapped(&ctx, &repo, 7).await?);
+    Ok(())
+}
+
+/// A context whose Scuba rows go to a file in the returned directory, one JSON object each.
+fn scuba_logging_context(fb: FacebookInit) -> Result<(CoreContext, TempDir)> {
+    let dir = tempfile::tempdir()?;
+    let scuba =
+        MononokeScubaSampleBuilder::with_discard().with_log_file(dir.path().join("scuba"))?;
+    Ok((CoreContext::new_with_scuba(fb, scuba), dir))
+}
+
+/// The rows logged with `log_tag`, their normal and int columns merged.
+fn scuba_rows(dir: &TempDir, log_tag: &str) -> Result<Vec<Value>> {
+    let rows = std::fs::read_to_string(dir.path().join("scuba")).unwrap_or_default();
+    let mut matching = vec![];
+    for line in rows.lines() {
+        let row: Value = serde_json::from_str(line)?;
+        let mut merged = row["int"].as_object().cloned().unwrap_or_default();
+        merged.extend(row["normal"].as_object().cloned().unwrap_or_default());
+        if merged.get("log_tag").and_then(Value::as_str) == Some(log_tag) {
+            matching.push(Value::Object(merged));
+        }
+    }
+    Ok(matching)
+}
+
+#[mononoke::fbinit_test]
+async fn test_build_failure_logs_the_stage_and_the_changelist(fb: FacebookInit) -> Result<()> {
+    let (ctx, dir) = scuba_logging_context(fb)?;
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+
+    import_changelists(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        DEPOT,
+        &master,
+        &[7, 8],
+        &ImportOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    let rows = scuba_rows(&dir, "P4 batch failed")?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["stage"], "build");
+    assert_eq!(row["first_change"], 7);
+    assert_eq!(row["last_change"], 8);
+    assert_eq!(row["failed_change"], 8);
+    assert_eq!(row["depot_root"], DEPOT);
+    assert_eq!(row["bookmark"], "master");
+    let error = row["error"].as_str().unwrap();
+    assert!(error.contains("building changelist 8"), "{error}");
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_commit_failure_logs_the_stage_and_the_batch(fb: FacebookInit) -> Result<()> {
+    let (ctx, dir) = scuba_logging_context(fb)?;
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+    let elsewhere = BonsaiP4MappingEntry::new(ONES_CSID, P4ChangelistId::new(9));
+    repo.bonsai_p4_mapping
+        .bulk_import(&ctx, &[elsewhere])
+        .await?;
+
+    import_changelists(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        DEPOT,
+        &master,
+        &[7, 9],
+        &ImportOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    let rows = scuba_rows(&dir, "P4 batch failed")?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["stage"], "commit");
+    assert_eq!(row["batch_changelists"], 2);
+    assert!(row.get("failed_change").is_none(), "{row:?}");
+    let error = row["error"].as_str().unwrap();
+    assert!(error.contains("committing changelists 7..=9"), "{error}");
+    assert!(scuba_rows(&dir, "P4 changelist imported")?.is_empty());
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_prepare_failure_has_the_prepare_stage(fb: FacebookInit) -> Result<()> {
+    let error = import_next_from(fb, &two_changelists(), "//tset1/")
+        .await
+        .unwrap_err();
+
+    assert_eq!(failed_stage(&error), Some(Stage::Prepare), "{error:?}");
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_build_failure_has_the_build_stage(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+
+    let error = import_changelists(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        DEPOT,
+        &master,
+        &[7, 8],
+        &ImportOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(failed_stage(&error), Some(Stage::Build), "{error:?}");
+    assert!(
+        error.downcast_ref::<BuildingChangelist>().is_some(),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+const NEW_COMMITS: &str = "new_commits";
+const BOOKMARK_MOVES: &str = "bookmark_moves";
+
+/// A repo whose update logs go to Scribe, and a context whose Scribe writes each category
+/// to a file in the returned directory.
+async fn logging_repo(fb: FacebookInit) -> Result<(TestRepo, CoreContext, TempDir)> {
+    let scribe = |category: &str| {
+        Some(LoggingDestination::Scribe {
+            scribe_category: category.to_owned(),
+        })
+    };
+    let repo = TestRepoFactory::new(fb)?
+        .with_config_override(|config| {
+            config.update_logging_config = UpdateLoggingConfig {
+                new_commit_logging_destination: scribe(NEW_COMMITS),
+                bookmark_logging_destination: scribe(BOOKMARK_MOVES),
+                git_content_refs_logging_destination: None,
+            }
+        })
+        .build()
+        .await?;
+    let dir = tempfile::tempdir()?;
+    let ctx = SessionContainer::new_with_defaults(fb).new_context_with_scribe(
+        MononokeScubaSampleBuilder::with_discard(),
+        Scribe::new_to_file(dir.path().to_owned()),
+    );
+    Ok((repo, ctx, dir))
+}
+
+fn logged(dir: &TempDir, category: &str) -> Result<Vec<Value>> {
+    let path = dir.path().join(category);
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    std::fs::read_to_string(path)?
+        .lines()
+        .map(|line| Ok(serde_json::from_str(line)?))
+        .collect()
+}
+
+#[mononoke::fbinit_test]
+async fn test_each_batch_logs_its_changesets_and_the_bookmark_move(fb: FacebookInit) -> Result<()> {
+    let (repo, ctx, dir) = logging_repo(fb).await?;
+    let master = BookmarkKey::new("master")?;
+    let source = two_changelists()
+        .with_changelist(11, &[("//test1/a.txt", 3, Action::Edit, Some(b"three\n"))]);
+    let options = ImportOptions::default();
+
+    let first = import_changelists(&ctx, &repo, &source, DEPOT, &master, &[7, 9], &options)
+        .await?
+        .changelists;
+    let second = import_changelists(&ctx, &repo, &source, DEPOT, &master, &[11], &options)
+        .await?
+        .changelists;
+
+    let ids: Vec<_> = first
+        .iter()
+        .chain(&second)
+        .map(|i| i.cs_id.to_string())
+        .collect();
+    let commits = logged(&dir, NEW_COMMITS)?;
+    assert_eq!(3, commits.len());
+    // A batch's commits are logged concurrently, so in no particular order.
+    let first_batch: BTreeSet<_> = commits[..2]
+        .iter()
+        .map(|row| row["changeset_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids[..2].iter().map(String::as_str).collect::<BTreeSet<_>>(),
+        first_batch
+    );
+    assert_eq!(ids[2], commits[2]["changeset_id"].as_str().unwrap());
+    for row in &commits {
+        assert_eq!("master", row["bookmark"]);
+        assert_eq!(true, row["is_public"]);
+    }
+
+    let moves = logged(&dir, BOOKMARK_MOVES)?;
+    let summary: Vec<_> = moves
+        .iter()
+        .map(|row| {
+            (
+                row["operation"].as_str().unwrap(),
+                row["old_bookmark_value"].as_str(),
+                row["new_bookmark_value"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        vec![
+            ("create", None, ids[1].as_str()),
+            ("update", Some(ids[1].as_str()), ids[2].as_str()),
+        ],
+        summary
+    );
+    for row in &moves {
+        assert_eq!("master", row["bookmark_name"]);
+        assert_eq!("pull_default", row["bookmark_kind"]);
+        assert_eq!("blobimport", row["update_reason"]);
+    }
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_batch_that_does_not_commit_logs_nothing(fb: FacebookInit) -> Result<()> {
+    let (repo, ctx, dir) = logging_repo(fb).await?;
+    let master = BookmarkKey::new("master")?;
+    let elsewhere = BonsaiP4MappingEntry::new(ONES_CSID, P4ChangelistId::new(9));
+    repo.bonsai_p4_mapping
+        .bulk_import(&ctx, &[elsewhere])
+        .await?;
+
+    import_changelists(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        DEPOT,
+        &master,
+        &[7, 9],
+        &ImportOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(logged(&dir, NEW_COMMITS)?.is_empty());
+    assert!(logged(&dir, BOOKMARK_MOVES)?.is_empty());
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_empty_changelist_is_an_empty_commit(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+    let source = FakeSource::default().with_changelist(5, &[]);
+
+    let imported = import_changelists(
+        &ctx,
+        &repo,
+        &source,
+        DEPOT,
+        &master,
+        &[5],
+        &ImportOptions::default(),
+    )
+    .await?
+    .changelists;
+
+    let changeset = imported[0].cs_id.load(&ctx, repo.repo_blobstore()).await?;
+    assert_eq!(0, changeset.file_changes().count());
+    assert_eq!(Some(imported[0].cs_id), mapped(&ctx, &repo, 5).await?);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_import_next_continues_after_the_bookmark_and_reports_each_changelist(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+    let mut source = two_changelists()
+        .with_changelist(
+            11,
+            &[
+                ("//other/x.txt", 1, Action::Add, Some(b"x\n")),
+                ("//test1/c.txt", 1, Action::Branch, Some(b"c\n")),
+                ("//test1/d.txt", 1, Action::Branch, Some(b"d\n")),
+                ("//test1/dir/f.txt", 1, Action::Add, Some(b"f\n")),
+            ],
+        )
+        .with_changelist(
+            13,
+            &[
+                ("//test1/dir", 1, Action::Add, Some(b"now a file\n")),
+                ("//test1/dir/f.txt", 2, Action::Delete, None),
+            ],
+        )
+        .with_branch("//test1/c.txt", "//test1/never.txt")
+        .with_branch("//test1/d.txt", "//test1/a.txt");
+    source
+        .integrations
+        .get_mut("//test1/d.txt#1")
+        .unwrap()
+        .push(Integration {
+            how: IntegrationHow::BranchFrom,
+            file: "//test1/b.txt".to_owned(),
+            start_rev: None,
+            end_rev: 1,
+        });
+    let report = |imported: &[ImportedChangelist]| -> Vec<_> {
+        imported
+            .iter()
+            .map(|i| {
+                (
+                    i.change,
+                    i.file_changes,
+                    i.other_depot_files,
+                    i.shadowed_deletions,
+                    i.dropped_copy_sources,
+                    i.ambiguous_copy_sources,
+                )
+            })
+            .collect()
+    };
+
+    let first = import_next(
+        &ctx,
+        &repo,
+        &source,
+        DEPOT,
+        &master,
+        1,
+        &ImportOptions::default(),
+    )
+    .await?;
+    let rest = import_next(
+        &ctx,
+        &repo,
+        &source,
+        DEPOT,
+        &master,
+        5,
+        &ImportOptions::default(),
+    )
+    .await?;
+    let none = import_next(
+        &ctx,
+        &repo,
+        &source,
+        DEPOT,
+        &master,
+        5,
+        &ImportOptions::default(),
+    )
+    .await?;
+
+    assert_eq!(vec![(7, 2, 0, 0, 0, 0)], report(&first.changelists));
+    assert_eq!(
+        vec![(9, 3, 0, 0, 0, 0), (11, 3, 1, 0, 1, 1), (13, 1, 0, 1, 0, 0)],
+        report(&rest.changelists)
+    );
+    assert_eq!(ImportedBatch::default(), none);
+    assert_eq!(
+        Some(rest.changelists[2].cs_id),
+        bookmark_target(&ctx, &repo, &master).await?
+    );
+    Ok(())
+}
+
+/// Deriving a type the repo doesn't enable would fail the batch after it is saved.
+#[mononoke::fbinit_test]
+async fn test_types_the_repo_does_not_enable_are_not_derived(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = TestRepoFactory::new(fb)?
+        .with_config_override(|config| {
+            if let Some(active) = config.derived_data_config.get_active_config_mut() {
+                active.types.remove(&DerivableType::Fsnodes);
+            }
+        })
+        .build()
+        .await?;
+    let master = BookmarkKey::new("master")?;
+    let options = ImportOptions {
+        backfill_derivation: BackfillDerivation::OnlySpecificTypes(vec![
+            DerivableType::Fsnodes,
+            DerivableType::Unodes,
+        ]),
+        ..Default::default()
+    };
+
+    let imported = import_changelists(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        DEPOT,
+        &master,
+        &[7, 9],
+        &options,
+    )
+    .await?;
+
+    let head = imported.changelists[1].cs_id;
+    let unodes = repo
+        .repo_derived_data()
+        .fetch_derived::<RootUnodeManifestId>(&ctx, head)
+        .await?;
+    assert!(unodes.is_some());
+    assert_eq!(Some(head), bookmark_target(&ctx, &repo, &master).await?);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_default_options_derive_the_types_the_repo_enables(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+
+    let imported = import_changelists(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        DEPOT,
+        &master,
+        &[7, 9],
+        &ImportOptions::default(),
+    )
+    .await?;
+
+    let head = imported.changelists[1].cs_id;
+    let derived_data = repo.repo_derived_data();
+    let mut underived = Vec::new();
+    for &ty in &derived_data.active_config().types {
+        if !derived_data
+            .manager()
+            .is_derived(&ctx, head, None, ty)
+            .await?
+        {
+            underived.push(ty);
+        }
+    }
+    assert_eq!(underived, Vec::<DerivableType>::new());
+    Ok(())
+}
+
+fn with_changelists(numbers: &[u64]) -> FakeSource {
+    numbers
+        .iter()
+        .fold(FakeSource::default(), |source, &number| {
+            source.with_changelist(number, &[])
+        })
+}
+
+#[mononoke::fbinit_test]
+async fn test_next_changes_list_once_up_to_the_latest(_fb: FacebookInit) -> Result<()> {
+    let source = FakeSource {
+        latest: Some(5_000_000),
+        ..with_changelists(&[3, 25, 26, 61])
+    };
+
+    let changes = next_changes(&source, DEPOT, None, 10).await?;
+
+    assert_eq!(vec![3, 25, 26, 61], changes);
+    assert_eq!(
+        vec![(None, 5_000_000, 10)],
+        *source.listed.lock().unwrap(),
+        "one listing, however far the server's numbers have gone"
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_next_changes_keep_the_first_after_the_resume_point(_fb: FacebookInit) -> Result<()> {
+    let source = with_changelists(&[3, 4, 5, 12, 25]);
+
+    let changes = next_changes(&source, DEPOT, Some(3), 2).await?;
+
+    assert_eq!(vec![4, 5], changes);
+    assert_eq!(vec![(Some(3), 25, 2)], *source.listed.lock().unwrap());
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_next_changes_do_not_list_once_caught_up(_fb: FacebookInit) -> Result<()> {
+    let source = FakeSource {
+        latest: Some(30),
+        ..with_changelists(&[3, 25, 26])
+    };
+
+    let nothing_new = next_changes(&source, DEPOT, Some(26), 10).await?;
+    let caught_up = next_changes(&source, DEPOT, Some(30), 10).await?;
+
+    assert_eq!(Vec::<u64>::new(), nothing_new);
+    assert_eq!(Vec::<u64>::new(), caught_up);
+    assert_eq!(
+        vec![(Some(26), 30, 10)],
+        *source.listed.lock().unwrap(),
+        "no listing at all once the resume point is the latest"
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_each_changelist_reports_how_many_files_it_uploaded(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+
+    let batch = import_changelists(
+        &ctx,
+        &repo,
+        &two_changelists(),
+        DEPOT,
+        &master,
+        &[7, 9],
+        &ImportOptions::default(),
+    )
+    .await?;
+
+    let uploaded: Vec<_> = batch
+        .changelists
+        .iter()
+        .map(|i| (i.change, i.timings.uploaded_files))
+        .collect();
+    // 9's deletion has no content to upload.
+    assert_eq!(vec![(7, 2), (9, 2)], uploaded);
+    Ok(())
+}
+
+async fn import_next_from(
+    fb: FacebookInit,
+    source: &FakeSource,
+    depot_root: &str,
+) -> Result<ImportedBatch> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let master = BookmarkKey::new("master")?;
+    import_next(
+        &ctx,
+        &repo,
+        source,
+        depot_root,
+        &master,
+        5,
+        &ImportOptions::default(),
+    )
+    .await
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_depot_root_must_match_the_server_exactly(fb: FacebookInit) -> Result<()> {
+    let exact = two_changelists();
+    let batch = import_next_from(fb, &exact, DEPOT).await?;
+    assert_eq!(2, batch.changelists.len());
+    assert_eq!(
+        ["depots", "server_info", "latest_change"],
+        exact.calls.lock().unwrap()[..3]
+    );
+
+    for (depot_root, expected) in [
+        (
+            "//tset1/",
+            UnknownDepotRoot::NotListed {
+                given: "//tset1/".to_owned(),
+            },
+        ),
+        (
+            "//Test1/",
+            UnknownDepotRoot::WrongCase {
+                given: "//Test1/".to_owned(),
+                server_spelling: "//test1/".to_owned(),
+            },
+        ),
+    ] {
+        let source = two_changelists();
+        let error = import_next_from(fb, &source, depot_root).await.unwrap_err();
+        assert_eq!(Some(&expected), error.downcast_ref(), "{error:?}");
+        assert_eq!(vec!["depots"], *source.calls.lock().unwrap());
+    }
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_depot_must_be_local_or_stream(fb: FacebookInit) -> Result<()> {
+    check_depot_root(&two_changelists(), "//streams/").await?;
+
+    for (name, depot_type) in [
+        ("spec", DepotType::Spec),
+        ("graph", DepotType::Graph),
+        ("remote", DepotType::Remote),
+    ] {
+        let source = two_changelists();
+        let depot_root = format!("//{name}/");
+        let error = import_next_from(fb, &source, &depot_root)
+            .await
+            .unwrap_err();
+        let expected = UnknownDepotRoot::UnsupportedType {
+            given: depot_root,
+            depot_type,
+        };
+        assert_eq!(Some(&expected), error.downcast_ref(), "{error:?}");
+        assert_eq!(vec!["depots"], *source.calls.lock().unwrap());
+    }
+    let error = check_depot_root(&two_changelists(), "//spec/")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        "//spec/ is a spec depot; only local and stream depots can be imported",
+        error.to_string()
+    );
+    Ok(())
+}
+
+async fn import_onto_master(
+    ctx: &CoreContext,
+    repo: &TestRepo,
+    source: &FakeSource,
+    depot_root: &str,
+    limit: usize,
+) -> Result<ImportedBatch> {
+    let master = BookmarkKey::new("master")?;
+    import_next(
+        ctx,
+        repo,
+        source,
+        depot_root,
+        &master,
+        limit,
+        &ImportOptions::default(),
+    )
+    .await
+}
+
+fn calls(source: &FakeSource) -> Vec<&'static str> {
+    std::mem::take(&mut *source.calls.lock().unwrap())
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_resume_must_continue_the_same_server(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let master = BookmarkKey::new("master")?;
+    let source = two_changelists();
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    import_onto_master(&ctx, &repo, &source, DEPOT, 1).await?;
+    assert_eq!(
+        ["depots", "server_info", "latest_change"],
+        calls(&source)[..3]
+    );
+    let head = bookmark_target(&ctx, &repo, &master).await?;
+    let head_changeset = head.unwrap().load(&ctx, repo.repo_blobstore()).await?;
+    assert_eq!(
+        Some(COMMIT_SERVER_ID),
+        p4_transform::recorded_server_id(&head_changeset)
+    );
+
+    let other_server = two_changelists().with_server(Some(REPLICA_ID), Some("other-commit"));
+    let error = import_onto_master(&ctx, &repo, &other_server, DEPOT, 1)
+        .await
+        .unwrap_err();
+    let expected = ResumeMismatch::OtherServer {
+        bookmark: "master".to_owned(),
+        recorded: COMMIT_SERVER_ID.to_owned(),
+        current: "other-commit".to_owned(),
+    };
+    assert_eq!(Some(&expected), error.downcast_ref(), "{error:?}");
+    assert_eq!(
+        "master was imported from Perforce server commit-1, not other-commit",
+        error.root_cause().to_string()
+    );
+    assert_eq!(vec!["depots", "server_info"], calls(&other_server));
+    assert_eq!(head, bookmark_target(&ctx, &repo, &master).await?);
+    assert_eq!(None, mapped(&ctx, &repo, 9).await?);
+
+    // The depot is the repo config's, so changing it is not a mismatch.
+    let batch = import_onto_master(&ctx, &repo, &source, "//other/", 1).await?;
+    assert_eq!(9, batch.changelists[0].change);
+    assert_eq!(3, batch.changelists[0].other_depot_files);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_resume_via_another_replica_of_the_same_commit_server(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let three_changelists = || {
+        two_changelists().with_changelist(11, &[("//test1/a.txt", 3, Action::Edit, Some(b"3\n"))])
+    };
+    import_onto_master(&ctx, &repo, &three_changelists(), DEPOT, 1).await?;
+
+    // Reading from the commit server itself, then from another standby: the same history.
+    for (server_id, commit_server_id, change) in [
+        (COMMIT_SERVER_ID, None, 9),
+        ("standby-2", Some(COMMIT_SERVER_ID), 11),
+    ] {
+        let source = three_changelists().with_server(Some(server_id), commit_server_id);
+        let batch = import_onto_master(&ctx, &repo, &source, DEPOT, 1).await?;
+        assert_eq!(change, batch.changelists[0].change, "via {server_id}");
+    }
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_standalone_server_records_its_server_id(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let master = BookmarkKey::new("master")?;
+    let source = two_changelists().with_server(Some("standalone-1"), None);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    import_onto_master(&ctx, &repo, &source, DEPOT, 1).await?;
+    let head = bookmark_target(&ctx, &repo, &master).await?;
+    let head_changeset = head.unwrap().load(&ctx, repo.repo_blobstore()).await?;
+    assert_eq!(
+        Some("standalone-1"),
+        p4_transform::recorded_server_id(&head_changeset)
+    );
+
+    let other_server = two_changelists().with_server(Some("standalone-2"), None);
+    let error = import_onto_master(&ctx, &repo, &other_server, DEPOT, 1)
+        .await
+        .unwrap_err();
+    let expected = ResumeMismatch::OtherServer {
+        bookmark: "master".to_owned(),
+        recorded: "standalone-1".to_owned(),
+        current: "standalone-2".to_owned(),
+    };
+    assert_eq!(Some(&expected), error.downcast_ref(), "{error:?}");
+    assert_eq!(head, bookmark_target(&ctx, &repo, &master).await?);
+
+    let batch = import_onto_master(&ctx, &repo, &source, DEPOT, 1).await?;
+    assert_eq!(9, batch.changelists[0].change);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_server_without_a_server_id_is_refused(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let master = BookmarkKey::new("master")?;
+    let source = two_changelists().with_server(None, None);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+
+    let error = import_onto_master(&ctx, &repo, &source, DEPOT, 1)
+        .await
+        .unwrap_err();
+
+    let expected = NoServerId {
+        address: FAKE_ADDRESS.to_owned(),
+    };
+    assert_eq!(Some(&expected), error.downcast_ref(), "{error:?}");
+    assert_eq!(Some(Stage::Prepare), failed_stage(&error));
+    assert_eq!(vec!["depots", "server_info"], calls(&source));
+    assert_eq!(None, bookmark_target(&ctx, &repo, &master).await?);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_head_without_a_server_id_is_refused(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let master = BookmarkKey::new("master")?;
+    let source = two_changelists();
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    import_onto_master(&ctx, &repo, &source, DEPOT, 1).await?;
+    let head = bookmark_target(&ctx, &repo, &master).await?.unwrap();
+    let mut unrecorded = head.load(&ctx, repo.repo_blobstore()).await?.into_mut();
+    unrecorded.hg_extra.remove(p4_transform::SERVER_ID_EXTRA);
+    let unrecorded = unrecorded.freeze()?;
+    let unrecorded_id = unrecorded.get_changeset_id();
+    save_and_derive_batch(&ctx, &repo, vec![unrecorded], &[]).await?;
+    let mut txn = repo.bookmarks().create_transaction(ctx.clone());
+    txn.update(&master, unrecorded_id, head, IMPORT_REASON)?;
+    assert!(txn.commit().await?.is_some());
+    calls(&source);
+
+    let error = import_onto_master(&ctx, &repo, &source, DEPOT, 1)
+        .await
+        .unwrap_err();
+
+    let expected = ResumeMismatch::NoServerRecorded {
+        bookmark: "master".to_owned(),
+    };
+    assert_eq!(Some(&expected), error.downcast_ref(), "{error:?}");
+    assert_eq!(vec!["depots", "server_info"], calls(&source));
+    assert_eq!(None, mapped(&ctx, &repo, 9).await?);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_first_import_needs_a_repo_without_mappings(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let source = two_changelists();
+    import_onto_master(&ctx, &repo, &source, DEPOT, 1).await?;
+    calls(&source);
+    let main = BookmarkKey::new("main")?;
+
+    let error = import_next(
+        &ctx,
+        &repo,
+        &source,
+        DEPOT,
+        &main,
+        5,
+        &ImportOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    let expected = MappedWithoutBookmark {
+        bookmark: "main".to_owned(),
+        max_change: 7,
+    };
+    assert_eq!(Some(&expected), error.downcast_ref(), "{error:?}");
+    assert_eq!(
+        "the repo has p4 mappings up to changelist 7 but no main: refusing a first import",
+        error.root_cause().to_string()
+    );
+    assert_eq!(vec!["depots", "server_info"], calls(&source));
+    assert_eq!(None, bookmark_target(&ctx, &repo, &main).await?);
+    assert_eq!(None, mapped(&ctx, &repo, 9).await?);
+    Ok(())
+}
+
+/// `two_changelists`, then 11 branching `count` files from `a.txt`.
+fn branches_of_a(count: usize) -> FakeSource {
+    let targets: Vec<&'static str> = (0..count)
+        .map(|i| &*format!("//test1/copy{i}.txt").leak())
+        .collect();
+    let files: Vec<FileSpec> = targets
+        .iter()
+        .map(|&target| (target, 1, Action::Branch, Some(&b"one\n"[..])))
+        .collect();
+    targets.iter().fold(
+        two_changelists().with_changelist(11, &files),
+        |source, target| source.with_branch(target, "//test1/a.txt"),
+    )
+}
+
+#[mononoke::fbinit_test]
+async fn test_files_are_fetched_at_most_file_concurrency_at_once(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let build = async |source: &FakeSource, file_concurrency| -> Result<Vec<_>> {
+        // One changelist at a time: the bound is per changelist.
+        let options = ImportOptions {
+            file_concurrency,
+            changelist_lookahead: 1,
+            ..Default::default()
+        };
+        let built =
+            build_changesets(&ctx, &repo, source, DEPOT, None, &[7, 9, 11], &options).await?;
+        Ok(built.iter().map(|b| b.changeset.clone()).collect())
+    };
+    let (sequential, concurrent) = (branches_of_a(10), branches_of_a(10));
+
+    let one_at_a_time = build(&sequential, 1).await?;
+    let three_at_a_time = build(&concurrent, 3).await?;
+
+    assert_eq!((1, 1), (sequential.prints.max(), sequential.filelogs.max()));
+    // One batched `integrations` call per changelist.
+    assert_eq!((3, 1), (concurrent.prints.max(), concurrent.filelogs.max()));
+    assert_eq!(one_at_a_time, three_at_a_time);
+    assert_eq!(10, three_at_a_time[2].file_changes().count());
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_zero_file_concurrency_still_builds(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let source = FakeSource::default()
+        .with_changelist(3, &[])
+        .with_changelist(5, &[("//test1/a.txt", 1, Action::Add, Some(b"one\n"))]);
+    let options = ImportOptions {
+        file_concurrency: 0,
+        ..Default::default()
+    };
+
+    let built = build_changesets(&ctx, &repo, &source, DEPOT, None, &[3, 5], &options).await?;
+
+    let changed: Vec<_> = built
+        .iter()
+        .map(|b| b.changeset.file_changes().count())
+        .collect();
+    assert_eq!(vec![0, 1], changed);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_changelists_are_fetched_ahead_at_most_changelist_lookahead_at_once(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let build = async |source: &FakeSource, changelist_lookahead| -> Result<Vec<_>> {
+        let options = ImportOptions {
+            changelist_lookahead,
+            ..Default::default()
+        };
+        let built =
+            build_changesets(&ctx, &repo, source, DEPOT, None, &[7, 9, 11], &options).await?;
+        Ok(built.iter().map(|b| b.changeset.clone()).collect())
+    };
+    let (sequential, ahead) = (branches_of_a(4), branches_of_a(4));
+
+    let one_at_a_time = build(&sequential, 1).await?;
+    let two_at_a_time = build(&ahead, 2).await?;
+
+    assert_eq!(1, sequential.describes.max());
+    assert_eq!(2, ahead.describes.max());
+    assert_eq!(one_at_a_time, two_at_a_time);
+    let parents: Vec<_> = two_at_a_time
+        .iter()
+        .map(|c| c.parents().collect::<Vec<_>>())
+        .collect();
+    let ids: Vec<_> = two_at_a_time.iter().map(|c| c.get_changeset_id()).collect();
+    assert_eq!(vec![vec![], vec![ids[0]], vec![ids[1]]], parents);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_rule_unchanged_revision_keeps_its_file_change(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let source = FakeSource::default()
+        .with_changelist(7, &[("//test1/a.txt", 1, Action::Add, Some(b"same\n"))])
+        .with_changelist(9, &[("//test1/a.txt", 2, Action::Edit, Some(b"same\n"))]);
+
+    let built = build_changesets(
+        &ctx,
+        &repo,
+        &source,
+        DEPOT,
+        None,
+        &[7, 9],
+        &ImportOptions::default(),
+    )
+    .await?;
+
+    let unchanged = files(&ctx, &repo, &built[1].changeset).await?;
+    assert_eq!(
+        vec![(
+            "a.txt".to_owned(),
+            Some(Bytes::from_static(b"same\n")),
+            None
+        )],
+        unchanged
+    );
+    Ok(())
+}
+
+/// The p4_sync job drops a batch wherever it is when its shard is stopped. Dropped after each
+/// of its awaits in turn, a batch has moved the bookmark and mapping fully or not at all, and
+/// the next import ends in the same state as an uninterrupted one.
+#[mononoke::fbinit_test]
+async fn test_a_batch_dropped_at_any_point_is_finished_by_the_next_import(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let master = BookmarkKey::new("master")?;
+    let source = two_changelists();
+    let options = ImportOptions::default();
+    let expected: Vec<_> = {
+        let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+        let batch = import_next(&ctx, &repo, &source, DEPOT, &master, 10, &options).await?;
+        batch
+            .changelists
+            .iter()
+            .map(|i| (i.change, i.cs_id))
+            .collect()
+    };
+    assert_eq!(2, expected.len());
+
+    let mut dropped = 0;
+    let mut saved_not_committed = 0;
+    for polls in 1..=100 {
+        let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+        let mut batch = Box::pin(import_next(
+            &ctx, &repo, &source, DEPOT, &master, 10, &options,
+        ));
+        let mut finished = false;
+        for _ in 0..polls {
+            if futures::poll!(batch.as_mut()).is_ready() {
+                finished = true;
+                break;
+            }
+            // Lets work the batch waits on elsewhere (SQLite, blobstore) make progress.
+            yield_once().await;
+        }
+        drop(batch);
+        if finished {
+            break;
+        }
+        dropped += 1;
+
+        let target = bookmark_target(&ctx, &repo, &master).await?;
+        let first = mapped(&ctx, &repo, expected[0].0).await?;
+        let second = mapped(&ctx, &repo, expected[1].0).await?;
+        let state = (target, first, second);
+        let committed = (
+            Some(expected[1].1),
+            Some(expected[0].1),
+            Some(expected[1].1),
+        );
+        assert!(
+            state == (None, None, None) || state == committed,
+            "after {polls} polls: {state:?}"
+        );
+        if target.is_none() && repo.commit_graph().exists(&ctx, expected[1].1).await? {
+            saved_not_committed += 1;
+        }
+        import_next(&ctx, &repo, &source, DEPOT, &master, 10, &options).await?;
+        assert_eq!(
+            Some(expected[1].1),
+            bookmark_target(&ctx, &repo, &master).await?
+        );
+        for &(change, cs_id) in &expected {
+            assert_eq!(
+                Some(cs_id),
+                mapped(&ctx, &repo, change).await?,
+                "after {polls} polls"
+            );
+        }
+    }
+    // Including after saving the changesets, before the transaction.
+    assert!(
+        dropped > 1 && saved_not_committed > 0,
+        "{dropped}, {saved_not_committed}"
+    );
+    Ok(())
+}
+
+async fn yield_once() {
+    let mut yielded = false;
+    futures::future::poll_fn(|cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
+}

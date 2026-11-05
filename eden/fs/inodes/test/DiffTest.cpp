@@ -215,6 +215,22 @@ ScmStatus DiffTest::resetCommitAndDiff(
   return EXPECT_FUTURE_RESULT(df);
 }
 
+TEST(DiffTest, diffMarksVisitedInodesReferenced) {
+  DiffTest test;
+  auto& mount = test.getMount();
+  mount.loadAllInodes();
+  auto dir = mount.getTreeInode("src");
+  auto file = mount.getFileInode("toplevel.txt");
+  auto loadedAt = dir->getLastGcRefTime();
+  EXPECT_EQ(loadedAt, file->getLastGcRefTime());
+
+  mount.getClock().advance(1h);
+  test.diff();
+
+  EXPECT_LT(loadedAt, dir->getLastGcRefTime());
+  EXPECT_LT(loadedAt, file->getLastGcRefTime());
+}
+
 class DiffTestParam : public ::testing::Test {
  protected:
   DiffTest createTest() {
@@ -668,6 +684,32 @@ void testResetReplaceFileWithDir(bool loadInodes) {
 TEST_F(DiffTestParam, resetReplaceFileWithDir) {
   testResetReplaceFileWithDir(true);
   testResetReplaceFileWithDir(false);
+}
+
+void testResetReplaceFileWithDirUnderMaterializedParent(bool loadInodes) {
+  SCOPED_TRACE(folly::to<string>("loadInodes=", loadInodes));
+
+  DiffTest t{};
+  t.getMount().overwriteFile("src/1.txt", "This is src/1.txt, modified.\n");
+  auto b2 = t.getBuilder().clone();
+  b2.removeFile("src/a/b/3.txt");
+  b2.removeFile("src/a/b/c/4.txt");
+  b2.setFile("src/a", "a is now a file");
+
+  auto result = t.resetCommitAndDiff(b2, loadInodes);
+  EXPECT_THAT(*result.errors(), UnorderedElementsAre());
+  EXPECT_THAT(
+      *result.entries(),
+      UnorderedElementsAre(
+          std::make_pair("src/1.txt", ScmFileStatus::MODIFIED),
+          std::make_pair("src/a/b/3.txt", ScmFileStatus::ADDED),
+          std::make_pair("src/a/b/c/4.txt", ScmFileStatus::ADDED),
+          std::make_pair("src/a", ScmFileStatus::REMOVED)));
+}
+
+TEST_F(DiffTestParam, resetReplaceFileWithDirUnderMaterializedParent) {
+  testResetReplaceFileWithDirUnderMaterializedParent(true);
+  testResetReplaceFileWithDirUnderMaterializedParent(false);
 }
 
 // Test with a .gitignore file in the top-level directory

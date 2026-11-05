@@ -36,6 +36,7 @@ from . import (
     revlog,
     scmutil,
     util,
+    wcoverlay,
 )
 from .i18n import _
 from .node import (
@@ -1567,7 +1568,15 @@ class committablectx(basectx):
 
     @propertycache
     def _flagfunc(self):
-        func = self._repo.dirstate.flagfunc(self._buildflagfunc)
+        repo = self._repo
+        dirstateflags = repo.dirstate.flagfunc(self._buildflagfunc)
+
+        def func(path, orig=dirstateflags):
+            overlaid = wcoverlay.lookup(repo, path)
+            if overlaid is not None:
+                return overlaid[1]
+            return orig(path)
+
         if git.isgitformat(self._repo):
             # change submodule flags to 'm'
             submodules = git.parsesubmodules(self)
@@ -1653,17 +1662,21 @@ class committablectx(basectx):
         ui.note(_("committing files:\n"))
 
         if not isgit:
-            # Prefetch rename data, since _filecommit will look for it.
-            # (git does not need this step)
             if hasattr(repo.fileslog, "metadatastore"):
                 keys = []
                 for f in added:
                     fctx = self[f]
                     if fctx.filenode() is not None:
                         keys.append((fctx.path(), fctx.filenode()))
+                    else:
+                        keys.extend(
+                            (f, node)
+                            for node in {m1.get(f), m2.get(f)}
+                            if node is not None
+                        )
                 if p2.node() == nullid:
                     # Not merging - only fetch direct file history so we avoid per-file
-                    # fetches for `flog.parents(node)` in _filecommit.
+                    # fetches for `flog.parents(node)` and `flog.cmp()` in _filecommit.
                     length = 1
                 else:
                     # If we are merging, _filecommit has some logic with flog history, so
@@ -1833,7 +1846,7 @@ class committablectx(basectx):
 
         with self._repo.dirstate.parentchange():
             for f in self.modified() + self.added():
-                self._repo.dirstate.normal(f)
+                wcoverlay.marknormal(self._repo, f)
             for f in self.removed():
                 self._repo.dirstate.delete(f)
             self._repo.dirstate.setparents(node)
@@ -1925,9 +1938,12 @@ class workingctx(committablectx):
                 scmutil.checkportable(ui, os.path.join(prefix, f))
                 try:
                     st = lstat(f)
-                except OSError:
+                except OSError as err:
                     if not quiet:
-                        ui.warn(_("%s does not exist!\n") % uipath(f))
+                        if isinstance(err, FileNotFoundError):
+                            ui.warn(_("%s does not exist!\n") % uipath(f))
+                        else:
+                            ui.warn(_("%s: %s\n") % (uipath(f), err))
                     rejected.append(f)
                     continue
                 if not (
@@ -2256,6 +2272,9 @@ class workingfilectx(committablefilectx):
         return self._filenode
 
     def data(self):
+        overlaid = wcoverlay.lookup(self._repo, self._path)
+        if overlaid is not None:
+            return overlaid[0]
         try:
             return self._repo.wread(self._path)
         except IOError as e:
@@ -2273,6 +2292,9 @@ class workingfilectx(committablefilectx):
         return rp, self._changectx._parents[0]._manifest.get(rp, nullid)
 
     def size(self):
+        overlaid = wcoverlay.lookup(self._repo, self._path)
+        if overlaid is not None:
+            return len(overlaid[0])
         return self._repo.wvfs.lstat(self._path).st_size
 
     def date(self):
@@ -2869,6 +2891,12 @@ def memfilefrompatch(patchstore):
     return getfilectx
 
 
+def _gitfilenode(fctx):
+    """Return the Git object ID for a file or submodule."""
+    fnode = git.submodule_node_from_fctx(fctx)
+    return fnode if fnode is not None else git.hashobj(b"blob", fctx.data())
+
+
 class memctx(committablectx):
     """Use memctx to perform in-memory commits via localrepo.commitctx().
 
@@ -3072,8 +3100,9 @@ class memctx(committablectx):
         man = pctx.manifest().copy()
 
         for f in self._status.modified:
+            fctx = self[f]
             if git.isgitformat(self._repo):
-                man[f] = git.hashobj(b"blob", self[f].data())
+                filenode = _gitfilenode(fctx)
             else:
                 p1node = nullid
                 p2node = nullid
@@ -3082,13 +3111,16 @@ class memctx(committablectx):
                     p1node = p[0].filenode()
                     if len(p) > 1:
                         p2node = p[1].filenode()
-                man[f] = revlog.hash(self[f].data(), p1node, p2node)
+                filenode = revlog.hash(fctx.data(), p1node, p2node)
+            man.set(f, filenode, fctx.flags())
 
         for f in self._status.added:
+            fctx = self[f]
             if git.isgitformat(self._repo):
-                man[f] = git.hashobj(b"blob", self[f].data())
+                filenode = _gitfilenode(fctx)
             else:
-                man[f] = revlog.hash(self[f].data(), nullid, nullid)
+                filenode = revlog.hash(fctx.data(), nullid, nullid)
+            man.set(f, filenode, fctx.flags())
 
         for f in self._status.removed:
             if f in man:

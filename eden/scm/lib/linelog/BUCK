@@ -19,14 +19,6 @@ sl_rust_library(
                     },
                 },
             },
-            "lib": {"name": "linelog"},
-            "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
-                "license": "MIT",
-                "name": "sapling-linelog",
-                "repository": "https://github.com/facebook/sapling",
-            },
         },
     },
     crate_root = "src/lib.rs",
@@ -39,5 +31,6 @@ sl_rust_library(
         "fbsource//third-party/rust:bitflags",
         "fbsource//third-party/rust:im",
         "fbsource//third-party/rust:smallvec",
+        "//eden/scm/lib/util/small_set:small_set",
     ],
 )

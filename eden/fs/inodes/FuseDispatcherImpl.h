@@ -116,7 +116,10 @@ class FuseDispatcherImpl : public FuseDispatcher {
       uint64_t offset,
       uint64_t length,
       const ObjectFetchContextPtr& context) override;
-  ImmediateFuture<folly::Unit> fsync(InodeNumber ino, bool datasync) override;
+  ImmediateFuture<folly::Unit> fsync(
+      InodeNumber ino,
+      bool datasync,
+      const ObjectFetchContextPtr& context) override;
   ImmediateFuture<folly::Unit> fsyncdir(InodeNumber ino, bool datasync)
       override;
 
@@ -131,7 +134,9 @@ class FuseDispatcherImpl : public FuseDispatcher {
       InodeNumber ino,
       folly::StringPiece name,
       const ObjectFetchContextPtr& context) override;
-  ImmediateFuture<std::vector<std::string>> listxattr(InodeNumber ino) override;
+  ImmediateFuture<std::vector<std::string>> listxattr(
+      InodeNumber ino,
+      const ObjectFetchContextPtr& context) override;
 
  private:
   ImmediateFuture<folly::Unit> renameImpl(
@@ -171,6 +176,15 @@ class FuseDispatcherImpl : public FuseDispatcher {
    * negative-entry TTL, which the kernel caches as a negative dentry.
    */
   fuse_entry_out negativeLookupEntry() const;
+
+  /**
+   * The reply for every lookup that resolves to a missing name. Runs the
+   * FuseDispatcherImpl::negativeLookup fault checkpoint, keyed by `name`,
+   * after ENOENT is decided and before the kernel caches the negative entry,
+   * then returns negativeLookupEntry().
+   */
+  ImmediateFuture<fuse_entry_out> negativeLookupReply(
+      PathComponentPiece name) const;
 
   // The EdenMount associated with this dispatcher.
   EdenMount* const mount_;

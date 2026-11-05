@@ -19,6 +19,7 @@ pub(crate) const DEFAULT_MIN_ROW_HEIGHT: usize = 2;
 pub struct OutputRendererOptions {
     pub min_row_height: usize,
     pub stagger_consecutive_disconnected_nodes: bool,
+    pub graph_row_shape_style: crate::pipeline::types::GraphRowShapeStyle,
 }
 
 /// Common stateful string line output utilities shared by ASCII and box-drawing
@@ -47,9 +48,10 @@ impl OutputRendererState {
         out: &mut String,
         mut line: String,
         message: Option<&str>,
+        text_gap: usize,
     ) {
         if let Some(message) = message {
-            line.push(' ');
+            line.extend(std::iter::repeat_n(' ', text_gap));
             line.push_str(message);
         }
         self.push_line(out, &line);
@@ -60,12 +62,14 @@ impl OutputRendererState {
         out: &mut String,
         base_pad_line: &str,
         message_lines: impl Iterator<Item = &'a str>,
+        text_gap: usize,
     ) -> bool {
         let mut emitted = false;
         for message in message_lines {
-            let mut pad_line = String::with_capacity(base_pad_line.len() + message.len() + 1);
+            let mut pad_line =
+                String::with_capacity(base_pad_line.len() + message.len() + text_gap);
             pad_line.push_str(base_pad_line);
-            pad_line.push(' ');
+            pad_line.extend(std::iter::repeat_n(' ', text_gap));
             pad_line.push_str(message);
             self.push_line(out, &pad_line);
             emitted = true;
@@ -90,6 +94,9 @@ impl OutputRendererState {
     }
 }
 
+/// Legacy text-renderer builder.
+/// New options since renderdag 0.2 might be ignored.
+/// Use [`crate::pipeline::GraphTextRenderer::configure`] for all options.
 pub struct OutputRendererBuilder<N, R>
 where
     R: Renderer<N, Output = GraphRow<N>> + Sized,
@@ -103,6 +110,7 @@ impl Default for OutputRendererOptions {
         Self {
             min_row_height: DEFAULT_MIN_ROW_HEIGHT,
             stagger_consecutive_disconnected_nodes: false,
+            graph_row_shape_style: Default::default(),
         }
     }
 }

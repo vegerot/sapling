@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Result;
 use async_runtime::block_on;
 use configmodel::Config;
 use copytrace::ContentSimilarityRenameFinder;
@@ -25,12 +26,12 @@ use cpython_ext::convert::ImplInto;
 use cpython_ext::convert::Serde;
 use dag::DagAlgorithm;
 use dag::Vertex;
+use manifest_tree::TreeResolver;
 use pypathmatcher::extract_matcher;
 use storemodel::FileStore;
 use storemodel::ReadRootTreeIds;
 use storemodel::SerializationFormat;
 use storemodel::TreeStore;
-use storemodel::types::RepoPathBuf;
 
 pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
     let name = [package, "copytrace"].join(".");
@@ -65,12 +66,14 @@ py_class!(pub class dagcopytrace |py| {
         _cls,
         root_tree_reader: ImplInto<Arc<dyn ReadRootTreeIds + Send + Sync>>,
         tree_store: ImplInto<Arc<dyn TreeStore>>,
+        tree_resolver: ImplInto<Result<Arc<dyn TreeResolver>>>,
         file_reader: ImplInto<Arc<dyn FileStore>>,
         dag: ImplInto<Arc<dyn DagAlgorithm + Send + Sync>>,
         config: ImplInto<Arc<dyn Config + Send + Sync>>,
     ) -> PyResult<Self> {
         let root_tree_reader = root_tree_reader.into();
         let tree_store = tree_store.into();
+        let tree_resolver = tree_resolver.into().map_pyerr(py)?;
         let config = config.into();
         let rename_finder: Arc<dyn RenameFinder + Send + Sync> = match tree_store.format() {
             SerializationFormat::Hg => Arc::new(
@@ -83,6 +86,7 @@ py_class!(pub class dagcopytrace |py| {
         let copytrace = DagCopyTrace::new(
             root_tree_reader,
             tree_store,
+            tree_resolver,
             rename_finder,
             dag,
             config,
@@ -106,8 +110,12 @@ py_class!(pub class dagcopytrace |py| {
             .map(|p| p.to_repo_path_buf().map_pyerr(py))
             .collect::<PyResult<Vec<_>>>()?;
         let inner = self.inner(py).clone();
-        let result = py.allow_threads(|| block_on(trace_renames(inner, src, dst, src_paths))).map_pyerr(py)?;
-        Ok(result)
+        let renames = py.allow_threads(|| block_on(copytrace::trace_renames(inner.as_ref(), src, dst, src_paths)));
+        let renames = renames
+            .into_iter()
+            .map(|(dst_path, src_path)| (dst_path.to_string(), src_path.to_string()))
+            .collect();
+        Ok(renames)
     }
 
     /// trace_rename(src: node, dst: node, src_path: str) -> Optional[dst_path]
@@ -200,22 +208,4 @@ fn content_similarity(
     let config = config.into();
     py.allow_threads(|| copytrace::content_similarity(a, b, &config, threshold))
         .map_pyerr(py)
-}
-
-async fn trace_renames(
-    dagcopytrace: Arc<DagCopyTrace>,
-    src: Vertex,
-    dst: Vertex,
-    src_paths: Vec<RepoPathBuf>,
-) -> Result<HashMap<String, String>, std::io::Error> {
-    let mut renames = HashMap::new();
-    for src_path in src_paths {
-        let dst_path = dagcopytrace
-            .trace_rename(src.clone(), dst.clone(), src_path.clone())
-            .await;
-        if let Ok(TraceResult::Renamed(dst_path)) = dst_path {
-            renames.insert(dst_path.to_string(), src_path.to_string());
-        }
-    }
-    Ok(renames)
 }

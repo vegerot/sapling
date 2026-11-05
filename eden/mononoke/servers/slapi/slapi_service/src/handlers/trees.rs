@@ -5,13 +5,14 @@
  * GNU General Public License version 2.
  */
 
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::collections::HashSet;
 use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Error;
 use async_trait::async_trait;
+use blobstore::BlobstoreIsPresent;
+use blobstore::KeyedBlobstore;
 use bytes::Bytes;
 use cloned::cloned;
 use context::PerfCounterType;
@@ -88,6 +89,7 @@ use types::RepoPathBuf;
 
 use super::HandlerInfo;
 use super::HandlerResult;
+use super::RequestBatchSize;
 use super::SaplingRemoteApiHandler;
 use super::SaplingRemoteApiMethod;
 use super::handler::SaplingRemoteApiContext;
@@ -105,10 +107,13 @@ define_stats! {
     manifests_served: timeseries(Rate, Sum),
     trees_batch_keys_requested: timeseries(Rate, Sum),
     upload_augmented_manifests_attempted: timeseries(Rate, Sum),
+    upload_augmented_manifests_batches_attempted: timeseries(Rate, Sum),
+    upload_augmented_manifests_batches_built: timeseries(Rate, Sum),
     upload_augmented_manifests_built: timeseries(Rate, Sum),
     upload_augmented_manifests_skipped_no_acl_work: timeseries(Rate, Sum),
     upload_augmented_manifests_failed: timeseries(Rate, Sum),
     upload_augmented_manifests_failed_missing_child: timeseries(Rate, Sum),
+    upload_augmented_manifests_failed_child_not_derived: timeseries(Rate, Sum),
     upload_augmented_manifests_build_ms: dynamic_histogram(
         "{}.upload_augmented_manifests_build_ms", (repo: String);
         20, 0, 10_000, Average, Count; P 50; P 90; P 99),
@@ -151,6 +156,7 @@ pub async fn trees(state: &mut State) -> Result<impl TryIntoResponse + use<>, Ht
     let repo: HgRepoContext<Repo> =
         get_repo(sctx, &rctx, &params.repo, Metric::TotalManifests).await?;
     let request = parse_wire_request::<WireTreeRequest>(state).await?;
+    state.put(RequestBatchSize(request.keys.len() as f64));
     if let Some(rd) = RequestDumper::try_borrow_mut_from(state) {
         rd.add_request(&request);
     };
@@ -506,13 +512,24 @@ async fn store_tree<R: MononokeRepo>(
     repo: HgRepoContext<R>,
     item: UploadTreeRequest,
 ) -> Result<(UploadTreeResponse, HgManifestEnvelope), Error> {
+    let (token, envelope) = verify_tree(&repo, item).await?;
+    repo.store_verified_tree(envelope.clone()).await?;
+    Ok((token, envelope))
+}
+
+/// Check a single tree against its node id, returning its token and the
+/// envelope to store, without storing anything.
+async fn verify_tree<R: MononokeRepo>(
+    repo: &HgRepoContext<R>,
+    item: UploadTreeRequest,
+) -> Result<(UploadTreeResponse, HgManifestEnvelope), Error> {
     let upload_node_id = HgNodeHash::from(item.entry.node_id);
     let contents = Bytes::from(item.entry.data);
     let p1 = item.entry.parents.p1().cloned().map(HgNodeHash::from);
     let p2 = item.entry.parents.p2().cloned().map(HgNodeHash::from);
     let computed_node_id = item.entry.computed_node_id.map(HgNodeHash::from);
     let envelope = repo
-        .store_tree(upload_node_id, p1, p2, contents, computed_node_id)
+        .verify_tree(upload_node_id, p1, p2, contents, computed_node_id)
         .await?;
     Ok((
         UploadTreeResponse {
@@ -522,15 +539,62 @@ async fn store_tree<R: MononokeRepo>(
     ))
 }
 
-/// A batch the client built wrong: a parent uploaded before a child it
-/// contains. Counted apart from genuine server failures.
-fn is_client_fault(err: &Error) -> bool {
-    err.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<UploadTreeBuildError>(),
-            Some(UploadTreeBuildError::MissingChild { .. })
-        )
-    })
+/// Why a batch did not build, as counted in ODS and logged as `failure_kind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildFailureKind {
+    /// The client's fault: a child the batch names is neither in it nor
+    /// stored, or the batch could not be ordered.
+    MissingChild,
+    /// The child tree is stored, typically by a concurrent upload of the same
+    /// commit whose changeset has not arrived yet, but its augmented manifest
+    /// is not derived. Expected, and not the client's fault.
+    ChildNotDerived,
+    Server,
+}
+
+impl BuildFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingChild => "missing_child",
+            Self::ChildNotDerived => "child_not_derived",
+            Self::Server => "server",
+        }
+    }
+}
+
+fn missing_child(err: &Error) -> Option<&UploadTreeBuildError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<UploadTreeBuildError>())
+}
+
+/// Only a complete batch can tell the client's mistake from our own, and only
+/// the store can tell a child that was never sent from one that is merely not
+/// derived yet.
+async fn classify_build_failure<R: MononokeRepo>(
+    repo: &HgRepoContext<R>,
+    err: &Error,
+    batch: &HashSet<HgNodeHash>,
+    complete_batch: bool,
+) -> BuildFailureKind {
+    let Some(UploadTreeBuildError::MissingChild { child, .. }) = missing_child(err) else {
+        return BuildFailureKind::Server;
+    };
+    if !complete_batch {
+        return BuildFailureKind::Server;
+    }
+    if batch.contains(child) {
+        return BuildFailureKind::MissingChild;
+    }
+    let key = HgManifestId::new(*child).blobstore_key();
+    match repo
+        .repo()
+        .repo_blobstore()
+        .is_present(repo.ctx(), &key)
+        .await
+    {
+        Ok(BlobstoreIsPresent::Present) => BuildFailureKind::ChildNotDerived,
+        _ => BuildFailureKind::MissingChild,
+    }
 }
 
 /// Bump the counters for one batch of augmented-manifest builds.
@@ -546,51 +610,72 @@ fn record_augmented_manifest_outcomes(built: &[UploadTreeAugmented]) {
     STATS::upload_augmented_manifests_skipped_no_acl_work.add_value(no_acl_work as i64);
 }
 
-/// Build augmented manifests for the trees one request stored.
+/// Build augmented manifests for the trees one request uploads.
 ///
-/// The trees themselves are already stored, so a failure here must not fail
-/// the upload.
+/// Runs while the trees themselves are stored, and a failure here must not
+/// fail the upload.
 async fn build_and_record_augmented_manifests<R: MononokeRepo>(
     repo: &HgRepoContext<R>,
     trees: Vec<HgManifestEnvelope>,
     batch_len: usize,
 ) {
-    // A store that failed drops its tree here, so a parent still in the batch
-    // can look like it is missing a child the client did send. Only a complete
-    // batch can tell the client's mistake from our own.
+    // A tree that failed verification is dropped here, so a parent still in
+    // the batch can look like it is missing a child the client did send. Only
+    // a complete batch can tell the client's mistake from our own.
     let complete_batch = trees.len() == batch_len;
+    let batch: HashSet<HgNodeHash> = trees.iter().map(|tree| tree.node_id()).collect();
     let repo_name = repo.repo().repo_identity().name().to_string();
     STATS::upload_augmented_manifests_attempted.add_value(trees.len() as i64);
+    STATS::upload_augmented_manifests_batches_attempted.add_value(1);
+    repo.ctx().perf_counters().add_to_counter(
+        PerfCounterType::EdenapiUploadTreesAugmentedTrees,
+        trees.len() as i64,
+    );
     STATS::upload_augmented_manifests_batch_trees
         .add_value(trees.len() as i64, (repo_name.clone(),));
-    // Runs before the response stream ends, so this is time the client waits
-    // on top of storing the trees. With the store knob on it includes writing
-    // the envelopes, which the metric name predates.
+    // Runs before the response stream ends, alongside storing the trees. With
+    // the store knob on it includes writing the envelopes, which the metric
+    // name predates.
     let started = Instant::now();
     let result = repo
         .build_and_store_augmented_manifests_for_uploaded_trees(trees)
         .await;
+    let elapsed = started.elapsed();
     STATS::upload_augmented_manifests_build_ms
-        .add_value(started.elapsed().as_millis() as i64, (repo_name.clone(),));
+        .add_value(elapsed.as_millis() as i64, (repo_name.clone(),));
+    // The per-repo histogram is sparse per task, so averaging it across tasks
+    // reads far too low; the request row carries the exact figure.
+    repo.ctx()
+        .perf_counters()
+        .add_duration_us(PerfCounterType::EdenapiUploadTreesAugmentedBuildUs, elapsed);
     match result {
         Ok(built) => {
             record_augmented_manifest_outcomes(&built);
+            STATS::upload_augmented_manifests_batches_built.add_value(1);
+            // A failure counter that never moved is never exported, and a
+            // monitor on it then reads no data rather than zero.
+            STATS::upload_augmented_manifests_failed.add_value(0);
+            STATS::upload_augmented_manifests_failed_missing_child.add_value(0);
+            STATS::upload_augmented_manifests_failed_child_not_derived.add_value(0);
             let levels = built.iter().map(|tree| tree.level + 1).max().unwrap_or(0);
             STATS::upload_augmented_manifests_batch_levels.add_value(levels as i64, (repo_name,));
         }
         Err(err) => {
-            let failure_kind = if complete_batch && is_client_fault(&err) {
-                STATS::upload_augmented_manifests_failed_missing_child.add_value(1);
-                "missing_child"
-            } else {
-                STATS::upload_augmented_manifests_failed.add_value(1);
-                "server"
-            };
+            let failure_kind = classify_build_failure(repo, &err, &batch, complete_batch).await;
+            match failure_kind {
+                BuildFailureKind::MissingChild => {
+                    STATS::upload_augmented_manifests_failed_missing_child.add_value(1)
+                }
+                BuildFailureKind::ChildNotDerived => {
+                    STATS::upload_augmented_manifests_failed_child_not_derived.add_value(1)
+                }
+                BuildFailureKind::Server => STATS::upload_augmented_manifests_failed.add_value(1),
+            }
             repo.ctx()
                 .scuba()
                 .clone()
                 .add("repo", repo.repo().repo_identity().name())
-                .add("failure_kind", failure_kind)
+                .add("failure_kind", failure_kind.as_str())
                 .log_with_msg(
                     "Failed to build augmented Hg manifests at tree upload",
                     Some(format!("{err:#}")),
@@ -626,42 +711,49 @@ impl SaplingRemoteApiHandler for UploadTreesHandler {
         );
 
         let batch_len = request.batch.len();
-        let stored = stream::iter(request.batch.into_iter().map({
-            cloned!(repo);
-            move |item| store_tree(repo.clone(), item)
-        }))
-        .buffer_unordered(MAX_CONCURRENT_UPLOAD_TREES_PER_REQUEST);
-
         if !build_augmented_manifests {
+            let stored = stream::iter(request.batch.into_iter().map({
+                cloned!(repo);
+                move |item| store_tree(repo.clone(), item)
+            }))
+            .buffer_unordered(MAX_CONCURRENT_UPLOAD_TREES_PER_REQUEST);
             return Ok(stored.map_ok(|(token, _tree)| token).boxed());
         }
 
-        // The build orders the batch by containment, so it runs once every
-        // tree has stored, after the last token has gone back.
-        let trees = Arc::new(Mutex::new(Vec::new()));
-        let tokens = stored.map_ok({
-            cloned!(trees);
-            move |(token, tree)| {
-                trees
-                    .lock()
-                    .expect("should not be poisoned, nothing panics while holding it")
-                    .push(tree);
-                token
+        // The build reads none of the batch's hg manifests, so it and its
+        // writes run while they are stored rather than after the last token.
+        let verified: Vec<_> = stream::iter(
+            request
+                .batch
+                .into_iter()
+                .map(|item| verify_tree(&repo, item)),
+        )
+        .buffered(MAX_CONCURRENT_UPLOAD_TREES_PER_REQUEST)
+        .collect()
+        .await;
+        let trees: Vec<HgManifestEnvelope> = verified
+            .iter()
+            .filter_map(|result| result.as_ref().ok().map(|(_, tree)| tree.clone()))
+            .collect();
+        let tokens = stream::iter(verified.into_iter().map({
+            cloned!(repo);
+            move |result| {
+                cloned!(repo);
+                async move {
+                    let (token, tree) = result?;
+                    repo.store_verified_tree(tree).await?;
+                    anyhow::Ok(token)
+                }
             }
-        });
-        let build = async move {
-            let trees = std::mem::take(
-                &mut *trees
-                    .lock()
-                    .expect("should not be poisoned, nothing panics while holding it"),
-            );
+        }))
+        .buffer_unordered(MAX_CONCURRENT_UPLOAD_TREES_PER_REQUEST);
+        let build = stream::once(async move {
             build_and_record_augmented_manifests(&repo, trees, batch_len).await;
-            None
-        };
+            None::<Result<UploadTreeResponse, Error>>
+        })
+        .filter_map(future::ready);
 
-        Ok(tokens
-            .chain(stream::once(build).filter_map(future::ready))
-            .boxed())
+        Ok(stream::select(tokens, build).boxed())
     }
 }
 
@@ -858,6 +950,8 @@ impl SaplingRemoteApiHandler for CheckPathPermissionHandler {
 mod tests {
     use anyhow::Result;
     use mononoke_macros::mononoke;
+    use mononoke_types::NonRootMPath;
+    use restricted_paths::DenyingRestriction;
     use restricted_paths::PermissionRequestGroup;
     use restricted_paths::RestrictedManifestId;
     use restricted_paths::RestrictedPathAccess;
@@ -941,10 +1035,20 @@ mod tests {
         denial_message: Option<&str>,
     ) -> Result<Error> {
         let permission_request_group: PermissionRequestGroup = permission_request_group.parse()?;
+        // Mirror production: path denials know their restriction root (the
+        // traversal walked through it); manifest denials may not.
+        let restriction_root = match &access {
+            RestrictedPathAccess::Path(path) => NonRootMPath::try_from(path.clone()).ok(),
+            RestrictedPathAccess::Manifest(_) => None,
+        };
         Ok(Error::new(MononokeError::RestrictedPathsAuthorizationError(
             RestrictedPathsAuthorizationError::new(
                 access,
-                permission_request_group,
+                DenyingRestriction {
+                    restriction_root,
+                    repo_region_acl: permission_request_group.clone(),
+                    permission_request_group,
+                },
                 denial_message.map(str::to_string),
             ),
         ))

@@ -14,6 +14,7 @@
 //! worktree group information without pulling in command-layer dependencies.
 
 mod backend;
+mod disk;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -33,13 +34,17 @@ use anyhow::Context;
 use anyhow::Result;
 use blake2::Blake2s256;
 use blake2::Digest;
+use configmodel::Config;
 use fs_err as fs;
+use repolock::LockError;
+use repolock::LockHandle;
 use serde::Deserialize;
 use serde::Serialize;
 use util::lock::PathLock;
 
 pub use crate::backend::ListedWorktree;
 pub use crate::backend::Worktrees;
+pub use crate::disk::check_disk_space;
 
 // --- Data Model ---
 
@@ -365,36 +370,64 @@ pub fn group_id_for_main_path(main_path: &Path) -> String {
 }
 
 fn worktree_path_lockfile_name(worktree_path: &Path) -> String {
-    // Keep the lock name under the shared store so callers can coordinate on a
-    // target path before the worktree itself exists on disk.
+    // Keep the lock under the shared store so callers can coordinate on a
+    // target path before the worktree itself exists on disk. `repolock` locks
+    // `<name>.lock`, the file older `sl` binaries lock.
     format!(
-        "worktree-op-{}.lock",
+        "worktree-op-{}",
         stable_path_id(WORKTREE_OP_LOCK_NAMESPACE, worktree_path)
     )
 }
 
-pub fn lock_worktree_path_op(shared_store_path: &Path, worktree_path: &Path) -> Result<PathLock> {
-    let registry_lock_held = REGISTRY_LOCK_DEPTH.with(|depth| depth.get() > 0);
-    if registry_lock_held {
-        anyhow::bail!("cannot acquire worktree path operation lock while holding registry lock");
-    }
-    let lock_path = shared_store_path.join(worktree_path_lockfile_name(worktree_path));
-    Ok(PathLock::exclusive(lock_path)?)
-}
-
-/// Hold the per-worktree operation lock for `worktree_path` while running `f`.
+/// Take the per-worktree operation lock for `worktree_path`.
+///
+/// Holding it makes the caller the only worktree command that may create,
+/// label, or remove the checkout at that path. Like the repository locks, a
+/// contended lock shows its holder while waiting and gives up after
+/// `ui.timeout`.
 ///
 /// Intended composition:
 /// 1. Take this lock around the long-running filesystem / EdenFS operation for
 ///    a specific worktree path.
 /// 2. Enter `with_registry_lock()` only for the short read-modify-write of
 ///    `worktrees.json`.
+pub fn lock_worktree_path_op(
+    config: &dyn Config,
+    shared_store_path: &Path,
+    worktree_path: &Path,
+) -> Result<LockHandle> {
+    let registry_lock_held = REGISTRY_LOCK_DEPTH.with(|depth| depth.get() > 0);
+    if registry_lock_held {
+        anyhow::bail!("cannot acquire worktree path operation lock while holding registry lock");
+    }
+    let name = worktree_path_lockfile_name(worktree_path);
+    repolock::lock_with_contents(config, shared_store_path, &name, "worktree").map_err(|err| {
+        match err {
+            LockError::Contended(err) => {
+                let holder = if err.contents.is_empty() {
+                    "another sl process".into()
+                } else {
+                    util::utf8::escape_non_utf8(&err.contents)
+                };
+                anyhow::anyhow!(
+                    "timed out waiting for lock on '{}' held by {holder}",
+                    worktree_path.display(),
+                )
+            }
+            err => err.into(),
+        }
+    })
+}
+
+/// Hold the per-worktree operation lock for `worktree_path` while running `f`;
+/// see [`lock_worktree_path_op`].
 pub fn with_worktree_path_op_lock<T>(
+    config: &dyn Config,
     shared_store_path: &Path,
     worktree_path: &Path,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let _lock = lock_worktree_path_op(shared_store_path, worktree_path)?;
+    let _lock = lock_worktree_path_op(config, shared_store_path, worktree_path)?;
     f()
 }
 
@@ -464,14 +497,27 @@ pub fn check_dest_not_in_repo(dest: &Path) -> Result<()> {
 // --- Registry Persistence ---
 
 pub fn load_registry(shared_store_path: &Path) -> Result<Registry> {
+    Ok(read_registry(shared_store_path)?.0)
+}
+
+/// Load the registry along with the file content it was parsed from, or `None`
+/// if the file does not exist.
+fn read_registry(shared_store_path: &Path) -> Result<(Registry, Option<String>)> {
     let path = shared_store_path.join("worktrees.json");
     match fs::read_to_string(&path) {
+        // Before registry writes were fsynced, a host crash could leave the
+        // renamed file empty. It holds no groups, and `with_registry_lock`
+        // rewrites it because its content differs from the serialized registry.
+        Ok(content) if content.is_empty() => {
+            tracing::warn!("worktree registry {} is empty", path.display());
+            Ok((Registry::new(), Some(content)))
+        }
         Ok(content) => {
             let registry: Registry = serde_json::from_str(&content)
                 .with_context(|| format!("failed to parse registry at {}", path.display()))?;
-            Ok(registry)
+            Ok((registry, Some(content)))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Registry::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Registry::new(), None)),
         Err(e) => Err(e.into()),
     }
 }
@@ -502,12 +548,22 @@ pub fn worktree_info(shared_store_path: &Path, repo_path: &Path) -> Result<Optio
 }
 
 pub fn save_registry(shared_store_path: &Path, registry: &Registry) -> Result<()> {
+    write_registry(shared_store_path, &serialize_registry(registry)?)
+}
+
+fn serialize_registry(registry: &Registry) -> Result<String> {
+    serde_json::to_string_pretty(registry).context("failed to serialize registry")
+}
+
+fn write_registry(shared_store_path: &Path, content: &str) -> Result<()> {
     let path = shared_store_path.join("worktrees.json");
-    let content = serde_json::to_string_pretty(registry).context("failed to serialize registry")?;
-    util::file::atomic_write(&path, |f| {
+    // fsync so a host crash can't leave a renamed but unflushed, empty
+    // registry, which every later worktree command would fail to parse.
+    atomicfile::atomic_write(&path, 0o644, true, |f| {
         use std::io::Write;
         f.write_all(content.as_bytes())
-    })?;
+    })
+    .with_context(|| format!("failed to write registry at {}", path.display()))?;
     Ok(())
 }
 
@@ -531,7 +587,8 @@ pub fn dissolve_group_if_empty(registry: &mut Registry, group_id: &str) {
     }
 }
 
-/// Lock the registry file, load it, run `f`, and write back the result.
+/// Lock the registry file, load it, run `f`, and write back the result if `f`
+/// changed it.
 ///
 /// This lock is intentionally coarse and should stay scoped to the
 /// `worktrees.json` read-modify-write sequence. Callers that need to serialize
@@ -545,10 +602,26 @@ pub fn with_registry_lock<T>(
     let _scope = RegistryLockScope::enter()?;
     let lock_path = shared_store_path.join("worktrees.lock");
     let _lock = PathLock::exclusive(&lock_path)?;
-    let mut registry = load_registry(shared_store_path)?;
+    let (mut registry, old_content) = read_registry(shared_store_path)?;
     let result = f(&mut registry)?;
-    save_registry(shared_store_path, &registry)?;
+    if let Some(new_content) = changed_registry_content(old_content.as_deref(), &registry)? {
+        write_registry(shared_store_path, &new_content)?;
+    }
     Ok(result)
+}
+
+/// Serialize `registry` if that changes the registry file, whose content is
+/// `old_content` (`None` if there is no file).
+fn changed_registry_content(
+    old_content: Option<&str>,
+    registry: &Registry,
+) -> Result<Option<String>> {
+    let new_content = serialize_registry(registry)?;
+    let unchanged = match old_content {
+        Some(old_content) => old_content == new_content,
+        None => registry.groups.is_empty(),
+    };
+    Ok((!unchanged).then_some(new_content))
 }
 
 // --- Reservation Persistence ---
@@ -938,19 +1011,83 @@ mod tests {
     fn test_lock_worktree_path_op_creates_lock_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = PathBuf::from("/tmp/some_worktree");
-        let _lock = lock_worktree_path_op(dir.path(), &path).unwrap();
+        let _lock =
+            lock_worktree_path_op(&BTreeMap::<String, String>::new(), dir.path(), &path).unwrap();
 
-        assert!(dir.path().join(worktree_path_lockfile_name(&path)).exists());
+        assert!(
+            dir.path()
+                .join(format!("{}.lock", worktree_path_lockfile_name(&path)))
+                .exists()
+        );
     }
 
     #[test]
     fn test_lock_worktree_path_op_different_paths_concurrent() {
         let dir = tempfile::tempdir().unwrap();
+        let config = BTreeMap::<String, String>::new();
         let path1 = PathBuf::from("/tmp/worktree1");
         let path2 = PathBuf::from("/tmp/worktree2");
 
-        let _lock1 = lock_worktree_path_op(dir.path(), &path1).unwrap();
-        let _lock2 = lock_worktree_path_op(dir.path(), &path2).unwrap();
+        let _lock1 = lock_worktree_path_op(&config, dir.path(), &path1).unwrap();
+        let _lock2 = lock_worktree_path_op(&config, dir.path(), &path2).unwrap();
+    }
+
+    #[test]
+    fn test_worktree_path_op_lock_timeout_names_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        // `ui.timeout` is unset, so a contended lock gives up right away.
+        let config = BTreeMap::<String, String>::new();
+        let path = dir.path().join("worktree");
+        let lock = lock_worktree_path_op(&config, dir.path(), &path).unwrap();
+        let err = with_worktree_path_op_lock(&config, dir.path(), &path, || -> Result<()> {
+            panic!("operation must not run while the path is locked")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("timed out waiting for lock on"), "{err}");
+        assert!(err.contains(&std::process::id().to_string()), "{err}");
+        drop(lock);
+
+        let _lock = lock_worktree_path_op(&config, dir.path(), &path).unwrap();
+    }
+
+    #[test]
+    fn test_worktree_path_op_lock_contends_with_older_binary_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = BTreeMap::<String, String>::new();
+        let path = dir.path().join("worktree");
+        // Older binaries lock the `.lock` file directly and record no holder.
+        let old = PathLock::exclusive(
+            dir.path()
+                .join(format!("{}.lock", worktree_path_lockfile_name(&path))),
+        )
+        .unwrap();
+        let err = lock_worktree_path_op(&config, dir.path(), &path)
+            .map(|_lock| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("timed out waiting for lock on") && err.contains("another sl process"),
+            "{err}"
+        );
+        drop(old);
+
+        let _lock = lock_worktree_path_op(&config, dir.path(), &path).unwrap();
+    }
+
+    #[test]
+    fn test_worktree_path_op_lock_waits_for_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = BTreeMap::from([("ui.timeout", "60"), ("devel.lock_backoff", "0.001")]);
+        let path = dir.path().join("worktree");
+        let held = lock_worktree_path_op(&config, dir.path(), &path).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+        });
+
+        let _lock = lock_worktree_path_op(&config, dir.path(), &path).unwrap();
+        releaser.join().unwrap();
     }
 
     #[test]
@@ -958,9 +1095,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = PathBuf::from("/tmp/worktree-lock-then-registry-lock");
 
-        with_worktree_path_op_lock(dir.path(), &path, || {
-            with_registry_lock(dir.path(), |_registry| Ok(()))
-        })
+        with_worktree_path_op_lock(
+            &BTreeMap::<String, String>::new(),
+            dir.path(),
+            &path,
+            || with_registry_lock(dir.path(), |_registry| Ok(())),
+        )
         .unwrap();
     }
 
@@ -970,7 +1110,8 @@ mod tests {
         let path = PathBuf::from("/tmp/registry-lock-then-worktree-lock");
 
         let err = with_registry_lock(dir.path(), |_registry| {
-            lock_worktree_path_op(dir.path(), &path).map(|_lock| ())
+            lock_worktree_path_op(&BTreeMap::<String, String>::new(), dir.path(), &path)
+                .map(|_lock| ())
         })
         .unwrap_err();
 
@@ -987,7 +1128,8 @@ mod tests {
         let path = PathBuf::from("/tmp/reservations-lock-then-worktree-lock");
 
         let err = with_reservations(dir.path(), |_registry, _reservations| {
-            lock_worktree_path_op(dir.path(), &path).map(|_lock| ())
+            lock_worktree_path_op(&BTreeMap::<String, String>::new(), dir.path(), &path)
+                .map(|_lock| ())
         })
         .unwrap_err();
 
@@ -1036,7 +1178,7 @@ mod tests {
         let name2 = worktree_path_lockfile_name(path);
         let other = worktree_path_lockfile_name(Path::new("/tmp/other_path"));
 
-        assert_eq!(name1, "worktree-op-418ede8060a3d4aa0723dc1ea9046340.lock");
+        assert_eq!(name1, "worktree-op-418ede8060a3d4aa0723dc1ea9046340");
         assert_eq!(name1, name2);
         assert_ne!(name1, other);
     }
@@ -1060,10 +1202,9 @@ mod tests {
         let name1 = worktree_path_lockfile_name(path);
         let name2 = worktree_path_lockfile_name(path);
 
-        assert_eq!(name1, "worktree-op-7cfc9b010bb34f6dfe81f449cbe366e8.lock");
+        assert_eq!(name1, "worktree-op-7cfc9b010bb34f6dfe81f449cbe366e8");
         assert_eq!(name1, name2);
         assert!(name1.starts_with("worktree-op-"));
-        assert!(name1.ends_with(".lock"));
     }
 
     #[cfg(windows)]
@@ -1074,7 +1215,7 @@ mod tests {
 
         assert_eq!(
             worktree_path_lockfile_name(unc_path),
-            "worktree-op-e35b48634bbcac02385a23320201f492.lock"
+            "worktree-op-e35b48634bbcac02385a23320201f492"
         );
         assert_ne!(
             worktree_path_lockfile_name(drive_path),
@@ -1110,6 +1251,33 @@ mod tests {
         assert!(loaded.groups.is_empty());
     }
 
+    #[test]
+    fn test_with_registry_lock_skips_unchanged_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worktrees.json");
+
+        // Without groups there is nothing to write.
+        with_registry_lock(dir.path(), |_registry| Ok(())).unwrap();
+        assert!(!path.exists());
+
+        let mut registry = Registry::new();
+        registry
+            .groups
+            .insert("grp".to_string(), Group::new(PathBuf::from("/tmp/main")));
+        save_registry(dir.path(), &registry).unwrap();
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap());
+
+        // An unchanged registry keeps the same file.
+        with_registry_lock(dir.path(), |_registry| Ok(())).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap()),
+            inode
+        );
+        assert_eq!(load_registry(dir.path()).unwrap().groups.len(), 1);
+    }
+
     // --- Other tests ---
 
     #[test]
@@ -1118,6 +1286,18 @@ mod tests {
         std::fs::write(dir.path().join("worktrees.json"), "not valid json!!!").unwrap();
         let result = load_registry(dir.path());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_empty_registry_is_read_as_empty_and_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worktrees.json");
+        std::fs::write(&path, "").unwrap();
+        assert!(load_registry(dir.path()).unwrap().groups.is_empty());
+
+        with_registry_lock(dir.path(), |_registry| Ok(())).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(serde_json::from_str::<Registry>(&content).is_ok());
     }
 
     #[test]

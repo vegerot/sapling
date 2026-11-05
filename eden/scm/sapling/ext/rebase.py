@@ -553,7 +553,7 @@ class rebaseruntime:
                 rev for rev, state in self.state.items() if state == revtodo
             }
             precheckrevs.difference_update(self.obsoletenotrebased)
-            if not ui.configbool("experimental", "evolution.allowdivergence"):
+            if not mutation.allow_divergence(ui):
                 precheckrevs.difference_update(
                     repo.revs(
                         "descendants(%ld)", self.obsoletewithoutsuccessorindestination
@@ -573,6 +573,7 @@ class rebaseruntime:
                     [repo[rev] for rev in sorted(precheckrevs)],
                     self.collapsemsg,
                 )
+            rewriteutil.rebasedestcheck(repo, self.destmap)
 
         # Keep track of the active bookmarks in order to reset them later
         self.activebookmark = self.activebookmark or repo._activebookmark
@@ -597,9 +598,7 @@ class rebaseruntime:
     def _performrebasesubset(self, tr, subset, pos, prog):
         repo, ui = self.repo, self.ui
         sortedrevs = repo.revs("sort(%ld, -topo)", subset)
-        allowdivergence = self.ui.configbool(
-            "experimental", "evolution.allowdivergence"
-        )
+        allowdivergence = mutation.allow_divergence(self.ui)
         if not allowdivergence:
             sortedrevs -= repo.revs(
                 "descendants(%ld) and not %ld",
@@ -786,25 +785,24 @@ class rebaseruntime:
             else:
                 date = self.date
 
-            removed = manifestbuilder.removed()
-            removedset = set(removed)
-            modified = manifestbuilder.modified() + list(resolved)
+            actions = manifestbuilder.pymerge_actions()
 
             def getfilectx(repo, memctx, path):
-                if path in removedset:
-                    return None
-                fctx = ctx[path]
-
                 data = resolved.get(path, None)
                 if data is not None:
                     return context.overlayfilectx(
-                        fctx,
+                        ctx[path],
                         datafunc=lambda: data,
                         copied=False,
                         ctx=memctx,
                     )
 
-                return fctx
+                action, (flags, _backup), _message = actions[path]
+                if action == "r":
+                    return None
+                # Permission-only actions retain the destination's content.
+                fctx = p1ctx[path] if action == "e" else ctx[path]
+                return context.overlayfilectx(fctx, flags=flags, ctx=memctx)
 
             merging = p2 != nullrev
             editform = cmdutil.mergeeditform(merging, "rebase")
@@ -814,7 +812,7 @@ class rebaseruntime:
                 repo,
                 parents=(repo[p1], repo[p2]),
                 text=commitmsg,
-                files=sorted(removed + modified),
+                files=sorted(actions.keys() | resolved.keys()),
                 filectxfn=getfilectx,
                 date=date,
                 extra=extra,
@@ -1559,6 +1557,14 @@ def rebase(ui, repo, templ=None, **opts):
         [rebase]
         experimental.inmemorywarning = Using experimental in-memory rebase
 
+      If the destination is based on older versions of commits that the
+      rebased commits are based on, rebase warns that their newer changes will
+      be lost (agents abort instead). Set ``warn``, ``prompt`` or ``abort`` to
+      choose the behavior; any other value disables the check::
+
+        [rebase]
+        obsolete-dest-mode = warn
+
     Returns 0 on success (also when nothing to rebase), 1 if there are
     unresolved conflicts.
 
@@ -2292,15 +2298,13 @@ def _checkobsrebase(repo, ui, rebaseobsrevs, rebaseobsskipped) -> None:
     successors in destination
     """
     # Obsolete node with successors not in dest leads to divergence
-    divergenceok = ui.configbool("experimental", "evolution.allowdivergence")
+    divergenceok = mutation.allow_divergence(ui)
     divergencebasecandidates = rebaseobsrevs - rebaseobsskipped
 
     if divergencebasecandidates and not divergenceok:
         divhashes = (str(repo[r]) for r in divergencebasecandidates)
         msg = _("this rebase will cause divergences from: %s")
-        h = _(
-            "to force the rebase please set experimental.evolution.allowdivergence=True"
-        )
+        h = _("to force the rebase please set mutation.allow-divergence=True")
         raise error.Abort(msg % (",".join(divhashes),), hint=h)
 
 

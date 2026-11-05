@@ -19,6 +19,7 @@ mod find_derivation_gaps;
 mod list_manifest;
 mod slice;
 mod verify_aug_direct;
+mod verify_aug_upload;
 mod verify_manifests;
 mod verify_stage_output;
 
@@ -29,6 +30,7 @@ use anyhow::Result;
 use bonsai_git_mapping::BonsaiGitMapping;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
+use bonsai_p4_mapping::BonsaiP4Mapping;
 use bonsai_svnrev_mapping::BonsaiSvnrevMapping;
 use bookmarks::Bookmarks;
 use clap::ArgGroup;
@@ -78,6 +80,8 @@ use self::slice::SliceArgs;
 use self::slice::slice;
 use self::verify_aug_direct::VerifyAugDirectArgs;
 use self::verify_aug_direct::verify_aug_direct;
+use self::verify_aug_upload::VerifyAugUploadArgs;
+use self::verify_aug_upload::verify_aug_upload;
 use self::verify_manifests::VerifyManifestsArgs;
 use self::verify_manifests::verify_manifests;
 use self::verify_stage_output::VerifyStageOutputArgs;
@@ -97,6 +101,9 @@ struct Repo {
     bonsai_globalrev_mapping: dyn BonsaiGlobalrevMapping,
     #[facet]
     bonsai_svnrev_mapping: dyn BonsaiSvnrevMapping,
+
+    #[facet]
+    bonsai_p4_mapping: dyn BonsaiP4Mapping,
     #[facet]
     repo_blobstore: RepoBlobstore,
     #[facet]
@@ -189,6 +196,8 @@ enum DerivedDataSubcommand {
     Slice(SliceArgs),
     /// Validate direct augmented-manifest derivation against stored data
     VerifyAugDirect(VerifyAugDirectArgs),
+    /// Compare augmented manifests stored at tree upload with canonical derivation, in memory
+    VerifyAugUpload(VerifyAugUploadArgs),
     /// Compare different manifest types to ensure they are equivalent
     VerifyManifests(VerifyManifestsArgs),
     /// Verify stage derivation output matches normal derivation output
@@ -322,6 +331,7 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
         | DerivedDataSubcommand::CountUnderived(_)
         | DerivedDataSubcommand::FindDerivationGaps(_)
         | DerivedDataSubcommand::VerifyAugDirect(_)
+        | DerivedDataSubcommand::VerifyAugUpload(_)
         | DerivedDataSubcommand::VerifyManifests(_)
         | DerivedDataSubcommand::VerifyStageOutput(_)
         | DerivedDataSubcommand::ListManifest(_)
@@ -353,6 +363,7 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
             | DerivedDataSubcommand::ListManifest(_)
             | DerivedDataSubcommand::Slice(_)
             | DerivedDataSubcommand::VerifyAugDirect(_)
+            | DerivedDataSubcommand::VerifyAugUpload(_)
             | DerivedDataSubcommand::VerifyStageOutput(_)
     );
 
@@ -382,6 +393,9 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
         }
         DerivedDataSubcommand::VerifyAugDirect(args) => {
             verify_aug_direct(&ctx, &repo, &manager, args).await?
+        }
+        DerivedDataSubcommand::VerifyAugUpload(args) => {
+            verify_aug_upload(&ctx, &repo, &manager, args).await?
         }
         DerivedDataSubcommand::VerifyManifests(args) => verify_manifests(&ctx, &repo, args).await?,
         DerivedDataSubcommand::ListManifest(args) => {

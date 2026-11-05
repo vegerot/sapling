@@ -12,7 +12,7 @@ anyhow = "1.0.104"
 async-trait = "0.1.92"
 blake3 = { version = "=1.8.6", features = ["mmap", "rayon", "traits-preview"] }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
-colored = "2.1.0"
+colored = "3.1.1"
 comfy-table = { version = "7.2.2", features = ["custom_styling"] }
 crossterm = { version = "0.29", features = ["event-stream", "serde"] }
 ctrlc = { version = "3.5.2", features = ["termination"] }
@@ -22,12 +22,13 @@ edenfs-asserted-states-client = { version = "0.1.0", path = "../../rust/edenfs-a
 edenfs-client = { version = "0.1.0", path = "../edenfs-client" }
 edenfs-error = { version = "0.1.0", path = "../edenfs-error" }
 edenfs-remove = { version = "0.1.0", path = "../edenfs-remove" }
+edenfs-telemetry = { path = "../../rust/edenfs-telemetry" }
 edenfs-utils = { version = "0.1.0", path = "../edenfs-utils" }
 fail = { version = "0.5.1", features = ["failpoints"] }
 futures = { version = "0.3.34", features = ["async-await", "compat"] }
 hdrhistogram = "7.6.0"
 hex = { version = "0.4.3", features = ["alloc"] }
-hg_util = { package = "sapling-util", version = "0.1.0", path = "../../../scm/lib/util" }
+hg_util = { package = "sapling-util", version = "0.2.0", path = "../../../scm/lib/util" }
 indicatif = { version = "0.18.6", features = ["futures", "improved_unicode", "rayon", "tokio"] }
 num-format = { version = "0.4.3", features = ["with-serde", "with-system-locale"] }
 rand = "0.10.3"
@@ -37,15 +38,15 @@ sapling-termlogger = { version = "0.1.0", path = "../../../scm/lib/io/term/logge
 sapling-thrift-types = { version = "0.1.0", path = "../../../scm/lib/thrift-types" }
 sapling-virtual-repo = { version = "0.1.0", path = "../../../scm/lib/virtual-repo" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 strum = { version = "0.28.0", features = ["derive"] }
 subprocess = "0.2.15"
 sysinfo = "0.39.6"
 tabular = "0.2.0"
 termwiz = { git = "https://github.com/wezterm/wezterm.git", rev = "05343b387085842b434d267f91b6b0ec157e4331", features = ["use_serde", "widgets"], default-features = false }
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
-tokio-util = { version = "0.7.19", features = ["full"] }
-toml = { version = "1.1.6", features = ["preserve_order"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
+tokio-util = { version = "0.7.20", features = ["full"] }
+toml = { version = "1.1.8", features = ["preserve_order"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

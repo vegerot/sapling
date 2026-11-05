@@ -67,6 +67,10 @@ enum CommitIdentityScheme {
 
   /// 32-byte hash of Mononoke's bonsai changeset, plus a 64-bit bubble
   EPHEMERAL_BONSAI = 6,
+
+  /// Commits identified by the Perforce changelist number they were imported
+  /// from (Perforce mirror repos only).
+  P4_CHANGELIST = 7,
 }
 
 /// A commit stored in an ephemeral bubble
@@ -106,6 +110,9 @@ union CommitId {
 
   /// Bonsai commit stored in an ephemeral bubble
   6: EphemeralBonsai ephemeral_bonsai;
+
+  /// Commit identified by the Perforce changelist number it was imported from.
+  7: i64 p4_changelist;
 }
 
 /// Specified a commit within a repo.
@@ -239,6 +246,10 @@ struct GitRepoStateResponse {
   1: GitRepoState state;
   /// Set only when state == IN_PROGRESS; identifies the in-flight create_repos mutation.
   2: optional string mutation_id;
+  /// Storage engine the repo was created on when its `create_repos` request
+  /// named one (`RepoCreationRequest.storage_config`); unset for the
+  /// template's engine and for rows that predate the field.
+  3: optional string storage_config;
 }
 
 struct CommitInfo {
@@ -918,6 +929,84 @@ struct RepoExistsParams {
   1: string repo_name;
 }
 
+struct StorageConfigExistsParams {
+  /// Storage engine name as it appears in the tier's storage map.
+  1: string name;
+}
+
+/// One org's own storage, as `create_org_storage_config` lands it.
+struct CreateOrgStorageConfigParams {
+  /// Repo portal org slug; the engine is named `org_<org>` and the data file
+  /// `scm/mononoke/repos/org_storage/<org>.json`. Lowercase letters, digits,
+  /// `_` and `-`; no dots.
+  1: string org;
+  /// Manifold bucket the org owns. Never one of Source Control's own.
+  2: string manifold_bucket;
+  /// XDB shard the org owns (`xdb.<name>`), empty or Mononoke-only. Never
+  /// one of Source Control's own.
+  3: string xdb_shard;
+}
+
+struct CreateOrgStorageConfigToken {
+  /// Configo mutation adding the file; unset when the file was already at
+  /// HEAD with the same content.
+  1: optional i64 mutation_id;
+  /// The file was already at HEAD with the same content; nothing was landed.
+  2: bool already_landed;
+}
+
+struct DeleteOrgStorageConfigParams {
+  1: string org;
+}
+
+struct DeleteOrgStorageConfigToken {
+  /// Configo mutation removing the file; unset when there was no file.
+  1: optional i64 mutation_id;
+  /// No file was at HEAD; nothing was landed.
+  2: bool already_absent;
+}
+
+enum OrgStorageConfigMutationState {
+  UNKNOWN = 0,
+  IN_PROGRESS = 1,
+  LANDED = 2,
+  FAILED = 3,
+  ABORTED = 4,
+}
+
+struct OrgStorageConfigPollParams {
+  1: i64 mutation_id;
+}
+
+struct OrgStorageConfigPollResponse {
+  1: OrgStorageConfigMutationState state;
+  /// Configo's error text when FAILED or ABORTED.
+  2: optional string message;
+}
+
+struct OrgStorageConfigParams {
+  1: string org;
+}
+
+/// The org -> storage engine mapping as this task has it loaded.
+struct OrgStorageConfigResponse {
+  /// `org_<org>` when the engine is in the answering task's storage map;
+  /// unset when it is not (not landed, or not yet loaded here).
+  1: optional string storage_config;
+  /// Configerator version of the tier manifest the answering task last
+  /// loaded; unset when configs do not come from configerator.
+  2: optional string manifest_version;
+}
+
+struct StorageConfigExistsResponse {
+  /// Whether the answering task has the engine loaded.
+  1: bool exists;
+  /// Configerator version of the tier manifest the answering task last
+  /// loaded, so a caller can compare it with the mutation that added the
+  /// engine. Unset when the task does not load configs from configerator.
+  2: optional string manifest_version;
+}
+
 struct RepoResolveBookmarkParams {
   /// The bookmark name to look up.
   1: string bookmark_name;
@@ -927,6 +1016,22 @@ struct RepoResolveBookmarkParams {
 
   /// Optional list of namespaces to check for the bookmark.
   3: optional list<string> namespaces;
+}
+
+struct RepoResolveP4FileRevisionParams {
+  /// The path, relative to the repo root (the depot root), spelled as Perforce
+  /// records it.
+  1: Path path;
+
+  /// The Perforce revision of the path, 1 or above.
+  2: i64 revision;
+
+  /// The bookmark whose history is searched for the revision. Defaults to
+  /// "master".
+  3: optional string bookmark;
+
+  /// Commit identity schemes to return.
+  4: set<CommitIdentityScheme> identity_schemes;
 }
 
 struct RepoResolveCommitPrefixParams {
@@ -1102,6 +1207,20 @@ struct RepoCreateCommitParamsCommitInfo {
   7: optional map<small_binary, binary_bytes> git_extra_headers;
 }
 
+/// A mutation (such as an amend or a rebase) that produced a new commit from
+/// existing commits, so clients can follow the replaced commits to it.
+struct RepoCreateCommitParamsMutationInfo {
+  /// The commits the new commit replaces.
+  1: list<CommitId> predecessors;
+
+  /// The mutation operation name (e.g., "amend", "rebase").
+  2: string op;
+
+  /// The user performing the mutation. If omitted, the service identity is
+  /// used, or the caller's user name when there is no service identity.
+  3: optional string user;
+}
+
 struct RepoCreateCommitParams {
   /// The info for the new commit.
   1: RepoCreateCommitParamsCommitInfo info;
@@ -1131,6 +1250,11 @@ struct RepoCreateCommitParams {
   // 6: deleted
 
   7: CreateCommitChecks checks;
+
+  /// Optional: the mutation that produced this commit, recorded for
+  /// Mercurial repos (other repos reject it). The mutation timestamp is the
+  /// server time.
+  8: optional RepoCreateCommitParamsMutationInfo mutation_info;
 }
 
 struct RepoCreateStackParamsCommit {
@@ -1139,6 +1263,11 @@ struct RepoCreateStackParamsCommit {
 
   /// A mapping from path to the change that is made at that path.
   3: map<string, RepoCreateCommitParamsChange> changes;
+
+  /// Optional: the mutation that produced this commit, recorded for
+  /// Mercurial repos (other repos reject it). The mutation timestamp is the
+  /// server time. All of the stack's mutations are recorded together.
+  4: optional RepoCreateCommitParamsMutationInfo mutation_info;
 }
 
 struct RepoCreateStackParams {
@@ -1412,9 +1541,8 @@ struct CommitGenerationParams {}
 
 enum CommitFingerprintVersion {
   UNKNOWN = 0,
-  /// V1: root FsnodeId blake2 hash. Universally available — every production
-  /// repo derives Fsnodes — but not the long-term recommendation. Prefer V2
-  /// where available.
+  /// Legacy request version. The server computes a V2 fingerprint and
+  /// reports V2 in the response.
   V1 = 1,
   /// V2: root ContentManifestId blake2 hash. Recommended long-term default.
   /// Requires ContentManifests derived data enabled for the repo;
@@ -1486,7 +1614,12 @@ struct CommitCompareOrderedParams {
   // to continue diffing after a previous ordered request reached
   // its limit.
   1: optional Path after_path;
-  // Limit the number of returned paths to this many.
+  // Limit the number of returned paths to this many. Paths omitted by
+  // partial responses (restricted-path denials) never consume this budget:
+  // pages are filled up to the limit with visible entries. The end of
+  // pagination is signaled by the absence of `last_path` in the response
+  // (feed it back as `after_path` to continue), even if a page holds
+  // fewer entries than the limit or is empty.
   2: i64 limit;
 }
 
@@ -1916,6 +2049,10 @@ struct CommitPathHistoryParams {
 struct CommitPathLastChangedParams {
   /// Commit identity schemes to return.
   1: set<CommitIdentityScheme> identity_schemes;
+
+  /// Perforce mirrors only: also return the Perforce revision the path has at
+  /// the commit (`CommitPathLastChange.p4_*`).
+  2: bool include_p4_revision;
 }
 
 struct CommitPathFirstChangedParams {
@@ -1936,6 +2073,10 @@ struct CommitMultiplePathLastChangedParams {
 
   /// Commit identity schemes to return.
   2: set<CommitIdentityScheme> identity_schemes;
+
+  /// Perforce mirrors only: also return the Perforce revision each path has at
+  /// the commit (`CommitPathLastChange.p4_*`).
+  3: bool include_p4_revision;
 }
 
 struct CommitRestrictedPathsAccessParams {
@@ -1957,7 +2098,93 @@ struct CommitFindRestrictedPathsParams {
   3: optional bool return_only_accessible;
 }
 
-struct CommitRestrictedPathsChangesParams {}
+const i64 COMMIT_RESTRICTED_PATHS_CHANGES_MAX_LIMIT = 10000;
+
+struct CommitRestrictedPathsChangesOrderedParams {
+  /// Continue strictly after this path in component-wise path order.
+  1: optional Path after_path;
+  /// Maximum changed paths returned, including inaccessible paths.
+  /// Must be between 1 and COMMIT_RESTRICTED_PATHS_CHANGES_MAX_LIMIT.
+  2: i64 limit;
+}
+
+enum CommitRestrictedPathsChangesFormat {
+  /// Page-local policy definitions with aggregate and sparse side references.
+  COMPACT = 1,
+}
+
+/// A restriction policy and its checked access in this response's caller context.
+/// Unlike CommitFindRestrictedPathsStreamItem, access is always checked and
+/// the request group is a full typed identity. Rollout controls remain internal.
+@rust.Ord
+struct CheckedPathRestrictionPolicy {
+  1: Path path;
+  2: list<PathAcl> acls;
+  /// Full typed identity, including the ACL fallback when no group is configured.
+  3: string permission_request_group_identity;
+  5: bool has_access;
+}
+
+/// Effective policy at a path, even when no file exists there.
+struct PathPolicyInfoCompact {
+  /// Indices into the enclosing response's checked policies table.
+  1: list<i32> restrictions;
+}
+
+struct PathRestrictionCopySourceInfoCompact {
+  /// Actual source revision, represented as a Bonsai commit ID.
+  1: CommitId commit_id;
+  2: Path path;
+  3: PathPolicyInfoCompact info;
+}
+
+/// A declared subtree-copy edge shared by all paths under its destination.
+@rust.Ord
+struct SubtreeSource {
+  1: CommitId commit_id;
+  2: Path source_prefix;
+  3: Path destination_prefix;
+}
+
+struct SubtreeSourcePolicyInfoCompact {
+  1: i32 subtree_source_index;
+  2: PathPolicyInfoCompact info;
+}
+
+struct PathPermissionChangeInfoCompact {
+  1: PathPolicyInfoCompact base;
+  2: PathPolicyInfoCompact target;
+  /// Per-file copy sources whose policy differs from the target path policy.
+  3: list<PathRestrictionCopySourceInfoCompact> copy_sources;
+  /// Present only when the selected subtree source policy differs from target.
+  4: optional SubtreeSourcePolicyInfoCompact subtree_source;
+}
+
+struct CommitRestrictedPathsChangesCompact {
+  /// Response-local definitions, deduplicated by full policy and checked access.
+  /// Every row is referenced; table order has no meaning outside this response.
+  1: list<CheckedPathRestrictionPolicy> policies;
+  /// Actual-content restriction union. Index lists reference policies, not access.
+  2: map<Path, list<i32>> restriction_roots;
+  /// Sparse effective-policy differences for returned changed paths only.
+  /// Missing entries mean aggregate metadata suffices, not that paths are public.
+  3: map<Path, PathPermissionChangeInfoCompact> permission_changes;
+  /// Response-local source-prefix mappings. Reparent a changed path by removing
+  /// destination_prefix component-wise and adding source_prefix.
+  4: list<SubtreeSource> subtree_sources;
+}
+
+struct CommitRestrictedPathsChangesParams {
+  /// Available only with COMPACT and ordered_params. The selected base is in
+  /// the same repo; otherwise the comparison uses the first parent or an empty
+  /// tree for a root. COMPACT also covers the subtree-source view for parents.
+  1: optional CommitId other_commit_id;
+  /// Required with COMPACT. Original-format requests remain unpaged.
+  2: optional CommitRestrictedPathsChangesOrderedParams ordered_params;
+  /// If absent, return the original aggregate format. COMPACT returns a policy
+  /// table and references in response.compact, with legacy restriction_roots empty.
+  3: optional CommitRestrictedPathsChangesFormat format;
+}
 
 struct CommitSparseProfileDeltaToken {
   1: i64 id;
@@ -2061,6 +2288,36 @@ struct CustomAclParams {
   1: string hipster_group;
 }
 
+/// A Hipster identity, as `<id_type>:<id_data>` spells it (e.g. AUTH_SET:scm).
+struct AclIdentity {
+  1: string id_type;
+  2: string id_data;
+}
+
+/// How to create the org ACL `repos/git/<org>` when the repo inherits it and
+/// it does not exist yet. Ignored when the ACL exists; the request still
+/// fails when the ACL is missing and these are not given.
+struct OrgAclParams {
+  /// Point of contact of the new ACL (oncall short name).
+  1: string oncall_name;
+  /// Maintainers of the new ACL, on top of the standard grants. At least one.
+  2: list<AclIdentity> maintainers;
+  /// Identities granted `write`, on top of the standard grants.
+  /// `AUTH_SET` entries here and above are checked to exist before the
+  /// create; other identity types are validated by Hipster.
+  3: list<AclIdentity> writers;
+}
+
+/// How to create a GitHub mirror repo.
+struct GithubMirrorParams {
+  /// Give the repo its own ACL `repos/git/<org>/<repo>`, maintained and
+  /// readable by this oncall (short name) and with it as point of contact,
+  /// instead of inheriting `repos/git/<org>`. The ACL also gets the grants of
+  /// the mirror sync and its verifier sweep. Each repo in a batch may name its
+  /// own oncall.
+  1: optional string maintainer_oncall;
+}
+
 enum RepoSizeBucket {
   /// <100MB
   EXTRA_SMALL = 0,
@@ -2098,6 +2355,20 @@ struct RepoCreationRequest {
   /// repo's ACL; the GitHub mirror sync does, and passes gitimport
   /// --bypass-readonly. Defaults to false (writable).
   7: optional bool readonly;
+  /// Create the org ACL `repos/git/<org>` if it does not exist yet. Only
+  /// meaningful without `custom_acl`.
+  8: optional OrgAclParams org_acl;
+  /// The repo mirrors a GitHub repo. Implies `readonly`.
+  9: optional GithubMirrorParams github_mirror;
+  /// The storage engine a repo is created on is decided by its org, not by
+  /// this field: `<slug>/...` goes on `org_<slug>` when that engine is in the
+  /// tier's storage map (landed by `create_org_storage_config`), on the
+  /// default git template's engine otherwise. When set, this is an assertion
+  /// of that engine (the repo portal sends the engine it believes the org
+  /// has); a value that is not what the org maps to is refused
+  /// (`STORAGE_CONFIG_REFUSED:org`). Every repo in a batch must land on the
+  /// same engine (`STORAGE_CONFIG_REFUSED:batch`).
+  10: optional string storage_config;
 }
 
 struct CreateReposParams {
@@ -2347,6 +2618,41 @@ enum RepoResolveCommitPrefixResponseType {
   NOT_FOUND = 2,
 }
 
+struct RepoResolveP4FileRevisionResponse {
+  /// The commit imported from the changelist that gave the path the revision,
+  /// in the requested schemes. Not set when the revision was not found: it is
+  /// newer than the bookmark (`revision` > `head_revision`), the path never
+  /// existed at the bookmark (no `head_revision`), or the search gave up
+  /// (`oldest_revision_walked` is set).
+  1: optional map<CommitIdentityScheme, CommitId> commit;
+
+  /// That commit's changelist, when found.
+  2: optional i64 changelist;
+
+  /// When found, whether the path exists at that revision: false when the
+  /// revision is a deletion.
+  3: bool exists;
+
+  /// When found, the path as Perforce records it.
+  4: optional Path path;
+
+  /// The revision the path has at the bookmark, a deletion included. Not set
+  /// when nothing ever existed at the path there.
+  5: optional i64 head_revision;
+
+  /// Set when the search walked its maximum number of changes to the path
+  /// without reaching `revision`: the oldest revision it saw. Revisions below
+  /// it need a search from an older commit.
+  6: optional i64 oldest_revision_walked;
+
+  /// How many changes to the path the search read.
+  7: i64 commits_walked;
+
+  /// With `head_revision`: whether the path exists at the bookmark, or that
+  /// revision deleted it.
+  8: optional bool head_exists;
+}
+
 struct RepoResolveCommitPrefixResponse {
   1: RepoResolveCommitPrefixResponseType resolved_type;
 
@@ -2441,6 +2747,11 @@ struct RepoFoldCommitsParams {
   /// Optional: Checks to perform on the commit.
   /// If not provided, all checks are performed in CHECK mode.
   8: CreateCommitChecks checks;
+
+  /// Leave the folded commits in place, like `--keep`: no mutation is
+  /// recorded, so the new commit doesn't replace them. Cannot be combined
+  /// with `mutation_info`.
+  9: bool keep_folded_commits;
 }
 
 struct RepoFoldCommitsResponse {
@@ -2510,6 +2821,43 @@ union RepoUpdateSubmoduleExpansionResult {
   2: MegarepoAsynchronousRequestError error;
 }
 
+/// Omitted paths grouped by the restriction that denied them. Entries are
+/// deduplicated by restriction: even thousands of omissions collapse to a
+/// handful of groups. Clients map a denied path to its group by longest
+/// `restriction_root` prefix match.
+struct OmittedRestrictionGroup {
+  /// Restriction root (directory containing the `.slacl`). Absent when the
+  /// denying source cannot report one (manifest denials).
+  1: optional string restriction_root;
+  /// Repo-region ACL of the denying restriction, e.g. "REPO_REGION:...".
+  2: string repo_region_acl;
+  /// Group the caller should request for access.
+  3: string permission_request_group;
+  /// Omitted paths denied under this restriction.
+  4: i64 omitted_count;
+}
+
+/// Partial-response signal: when the server omits entries due to
+/// restricted-path denials instead of failing the request, it sets this
+/// field so typed clients get an exact verdict. `partial` is true iff
+/// entries were omitted; `omitted_restricted_paths_count` carries the count
+/// when known up front (unary) and is absent when the count lives only in
+/// Scuba (streams). `omitted_by_restriction` breaks the count down by
+/// denying restriction, and is absent when the server did not collect
+/// groups for this request. The field is populated when partial responses are
+/// allowed for the request: the `scs_enable_partial_responses` killswitch
+/// is on for the repo, or the client sent the opt-in request header,
+/// unless the client sent the opt-out request header. Its
+/// absence means the server does not support partial responses, or they
+/// are not allowed for this request. For diffs, both sides of an entry
+/// are counted separately: one omitted entry can contribute 2 to the
+/// count.
+struct PartialResponseInfo {
+  1: bool partial;
+  2: optional i64 omitted_restricted_paths_count;
+  3: optional list<OmittedRestrictionGroup> omitted_by_restriction;
+}
+
 struct CommitCompareResponse {
   /// List of the files that are different between commits with their metadata
   /// Can be used for subsequent `commit_path_diff` calls for file-level diffs.
@@ -2524,12 +2872,17 @@ struct CommitCompareResponse {
   /// This is the last path that was produced, suitable for passing into
   /// the `after_path` parameter of a subsequent ordered request.
   4: optional Path last_path;
+  /// Partial-response verdict. See PartialResponseInfo.
+  5: optional PartialResponseInfo partial_info;
 }
 
 struct CommitFileDiffsResponseElement {
   1: optional Path base_path;
   2: optional Path other_path;
-  3: Diff diff;
+  /// Absent when both sides of the requested pair were denied: a
+  /// placeholder preserving request order, so clients correlate by
+  /// position. Both paths are absent too.
+  3: optional Diff diff;
   4: optional CommitId other_commit_id;
 }
 
@@ -2542,6 +2895,8 @@ struct CommitFileDiffsResponse {
   1: list<CommitFileDiffsResponseElement> path_diffs;
   /// The first pair for which a diff was not returned. Start next request from this pair if you want to resume.
   2: optional CommitFileDiffsStoppedAtPair stopped_at_pair;
+  /// Partial-response verdict. See PartialResponseInfo.
+  3: optional PartialResponseInfo partial_info;
 }
 
 struct CommitLookupResponse {
@@ -2570,6 +2925,8 @@ struct CommitLookupPushrebaseHistoryResponse {
 struct CommitFindFilesResponse {
   /// The files that match.
   1: list<string> files;
+  /// Partial-response verdict. See PartialResponseInfo.
+  2: optional PartialResponseInfo partial_info;
 }
 
 struct CommitFindFilesStreamResponse {}
@@ -2577,6 +2934,14 @@ struct CommitFindFilesStreamResponse {}
 struct CommitFindFilesStreamItem {
   /// The files that match.
   1: list<string> files;
+  /// Partial-response verdict, set only on the terminal item.
+  /// The server appends a final item carrying this (with an empty file
+  /// list) when the stream filtered restricted paths; its absence on the
+  /// last item means a complete stream. The end of pagination is signaled
+  /// by a short (or empty) non-terminal page: consume pages
+  /// with `after` until one returns fewer than `limit` files. See
+  /// PartialResponseInfo.
+  2: optional PartialResponseInfo partial_info;
 }
 
 struct CommitHistoryResponse {
@@ -2605,6 +2970,14 @@ struct HookOutcomeRejected {
   1: string description;
   /// A full explanation of what went wrong, suitable for presenting to the user (should include guidance for fixing this failure, where possible)
   2: string long_description;
+  /// Name of the declared hook message that `long_description` was rendered
+  /// from, unique within the hook's implementation. Unset if the hook does
+  /// not declare its messages. Repos can replace a message's text, so use the
+  /// name, not the text, to tell rejections apart.
+  3: optional string message_name;
+  /// Parameter values `long_description` was rendered with, by parameter
+  /// name. Unset when `message_name` is.
+  4: optional map<string, string> message_params;
 }
 
 @hack.MigrationBlockingLegacyJSONSerialization
@@ -2739,6 +3112,8 @@ struct CommitMultiplePathInfoResponse {
   ///
   /// Note: requested paths that do not exist are omitted from the map.
   1: map<Path, CommitPathInfoResponse> path_info;
+  /// Partial-response verdict. See PartialResponseInfo.
+  2: optional PartialResponseInfo partial_info;
 }
 
 struct CommitPathBlameResponse {
@@ -2761,6 +3136,20 @@ struct CommitPathLastChange {
   /// If nothing exists at this path, but something used to and has been
   /// deleted, this is the commit it was deleted in.
   2: map<CommitIdentityScheme, CommitId> last_changed_commit;
+
+  /// Perforce mirrors only, filled when `include_p4_revision` is set and the
+  /// last-changed commit was imported from Perforce: the Perforce revision the
+  /// path has at the commit. When `exists` is false, the revision of the
+  /// deletion.
+  3: optional i64 p4_revision;
+
+  /// Perforce mirrors only, filled with `p4_revision`: the changelist that
+  /// gave the path that revision (the last-changed commit's changelist).
+  4: optional i64 p4_changelist;
+
+  /// Perforce mirrors only, filled with `p4_revision`: the path as Perforce
+  /// records it, when its spelling differs from the requested path.
+  5: optional Path p4_path;
 }
 
 struct CommitPathLastChangedResponse {
@@ -2779,6 +3168,8 @@ struct CommitMultiplePathLastChangedResponse {
   ///
   /// Requested paths that have never existed are omitted.
   1: map<Path, CommitPathLastChange> path_last_change;
+  /// Partial-response verdict. See PartialResponseInfo.
+  2: optional PartialResponseInfo partial_info;
 }
 
 struct CommitRestrictedPathsAccessResponse {
@@ -2810,16 +3201,32 @@ struct CommitFindRestrictedPathsStreamItem {
 }
 
 struct CommitRestrictedPathsChangesResponse {
-  /// Extent to which the changed paths in this commit are restricted
+  /// Coverage of actual literal, ordinary-copy and subtree-source restrictions on each returned path.
   1: PathCoverage are_restricted;
-  /// Extent to which the caller has authorization to access the changed paths
+  /// Coverage of access to all actual content sides and admitted sources of each returned path.
   2: PathCoverage has_access;
-  /// Maps each changed path that is inside a restriction to its restriction roots and their ACLs.
+  /// Union of actual literal, ordinary-copy and subtree-source restrictions.
+  /// A source's restriction root need not cover the changed destination path.
+  /// Different ACLs or request groups at the same root are separate; absent-file policies are excluded.
   3: map<Path, list<PathRestrictionRoot>> restriction_roots;
-  /// Subset of the changed paths that the caller has access to
+  /// Returned paths whose complete comparisons the caller can access, in component-wise order.
   4: list<Path> authorized_paths;
-  /// All paths changed in this commit (added, modified, or deleted)
+  /// Net endpoint file differences, in component-wise path order. COMPACT parent comparisons
+  /// also include differences against declared subtree sources: an unchanged destination or
+  /// a source-only deleted file can therefore appear. Bounded by ordered_params.limit.
   5: list<Path> changed_paths;
+  /// True when all actual literal, ordinary-copy and subtree-source content sides of every
+  /// returned path were checked, including empty/root comparisons. This is not completion.
+  /// Clients requiring these semantics must reject an absent or false verdict.
+  6: optional bool checked_both_sides;
+  /// Continuation cursor for an ordered request, set only when more paths remain.
+  /// Pass as after_path with the same target and comparison base.
+  /// Absence means enumeration is complete. Unordered requests return the whole comparison.
+  7: optional Path last_path;
+  /// Present only for a COMPACT request, including an empty comparison.
+  /// Policy indexes are local to this response, never stable across pages.
+  /// Absence on a COMPACT request means unsupported, not unrestricted content.
+  10: optional CommitRestrictedPathsChangesCompact compact;
 }
 
 struct CommitSparseProfileDeltaResponse {
@@ -3461,6 +3868,75 @@ service SourceControlService {
     3: OverloadError overload_error,
   );
 
+  /// Check whether a storage engine is loaded on the answering task.
+  ///
+  /// Global like `repo_exists`, and answered from the tier's storage map
+  /// alone (no repo, blobstore or database access). Exists so that whoever
+  /// lands a new engine can wait for Mononoke to pick it up before creating
+  /// repos on it, instead of the first `create_repos` discovering it through
+  /// `STORAGE_CONFIG_UNKNOWN`. Any task answers for itself only; a positive
+  /// answer from one task does not prove the whole tier has reloaded.
+  StorageConfigExistsResponse storage_config_exists(
+    1: StorageConfigExistsParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
+  /// Land the storage engine data file for an org's own bucket and shard
+  /// (`scm/mononoke/repos/org_storage/<org>.json`), from which configerator
+  /// builds the `org_<org>` engine and lists the shard in the Mononoke schema
+  /// domains. Idempotent: a file already at HEAD with the same content lands
+  /// nothing; one with different content is refused (`ORG_STORAGE_CONFLICT`)
+  /// rather than overwritten. Stateless: poll the token with
+  /// `org_storage_config_poll`, then wait for `org_storage_config` to answer
+  /// on the tier before creating repos on the engine. Landing an engine needs
+  /// membership of `repo_portal_storage_setters` (the repo portal's identity)
+  /// or Source Control admin; creating repos on it afterwards does not, the
+  /// engine follows from the org.
+  CreateOrgStorageConfigToken create_org_storage_config(
+    1: CreateOrgStorageConfigParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
+  /// Remove an org's storage engine data file. Refused while any repo names
+  /// the engine: a source-of-truth row under `<org>/` in any state, or a
+  /// loaded repo config with that `storage_config`. Same caller gate as
+  /// `create_org_storage_config`.
+  DeleteOrgStorageConfigToken delete_org_storage_config(
+    1: DeleteOrgStorageConfigParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
+  /// Progress of a mutation from `create_org_storage_config` or
+  /// `delete_org_storage_config`. Initiates the land once the mutation is
+  /// prepared; never cleans anything up on failure, since there is no
+  /// reservation to free.
+  OrgStorageConfigPollResponse org_storage_config_poll(
+    1: OrgStorageConfigPollParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
+  /// The storage engine an org's repos are created on, as the answering task
+  /// has it loaded. Global like `repo_exists`; any task answers for itself.
+  OrgStorageConfigResponse org_storage_config(
+    1: OrgStorageConfigParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
   /// Repository methods
   /// ==================
 
@@ -3482,6 +3958,29 @@ service SourceControlService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+  );
+
+  /// Find the commit a Perforce revision of a path was imported as, in a
+  /// Perforce mirror repo.
+  ///
+  /// Walks the path's changes back from the bookmark, newest first, until the
+  /// one that gave it the revision. The mirror is a linear import of one
+  /// stream, so revisions of a depot path only go up along it and the walk
+  /// stops early once it passes below the revision (merges would break that;
+  /// so does `p4 obliterate` of a whole file, whose earlier revisions are then
+  /// not found). It also stops after a server-side maximum number of changes
+  /// (`oldest_revision_walked`): until a revision index exists, a miss deep
+  /// in a much-changed file reads that many commits. Every commit of a
+  /// Perforce mirror records its files' revisions; one without is an
+  /// internal error.
+  RepoResolveP4FileRevisionResponse repo_resolve_p4_file_revision(
+    1: RepoSpecifier repo,
+    2: RepoResolveP4FileRevisionParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   /// Resolve a bookmark
@@ -4080,9 +4579,11 @@ service SourceControlService {
     3: OverloadError overload_error,
   );
 
-  /// Query restriction information for all file changes in the specified commit.
-  /// This is a convenience wrapper around commit_restricted_paths_access that
-  /// extracts the changed paths from the commit first.
+  /// Query literal endpoint file differences; COMPACT parent requests also cover differences
+  /// against declared subtree sources. Check every actual literal, ordinary-copy and
+  /// subtree-source content side under its own policy, retaining inaccessible paths as metadata.
+  /// No content is returned. Verdicts cover the retained page, not the whole enumeration.
+  /// Continue ordered requests until last_path is absent; checked_both_sides is not completion.
   CommitRestrictedPathsChangesResponse commit_restricted_paths_changes(
     1: CommitSpecifier commit,
     2: CommitRestrictedPathsChangesParams params,

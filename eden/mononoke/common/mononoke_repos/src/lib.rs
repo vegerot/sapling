@@ -61,6 +61,12 @@ impl<R> MononokeRepos<R> {
         }
     }
 
+    /// Whether this collection can build a placeholder on request, i.e. was
+    /// constructed with a loader.
+    pub fn loads_on_demand(&self) -> bool {
+        self.loader.is_some()
+    }
+
     /// Get the repo corresponding to the repo-name if the repo
     /// has been loaded for the service/command, else return None.
     pub fn get_by_name(&self, repo_name: &str) -> Option<Arc<R>> {
@@ -392,9 +398,6 @@ impl<R> MononokeRepos<R> {
     /// `None` covers both "not assigned to this service" and "assigned, but
     /// this collection cannot load anything", deliberately: splitting them
     /// would send a reader looking at shard assignment over a wiring mistake.
-    ///
-    /// Bounded because the build runs on a detached task. The bound is on the
-    /// method so a collection that never builds stays usable for any `R`.
     pub async fn get(&self, repo_name: &str) -> Result<Option<Arc<R>>>
     where
         R: Send + Sync + 'static,
@@ -411,10 +414,57 @@ impl<R> MononokeRepos<R> {
             return Ok(None);
         };
 
-        repo_slot
-            .get_or_build(move |repo_name| loader.load(repo_name))
-            .await
-            .map(Some)
+        repo_slot.get_or_build(loader).await.map(Some)
+    }
+
+    /// Registers the repo if it is absent and builds it now with `loader`,
+    /// through its slot, so eager builds share single-flight and the
+    /// failed-build hold with lazy ones. A repo that is already built is
+    /// returned as is.
+    pub async fn add_and_build(
+        &self,
+        repo_name: &str,
+        repo_id: i32,
+        loader: Arc<dyn RepoLoader<R>>,
+    ) -> Result<Arc<R>>
+    where
+        R: Send + Sync + 'static,
+    {
+        self.add_placeholder(repo_name, repo_id);
+        let Some(repo_slot) = self.name_to_repo_map.load().get(repo_name).cloned() else {
+            bail!("Repo {repo_name} was removed before it could be built");
+        };
+        repo_slot.get_or_build(loader).await
+    }
+
+    /// Builds a repo that is already built here again with `loader`, and
+    /// swaps it in. The old repo keeps serving until then, and stays if the
+    /// build fails. `None`, without building, if the repo is not built here,
+    /// or was removed before its new build finished: a rebuild never builds
+    /// an unbuilt repo nor resurrects a removed one.
+    ///
+    /// Runs on the caller's task, outside the slot's single-flight: there is
+    /// nothing to share, as a built slot has no build in flight.
+    pub async fn rebuild_if_present(
+        &self,
+        repo_name: &str,
+        loader: Arc<dyn RepoLoader<R>>,
+    ) -> Result<Option<Arc<R>>> {
+        let Some(repo_slot) = self.name_to_repo_map.load().get(repo_name).cloned() else {
+            return Ok(None);
+        };
+        if repo_slot.loaded().is_none() {
+            return Ok(None);
+        }
+
+        let repo = Arc::new(loader.load(repo_name.to_string()).await?);
+        let replaced = repo_slot.replace(Arc::clone(&repo));
+        let still_present = self
+            .name_to_repo_map
+            .load()
+            .get(repo_name)
+            .is_some_and(|current| Arc::ptr_eq(current, &repo_slot));
+        Ok((replaced && still_present).then_some(repo))
     }
 }
 

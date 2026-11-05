@@ -17,9 +17,7 @@ constraint(
 
 cpp_library(
     name = "sapling_backingstore_error",
-    headers = {
-        "SaplingBackingStoreError.h": "include/SaplingBackingStoreError.h",
-    },
+    headers = ["include/SaplingBackingStoreError.h"],
     exported_deps = ["fbsource//third-party/rust:cxx-core"],
 )
 
@@ -29,16 +27,19 @@ cpp_library(
     headers = glob(["include/**/*.h"]),
     undefined_symbols = True,
     deps = [
+        "fbsource//xplat/folly:cpp_attributes",
+        "fbsource//xplat/folly:try",
+        "fbsource//xplat/folly/json:dynamic",
+        "fbsource//xplat/folly/logging:logging",
         "//eden/common/telemetry:log_info",
         "//eden/fs/telemetry:structured_logger",
-        "//folly:cpp_attributes",
-        "//folly:try",
-        "//folly/io:iobuf",
-        "//folly/json:dynamic",
-        "//folly/logging:logging",
     ],
     exported_deps = [
         "fbsource//third-party/rust:cxx-core",
+        "fbsource//xplat/folly:range",
+        "fbsource//xplat/folly/container:fbvector",
+        "fbsource//xplat/folly/futures:core",
+        "fbsource//xplat/folly/io:iobuf",
         ":backingstore@header",  # @manual
         "//eden/common/utils:case_sensitivity",
         "//eden/common/utils:path",
@@ -47,9 +48,6 @@ cpp_library(
         "//eden/fs/model:model-fwd",
         "//eden/fs/store:context",  # @manual - used in ffi.rs via CXX bridge
         "//eden/fs/store/sl:sapling_object_id",
-        "//folly:range",
-        "//folly/container:fbvector",
-        "//folly/futures:core",
     ],
 )
 
@@ -67,21 +65,19 @@ sl_rust_library(
             "dependencies_override": {
                 "dependencies": {
                     "sapling-constructors": {"default-features": False},
-                    "sapling-indexedlog": {"features": ["configurable"]},
+                    "sapling-repo": {"features": ["wdir"]},
                 },
             },
             "features": {
                 "cas": [],
                 "fb": ["sapling-configloader/fb"],
             },
-            "lib": {"name": "backingstore"},
-            "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
-                "license": "MIT",
-                "name": "sapling-backingstore",
-                "repository": "https://github.com/facebook/sapling",
+            "oss_dependencies_override": {
+                "dependencies": {
+                    "edenfs-telemetry": {"path": "../../../fs/rust/edenfs-telemetry"},
+                },
             },
+            "package": {"autobenches": False},
         },
     },
     cpp_deps = [
@@ -101,6 +97,7 @@ sl_rust_library(
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:arc-swap",
+        "fbsource//third-party/rust:crossfire",
         "fbsource//third-party/rust:cxx",
         "fbsource//third-party/rust:env_logger",
         "fbsource//third-party/rust:flume",
@@ -121,6 +118,7 @@ sl_rust_library(
         "//eden/scm/lib/http-client:http-client",
         "//eden/scm/lib/identity:identity",
         "//eden/scm/lib/indexedlog:indexedlog",
+        "//eden/scm/lib/indexedlog/config:indexedlog-config",
         "//eden/scm/lib/manifest:manifest",
         "//eden/scm/lib/manifest-tree:manifest-tree",
         "//eden/scm/lib/metrics:metrics",
@@ -148,6 +146,7 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/testing:test_util",
         ":backingstore",  # @manual
         ":sapling_native_backingstore",
         "//eden/common/telemetry:log_info",
@@ -158,6 +157,5 @@ cpp_unittest(
         "//eden/fs/telemetry:structured_logger",
         "//eden/fs/telemetry:xplat_keys",
         "//eden/fs/telemetry:xplat_logger",
-        "//folly/testing:test_util",
     ],
 )

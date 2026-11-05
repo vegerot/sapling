@@ -32,6 +32,7 @@
 #include "eden/fs/model/EntryAttributeFlags.h"
 #include "eden/fs/model/Tree.h"
 #include "eden/fs/model/TreeAuxDataFwd.h"
+#include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/utils/MiniTracer.h"
 
 namespace facebook::eden {
@@ -169,6 +170,15 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   };
 
   /**
+   * Directory contents built from a source control tree, with the entry
+   * counts taken while building them.
+   */
+  struct TreeDirContents {
+    DirContents contents;
+    ObjectFetchContext::DirEntryCounts entryCounts;
+  };
+
+  /**
    * Construct a TreeInode from an unrestricted source control tree.
    */
   TreeInode(
@@ -181,6 +191,7 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   /**
    * Construct an inode that only has backing in the Overlay area.
    * Set isRestricted=true for directories denied by server-side path ACLs.
+   * The entries of dir are counted unless entryCounts is given.
    */
   TreeInode(
       InodeNumber ino,
@@ -193,7 +204,9 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       bool isRestricted = false,
       std::optional<bool> hasACL = std::nullopt,
       InitialPermissionCheck initialPermissionCheck =
-          InitialPermissionCheck::Unknown);
+          InitialPermissionCheck::Unknown,
+      std::optional<ObjectFetchContext::DirEntryCounts> entryCounts =
+          std::nullopt);
 
   /**
    * Construct the root TreeInode from a source control commit's root.
@@ -202,6 +215,7 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
 
   /**
    * Construct the root inode from data saved in the overlay.
+   * The entries of dir are counted unless entryCounts is given.
    */
   TreeInode(
       EdenMount* mount,
@@ -210,7 +224,9 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       bool isRestricted = false,
       std::optional<bool> hasACL = std::nullopt,
       InitialPermissionCheck initialPermissionCheck =
-          InitialPermissionCheck::Unknown);
+          InitialPermissionCheck::Unknown,
+      std::optional<ObjectFetchContext::DirEntryCounts> entryCounts =
+          std::nullopt);
 
   ~TreeInode() override;
 
@@ -405,6 +421,14 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   }
   folly::Synchronized<TreeInodeState>& getContentsUnchecked() {
     return contents_;
+  }
+
+  /**
+   * Number of file and directory entries this inode had when it was loaded.
+   * Not updated as entries are added or removed afterwards.
+   */
+  ObjectFetchContext::DirEntryCounts loadTimeEntryCounts() const {
+    return loadTimeEntryCounts_;
   }
 
   /**
@@ -659,7 +683,10 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    * The TreeInode will call InodeMap::inodeLoadComplete() or
    * InodeMap::inodeLoadFailed() when the load finishes.
    */
-  void loadChildInode(PathComponentPiece name, InodeNumber number);
+  void loadChildInode(
+      PathComponentPiece name,
+      InodeNumber number,
+      const ObjectFetchContextPtr& context);
 
   /**
    * Internal API only for use by InodeMap.
@@ -698,10 +725,16 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    * Unload all children, recursively, neither referenced internally by Eden
    * nor by FUSE or ProjectedFS.
    *
+   * When a cutoff is given, a child is only unloaded if it has not been
+   * referenced since then (see InodeBase::getLastGcRefTime), so an inode
+   * that a recent status or Thrift request loaded survives the way one the
+   * kernel holds does. Inode GC passes its cutoff; checkout passes none.
+   *
    * Returns the number of inodes unloaded.
    */
   size_t unloadChildrenUnreferencedByFs(
-      const folly::CancellationToken& cancellationToken = {});
+      const folly::CancellationToken& cancellationToken = {},
+      std::optional<EdenTimestamp> cutoff = std::nullopt);
 
   struct InodeGCUnloadResult {
     size_t unloaded{0};
@@ -709,7 +742,8 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   };
 
   InodeGCUnloadResult unloadChildrenUnreferencedByFsForInodeGC(
-      const folly::CancellationToken& cancellationToken = {});
+      const folly::CancellationToken& cancellationToken = {},
+      std::optional<EdenTimestamp> cutoff = std::nullopt);
 
 #ifndef _WIN32
   /**
@@ -825,11 +859,6 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       bool followSymlink) override;
 #endif
 
-  /**
-   * Called by the child's inode (while it's location lock is held!)
-   */
-  void childWasStat(bool isFile, const ObjectFetchContext& context);
-
   uint64_t getInMemoryDescendants();
 
   void increaseInMemoryDescendants(int64_t inc);
@@ -855,11 +884,8 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       bool reportLocalOnlyAsConflicts,
       bool removeLocalOnly);
 
-  folly::Try<CheckoutFinalizeState> processCheckoutActionResults(
-      CheckoutContext* ctx,
-      const std::vector<std::shared_ptr<CheckoutAction>>& actions,
+  static folly::Try<CheckoutFinalizeState> processCheckoutActionResults(
       bool shouldInvalidateDirectory,
-      bool propagateErrors,
       bool hadConflicts,
       bool localOnlyRemains,
       std::vector<folly::Try<CheckoutActionResult>>& actionResults);
@@ -1039,34 +1065,37 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       const DirContents& contents,
       bool isMaterialized = true) const;
 
+  TreeInode(
+      InodeNumber ino,
+      TreeInodePtr parent,
+      PathComponentPiece name,
+      mode_t initialMode,
+      TreeDirContents&& dir,
+      std::optional<ObjectId> treeId,
+      std::optional<bool> hasACL);
+
+  TreeInode(
+      EdenMount* mount,
+      TreeDirContents&& dir,
+      const std::optional<ObjectId>& treeId,
+      bool isRestricted,
+      std::optional<bool> hasACL);
+
   /**
    * Converts a Tree to a Dir and saves it to the Overlay under the given inode
    * number.
    */
-  static DirContents
+  static TreeDirContents
   saveDirFromTree(InodeNumber inodeNumber, const Tree* tree, EdenMount* mount);
 
   /** Translates a Tree object from our store into a Dir object
    * used to track the directory in the inode */
-  static DirContents buildDirFromTree(
+  static TreeDirContents buildDirFromTree(
       const Tree* tree,
       Overlay* overlay,
       CaseSensitivity caseSensitive);
 
   void updateAtime();
-
-  void considerReaddirPrefetch(const ObjectFetchContextPtr& context);
-
-  /**
-   * Bitset indicating what entry types should be prefetched.
-   */
-  using PrefetchSet = uint8_t;
-  enum : PrefetchSet {
-    PrefetchFiles = 1,
-    PrefetchTrees = 2,
-  };
-
-  void doPrefetch(PrefetchSet prefetchSet, const ObjectFetchContext& context);
 
   /**
    * Get a TreeInodePtr to ourself.
@@ -1200,6 +1229,7 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   struct BuildUnrestrictedDirContentsResult {
     DirContents contents;
     bool refreshedStaleDeniedAclRootStates{false};
+    std::optional<ObjectFetchContext::DirEntryCounts> entryCounts;
   };
 
   BuildUnrestrictedDirContentsResult buildUnrestrictedDirContents(
@@ -1287,8 +1317,19 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   [[nodiscard]] static int checkPreRemove(const FileInode& child);
 
   /**
+   * Claim a child load, repairing a conflicting binding when online fsck is
+   * enabled. Must be called with the contents_ write lock held.
+   */
+  bool startLoadingChild(
+      PathComponentPiece name,
+      DirEntry& entry,
+      folly::Promise<InodePtr>& promise);
+
+  /**
    * This helper function starts loading a currently unloaded child inode.
-   * Must be called with the contents_ lock held.
+   * Must be called with the contents_ write lock held.
+   * name must use the canonical spelling from the DirEntry key, which may
+   * differ from the source-control spelling on case-insensitive mounts.
    */
   ImmediateFuture<InodePtr> loadChildLocked(
       PathComponentPiece name,
@@ -1608,6 +1649,13 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       PathComponentPiece name,
       const ObjectFetchContextPtr& context);
 
+  /**
+   * Hand the load-time entry counts to the backing store for walk detection.
+   */
+  void witnessLoadedSize();
+
+  ObjectFetchContext::DirEntryCounts loadTimeEntryCounts_;
+
   folly::Synchronized<TreeInodeState> contents_;
 
   /**
@@ -1625,29 +1673,6 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    * this to now() and resumes TTL throttling.
    */
   std::atomic<std::chrono::steady_clock::time_point> lastPermissionCheck_{};
-
-  /**
-   * Valid state transitions:
-   *   NeverEnumerated -> Enumerated
-   *   Enumerated -> PrefetchedTrees
-   *   Enumerated -> PrefetchedAll
-   *   PrefetchedTrees -> PrefetchedAll
-   */
-  enum PrefetchState : uint8_t {
-    /// readdir() has not been called on this inode since it was loaded.
-    NeverEnumerated,
-    /// readdir() has been called.
-    Enumerated,
-    /// A child tree was stat() and we have prefetched all child trees.
-    PrefetchedTrees,
-    /// A child file was stat() and we have prefetched inodes for all children.
-    PrefetchedAll,
-  };
-
-  /**
-   * Only prefetch children aux data once.
-   */
-  std::atomic<PrefetchState> prefetchState_{NeverEnumerated};
 
   /**
    * Index shared by the requests of a listing in flight; see readdirImpl.

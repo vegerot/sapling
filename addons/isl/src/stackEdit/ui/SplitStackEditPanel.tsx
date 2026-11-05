@@ -18,7 +18,7 @@ import {Icon} from 'isl-components/Icon';
 import {Subtle} from 'isl-components/Subtle';
 import {TextField} from 'isl-components/TextField';
 import {Tooltip} from 'isl-components/Tooltip';
-import {useAtom, useAtomValue} from 'jotai';
+import {useAtomValue} from 'jotai';
 import type {JSX} from 'react';
 import {useEffect, useMemo, useRef, useState} from 'react';
 import {useContextMenu} from 'shared/ContextMenu';
@@ -39,17 +39,14 @@ import {useGeneratedFileStatuses} from '../../GeneratedFile';
 import {tracker} from '../../analytics';
 import {t, T} from '../../i18n';
 import {readAtom} from '../../jotaiUtils';
-import {themeState} from '../../theme';
 import {GeneratedStatus} from '../../types';
 import {isAbsent, reorderedRevs} from '../commitStackState';
 import {max, next, prev} from '../revMath';
-import {AISplitButton} from './AISplit';
 import {computeLinesForFileStackEditor} from './FileStackEditorLines';
 import css from './SplitStackEditPanel.module.css';
 import {
   bumpStackEditMetric,
   findStartEndRevs,
-  shouldAutoSplitState,
   SplitRangeRecord,
   useStackEditState,
 } from './stackEditState';
@@ -137,7 +134,6 @@ export function SplitStackEditPanel() {
     .map(rev => (
       <SplitColumn
         stackEdit={stackEdit}
-        commitStack={commitStack}
         key={rev}
         rev={rev}
         subStack={subStack}
@@ -157,7 +153,6 @@ export function SplitStackEditPanel() {
 
 type SplitColumnProps = {
   stackEdit: UseStackEditState;
-  commitStack: CommitStackState;
   subStack: CommitStackState;
   rev: CommitRev;
   insertBlankCommit: (rev: CommitRev) => unknown;
@@ -228,7 +223,7 @@ function SwapCommitsButton({
 }
 
 function SplitColumn(props: SplitColumnProps) {
-  const {stackEdit, commitStack, subStack, rev, insertBlankCommit, removeEmptyCommit} = props;
+  const {stackEdit, subStack, rev, insertBlankCommit, removeEmptyCommit} = props;
 
   const [collapsedFiles, setCollapsedFiles] = useState(new Set());
 
@@ -354,22 +349,6 @@ function SplitColumn(props: SplitColumnProps) {
     return options;
   });
 
-  const [shouldAutoSplit, setShouldAutoSplit] = useAtom(shouldAutoSplitState);
-  const aiSplitButtonRef = useRef<HTMLButtonElement | null>(null);
-
-  useEffect(() => {
-    const autoTriggerAISplit = () => {
-      if (aiSplitButtonRef.current != null) {
-        aiSplitButtonRef.current.click();
-      }
-    };
-
-    if (shouldAutoSplit) {
-      setShouldAutoSplit(false);
-      autoTriggerAISplit();
-    }
-  }, [setShouldAutoSplit, shouldAutoSplit]);
-
   return (
     <>
       <Column>
@@ -382,13 +361,6 @@ function SplitColumn(props: SplitColumnProps) {
             {rev + 1} / {subStack.size}
           </span>
           <EditableCommitTitle commitMessage={commitMessage} commitKey={commit?.key} />
-          <AISplitButton
-            stackEdit={stackEdit}
-            commitStack={commitStack}
-            subStack={subStack}
-            rev={rev}
-            ref={aiSplitButtonRef}
-          />
           <Button icon onClick={e => showExtraCommitActionsContextMenu(e)}>
             <Icon icon="ellipsis" />
           </Button>
@@ -886,8 +858,6 @@ type SplitFileProps = {
   path: string;
 };
 
-const useThemeHook = () => useAtomValue(themeState);
-
 export function SplitFile(props: SplitFileProps) {
   const mainContentRef = useRef<HTMLTableElement | null>(null);
   const [expandedLines, setExpandedLines] = useState<ImSet<LineIdx>>(ImSet);
@@ -933,13 +903,7 @@ export function SplitFile(props: SplitFileProps) {
   const aLines = useMemo(() => splitLines(aText), [aText]);
   const abBlocks = diffBlocks(aLines, bLines);
 
-  const highlights = useTokenizedContentsOnceVisible(
-    props.path,
-    aLines,
-    bLines,
-    mainContentRef,
-    useThemeHook,
-  );
+  const highlights = useTokenizedContentsOnceVisible(props.path, aLines, bLines, mainContentRef);
   const hasCopyFrom = copyFromText != null;
 
   const {leftGutter, leftButtons, mainContent, rightGutter, rightButtons, lineKind} =

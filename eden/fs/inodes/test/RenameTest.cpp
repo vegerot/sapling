@@ -244,6 +244,10 @@ TEST_F(RenameCaseVariantTest, replaceTakesRequestedSpelling) {
   EXPECT_EQ((Names{"B", "src"}), rootNames());
   EXPECT_EQ((Names{"B", "src"}), rootOverlayNames());
 
+#ifndef _WIN32
+  // A Windows remount rebuilds the InMemory overlay from the ProjFS scan, and
+  // TestMount has no projected disk state, so the root reverts to the SCM
+  // spelling.
   src.reset();
   file.reset();
   root_.reset();
@@ -251,9 +255,10 @@ TEST_F(RenameCaseVariantTest, replaceTakesRequestedSpelling) {
   root_ = mount_->getEdenMount()->getRootInode();
   EXPECT_EQ((Names{"B", "src"}), rootNames());
   EXPECT_EQ("new\n", mount_->readFile("B"));
+#endif
 }
 
-TEST_F(RenameCaseVariantTest, caseOnlyFileRename) {
+TEST_F(RenameCaseVariantTest, caseOnlyFileRenameTakesRequestedSpelling) {
   auto file = mount_->getFileInode("b");
   auto future = root_
                     ->rename(
@@ -268,19 +273,24 @@ TEST_F(RenameCaseVariantTest, caseOnlyFileRename) {
   std::move(future).get(0ms);
 
   using Names = std::vector<std::string>;
-  EXPECT_EQ(RelativePath{"b"}, file->getPath().value());
-  EXPECT_EQ((Names{"b", "src"}), rootNames());
-  EXPECT_EQ((Names{"b", "src"}), rootOverlayNames());
+  EXPECT_EQ(RelativePath{"B"}, file->getPath().value());
+  EXPECT_EQ((Names{"B", "src"}), rootNames());
+  EXPECT_EQ((Names{"B", "src"}), rootOverlayNames());
 
+#ifndef _WIN32
+  // A Windows remount rebuilds the InMemory overlay from the ProjFS scan, and
+  // TestMount has no projected disk state, so the root reverts to the SCM
+  // spelling.
   file.reset();
   root_.reset();
   mount_->remount();
   root_ = mount_->getEdenMount()->getRootInode();
-  EXPECT_EQ((Names{"b", "src"}), rootNames());
+  EXPECT_EQ((Names{"B", "src"}), rootNames());
   EXPECT_EQ("old\n", mount_->readFile("B"));
+#endif
 }
 
-TEST_F(RenameCaseVariantTest, caseOnlyDirectoryRename) {
+TEST_F(RenameCaseVariantTest, caseOnlyDirectoryRenameTakesRequestedSpelling) {
   auto dir = mount_->getTreeInode("src");
   auto future = root_
                     ->rename(
@@ -295,11 +305,11 @@ TEST_F(RenameCaseVariantTest, caseOnlyDirectoryRename) {
   std::move(future).get(0ms);
 
   using Names = std::vector<std::string>;
-  EXPECT_EQ(RelativePath{"src"}, dir->getPath().value());
-  EXPECT_EQ((Names{"b", "src"}), rootNames());
-  EXPECT_EQ((Names{"b", "src"}), rootOverlayNames());
+  EXPECT_EQ(RelativePath{"SRC"}, dir->getPath().value());
+  EXPECT_EQ((Names{"SRC", "b"}), rootNames());
+  EXPECT_EQ((Names{"SRC", "b"}), rootOverlayNames());
   EXPECT_EQ(
-      RelativePath{"src/file.txt"},
+      RelativePath{"SRC/file.txt"},
       mount_->getFileInode("SRC/file.txt")->getPath().value());
 }
 

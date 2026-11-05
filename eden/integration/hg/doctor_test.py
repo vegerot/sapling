@@ -6,7 +6,9 @@
 
 # pyre-unsafe
 
+import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -128,3 +130,27 @@ class DoctorTest(EdenHgTestCase):
 
         fixed_parent = self.hg("log", "-r.", "-T{node}")
         self.assertEqual(fixed_parent, self.commit2)
+
+    def test_doctor_watchman_error_reply(self) -> None:
+        # A watchman whose `watch-project` fails answers with an error, not
+        # with a watcher. `eden doctor` skips the watcher check instead of
+        # reporting a watcher of the wrong type.
+        fake_bin = Path(self.tmp_dir) / "fake_watchman_bin"
+        fake_bin.mkdir()
+        script = fake_bin / "watchman"
+        watch_list_reply = shlex.quote(json.dumps({"roots": [self.mount]}))
+        script.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            f"  watch-list) printf '%s' {watch_list_reply} ;;\n"
+            "  *) echo 'watch-project failed' >&2; exit 1 ;;\n"
+            "esac\n"
+        )
+        script.chmod(0o755)
+        env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+        result = self.eden.run_unchecked(
+            "doctor", "--current-edenfs-only", "-n", stdout=subprocess.PIPE, env=env
+        )
+        out = result.stdout.decode()
+        self.assertNotIn("wrong watcher type", out)
+        self.assertNotIn("Would fix watchman watch", out)

@@ -32,41 +32,33 @@ endif()
 
 # The following integration test files contain one or more tests that require
 # pexpect.  For now we disable the entire files when pexpect is unavailable.
-if(NOT pexpect_FOUND)
+if(NOT EDEN_HAVE_PEXPECT)
   list(
     REMOVE_ITEM INTEGRATION_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/health_test.py
     ${CMAKE_CURRENT_SOURCE_DIR}/restart_test.py
     ${CMAKE_CURRENT_SOURCE_DIR}/service_log_test.py
     ${CMAKE_CURRENT_SOURCE_DIR}/stop_test.py
+    ${CMAKE_CURRENT_SOURCE_DIR}/takeover_test.py
   )
 endif()
 
-find_package(FBThrift CONFIG REQUIRED)
-
 add_fb_python_unittest(
   integration_tests.egg
-  TYPE "pex"
+  TYPE "dir"
   SOURCES ${INTEGRATION_SRCS}
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
   DEPENDS
     edenfsctl.real.main_lib
     eden_integration_lib
     eden_hg_integration_lib
-    python-psutil::python-psutil
-    FBThrift::thrift_python_cpp
-    Folly::folly_python_cpp
-  NORMAL_DEPENDS
-    FBThrift::thriftcpp2
-    Folly::folly
-    fmt::fmt
-    glog::glog
   ENV
     "CMAKE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
 )
 
 add_subdirectory(hg)
 add_subdirectory(helpers)
+add_subdirectory(posix)
 
 if(IS_FB_BUILD)
   add_subdirectory(facebook/lib)

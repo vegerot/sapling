@@ -612,13 +612,19 @@ def showfilestat(**args) -> _hybrid:
 @templatekeyword("graphnode")
 def showgraphnode(repo, ctx, **args) -> str:
     """String. The character representing the changeset node in an ASCII
-    revision graph."""
+    revision graph: ``@`` for a working directory parent, ``v`` for an
+    obsolete commit that diverged (it was replaced by more than one visible
+    version), ``x`` for another obsolete commit, and ``o`` otherwise."""
     wpnodes = repo.dirstate.parents()
     if wpnodes[1] == nullid:
         wpnodes = wpnodes[:1]
     if ctx.node() in wpnodes:
         return "@"
     elif ctx.obsolete():
+        if repo.ui.configbool(
+            "experimental", "graph.divergent-node", True
+        ) and mutation.isdivergent(repo, ctx.node()):
+            return "v"
         return "x"
     else:
         return "o"
@@ -817,6 +823,97 @@ def showsuccessorssets(repo, ctx, **args) -> Union[_hybrid, str]:
         yield "; ".join(render(d) for d in data)
 
     return _hybrid(gen(data), data, lambda x: {"successorset": x}, util.identity)
+
+
+def _mutationnodelist(repo):
+    """Returns a function that makes a template list of commits, where a
+    commit that is not available locally has only ``{node}``."""
+    islocal = mutation.getislocal(repo)
+
+    def nodelist(nodes):
+        local = {hex(n) for n in nodes if islocal(n)}
+        return _hybrid(
+            None,
+            [hex(n) for n in nodes],
+            lambda x: {"ctx": repo[x], "revcache": {}} if x in local else {"node": x},
+            lambda x: x[:12],
+        )
+
+    return nodelist
+
+
+@templatekeyword("mutatedfrom")
+def showmutatedfrom(repo, ctx, **args) -> _hybrid:
+    """How the commit was created by mutating other commits, or nothing if
+    it was not. As a string, the name of the operation.
+
+    It has the following fields:
+      - 'operation' is the name of the mutation operation, e.g. ``amend``
+      - 'user' is who ran the operation
+      - 'date' is when the operation ran
+      - 'predecessors' is the list of commits it replaced
+      - 'split' is the list of all the commits a split created, in order,
+        or empty if the operation was not a split
+      - 'splitpart' is the position of this commit in 'split', counting
+        from 1, or 0 if the operation was not a split
+
+    In 'predecessors' and 'split', only ``{node}`` refers to a commit that is
+    not available locally; other keywords refer to the commit being shown.
+    """
+    entry = mutation.lookupsplit(repo, ctx.node()) if mutation.enabled(repo) else None
+    if entry is None:
+        return _hybrid(None, [], lambda x: x, lambda x: "")
+    nodelist = _mutationnodelist(repo)
+    split = list(entry.split() or [])
+    if split:
+        split.append(entry.succ())
+    data = {
+        "operation": entry.op(),
+        "user": entry.user(),
+        "date": (entry.time(), entry.tz()),
+        "predecessors": nodelist(util.removeduplicates(entry.preds())),
+        "split": nodelist(split),
+        "splitpart": split.index(ctx.node()) + 1 if split else 0,
+    }
+    return _hybrid(None, [data], lambda x: x, lambda x: x["operation"])
+
+
+@templatekeyword("mutatedinto")
+def showmutatedinto(repo, ctx, **args) -> _hybrid:
+    """The mutations that replaced the commit, oldest first, or nothing if
+    there are none. Unlike ``{mutations}``, which follows each one to the
+    visible commits it led to, these are the next versions. As a string, the
+    names of the operations.
+
+    Each has the following fields:
+      - 'operation' is the name of the mutation operation, e.g. ``amend``
+      - 'user' is who ran the operation
+      - 'date' is when the operation ran
+      - 'successors' is the list of commits it created: for a split, all the
+        parts, in order
+
+    In 'successors', only ``{node}`` refers to a commit that is not available
+    locally; other keywords refer to the commit being shown.
+    """
+    entries = []
+    if mutation.enabled(repo):
+        ms = repo._mutationstore
+        for succset in mutation.lookupsuccessors(repo, ctx.node()):
+            entry = ms.get(succset[-1])
+            if entry is not None:
+                entries.append(entry)
+    entries.sort(key=lambda entry: (entry.time(), entry.succ()))
+    nodelist = _mutationnodelist(repo)
+    data = [
+        {
+            "operation": entry.op(),
+            "user": entry.user(),
+            "date": (entry.time(), entry.tz()),
+            "successors": nodelist(list(entry.split() or []) + [entry.succ()]),
+        }
+        for entry in entries
+    ]
+    return _hybrid(None, data, lambda x: x, lambda x: x["operation"])
 
 
 @templatekeyword("mutations")

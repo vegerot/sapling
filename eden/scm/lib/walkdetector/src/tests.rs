@@ -16,6 +16,7 @@ use crate::Config;
 use crate::Detector;
 use crate::Walk;
 use crate::WalkType;
+use crate::walk_node::SeenNames;
 use crate::walk_node::WalkNode;
 
 fn p(p: impl AsRef<str>) -> RepoPathBuf {
@@ -44,6 +45,35 @@ fn test_walk_big_dir() {
     detector.file_loaded(p("dir/d"), 0);
     detector.file_loaded(p("dir/e"), 0);
 
+    assert_eq!(detector.file_walks(), vec![(p("dir"), 0)]);
+}
+
+#[test]
+fn test_file_loaded_with_dir_size() {
+    let mut detector = Detector::new();
+    detector.set_walk_threshold(TEST_WALK_THRESHOLD);
+
+    // The hint says "dir" holds a single file, so its first load is a walk.
+    assert!(detector.file_loaded_with_dir_size(p("dir/a"), Some((1, 0)), 0));
+    assert_eq!(detector.file_walks(), vec![(p("dir"), 0)]);
+
+    // Without a hint the usual threshold applies.
+    assert!(!detector.file_loaded_with_dir_size(p("other/a"), None, 0));
+    assert_eq!(detector.file_walks(), vec![(p("dir"), 0)]);
+
+    // A large hint raises the threshold above the base threshold.
+    assert!(!detector.file_loaded_with_dir_size(p("huge/a"), Some((1000, 0)), 0));
+    assert!(!detector.file_loaded_with_dir_size(p("huge/b"), Some((1000, 0)), 0));
+    assert_eq!(detector.file_walks(), vec![(p("dir"), 0)]);
+
+    // A hint of zero files cannot describe the directory of a loaded file, so it is ignored.
+    assert!(!detector.file_loaded_with_dir_size(p("stale/a"), Some((0, 1)), 0));
+    assert_eq!(detector.file_walks(), vec![(p("dir"), 0)]);
+
+    // A size the detector already knows is not replaced by the hint.
+    detector.dir_loaded(p("big"), 1000, 0, 0);
+    assert!(!detector.file_loaded_with_dir_size(p("big/a"), Some((1, 0)), 0));
+    assert!(!detector.file_loaded_with_dir_size(p("big/b"), Some((1, 0)), 0));
     assert_eq!(detector.file_walks(), vec![(p("dir"), 0)]);
 }
 
@@ -166,23 +196,23 @@ fn test_walk_node_insert() {
     let config = Config::default();
     let mut node = WalkNode::new(config.gc_timeout);
 
-    node.insert_walk(&config, WalkType::File, &p("foo"), Walk::new(1), 0);
+    node.insert_walk(&config, WalkType::File, &p("foo"), Walk::new(1));
     // Can re-insert.
-    node.insert_walk(&config, WalkType::File, &p("foo"), Walk::new(1), 0);
+    node.insert_walk(&config, WalkType::File, &p("foo"), Walk::new(1));
     assert_eq!(
         node.list_walks(Some(WalkType::File)),
         vec![(p("foo"), 1, WalkType::File)]
     );
 
     // Don't insert since it is fully contained by "foo" walk.
-    node.insert_walk(&config, WalkType::File, &p("foo/bar"), Walk::new(0), 0);
+    node.insert_walk(&config, WalkType::File, &p("foo/bar"), Walk::new(0));
     assert_eq!(
         node.list_walks(Some(WalkType::File)),
         vec![(p("foo"), 1, WalkType::File)]
     );
 
     let baz_walk = Walk::new(2);
-    node.insert_walk(&config, WalkType::File, &p("foo/bar/baz"), baz_walk, 0);
+    node.insert_walk(&config, WalkType::File, &p("foo/bar/baz"), baz_walk);
     assert_eq!(
         node.list_walks(Some(WalkType::File)),
         vec![
@@ -192,7 +222,7 @@ fn test_walk_node_insert() {
     );
 
     let root_walk = Walk::new(0);
-    node.insert_walk(&config, WalkType::File, &p(""), root_walk, 0);
+    node.insert_walk(&config, WalkType::File, &p(""), root_walk);
     assert_eq!(
         node.list_walks(Some(WalkType::File)),
         vec![
@@ -204,7 +234,7 @@ fn test_walk_node_insert() {
 
     // depth=1 doesn't contain any descendant walks - don't clear anything out.
     let root_walk = Walk::new(1);
-    node.insert_walk(&config, WalkType::File, &p(""), root_walk, 0);
+    node.insert_walk(&config, WalkType::File, &p(""), root_walk);
     assert_eq!(
         node.list_walks(Some(WalkType::File)),
         vec![
@@ -216,7 +246,7 @@ fn test_walk_node_insert() {
 
     // depth=2 contains the "foo" walk - clear "foo" out.
     let root_walk = Walk::new(2);
-    node.insert_walk(&config, WalkType::File, &p(""), root_walk, 0);
+    node.insert_walk(&config, WalkType::File, &p(""), root_walk);
     assert_eq!(
         node.list_walks(Some(WalkType::File)),
         vec![
@@ -227,7 +257,7 @@ fn test_walk_node_insert() {
 
     // Contains the "foo/bar/baz" walk.
     let root_walk = Walk::new(5);
-    node.insert_walk(&config, WalkType::File, &p(""), root_walk, 0);
+    node.insert_walk(&config, WalkType::File, &p(""), root_walk);
     assert_eq!(
         node.list_walks(Some(WalkType::File)),
         vec![(p(""), 5, WalkType::File)]
@@ -249,21 +279,21 @@ fn test_walk_node_get() {
     assert!(get_depth(&mut node, &p("foo/bar")).is_none());
 
     let foo_walk = Walk::new(1);
-    node.insert_walk(&config, WalkType::File, &p("foo"), foo_walk, 0);
+    node.insert_walk(&config, WalkType::File, &p("foo"), foo_walk);
 
     assert!(get_depth(&mut node, &p("")).is_none());
     assert_eq!(get_depth(&mut node, &p("foo")), Some(1));
     assert!(get_depth(&mut node, &p("foo/bar")).is_none());
 
     let foo_bar_walk = Walk::new(2);
-    node.insert_walk(&config, WalkType::File, &p("foo/bar"), foo_bar_walk, 0);
+    node.insert_walk(&config, WalkType::File, &p("foo/bar"), foo_bar_walk);
 
     assert!(get_depth(&mut node, &p("")).is_none());
     assert_eq!(get_depth(&mut node, &p("foo")), Some(1));
     assert_eq!(get_depth(&mut node, &p("foo/bar")), Some(2));
 
     let root_walk = Walk::new(0);
-    node.insert_walk(&config, WalkType::File, &p(""), root_walk, 0);
+    node.insert_walk(&config, WalkType::File, &p(""), root_walk);
 
     assert_eq!(get_depth(&mut node, &p("")), Some(0));
     assert_eq!(get_depth(&mut node, &p("foo")), Some(1));
@@ -279,12 +309,12 @@ fn test_walk_get_containing_node() {
 
     assert!(node.get_owning_node(WalkType::File, &dir).is_none());
 
-    node.insert_walk(&config, WalkType::File, &p("foo/bar"), Walk::new(0), 0);
+    node.insert_walk(&config, WalkType::File, &p("foo/bar"), Walk::new(0));
 
     // Still not containing due to depth.
     assert!(node.get_owning_node(WalkType::File, &dir).is_none());
 
-    node.insert_walk(&config, WalkType::File, &p("foo/bar"), Walk::new(1), 0);
+    node.insert_walk(&config, WalkType::File, &p("foo/bar"), Walk::new(1));
 
     let (containing_node, suffix) = node.get_owning_node(WalkType::File, &dir).unwrap();
     assert_eq!(
@@ -368,6 +398,8 @@ fn test_retain_interesting_metadata_when_covered_by_walk() {
     let mut detector = Detector::new();
     detector.set_walk_threshold(TEST_WALK_THRESHOLD);
     detector.set_walk_ratio(0.1);
+    // The accesses below are in order; this test is about the plain ratio.
+    detector.set_walk_ratio_sorted_factor(1.0);
 
     // Start off with a directory walk at root/ triggered by un-interesting directories.
     detector.dir_loaded(p("root/dir1"), 0, 0, 0);
@@ -426,6 +458,76 @@ fn test_merge_cousins() {
             (p("root/foo/dir2/dir2_1"), 3)
         ]
     );
+}
+
+#[test]
+fn test_merge_siblings_walked_over_time() {
+    let mut detector = Detector::new();
+    detector.set_walk_threshold(3);
+    detector.set_gc_timeout(Duration::from_secs(2));
+
+    // Each sibling walk expires before the third arrives, so the three are never live together.
+    insert_walk(&detector, p("root/a"), WalkType::File, 0);
+    MockClock::advance(Duration::from_secs(1));
+    insert_walk(&detector, p("root/b"), WalkType::File, 0);
+    MockClock::advance(Duration::from_secs(1));
+    assert_eq!(detector.file_walks(), vec![(p("root/b"), 0)]);
+
+    insert_walk(&detector, p("root/c"), WalkType::File, 0);
+    assert_eq!(detector.file_walks(), vec![(p("root"), 1)]);
+
+    // A gap longer than the GC timeout forgets siblings whose walks have expired.
+    insert_walk(&detector, p("other/x"), WalkType::File, 0);
+    MockClock::advance(Duration::from_secs(3));
+    insert_walk(&detector, p("other/y"), WalkType::File, 0);
+    insert_walk(&detector, p("other/z"), WalkType::File, 0);
+    assert_eq!(
+        detector.file_walks(),
+        vec![(p("other/y"), 0), (p("other/z"), 0)]
+    );
+
+    insert_walk(&detector, p("other/w"), WalkType::File, 0);
+    assert_eq!(detector.file_walks(), vec![(p("other"), 1)]);
+}
+
+#[test]
+fn test_walked_siblings_do_not_block_advancing_parent() {
+    let mut detector = Detector::new();
+    detector.set_walk_threshold(TEST_WALK_THRESHOLD);
+
+    insert_walk(&detector, p("root"), WalkType::File, 1);
+
+    // Children walking deeper than the parent's walk advance it rather than re-merging into it.
+    insert_walk(&detector, p("root/a"), WalkType::File, 1);
+    insert_walk(&detector, p("root/b"), WalkType::File, 1);
+    assert_eq!(detector.file_walks(), vec![(p("root"), 2)]);
+
+    insert_walk(&detector, p("root/c"), WalkType::File, 2);
+    insert_walk(&detector, p("root/d"), WalkType::File, 2);
+    assert_eq!(detector.file_walks(), vec![(p("root"), 3)]);
+}
+
+#[test]
+fn test_merge_siblings_keeps_live_walks_after_gap() {
+    let mut detector = Detector::new();
+    detector.set_walk_threshold(3);
+    detector.set_gc_timeout(Duration::from_secs(2));
+
+    // "root/a" stays busy while "root" itself sees no activity, so it still counts once "root/b"
+    // and "root/c" arrive.
+    insert_walk(&detector, p("root/a"), WalkType::File, 0);
+    MockClock::advance(Duration::from_secs(1));
+    detector.file_loaded(p("root/a/file1"), 0);
+    MockClock::advance(Duration::from_secs(1));
+    detector.file_loaded(p("root/a/file2"), 0);
+    insert_walk(&detector, p("root/b"), WalkType::File, 0);
+    assert_eq!(
+        detector.file_walks(),
+        vec![(p("root/a"), 0), (p("root/b"), 0)]
+    );
+
+    insert_walk(&detector, p("root/c"), WalkType::File, 0);
+    assert_eq!(detector.file_walks(), vec![(p("root"), 1)]);
 }
 
 #[test]
@@ -528,11 +630,10 @@ fn test_gc_stats() {
     detector.file_loaded(p("dir3/dir4/b"), 0);
 
     // Manually run GC to check stats.
-    let gc_result = detector.inner.write().node.gc(&Default::default(), false);
+    let gc_result = detector.inner.write().node.gc(&Default::default());
     let nodes_removed = gc_result.deleted_nodes;
     let nodes_remaining = gc_result.remaining_nodes;
     let walks_removed = gc_result.deleted_walks;
-    assert!(gc_result.important_metadata.is_none());
 
     // "dir1" and "dir2"
     assert_eq!(nodes_removed, 2);
@@ -636,7 +737,7 @@ fn test_touched() {
         MockClock::advance(Duration::from_secs(1));
 
         assert!(detector.file_read(p("dir1/c"), 0));
-        assert!(detector.dir_read(p("dir2/c"), 0, 0, 0));
+        assert!(detector.dir_read(p("dir2/c"), 0));
     }
 
     detector.file_loaded(p("something/else"), 0);
@@ -673,7 +774,7 @@ fn test_counters() {
     detector.dir_loaded(p("dir1/dir1_1"), 0, 0, 0);
     detector.dir_loaded(p("dir1/dir1_2"), 0, 0, 0);
     detector.dir_loaded(p("dir1/dir1_2"), 0, 0, 0);
-    detector.dir_read(p("dir1/dir1_2"), 0, 0, 0);
+    detector.dir_read(p("dir1/dir1_2"), 0);
     assert_eq!(
         get_counters(p("dir1"), WalkType::Directory),
         (0, 0, 0, 3, 1)
@@ -686,7 +787,8 @@ fn test_counters() {
 
     detector.files_preloaded(p("dir1"), 1);
     let (preloaded, read) = detector.files_preloaded(p("dir1"), 1);
-    assert_eq!(read, 1);
+    // Two remote loads plus one cached read.
+    assert_eq!(read, 3);
     assert_eq!(preloaded, 2);
 
     assert_eq!(get_counters(p("dir1"), WalkType::File), (2, 1, 2, 3, 1));
@@ -698,36 +800,12 @@ fn test_counters() {
 }
 
 #[test]
-fn test_stricter_threshold() {
-    let mut detector = Detector::new();
-    detector.set_walk_threshold(TEST_WALK_THRESHOLD);
-    detector.set_lax_depth(1);
-    detector.set_strict_multiplier(2);
-
-    detector.file_loaded(p("dir1/a"), 0);
-    detector.file_loaded(p("dir1/b"), 0);
-
-    detector.file_loaded(p("dir2/a"), 0);
-    detector.file_loaded(p("dir2/b"), 0);
-
-    // Walk didn't get propagated to root due to stricter threshold above depth 1.
-    assert_eq!(detector.file_walks(), vec![(p("dir1"), 0), (p("dir2"), 0)]);
-
-    detector.file_loaded(p("dir3/a"), 0);
-    detector.file_loaded(p("dir3/b"), 0);
-
-    detector.file_loaded(p("dir4/a"), 0);
-    detector.file_loaded(p("dir4/b"), 0);
-
-    // Still eventually gets propagated.
-    assert_eq!(detector.file_walks(), vec![(p(""), 1)]);
-}
-
-#[test]
 fn test_huge_directory() {
     let mut detector = Detector::new();
     detector.set_walk_threshold(TEST_WALK_THRESHOLD);
     detector.set_walk_ratio(0.1);
+    // The accesses below are in order; this test is about the plain ratio.
+    detector.set_walk_ratio_sorted_factor(1.0);
 
     // Huge directory.
     detector.dir_loaded(p("dir1"), 100, 100, 0);
@@ -870,7 +948,7 @@ fn test_important_metadata() {
     detector.set_walk_ratio(0.1);
 
     detector.dir_loaded(p("big_remote"), 1000, 1000, 0);
-    detector.dir_read(p("big_cached"), 1000, 1000, 0);
+    detector.dir_metadata(p("big_cached"), 1000, 1000);
 
     // Trigger a GC.
     MockClock::advance(Duration::from_mins(1));
@@ -1004,6 +1082,8 @@ fn test_advance_depth_across_wide_dir() {
     let mut detector = Detector::new();
     detector.set_walk_threshold(TEST_WALK_THRESHOLD);
     detector.set_walk_ratio(0.1);
+    // The accesses below are in order; this test is about the plain ratio.
+    detector.set_walk_ratio_sorted_factor(1.0);
 
     // Big dir with 100 sub-directories.
     detector.dir_loaded(p("really/big/dir"), 0, 100, 0);
@@ -1031,6 +1111,64 @@ fn test_advance_depth_across_wide_dir() {
     }
     // Now we surpassed the 10% (of 100) threshold for depth 4.
     assert_eq!(detector.file_walks(), vec![(p(""), 4)]);
+}
+
+#[test]
+fn test_breadth_credit() {
+    let mut detector = Detector::new();
+    detector.set_walk_threshold(TEST_WALK_THRESHOLD);
+    detector.set_walk_ratio(0.1);
+
+    // "big" has 100 directories, so detecting its walk takes 10 of them.
+    detector.dir_loaded(p("big"), 0, 100, 0);
+    for i in 0..10 {
+        detector.dir_loaded(p(format!("big/d{i}")), 0, 0, 0);
+    }
+    assert_eq!(detector.dir_walks(), vec![(p("big"), 0)]);
+
+    // The walk already crossed 100 children, so advancing needs only the base threshold.
+    insert_walk(&detector, p("big/d0"), WalkType::Directory, 0);
+    insert_walk(&detector, p("big/d1"), WalkType::Directory, 0);
+    assert_eq!(detector.dir_walks(), vec![(p("big"), 1)]);
+
+    // A wider level than any crossed so far still needs the ratio: big/d0 has 1000 directories.
+    detector.dir_loaded(p("big/d0"), 0, 1000, 0);
+    insert_walk(&detector, p("big/d0/x"), WalkType::Directory, 0);
+    insert_walk(&detector, p("big/d1/x"), WalkType::Directory, 0);
+    assert_eq!(
+        detector.dir_walks(),
+        vec![(p("big"), 1), (p("big/d0/x"), 0), (p("big/d1/x"), 0)]
+    );
+
+    // A walk rooted inside big's coverage inherits big's credit: big/d2 and big/d2/x each have 100
+    // directories, no wider than the 100 already crossed, so two kin walks suffice to deepen it.
+    detector.dir_loaded(p("big/d2"), 0, 100, 0);
+    detector.dir_loaded(p("big/d2/x"), 0, 100, 0);
+    insert_walk(&detector, p("big/d2"), WalkType::Directory, 1);
+    insert_walk(&detector, p("big/d2/x/q"), WalkType::Directory, 0);
+    insert_walk(&detector, p("big/d2/y/q"), WalkType::Directory, 0);
+    assert!(detector.dir_walks().contains(&(p("big/d2"), 2)));
+}
+
+#[test]
+fn test_fast_paths() {
+    let mut detector = Detector::new();
+    detector.set_walk_threshold(TEST_WALK_THRESHOLD);
+
+    // Nothing covers these yet, so the fast paths decline and the slow paths detect the walk.
+    assert!(!detector.file_loaded_fast(p("dir/a"), 0));
+    assert!(!detector.dir_loaded_fast(p("dir/sub1"), 5, 5, 0));
+    detector.file_loaded(p("dir/a"), 0);
+    detector.file_loaded(p("dir/b"), 0);
+    assert_eq!(detector.file_walks(), vec![(p("dir"), 0)]);
+
+    // Inside the walk the fast paths account the access and the walk's counters advance.
+    assert!(detector.file_loaded_fast(p("dir/c"), 0));
+    assert!(detector.dir_loaded_fast(p("dir/sub2"), 5, 5, 0));
+    // A directory size worth remembering still needs the slow path.
+    assert!(!detector.dir_loaded_fast(p("dir/sub3"), 1, 0, 0));
+    let (_, reads) = detector.files_preloaded(p("dir"), 0);
+    assert_eq!(reads, 3);
 }
 
 #[test]
@@ -1075,7 +1213,7 @@ fn test_might_have_walk() {
     insert_walk(&detector, p("foo/bar"), WalkType::Directory, 2);
 
     // GC foo/baz/qux walk - foo/baz should no longer have walk
-    detector.inner.write().node.gc(&detector.config, false);
+    detector.inner.write().node.gc(&detector.config);
     assert!(might_have_walk(""));
     assert!(might_have_walk("foo"));
     assert!(!might_have_walk("foo/bar"));
@@ -1083,173 +1221,112 @@ fn test_might_have_walk() {
 }
 
 #[test]
-fn test_persist_and_load_metadata() {
-    let dir = tempfile::tempdir().unwrap();
-    let persist_path = dir.path().join("walk_metadata.jsonl");
+fn test_seen_names_order() {
+    let name = |s: &str| p(s).last_component().unwrap().to_owned();
+    let mut seen = SeenNames::default();
 
-    // Create a detector with large directory metadata.
+    seen.insert(name("a"));
+    seen.insert(name("c"));
+    // A repeat carries no order information.
+    seen.insert(name("a"));
+    assert_eq!((seen.len(), seen.is_sorted()), (2, true));
+
+    seen.insert(name("b"));
+    assert_eq!((seen.len(), seen.is_sorted()), (3, false));
+    // Ascending again does not undo it.
+    seen.insert(name("d"));
+    assert!(!seen.is_sorted());
+
+    // After a reset the arrival order of the seeds is unknown, so a later name is in order only
+    // if it sorts after all of them.
+    seen.reset_to([name("c"), name("a")]);
+    seen.insert(name("b"));
+    assert_eq!((seen.len(), seen.is_sorted()), (3, false));
+    seen.reset_to([name("c"), name("a")]);
+    seen.insert(name("d"));
+    assert_eq!((seen.len(), seen.is_sorted()), (3, true));
+}
+
+#[test]
+fn test_sorted_walk_ratio() {
     let mut detector = Detector::new();
     detector.set_walk_threshold(TEST_WALK_THRESHOLD);
     detector.set_walk_ratio(0.1);
-    detector.set_persistence_path(persist_path.clone());
+    detector.set_walk_ratio_sorted_factor(0.4);
 
-    detector.dir_loaded(p("big_dir"), 500, 500, 0);
-    detector.dir_loaded(p("another/big"), 0, 300, 0);
-    // Small dir - should NOT be persisted.
-    detector.dir_loaded(p("small"), 2, 2, 0);
+    // Keep the root from merging the two directory walks below.
+    detector.dir_metadata(p(""), 0, 1000);
 
-    // Persist metadata collected during GC.
-    let metadata = detector
-        .inner
-        .write()
-        .node
-        .gc(&detector.config, true)
-        .important_metadata
-        .unwrap();
-    detector.persist_metadata(metadata);
+    // "big" has 100 subdirectories: a walk takes 10 of them, or 4 loaded in sorted order.
+    detector.dir_metadata(p("big"), 0, 100);
+    for name in ["a", "b", "c"] {
+        detector.dir_loaded(p(format!("big/{name}")), 0, 0, 0);
+    }
+    assert!(detector.dir_walks().is_empty());
+    detector.dir_loaded(p("big/d"), 0, 0, 0);
+    assert_eq!(detector.dir_walks(), vec![(p("big"), 0)]);
 
-    assert!(persist_path.exists());
-    let contents = std::fs::read_to_string(&persist_path).unwrap();
-    let lines: Vec<&str> = contents.lines().collect();
-    assert_eq!(lines.len(), 2);
-
-    // Load into a fresh detector.
-    let mut detector2 = Detector::new();
-    detector2.set_walk_threshold(TEST_WALK_THRESHOLD);
-    detector2.set_walk_ratio(0.1);
-    detector2.set_persistence_path(persist_path);
-    detector2.load_persisted_metadata();
-
-    let inner = detector2.inner.read();
-    let big_dir = inner.node.get_node(&p("big_dir")).unwrap();
-    assert_eq!(big_dir.total_dirs(), Some(500));
-    assert_eq!(big_dir.total_files(), Some(500));
-
-    let another_big = inner.node.get_node(&p("another/big")).unwrap();
-    assert_eq!(another_big.total_dirs(), Some(300));
-    assert_eq!(another_big.total_files(), Some(0));
-
-    // Small dir should not have been persisted/loaded.
-    assert!(inner.node.get_node(&p("small")).is_none());
+    // One load out of order and the full ratio applies, even though later loads ascend.
+    detector.dir_metadata(p("other"), 0, 100);
+    for name in ["b", "a", "c", "d", "e", "f", "g", "h", "i"] {
+        detector.dir_loaded(p(format!("other/{name}")), 0, 0, 0);
+    }
+    assert_eq!(detector.dir_walks(), vec![(p("big"), 0)]);
+    detector.dir_loaded(p("other/j"), 0, 0, 0);
+    assert_eq!(detector.dir_walks(), vec![(p("big"), 0), (p("other"), 0)]);
 }
 
 #[test]
-fn test_gc_from_dir_loaded_persists_metadata() {
-    let dir = tempfile::tempdir().unwrap();
-    let persist_path = dir.path().join("walk_metadata.jsonl");
-
+fn test_sorted_walk_ratio_after_expiry() {
     let mut detector = Detector::new();
     detector.set_walk_threshold(TEST_WALK_THRESHOLD);
     detector.set_walk_ratio(0.1);
-    detector.set_persistence_path(persist_path.clone());
+    detector.set_walk_ratio_sorted_factor(0.4);
+    detector.set_gc_timeout(Duration::from_secs(1));
+    detector.set_gc_interval(Duration::from_secs(100));
 
-    assert!(!persist_path.exists());
+    detector.dir_metadata(p(""), 0, 1000);
 
-    MockClock::advance(Duration::from_secs(11));
-    detector.dir_loaded(p("big_dir"), 500, 500, 0);
+    // "big" is large enough that its node outlives expiry to keep its size metadata.
+    detector.dir_metadata(p("big"), 0, 100);
+    detector.dir_loaded(p("big/b"), 0, 0, 0);
+    detector.dir_loaded(p("big/a"), 0, 0, 0);
 
-    assert!(persist_path.exists());
-    let contents = std::fs::read_to_string(&persist_path).unwrap();
-    let lines: Vec<&str> = contents.lines().collect();
-    assert_eq!(lines.len(), 1);
+    MockClock::advance(Duration::from_secs(2));
+    detector.inner.write().node.gc(&detector.config);
+    assert!(detector.dir_walks().is_empty());
+
+    // The out-of-order loads expired with the node, so a fresh in-order listing is detected at
+    // the sorted ratio: 4 of 100.
+    for name in ["c", "d", "e"] {
+        detector.dir_loaded(p(format!("big/{name}")), 0, 0, 0);
+    }
+    assert!(detector.dir_walks().is_empty());
+    detector.dir_loaded(p("big/f"), 0, 0, 0);
+    assert_eq!(detector.dir_walks(), vec![(p("big"), 0)]);
 }
 
 #[test]
-fn test_load_missing_file() {
-    let mut detector = Detector::new();
-    detector.set_persistence_path("/nonexistent/path/metadata.jsonl".into());
-    // Should not panic.
-    detector.load_persisted_metadata();
-}
+fn test_sorted_sibling_walks_merge_sooner() {
+    let walk_siblings = |order: [&str; 3]| {
+        let mut detector = Detector::new();
+        detector.set_walk_threshold(TEST_WALK_THRESHOLD);
+        detector.set_walk_ratio(0.1);
+        detector.set_walk_ratio_sorted_factor(0.3);
 
-#[test]
-fn test_load_skips_malformed_metadata() {
-    let dir = tempfile::tempdir().unwrap();
-    let persist_path = dir.path().join("walk_metadata.jsonl");
-    std::fs::write(
-        &persist_path,
-        concat!(
-            "{\"v\":1,\"d\":\"big_dir\",\"f\":500,\"s\":500}\n",
-            "{\"d\":\"missing_version\",\"f\":500,\"s\":500}\n",
-            "{\"v\":2,\"d\":\"wrong_version\",\"f\":500,\"s\":500}\n",
-            "{\"v\":1,\"f\":500,\"s\":500}\n",
-            "{\"v\":1,\"d\":\"missing_files\",\"s\":500}\n",
-            "{\"v\":1,\"d\":\"wrong_type\",\"f\":\"500\",\"s\":500}\n",
-            "{\"v\":1,\"d\":\"bad//path\",\"f\":500,\"s\":500}\n",
-            "not json\n",
-        ),
-    )
-    .unwrap();
+        // The root has 100 subdirectories: merging child walks into it takes 10 of them, or 3
+        // walked in sorted order.
+        detector.dir_metadata(p(""), 0, 100);
+        for dir in order {
+            detector.file_loaded(p(format!("{dir}/x")), 0);
+            detector.file_loaded(p(format!("{dir}/y")), 0);
+        }
+        detector.file_walks()
+    };
 
-    let mut detector = Detector::new();
-    detector.set_walk_threshold(TEST_WALK_THRESHOLD);
-    detector.set_walk_ratio(0.1);
-    detector.set_persistence_path(persist_path);
-    detector.load_persisted_metadata();
-
-    let inner = detector.inner.read();
-    assert!(inner.node.get_node(&p("big_dir")).is_some());
-    assert!(inner.node.get_node(&p("missing_version")).is_none());
-    assert!(inner.node.get_node(&p("wrong_version")).is_none());
-    assert!(inner.node.get_node(&p("missing_files")).is_none());
-    assert!(inner.node.get_node(&p("wrong_type")).is_none());
-    assert!(inner.node.total_dirs().is_none());
-}
-
-#[test]
-fn test_persist_empty_cleans_up() {
-    let dir = tempfile::tempdir().unwrap();
-    let persist_path = dir.path().join("walk_metadata.jsonl");
-
-    let mut detector = Detector::new();
-    detector.set_persistence_path(persist_path.clone());
-
-    // Write a file with content first.
-    std::fs::write(&persist_path, "junk\n").unwrap();
-    assert!(persist_path.exists());
-
-    // Persisting with no important metadata removes the file.
-    detector.persist_metadata(Vec::new());
-    assert!(!persist_path.exists());
-}
-
-#[test]
-fn test_clear_persistence_path_disables_persistence() {
-    let dir = tempfile::tempdir().unwrap();
-    let persist_path = dir.path().join("walk_metadata.jsonl");
-
-    let mut detector = Detector::new();
-    detector.set_walk_threshold(TEST_WALK_THRESHOLD);
-    detector.set_walk_ratio(0.1);
-    detector.set_persistence_path(persist_path.clone());
-    detector.dir_loaded(p("big_dir"), 500, 500, 0);
-    let metadata = detector
-        .inner
-        .write()
-        .node
-        .gc(&detector.config, true)
-        .important_metadata
-        .unwrap();
-    detector.persist_metadata(metadata);
-    assert!(persist_path.exists());
-
-    let mut detector2 = Detector::new();
-    detector2.set_walk_threshold(TEST_WALK_THRESHOLD);
-    detector2.set_walk_ratio(0.1);
-    detector2.set_persistence_path(persist_path.clone());
-    detector2.clear_persistence_path();
-    detector2.load_persisted_metadata();
-
-    assert!(
-        detector2
-            .inner
-            .read()
-            .node
-            .get_node(&p("big_dir"))
-            .is_none()
+    assert_eq!(walk_siblings(["a", "b", "c"]), vec![(p(""), 1)]);
+    assert_eq!(
+        walk_siblings(["b", "a", "c"]),
+        vec![(p("a"), 0), (p("b"), 0), (p("c"), 0)]
     );
-
-    detector2.persist_metadata(vec![(p("big_dir"), 500, 500)]);
-    let contents = std::fs::read_to_string(&persist_path).unwrap();
-    assert!(!contents.is_empty());
 }

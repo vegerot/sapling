@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -29,7 +31,12 @@ use sql_ext::mononoke_queries;
 
 use crate::repo_provider::RepoProvider;
 
-const BATCH_SIZE: usize = 500;
+/// Pairs per `IN (...)` statement. Measured on the production bookmarks shard
+/// (2026-10-19): 500, 1,000 and 2,000 tuples all plan as one PRIMARY range scan
+/// and cost tens of milliseconds each, so the statement count, not its size,
+/// is what the read pays for. 2,000 keeps a 300-branch land's ~423k pairs at
+/// ~210 statements instead of ~850.
+const BATCH_SIZE: usize = 2000;
 
 /// Chunks are independent `IN (...)` reads against the same shard's
 /// connection pool, so this many run concurrently instead of one at a time.
@@ -72,6 +79,37 @@ mononoke_queries! {
     }
 }
 
+/// How the statements of one bulk read spread out: whether a slow read is a
+/// few slow statements or every statement waiting the same.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChunkTimings {
+    pub statements: usize,
+    /// Slowest single statement.
+    pub max: Duration,
+    /// Median single statement.
+    pub p50: Duration,
+    /// Time to the first statement returning: pool acquisition and the first
+    /// round trip, before any concurrency helps.
+    pub first: Duration,
+}
+
+impl ChunkTimings {
+    /// `samples` is one `(finished_at, elapsed)` per statement, both relative
+    /// to the read's start.
+    fn from_samples(mut samples: Vec<(Duration, Duration)>) -> Self {
+        let Some(first) = samples.iter().map(|(finished_at, _)| *finished_at).min() else {
+            return Self::default();
+        };
+        samples.sort_by_key(|(_, elapsed)| *elapsed);
+        Self {
+            statements: samples.len(),
+            max: samples[samples.len() - 1].1,
+            p50: samples[samples.len() / 2].1,
+            first,
+        }
+    }
+}
+
 /// Bookmark values for exact `(repo_id, name)` pairs, read with chunked
 /// tuple-IN queries on `conn_repo`'s shard connection. No per-repo facet is
 /// involved, so N distinct repos still cost `ceil(pairs / 500)` queries, not
@@ -91,6 +129,24 @@ pub async fn bulk_read_bookmarks<R>(
 where
     R: SqlBookmarksRef + Send + Sync,
 {
+    Ok(bulk_read_bookmarks_timed(ctx, conn_repo, freshness, pairs)
+        .await?
+        .0)
+}
+
+/// [`bulk_read_bookmarks`] plus how its statements spread out.
+pub async fn bulk_read_bookmarks_timed<R>(
+    ctx: &CoreContext,
+    conn_repo: &R,
+    freshness: Freshness,
+    pairs: &[(RepositoryId, BookmarkName)],
+) -> Result<(
+    HashMap<(RepositoryId, BookmarkName), ChangesetId>,
+    ChunkTimings,
+)>
+where
+    R: SqlBookmarksRef + Send + Sync,
+{
     let mut seen: HashSet<&(RepositoryId, BookmarkName)> = HashSet::new();
     let unique: Vec<(RepositoryId, BookmarkName)> = pairs
         .iter()
@@ -99,26 +155,34 @@ where
         .collect();
 
     let conn = conn_repo.sql_bookmarks().connection(ctx, freshness);
-    let values = stream::iter(unique.chunks(BATCH_SIZE).map(<[_]>::to_vec))
+    let started = Instant::now();
+    let (values, samples) = stream::iter(unique.chunks(BATCH_SIZE).map(<[_]>::to_vec))
         .map(|chunk| async move {
-            BulkResolveBookmarksCrossRepo::query(conn, ctx.sql_query_telemetry(), &chunk)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to query bookmarks for chunk of {} pairs",
-                        chunk.len()
-                    )
-                })
+            let statement_started = Instant::now();
+            let rows =
+                BulkResolveBookmarksCrossRepo::query(conn, ctx.sql_query_telemetry(), &chunk)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to query bookmarks for chunk of {} pairs",
+                            chunk.len()
+                        )
+                    })?;
+            anyhow::Ok((rows, (started.elapsed(), statement_started.elapsed())))
         })
         .buffer_unordered(CHUNK_CONCURRENCY)
-        .try_fold(HashMap::new(), |mut values, rows| async move {
-            for (repo_id, name, cs_id) in rows {
-                values.insert((repo_id, name), cs_id);
-            }
-            Ok(values)
-        })
+        .try_fold(
+            (HashMap::new(), Vec::new()),
+            |(mut values, mut samples), (rows, sample)| async move {
+                for (repo_id, name, cs_id) in rows {
+                    values.insert((repo_id, name), cs_id);
+                }
+                samples.push(sample);
+                Ok((values, samples))
+            },
+        )
         .await?;
-    Ok(values)
+    Ok((values, ChunkTimings::from_samples(samples)))
 }
 
 /// Git identities for exact `(repo_id, changeset)` pairs, read with chunked
@@ -226,6 +290,10 @@ pub enum ResolveOutcome {
     Resolved(GitSha1),
     /// Human-readable reason resolution failed.
     Error(String),
+    /// The repo is not served here; the message keeps the `unknown repo` form.
+    UnknownRepo(String),
+    /// The repo is served but did not build; the reason is the load error.
+    LoadFailed(String),
 }
 
 /// Per-entry result; results are returned in input order.
@@ -234,6 +302,24 @@ pub struct ResolveResult {
     pub repo_name: String,
     pub bookmark_name: String,
     pub outcome: ResolveOutcome,
+}
+
+/// Wall time of each `resolve_bookmarks_cross_repo` phase and the sizes behind them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResolveTimings {
+    /// The per-entry repo lookups through the provider.
+    pub lookup: Duration,
+    /// The bulk bookmark read.
+    pub bookmarks: Duration,
+    /// How the bookmark read's statements spread out.
+    pub bookmark_chunks: ChunkTimings,
+    /// The bulk git-mapping read.
+    pub mapping: Duration,
+    pub entries: usize,
+    /// Distinct `(repo, bookmark)` pairs the bookmark read was given.
+    pub unique_pairs: usize,
+    /// Distinct served repos among the entries.
+    pub unique_repos: usize,
 }
 
 /// Output mirrors `entries` element-for-element.
@@ -252,19 +338,40 @@ pub async fn resolve_bookmarks_cross_repo<R>(
 where
     R: RepoIdentityRef + SqlBookmarksRef + Send + Sync,
 {
+    Ok(resolve_bookmarks_cross_repo_timed(ctx, provider, entries)
+        .await?
+        .0)
+}
+
+/// [`resolve_bookmarks_cross_repo`] plus how long each phase took.
+pub async fn resolve_bookmarks_cross_repo_timed<R>(
+    ctx: &CoreContext,
+    provider: &dyn RepoProvider<R>,
+    entries: &[ResolveEntry],
+) -> Result<(Vec<ResolveResult>, ResolveTimings)>
+where
+    R: RepoIdentityRef + SqlBookmarksRef + Send + Sync,
+{
+    let mut timings = ResolveTimings {
+        entries: entries.len(),
+        ..ResolveTimings::default()
+    };
     if entries.is_empty() {
-        return Ok(vec![]);
+        return Ok((vec![], timings));
     }
 
     // resolved: (original_index, repo_id, repo_name, bookmark_name)
     let mut resolved: Vec<(usize, RepositoryId, String, String)> = Vec::new();
     let mut results: Vec<Option<ResolveResult>> = vec![None; entries.len()];
     let mut any_repo: Option<Arc<R>> = None;
+    let mut repo_ids: HashSet<RepositoryId> = HashSet::new();
 
+    let started = Instant::now();
     for (idx, entry) in entries.iter().enumerate() {
-        match provider.get_by_name(&entry.repo_name) {
-            Some(repo) => {
+        match provider.get_or_load(&entry.repo_name).await {
+            Ok(Some(repo)) => {
                 let repo_id = repo.repo_identity().id();
+                repo_ids.insert(repo_id);
                 if any_repo.is_none() {
                     any_repo = Some(repo);
                 }
@@ -275,13 +382,27 @@ where
                     entry.bookmark_name.clone(),
                 ));
             }
-            None => {
+            Ok(None) => {
                 if let Some(slot) = results.get_mut(idx) {
                     *slot = Some(ResolveResult {
                         repo_name: entry.repo_name.clone(),
                         bookmark_name: entry.bookmark_name.clone(),
-                        outcome: ResolveOutcome::Error(format!(
+                        outcome: ResolveOutcome::UnknownRepo(format!(
                             "unknown repo: {}",
+                            entry.repo_name
+                        )),
+                    });
+                }
+            }
+            // A served repo that failed to load is this entry's error, not the
+            // batch's: the other members still resolve.
+            Err(e) => {
+                if let Some(slot) = results.get_mut(idx) {
+                    *slot = Some(ResolveResult {
+                        repo_name: entry.repo_name.clone(),
+                        bookmark_name: entry.bookmark_name.clone(),
+                        outcome: ResolveOutcome::LoadFailed(format!(
+                            "repo {} failed to load: {e:#}",
                             entry.repo_name
                         )),
                     });
@@ -289,9 +410,11 @@ where
             }
         }
     }
+    timings.lookup = started.elapsed();
+    timings.unique_repos = repo_ids.len();
 
     if resolved.is_empty() {
-        return Ok(results.into_iter().flatten().collect());
+        return Ok((results.into_iter().flatten().collect(), timings));
     }
 
     // Exact (repo_id, name) tuple IN-clause — no cross-product false positives.
@@ -322,16 +445,21 @@ where
         anyhow::anyhow!("internal error: resolved is non-empty but no repo was found")
     })?;
 
-    let bookmark_map: HashMap<(RepositoryId, String), ChangesetId> = bulk_read_bookmarks(
+    timings.unique_pairs = bookmark_pairs.len();
+    let started = Instant::now();
+    let (bookmark_values, bookmark_chunks) = bulk_read_bookmarks_timed(
         ctx,
         any_repo.as_ref(),
         Freshness::MostRecent,
         &bookmark_pairs,
     )
-    .await?
-    .into_iter()
-    .map(|((repo_id, name), cs_id)| ((repo_id, name.to_string()), cs_id))
-    .collect();
+    .await?;
+    let bookmark_map: HashMap<(RepositoryId, String), ChangesetId> = bookmark_values
+        .into_iter()
+        .map(|((repo_id, name), cs_id)| ((repo_id, name.to_string()), cs_id))
+        .collect();
+    timings.bookmarks = started.elapsed();
+    timings.bookmark_chunks = bookmark_chunks;
 
     let mut cs_id_pairs: HashSet<(RepositoryId, ChangesetId)> = HashSet::new();
 
@@ -359,8 +487,10 @@ where
 
     // Bulk git-mapping lookup, same exact-tuple IN-clause.
     let git_pairs: Vec<(RepositoryId, ChangesetId)> = cs_id_pairs.iter().copied().collect();
+    let started = Instant::now();
     let git_map =
         bulk_read_git_sha1s(ctx, any_repo.as_ref(), Freshness::MostRecent, &git_pairs).await?;
+    timings.mapping = started.elapsed();
 
     // Assemble in original request order.
     for (idx, repo_id, repo_name, bookmark_name) in &resolved {
@@ -384,5 +514,5 @@ where
         }
     }
 
-    Ok(results.into_iter().flatten().collect())
+    Ok((results.into_iter().flatten().collect(), timings))
 }

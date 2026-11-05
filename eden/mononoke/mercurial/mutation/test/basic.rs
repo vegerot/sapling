@@ -424,3 +424,51 @@ async fn check_mutations_are_cut_when_reaching_limit(fb: FacebookInit) -> Result
 
     Ok(())
 }
+
+#[mononoke::fbinit_test]
+async fn first_entry_for_a_successor_wins(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let store = SqlHgMutationStoreBuilder::with_sqlite_in_memory()
+        .unwrap()
+        .with_repo_id(REPO_ZERO);
+
+    let first = HgMutationEntry::new(
+        make_hg_cs_id(1),
+        vec![make_hg_cs_id(2)],
+        vec![],
+        String::from("amend"),
+        String::from("testuser"),
+        0,
+        0,
+        vec![],
+    );
+    store
+        .add_entries(&ctx, hashset![make_hg_cs_id(1)], vec![first.clone()])
+        .await?;
+
+    // A different client claims 1 was a fold of 2 and 3.  The entry for successor 1 already
+    // exists, so this must be ignored.
+    let second = HgMutationEntry::new(
+        make_hg_cs_id(1),
+        vec![make_hg_cs_id(2), make_hg_cs_id(3)],
+        vec![],
+        String::from("fold"),
+        String::from("testuser"),
+        0,
+        0,
+        vec![],
+    );
+    store
+        .add_entries(&ctx, hashset![make_hg_cs_id(1)], vec![second])
+        .await?;
+
+    let fetched = store
+        .all_predecessors(&ctx, hashset![make_hg_cs_id(1)])
+        .await?;
+    assert_eq!(
+        fetched,
+        vec![first],
+        "the later entry for successor 1 must be ignored (first writer wins)"
+    );
+    Ok(())
+}

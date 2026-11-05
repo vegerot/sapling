@@ -26,9 +26,11 @@
 #include <folly/File.h>
 #include <folly/SharedMutex.h>
 #include <folly/Synchronized.h>
+#include <folly/hash/Hash.h>
+#include <folly/lang/Align.h>
 #include <folly/synchronization/CallOnce.h>
 
-#include <gtest/gtest_prod.h>
+#include <folly/portability/GTestProd.h>
 
 #include "eden/fs/fuse/DevFuseTransport.h"
 #include "eden/fs/fuse/FuseFeatures.h"
@@ -98,12 +100,16 @@ class IoUringFuseTransport final : public FuseTransport {
 
  private:
 #if EDEN_HAVE_FUSE_IO_URING
-  FRIEND_TEST(FuseChannelTest, ioUringSubmitAndWaitErrorPolicy);
-  FRIEND_TEST(FuseChannelTest, ioUringCqeErrorPolicy);
-  FRIEND_TEST(FuseChannelTest, ioUringDisableIoWaitAppliesNoIoWait);
-  FRIEND_TEST(FuseChannelTest, ioUringDefaultDoesNotDisableIoWait);
-  FRIEND_TEST(FuseChannelTest, ioUringStopWakeupBeforeEventFdPublished);
-  FRIEND_TEST(FuseChannelTest, ioUringRequestStopWakeupBeforeRingPoolPublished);
+  FOLLY_GTEST_FRIEND_TEST(FuseChannelTest, ioUringSubmitAndWaitErrorPolicy);
+  FOLLY_GTEST_FRIEND_TEST(FuseChannelTest, ioUringCqeErrorPolicy);
+  FOLLY_GTEST_FRIEND_TEST(FuseChannelTest, ioUringDisableIoWaitAppliesNoIoWait);
+  FOLLY_GTEST_FRIEND_TEST(FuseChannelTest, ioUringDefaultDoesNotDisableIoWait);
+  FOLLY_GTEST_FRIEND_TEST(
+      FuseChannelTest,
+      ioUringStopWakeupBeforeEventFdPublished);
+  FOLLY_GTEST_FRIEND_TEST(
+      FuseChannelTest,
+      ioUringRequestStopWakeupBeforeRingPoolPublished);
 
   struct RingPool;
 
@@ -281,8 +287,20 @@ class IoUringFuseTransport final : public FuseTransport {
   void destroyRingPool() noexcept;
   static void* allocatePageAlignedBuffer(size_t size);
 
-  mutable folly::Synchronized<std::unordered_map<uint64_t, RingEntry*>>
-      outstandingEntries_;
+  // Every ring worker registers and takes an entry per request, so the map is
+  // sharded by a hash of the request's `unique` to keep workers off each
+  // other's locks.
+  struct alignas(folly::hardware_destructive_interference_size)
+      OutstandingShard {
+    folly::Synchronized<std::unordered_map<uint64_t, RingEntry*>> entries;
+  };
+  mutable std::array<OutstandingShard, 64> outstandingEntries_;
+  folly::Synchronized<std::unordered_map<uint64_t, RingEntry*>>&
+  outstandingShard(uint64_t unique) const {
+    return outstandingEntries_
+        [folly::hash::twang_mix64(unique) % outstandingEntries_.size()]
+            .entries;
+  }
   mutable folly::once_flag sessionInitFlag_;
   mutable std::atomic<size_t> nextWorkerId_{0};
   // When true, pass IORING_ENTER_NO_IOWAIT on io_uring_enter so that a worker

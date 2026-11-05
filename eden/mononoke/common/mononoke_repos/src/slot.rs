@@ -5,7 +5,7 @@
  * GNU General Public License version 2.
  */
 
-use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -19,6 +19,8 @@ use futures::channel::oneshot;
 use futures::future::Shared;
 use mononoke_macros::mononoke;
 use parking_lot::Mutex;
+
+use crate::RepoLoader;
 
 /// How long a failed build is remembered before a caller is allowed to retry.
 ///
@@ -39,18 +41,16 @@ type SharedBuild<R> = Shared<oneshot::Receiver<BuildOutcome<R>>>;
 /// One repo's entry in [`crate::MononokeRepos`]: either the built repo, or
 /// nothing yet.
 ///
-/// # DO NOT BUILD ON THIS YET
+/// # Experimental: use at your own risk
 ///
-/// This type is scaffolding for the in-progress inexpensive-repos work (lazy
-/// repo loading) and **is not rolled out**. Nothing in production creates an
-/// unbuilt slot, so today it is an implementation detail of the repo map and
-/// not a supported way to model repo state.
+/// This type is part of the inexpensive-repos work (lazy repo loading), which
+/// is still rolling out. Every repo `MononokeReposManager` holds is built
+/// through a slot, eager or lazy, but what an unbuilt repo means for callers
+/// is not settled, and the semantics here (single-flight, failed-build hold,
+/// eviction) may still change.
 ///
-/// If you are about to reach for `RepoSlot`, or for its unbuilt state, in new
-/// code - **stop and talk to lmvasquezg first**. This applies to coding agents
-/// as much as to people: the rollout has not settled what an unbuilt repo means
-/// for callers, and depending on it early bakes in answers that are still being
-/// decided.
+/// If you build on `RepoSlot` or its unbuilt state, expect to follow those
+/// changes, and give lmvasquezg a heads-up so the rollout knows about you.
 ///
 /// Slots are `Arc`-shared and outlive any individual snapshot of the repo map,
 /// so a caller that resolved a slot from an older snapshot still observes state
@@ -91,8 +91,8 @@ enum Claim<R> {
     /// A recent build failed and the retry window has not elapsed.
     Failed(Arc<Error>),
     /// This caller won the race: run the build, report it through the
-    /// completion handle, then wait on the shared handle like everyone else.
-    Start(BuildCompletion<R>, SharedBuild<R>),
+    /// sender, then wait on the shared handle like everyone else.
+    Start(oneshot::Sender<BuildOutcome<R>>, SharedBuild<R>),
 }
 
 impl<R> RepoSlot<R> {
@@ -129,6 +129,18 @@ impl<R> RepoSlot<R> {
         }
     }
 
+    /// Swaps in a newly built repo for the one this slot serves. `false`,
+    /// without swapping, if the slot is not built: a build in flight would
+    /// overwrite the swap with its own outcome.
+    pub(crate) fn replace(&self, repo: Arc<R>) -> bool {
+        let _transition = self.transition.lock();
+        if !matches!(**self.state.load(), SlotState::Ready(_)) {
+            return false;
+        }
+        self.state.store(Arc::new(SlotState::Ready(repo)));
+        true
+    }
+
     /// The claim this slot can answer without taking the lock. `None` when it
     /// is `Empty`, the one case that needs a writer.
     fn peek(&self) -> Option<Claim<R>> {
@@ -148,16 +160,17 @@ impl<R> RepoSlot<R> {
     /// the obligation to run one. The build is not run here and needs no
     /// runtime: this decides *who* builds, not *how*.
     ///
-    /// Exactly one caller is handed [`Claim::Start`] per build, and dropping
-    /// its [`BuildCompletion`] without finishing publishes a failure, so a
-    /// claim can never be silently abandoned.
+    /// Exactly one caller is handed [`Claim::Start`] per build.
     ///
     /// Single-flight holds **per slot, not per repo name**: `remove` followed
     /// by a re-`add` of the same name makes a *new* slot, so a build against
-    /// the old one can still be in flight. Harmless while nothing evicts - the
-    /// orphaned slot is unreachable and its result dropped - but eviction has
-    /// to account for it.
-    fn claim_build(self: &Arc<Self>) -> Claim<R> {
+    /// the old one can still be in flight. The orphaned slot is unreachable and
+    /// its result dropped, so this costs a duplicate build, never a wrong repo.
+    /// A caller that evicts avoids even that by not removing a repo while
+    /// anyone still waits on its build: the async-requests worker, which unloads
+    /// an on-demand repo when its last request finishes, holds each request's
+    /// reference until that request has seen the build complete.
+    fn claim_build(&self) -> Claim<R> {
         if let Some(claim) = self.peek() {
             return claim;
         }
@@ -176,13 +189,7 @@ impl<R> RepoSlot<R> {
             .store(Arc::new(SlotState::Building(pending.clone())));
         drop(transition);
 
-        Claim::Start(
-            BuildCompletion {
-                repo_slot: Arc::clone(self),
-                send_outcome: Some(send_outcome),
-            },
-            pending,
-        )
+        Claim::Start(send_outcome, pending)
     }
 
     /// Publishes a finished build into this slot.
@@ -195,13 +202,10 @@ impl<R> RepoSlot<R> {
     fn apply_outcome(&self, outcome: &BuildOutcome<R>) {
         let next = match outcome {
             Ok(repo) => SlotState::Ready(Arc::clone(repo)),
-            // TODO(lmvasquezg): a repo that never builds is invisible beyond
-            // the error each caller happens to see, so it looks like a slow
-            // repo rather than a broken one. Needs a counter here and an alert
-            // on it before any service builds lazily. The counter cannot live
-            // in this crate, which has no stats dependency and should keep it
-            // that way; `mononoke_app` already has `define_stats!`, so the
-            // outcome has to surface to the caller that owns the loader.
+            // A repo that never builds would otherwise look slow rather than
+            // broken. This crate has no stats dependency and should keep it
+            // that way, so the failure is counted by the loader that owns the
+            // build (`mononoke.app.lazy_repo_build_failed` in `mononoke_app`).
             Err(error) => SlotState::Failed {
                 error: Arc::clone(error),
                 retry_after: Instant::now() + FAILED_BUILD_TTL,
@@ -225,18 +229,13 @@ impl<R> RepoSlot<R> {
         }));
     }
 
-    /// The built repo, building it with `build` if this is the first caller to
-    /// ask.
-    ///
-    /// `build` is handed in per call rather than held by the slot, and takes an
-    /// owned name because it runs on a task that outlives this call. That
-    /// detached task is the only reason `R` is bounded, so the bound sits here
-    /// rather than on the impl block.
-    pub(crate) async fn get_or_build<Build, Fut>(self: &Arc<Self>, build: Build) -> Result<Arc<R>>
+    /// The built repo, loading it if this is the first caller to ask.
+    pub(crate) async fn get_or_build(
+        self: &Arc<Self>,
+        loader: Arc<dyn RepoLoader<R>>,
+    ) -> Result<Arc<R>>
     where
         R: Send + Sync + 'static,
-        Build: FnOnce(String) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<R>> + Send + 'static,
     {
         let pending = match self.claim_build() {
             Claim::Ready(repo) => return Ok(repo),
@@ -248,7 +247,7 @@ impl<R> RepoSlot<R> {
                 ));
             }
             Claim::Wait(pending) => pending,
-            Claim::Start(completion, pending) => {
+            Claim::Start(send_outcome, pending) => {
                 // Detached rather than driven by the caller's future: a caller
                 // that goes away mid-build (client disconnect, deadline) must
                 // neither cancel the build nor force the next caller to restart
@@ -256,14 +255,28 @@ impl<R> RepoSlot<R> {
                 // livelock a repo behind any client timeout shorter than its
                 // build.
                 //
-                // Unbounded by design for now: one spawn per assigned repo at
-                // most, and no service calls this yet. A concurrency bound has
-                // to exist before any service switches to building on first
-                // request, or a restart releases one build per assigned repo at
-                // once.
-                let repo_name = self.name.clone();
+                // Unbounded here: at most one spawn per slot at a time, so
+                // concurrent builds are bounded only by how many distinct
+                // unbuilt repos callers ask for at once. The async-requests
+                // worker is bounded by how many requests it runs at once, and
+                // request-time loading by the loader `mononoke_app` installs.
+                let repo_slot = Arc::clone(self);
                 mononoke::spawn_task(async move {
-                    completion.finish(build(repo_name).await.map(Arc::new).map_err(Arc::new));
+                    let repo_name = repo_slot.name.clone();
+                    // A panicking build must still publish an outcome: left
+                    // `Building`, the slot would never be claimable again.
+                    let outcome = AssertUnwindSafe(async move { loader.load(repo_name).await })
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(anyhow!("Build of repo {} panicked", repo_slot.name))
+                        })
+                        .map(Arc::new)
+                        .map_err(Arc::new);
+                    // Applied before sending, so a woken waiter sees the final
+                    // state rather than still `Building`.
+                    repo_slot.apply_outcome(&outcome);
+                    let _ = send_outcome.send(outcome);
                 });
                 pending
             }
@@ -276,57 +289,10 @@ impl<R> RepoSlot<R> {
         match pending.await {
             Ok(Ok(repo)) => Ok(repo),
             Ok(Err(error)) => Err(anyhow!("Failed to build repo {}: {error:#}", self.name)),
-            // Unreachable while `BuildCompletion` is the only way to finish a
-            // build, since it reports on `Drop` as well as on `finish` and so
-            // cannot lose the sender. Kept as the honest answer if that ever
-            // stops being true.
+            // Only when the build task is dropped unfinished, which happens
+            // only as the runtime shuts down.
             Err(oneshot::Canceled) => Err(anyhow!("Build task for repo {} went away", self.name)),
         }
-    }
-}
-
-/// The obligation that comes with winning a [`Claim::Start`]: publish the
-/// build's result into the slot and hand it to every waiter.
-///
-/// Dropping it without calling [`BuildCompletion::finish`] publishes a failure
-/// instead, so a build that panics, or is dropped by a shutting-down runtime,
-/// cannot leave the slot stuck in [`SlotState::Building`] behind an
-/// already-resolved handle - a state nothing recovers from, because the slot
-/// never looks claimable again.
-struct BuildCompletion<R> {
-    repo_slot: Arc<RepoSlot<R>>,
-    send_outcome: Option<oneshot::Sender<BuildOutcome<R>>>,
-}
-
-impl<R> BuildCompletion<R> {
-    /// Publishes the result of the build. Takes `self` by value so the
-    /// obligation is discharged exactly once.
-    fn finish(mut self, outcome: BuildOutcome<R>) {
-        self.publish(outcome);
-    }
-
-    /// Applies the outcome before sending, so a waiter woken by it always
-    /// observes the slot in its final state rather than still `Building`.
-    fn publish(&mut self, outcome: BuildOutcome<R>) {
-        let Some(send_outcome) = self.send_outcome.take() else {
-            return;
-        };
-        self.repo_slot.apply_outcome(&outcome);
-        let _ = send_outcome.send(outcome);
-    }
-}
-
-impl<R> Drop for BuildCompletion<R> {
-    fn drop(&mut self) {
-        // `publish` would no-op anyway once `finish` has taken the sender. The
-        // check is to not build an error message on every successful build.
-        if self.send_outcome.is_none() {
-            return;
-        }
-        let repo_name = self.repo_slot.name().to_string();
-        self.publish(Err(Arc::new(anyhow!(
-            "Build of repo {repo_name} ended without producing a result"
-        ))));
     }
 }
 
@@ -336,6 +302,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use anyhow::bail;
+    use futures::future::BoxFuture;
     use mononoke_macros::mononoke;
     use tokio::sync::Notify;
     use tokio::task::JoinHandle;
@@ -360,22 +327,36 @@ mod tests {
         }
     }
 
+    struct GatedLoader(Arc<Gate>);
+
+    impl RepoLoader<i32> for GatedLoader {
+        fn load(&self, _repo_name: String) -> BoxFuture<'static, Result<i32>> {
+            Arc::clone(&self.0).build().boxed()
+        }
+    }
+
     fn call(repo_slot: &Arc<RepoSlot<i32>>, gate: &Arc<Gate>) -> JoinHandle<Result<Arc<i32>>> {
-        let (repo_slot, gate) = (Arc::clone(repo_slot), Arc::clone(gate));
-        mononoke::spawn_task(async move { repo_slot.get_or_build(|_| gate.build()).await })
+        let repo_slot = Arc::clone(repo_slot);
+        let loader = Arc::new(GatedLoader(Arc::clone(gate)));
+        mononoke::spawn_task(async move { repo_slot.get_or_build(loader).await })
     }
 
-    async fn never_built(repo_name: String) -> Result<i32> {
-        panic!("must not build {repo_name}")
+    enum TestLoader {
+        Ready,
+        Failed,
+        Panics,
+        Never,
     }
 
-    async fn failing_build(repo_name: String) -> Result<i32> {
-        bail!("no config for {repo_name}")
-    }
-
-    /// The one failure a build cannot report for itself.
-    async fn panicking_build(repo_name: String) -> Result<i32> {
-        panic!("build of {repo_name} blew up")
+    impl RepoLoader<i32> for TestLoader {
+        fn load(&self, repo_name: String) -> BoxFuture<'static, Result<i32>> {
+            match self {
+                Self::Ready => async { Ok(42) }.boxed(),
+                Self::Failed => async move { bail!("no config for {repo_name}") }.boxed(),
+                Self::Panics => async move { panic!("build of {repo_name} blew up") }.boxed(),
+                Self::Never => async move { panic!("must not build {repo_name}") }.boxed(),
+            }
+        }
     }
 
     /// Builds run on a detached task, so completion is observed by polling
@@ -477,7 +458,10 @@ mod tests {
     async fn test_a_built_slot_is_served_without_rebuilding() {
         let repo_slot = Arc::new(RepoSlot::ready("foo".to_string(), Arc::new(100)));
 
-        let repo = repo_slot.get_or_build(never_built).await.unwrap();
+        let repo = repo_slot
+            .get_or_build(Arc::new(TestLoader::Never))
+            .await
+            .unwrap();
         assert_eq!(*repo, 100);
     }
 
@@ -485,7 +469,10 @@ mod tests {
     async fn test_a_failed_build_is_reported_then_cached() {
         let repo_slot = Arc::new(RepoSlot::empty("foo".to_string()));
 
-        let err = repo_slot.get_or_build(failing_build).await.unwrap_err();
+        let err = repo_slot
+            .get_or_build(Arc::new(TestLoader::Failed))
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("Failed to build repo foo"),
             "unexpected error: {err:#}"
@@ -493,9 +480,12 @@ mod tests {
         assert!(repo_slot.loaded().is_none());
 
         // The next caller is served the failure rather than starting a second
-        // build. `never_built` panics if reached, so this pins that the build
+        // build. `TestLoader::Never` panics if reached, so this pins that the build
         // does not run again, not merely that the call still errors.
-        let err = repo_slot.get_or_build(never_built).await.unwrap_err();
+        let err = repo_slot
+            .get_or_build(Arc::new(TestLoader::Never))
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("Not retrying build of repo foo"),
             "unexpected error: {err:#}"
@@ -506,11 +496,16 @@ mod tests {
     async fn test_a_cached_failure_stops_holding_the_slot_once_it_expires() {
         let repo_slot = Arc::new(RepoSlot::empty("foo".to_string()));
 
-        assert!(repo_slot.get_or_build(failing_build).await.is_err());
+        assert!(
+            repo_slot
+                .get_or_build(Arc::new(TestLoader::Failed))
+                .await
+                .is_err()
+        );
         repo_slot.expire_cached_failure();
 
         let repo = repo_slot
-            .get_or_build(|_| async { Ok(42) })
+            .get_or_build(Arc::new(TestLoader::Ready))
             .await
             .expect("an expired failure must let the next caller build");
         assert_eq!(*repo, 42);
@@ -520,7 +515,10 @@ mod tests {
     async fn test_a_panicking_build_leaves_the_slot_retryable() {
         let repo_slot = Arc::new(RepoSlot::empty("foo".to_string()));
 
-        let err = repo_slot.get_or_build(panicking_build).await.unwrap_err();
+        let err = repo_slot
+            .get_or_build(Arc::new(TestLoader::Panics))
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("Failed to build repo foo"),
             "unexpected error: {err:#}"
@@ -533,9 +531,51 @@ mod tests {
         // outlives the window.
         repo_slot.expire_cached_failure();
         let repo = repo_slot
-            .get_or_build(|_| async { Ok(42) })
+            .get_or_build(Arc::new(TestLoader::Ready))
             .await
             .expect("a panicking build must leave the slot retryable");
         assert_eq!(*repo, 42);
+    }
+
+    struct PanicsOnLoad;
+
+    impl RepoLoader<i32> for PanicsOnLoad {
+        fn load(&self, repo_name: String) -> BoxFuture<'static, Result<i32>> {
+            panic!("load of {repo_name} blew up before returning a future")
+        }
+    }
+
+    #[mononoke::test]
+    async fn test_a_loader_panicking_before_returning_a_future_finishes_the_build() {
+        let repo_slot = Arc::new(RepoSlot::empty("foo".to_string()));
+
+        assert!(
+            repo_slot
+                .get_or_build(Arc::new(PanicsOnLoad))
+                .await
+                .is_err()
+        );
+        assert!(repo_slot.loaded().is_none());
+
+        repo_slot.expire_cached_failure();
+        let repo = repo_slot
+            .get_or_build(Arc::new(TestLoader::Ready))
+            .await
+            .expect("a loader panic must not leave the slot stuck building");
+        assert_eq!(*repo, 42);
+    }
+
+    #[mononoke::test]
+    fn test_replace_swaps_only_a_built_repo() {
+        let repo_slot = RepoSlot::ready("foo".to_string(), Arc::new(100));
+        assert!(repo_slot.replace(Arc::new(42)));
+        assert_eq!(repo_slot.loaded().as_deref(), Some(&42));
+
+        let repo_slot: RepoSlot<i32> = RepoSlot::empty("foo".to_string());
+        assert!(
+            !repo_slot.replace(Arc::new(42)),
+            "an unbuilt slot must not be filled by a rebuild"
+        );
+        assert!(repo_slot.loaded().is_none());
     }
 }

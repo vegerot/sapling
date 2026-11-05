@@ -164,9 +164,16 @@ use crate::builder::Config;
 use crate::errors::SaplingRemoteApiError;
 use crate::response::Response;
 use crate::response::ResponseMeta;
+use crate::retryable::BorrowedKey;
 use crate::retryable::RetryableFileAttrs;
+use crate::retryable::RetryableKeys;
 use crate::retryable::RetryableStreamRequest;
+use crate::retryable::RetryableStreamingClone;
 use crate::retryable::RetryableTrees;
+use crate::retryable::RetryableUploads;
+
+#[cfg(test)]
+mod retry_tests;
 
 const MAX_CONCURRENT_LOOKUPS_PER_REQUEST: usize = 10000;
 const MAX_CONCURRENT_UPLOAD_FILENODES_PER_REQUEST: usize = 10000;
@@ -869,24 +876,23 @@ impl Client {
 
     async fn ephemeral_extend_attempt(
         &self,
-        bubble_id: NonZeroU64,
-        custom_duration_secs: Option<u64>,
+        request: EphemeralExtendRequest,
     ) -> Result<EphemeralExtendResponse, SaplingRemoteApiError> {
-        if let Some(duration) = custom_duration_secs {
+        if let Some(duration) = request.custom_duration_secs {
             tracing::info!(
-                "Extending ephemeral bubble {} ttl to {} seconds",
-                bubble_id,
-                duration
+                "Extending ephemeral bubble ttl to {duration} seconds; bubble_id={:?}, snapshot_id={:?}",
+                request.bubble_id,
+                request.snapshot_id
             );
         } else {
-            tracing::info!("Extending ephemeral bubble {} ttl", bubble_id);
+            tracing::info!(
+                "Extending ephemeral bubble ttl; bubble_id={:?}, snapshot_id={:?}",
+                request.bubble_id,
+                request.snapshot_id
+            );
         }
         let url = self.build_url(paths::EPHEMERAL_EXTEND)?;
-        let req = EphemeralExtendRequest {
-            bubble_id,
-            custom_duration_secs,
-        }
-        .to_wire();
+        let req = request.to_wire();
         let request = self
             .configure_request(paths::EPHEMERAL_EXTEND, self.inner.client.post(url))?
             .cbor(&req)
@@ -930,11 +936,11 @@ impl Client {
         self.fetch_single::<AlterSnapshotResponse>(request).await
     }
 
-    async fn history_attempt(
+    async fn history_request(
         &self,
         keys: Vec<Key>,
         length: Option<u32>,
-    ) -> Result<Response<HistoryEntry>, SaplingRemoteApiError> {
+    ) -> Result<Response<HistoryResponseChunk>, SaplingRemoteApiError> {
         tracing::info!("Requesting history for {} file(s)", keys.len());
 
         if keys.is_empty() {
@@ -964,15 +970,7 @@ impl Client {
             },
         )?;
 
-        let Response { entries, stats } = self.fetch::<HistoryResponseChunk>(requests)?;
-
-        // Convert received `HistoryResponseChunk`s into `HistoryEntry`s.
-        let entries = entries
-            .map_ok(|entries| stream::iter(entries.into_iter().map(Ok)))
-            .try_flatten()
-            .boxed();
-
-        Ok(Response { entries, stats })
+        self.fetch::<HistoryResponseChunk>(requests)
     }
 
     async fn path_history_attempt(
@@ -996,9 +994,9 @@ impl Client {
             self.config().min_batch_size,
             |paths| {
                 let cursor_for_paths = cursor
-                    .clone()
-                    .into_iter()
+                    .iter()
                     .filter(|c| paths.contains(&c.path))
+                    .cloned()
                     .collect();
                 let req = PathHistoryRequest {
                     commit,
@@ -1073,7 +1071,7 @@ impl Client {
         self.fetch::<SuffixQueryResponse>(vec![requests])
     }
 
-    async fn streaming_clone_attempt(
+    pub(crate) async fn streaming_clone_attempt(
         &self,
         tag: Option<String>,
     ) -> Result<Response<StreamingChangelogResponse>, SaplingRemoteApiError> {
@@ -1616,8 +1614,37 @@ impl SaplingRemoteApi for Client {
         keys: Vec<Key>,
         length: Option<u32>,
     ) -> Result<Response<HistoryEntry>, SaplingRemoteApiError> {
-        self.with_retry(|this| this.history_attempt(keys.clone(), length.clone()).boxed())
-            .await
+        let Response { entries, stats } = if self.config().stream_retries {
+            if length == Some(0) {
+                return Ok(Response::empty());
+            }
+
+            RetryableKeys::new(
+                keys,
+                move |client: Client, keys| {
+                    async move { client.history_request(keys, length).await }.boxed()
+                },
+                |pending, chunk: &HistoryResponseChunk| {
+                    // The first entry identifies the requested key; the chunk contains its full response.
+                    if let Some(entry) = chunk.entries.first() {
+                        pending.remove(&BorrowedKey {
+                            path: &chunk.path,
+                            hgid: entry.node,
+                        });
+                    }
+                },
+            )
+            .perform_with_retries(self.clone())
+            .await?
+        } else {
+            self.with_retry(|this| this.history_request(keys.clone(), length).boxed())
+                .await?
+        };
+        let entries = entries
+            .map_ok(|chunk| stream::iter(chunk.into_iter().map(Ok)))
+            .try_flatten()
+            .boxed();
+        Ok(Response { entries, stats })
     }
 
     async fn path_history(
@@ -1627,10 +1654,31 @@ impl SaplingRemoteApi for Client {
         limit: Option<u32>,
         cursor: Vec<PathHistoryRequestPaginationCursor>,
     ) -> Result<Response<PathHistoryResponse>, SaplingRemoteApiError> {
-        self.with_retry(|this| {
-            this.path_history_attempt(commit.clone(), paths.clone(), limit.clone(), cursor.clone())
+        if !self.config().stream_retries {
+            return self
+                .with_retry(|this| {
+                    this.path_history_attempt(commit, paths.clone(), limit, cursor.clone())
+                        .boxed()
+                })
+                .await;
+        }
+
+        RetryableKeys::new(
+            paths,
+            move |client: Client, paths| {
+                let cursor = cursor.clone();
+                async move {
+                    client
+                        .path_history_attempt(commit, paths, limit, cursor)
+                        .await
+                }
                 .boxed()
-        })
+            },
+            |pending, entry: &PathHistoryResponse| {
+                pending.remove(&entry.path);
+            },
+        )
+        .perform_with_retries(self.clone())
         .await
     }
 
@@ -1651,8 +1699,23 @@ impl SaplingRemoteApi for Client {
         &self,
         hgids: Vec<HgId>,
     ) -> Result<Response<CommitRevlogData>, SaplingRemoteApiError> {
-        self.with_retry(|this| this.commit_revlog_data_attempt(hgids.clone()).boxed())
-            .await
+        if !self.config().stream_retries {
+            return self
+                .with_retry(|this| this.commit_revlog_data_attempt(hgids.clone()).boxed())
+                .await;
+        }
+
+        RetryableKeys::new(
+            hgids,
+            |client: Client, hgids| {
+                async move { client.commit_revlog_data_attempt(hgids).await }.boxed()
+            },
+            |pending, entry: &CommitRevlogData| {
+                pending.remove(&entry.hgid);
+            },
+        )
+        .perform_with_retries(self.clone())
+        .await
     }
 
     async fn hash_prefixes_lookup(
@@ -2066,8 +2129,21 @@ impl SaplingRemoteApi for Client {
         &self,
         items: Vec<HgFilenodeData>,
     ) -> Result<Response<UploadTokensResponse>, SaplingRemoteApiError> {
-        self.with_retry(|this| this.upload_filenodes_batch_attempt(items.clone()).boxed())
-            .await
+        if !self.config().stream_retries {
+            return self
+                .with_retry(|this| this.upload_filenodes_batch_attempt(items.clone()).boxed())
+                .await;
+        }
+
+        RetryableUploads::new(
+            items,
+            |item| AnyId::HgFilenodeId(item.node_id),
+            |client: Client, items| {
+                async move { client.upload_filenodes_batch_attempt(items).await }.boxed()
+            },
+        )
+        .perform_with_retries(self.clone())
+        .await
     }
 
     async fn upload_trees_batch(
@@ -2083,10 +2159,29 @@ impl SaplingRemoteApi for Client {
         changesets: Vec<UploadHgChangeset>,
         mutations: Vec<HgMutationEntryContent>,
     ) -> Result<Response<UploadTokensResponse>, SaplingRemoteApiError> {
-        self.with_retry(|this| {
-            this.upload_changesets_attempt(changesets.clone(), mutations.clone())
+        if !self.config().stream_retries {
+            return self
+                .with_retry(|this| {
+                    this.upload_changesets_attempt(changesets.clone(), mutations.clone())
+                        .boxed()
+                })
+                .await;
+        }
+
+        RetryableUploads::new(
+            changesets,
+            |item| AnyId::HgChangesetId(item.node_id),
+            move |client: Client, changesets| {
+                let mutations = mutations.clone();
+                async move {
+                    client
+                        .upload_changesets_attempt(changesets, mutations)
+                        .await
+                }
                 .boxed()
-        })
+            },
+        )
+        .perform_with_retries(self.clone())
         .await
     }
 
@@ -2094,10 +2189,23 @@ impl SaplingRemoteApi for Client {
         &self,
         changesets: Vec<IdenticalChangesetContent>,
     ) -> Result<Response<UploadTokensResponse>, SaplingRemoteApiError> {
-        self.with_retry(|this| {
-            this.upload_identical_changesets_attempt(changesets.clone())
-                .boxed()
-        })
+        if !self.config().stream_retries {
+            return self
+                .with_retry(|this| {
+                    this.upload_identical_changesets_attempt(changesets.clone())
+                        .boxed()
+                })
+                .await;
+        }
+
+        RetryableUploads::new(
+            changesets,
+            |item| AnyId::HgChangesetId(item.hg_info.node_id),
+            |client: Client, changesets| {
+                async move { client.upload_identical_changesets_attempt(changesets).await }.boxed()
+            },
+        )
+        .perform_with_retries(self.clone())
         .await
     }
 
@@ -2130,14 +2238,10 @@ impl SaplingRemoteApi for Client {
     /// If no duration is provided, the lifetime resets to the greater of the default lifetime or the remaining lifetime.
     async fn ephemeral_extend(
         &self,
-        bubble_id: NonZeroU64,
-        custom_duration_secs: Option<u64>,
+        request: EphemeralExtendRequest,
     ) -> Result<EphemeralExtendResponse, SaplingRemoteApiError> {
-        self.with_retry(|this| {
-            this.ephemeral_extend_attempt(bubble_id, custom_duration_secs)
-                .boxed()
-        })
-        .await
+        self.with_retry(|this| this.ephemeral_extend_attempt(request.clone()).boxed())
+            .await
     }
 
     async fn fetch_snapshot(
@@ -2193,22 +2297,64 @@ impl SaplingRemoteApi for Client {
         to_repo: Option<String>,
         lookup_behavior: Option<String>,
     ) -> Result<Response<CommitTranslateIdResponse>, SaplingRemoteApiError> {
-        self.with_retry(|this| {
-            this.commit_translate_id_attempt(
-                commits.clone(),
-                scheme.clone(),
-                from_repo.clone(),
-                to_repo.clone(),
-                lookup_behavior.clone(),
-            )
-            .boxed()
-        })
+        if !self.config().stream_retries {
+            return self
+                .with_retry(|this| {
+                    this.commit_translate_id_attempt(
+                        commits.clone(),
+                        scheme,
+                        from_repo.clone(),
+                        to_repo.clone(),
+                        lookup_behavior.clone(),
+                    )
+                    .boxed()
+                })
+                .await;
+        }
+
+        RetryableKeys::new(
+            commits,
+            move |client: Client, commits| {
+                let from_repo = from_repo.clone();
+                let to_repo = to_repo.clone();
+                let lookup_behavior = lookup_behavior.clone();
+                async move {
+                    client
+                        .commit_translate_id_attempt(
+                            commits,
+                            scheme,
+                            from_repo,
+                            to_repo,
+                            lookup_behavior,
+                        )
+                        .await
+                }
+                .boxed()
+            },
+            |pending, entry: &CommitTranslateIdResponse| {
+                pending.remove(&entry.commit);
+            },
+        )
+        .perform_with_retries(self.clone())
         .await
     }
 
     async fn blame(&self, files: Vec<Key>) -> Result<Response<BlameResult>, SaplingRemoteApiError> {
-        self.with_retry(|this| this.blame_attempt(files.clone()).boxed())
-            .await
+        if !self.config().stream_retries {
+            return self
+                .with_retry(|this| this.blame_attempt(files.clone()).boxed())
+                .await;
+        }
+
+        RetryableKeys::new(
+            files,
+            |client: Client, files| async move { client.blame_attempt(files).await }.boxed(),
+            |pending, entry: &BlameResult| {
+                pending.remove(&entry.file);
+            },
+        )
+        .perform_with_retries(self.clone())
+        .await
     }
 
     async fn cloud_workspace(
@@ -2336,7 +2482,14 @@ impl SaplingRemoteApi for Client {
         &self,
         tag: Option<String>,
     ) -> Result<Response<StreamingChangelogResponse>, SaplingRemoteApiError> {
-        self.with_retry(|this| this.streaming_clone_attempt(tag.clone()).boxed())
+        if !self.config().stream_retries {
+            return self
+                .with_retry(|this| this.streaming_clone_attempt(tag.clone()).boxed())
+                .await;
+        }
+
+        RetryableStreamingClone::new(tag)
+            .perform_with_retries(self.clone())
             .await
     }
 
@@ -2344,18 +2497,64 @@ impl SaplingRemoteApi for Client {
         &self,
         request: CheckPathPermissionRequest,
     ) -> Result<Response<CheckPathPermissionResponse>, SaplingRemoteApiError> {
-        self.with_retry(|this| this.check_path_permission_attempt(request.clone()).boxed())
-            .await
+        if !self.config().stream_retries {
+            return self
+                .with_retry(|this| this.check_path_permission_attempt(request.clone()).boxed())
+                .await;
+        }
+
+        let hg_cs_id = request.hg_cs_id;
+        RetryableKeys::new(
+            request.paths,
+            move |client: Client, paths| {
+                async move {
+                    client
+                        .check_path_permission_attempt(CheckPathPermissionRequest {
+                            hg_cs_id,
+                            paths,
+                        })
+                        .await
+                }
+                .boxed()
+            },
+            |pending, entry: &CheckPathPermissionResponse| {
+                pending.remove(&entry.path);
+            },
+        )
+        .perform_with_retries(self.clone())
+        .await
     }
 
     async fn check_manifest_permission(
         &self,
         request: CheckManifestPermissionRequest,
     ) -> Result<Response<CheckManifestPermissionResponse>, SaplingRemoteApiError> {
-        self.with_retry(|this| {
-            this.check_manifest_permission_attempt(request.clone())
+        if !self.config().stream_retries {
+            return self
+                .with_retry(|this| {
+                    this.check_manifest_permission_attempt(request.clone())
+                        .boxed()
+                })
+                .await;
+        }
+
+        RetryableKeys::new(
+            request.manifest_ids,
+            |client: Client, manifest_ids| {
+                async move {
+                    client
+                        .check_manifest_permission_attempt(CheckManifestPermissionRequest {
+                            manifest_ids,
+                        })
+                        .await
+                }
                 .boxed()
-        })
+            },
+            |pending, entry: &CheckManifestPermissionResponse| {
+                pending.remove(&entry.manifest_id);
+            },
+        )
+        .perform_with_retries(self.clone())
         .await
     }
 }
@@ -2415,7 +2614,11 @@ async fn raise_for_status(res: AsyncResponse) -> Result<AsyncResponse, SaplingRe
     let url = res.url().to_string();
     let (head, body) = res.into_parts();
     let body = body.decoded().try_concat().await?;
-    let mut message = String::from_utf8_lossy(&body).into_owned();
+    // For a denied request (403), keep only the server's explanation.
+    let mut message = (status.as_u16() == 403)
+        .then(|| json_error_message(&body))
+        .flatten()
+        .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
 
     if message.len() >= 9 && &*message[..9].to_lowercase() == "<!doctype" {
         message = "HTML content omitted (this error may have come from a proxy server)".into();
@@ -2431,6 +2634,17 @@ async fn raise_for_status(res: AsyncResponse) -> Result<AsyncResponse, SaplingRe
         headers: Box::new(headers),
         url,
     })
+}
+
+/// The `message` field of a JSON error body (`{"message": ...}`), if `body` is one.
+fn json_error_message(body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct ErrorBody {
+        message: String,
+    }
+    serde_json::from_slice::<ErrorBody>(body)
+        .ok()
+        .map(|body| body.message)
 }
 
 async fn with_retry<'t, T>(
@@ -2467,6 +2681,7 @@ mod tests {
     use anyhow::Result;
 
     use crate::builder::HttpClientBuilder;
+    use crate::client::json_error_message;
     use crate::client::split_into_batches;
     use crate::client::tree_attributes_with_config;
     use crate::types::TreeAttributes;
@@ -2585,6 +2800,15 @@ mod tests {
                 "{name}",
             );
         }
+    }
+
+    #[test]
+    fn test_json_error_message() {
+        assert_eq!(
+            json_error_message(br#"{"message":"denied","request_id":"abc"}"#).as_deref(),
+            Some("denied"),
+        );
+        assert_eq!(json_error_message(b"<!DOCTYPE html>"), None);
     }
 
     #[test]

@@ -58,6 +58,7 @@ use source_control_clients::errors::RepoPrepareCommitsError;
 use source_control_clients::errors::RepoRebaseStackError;
 use source_control_clients::errors::RepoResolveBookmarkError;
 use source_control_clients::errors::RepoResolveCommitPrefixError;
+use source_control_clients::errors::RepoResolveP4FileRevisionError;
 use source_control_clients::errors::RepoStackGitBundleStoreError;
 use source_control_clients::errors::RepoUpdateSubmoduleExpansionError;
 use source_control_clients::errors::TreeExistsError;
@@ -96,8 +97,9 @@ fn format_restricted_paths_authz(e: &thrift::RestrictedPathsAuthorizationError) 
 
 // Return a friendly "repo does not exist" error if `self` is a ServiceRouter
 // selection error for a nonexistent domain. Shared by both impl macros below.
-// Only used on Linux (macOS/Windows impls don't check selection errors).
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+// Only used by internal builds on Linux (other builds don't check selection
+// errors).
+#[cfg(all(fbcode_build, not(any(target_os = "macos", target_os = "windows"))))]
 macro_rules! return_if_selection_error {
     ($self:ident, $type:ident, $repo:ident) => {
         if let $type::ThriftError(ref err) = $self {
@@ -122,13 +124,13 @@ macro_rules! return_if_selection_error {
 macro_rules! impl_handle_selection_error {
     ($type: ident) => {
         impl SelectionErrorExt for $type {
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            #[cfg(all(fbcode_build, not(any(target_os = "macos", target_os = "windows"))))]
             fn handle_selection_error(self, repo: &thrift::RepoSpecifier) -> Error {
                 return_if_selection_error!(self, $type, repo);
                 self.into()
             }
 
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(not(fbcode_build), target_os = "macos", target_os = "windows"))]
             fn handle_selection_error(self, _repo: &thrift::RepoSpecifier) -> Error {
                 self.into()
             }
@@ -141,7 +143,7 @@ macro_rules! impl_handle_selection_error {
 macro_rules! impl_handle_selection_error_with_restricted_paths {
     ($type: ident) => {
         impl SelectionErrorExt for $type {
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            #[cfg(all(fbcode_build, not(any(target_os = "macos", target_os = "windows"))))]
             fn handle_selection_error(self, repo: &thrift::RepoSpecifier) -> Error {
                 return_if_selection_error!(self, $type, repo);
                 if let $type::restricted_paths_authorization_error(ref e) = self {
@@ -150,7 +152,7 @@ macro_rules! impl_handle_selection_error_with_restricted_paths {
                 self.into()
             }
 
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(not(fbcode_build), target_os = "macos", target_os = "windows"))]
             fn handle_selection_error(self, _repo: &thrift::RepoSpecifier) -> Error {
                 if let $type::restricted_paths_authorization_error(ref e) = self {
                     return format_restricted_paths_authz(e);
@@ -184,6 +186,7 @@ impl_handle_selection_error_with_restricted_paths!(CommitMultiplePathLastChanged
 impl_handle_selection_error_with_restricted_paths!(CommitPathBlameError);
 impl_handle_selection_error_with_restricted_paths!(CommitPathExistsError);
 impl_handle_selection_error_with_restricted_paths!(CommitPathFirstChangedError);
+impl_handle_selection_error_with_restricted_paths!(RepoResolveP4FileRevisionError);
 impl_handle_selection_error_with_restricted_paths!(CommitPathHistoryError);
 impl_handle_selection_error_with_restricted_paths!(CommitPathInfoError);
 impl_handle_selection_error_with_restricted_paths!(CommitPathLastChangedError);

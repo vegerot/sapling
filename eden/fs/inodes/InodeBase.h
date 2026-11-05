@@ -130,6 +130,9 @@ class InodeBase {
       auto prevValue =
           numFsReferences_.fetch_sub(count, std::memory_order_acq_rel);
       XDCHECK_GE(prevValue, count);
+      if (prevValue == count) {
+        fsReleasedLastReference();
+      }
     } else {
       XDCHECK_GE(count, 1u);
       clearFsRefcount();
@@ -142,7 +145,12 @@ class InodeBase {
    * (NFS and Windows).
    */
   bool clearFsRefcount() {
-    return numFsReferences_.exchange(0u, std::memory_order_acq_rel) != 0;
+    bool wasReferenced =
+        numFsReferences_.exchange(0u, std::memory_order_acq_rel) != 0;
+    if (wasReferenced) {
+      fsReleasedLastReference();
+    }
+    return wasReferenced;
   }
 
   /**
@@ -181,6 +189,13 @@ class InodeBase {
       const ObjectFetchContextPtr& fetchContext) = 0;
 
 #ifndef _WIN32
+  /**
+   * Return type-only attributes to let clients address and remove an inode
+   * whose overlay data is unreadable. Permission bits are omitted to prevent
+   * clients from interpreting the zero size as readable, empty contents.
+   */
+  struct stat getStatForCorruptOverlay() const noexcept;
+
   [[nodiscard]] folly::Future<folly::Unit>
   setxattr(folly::StringPiece name, folly::StringPiece value, int flags);
   [[nodiscard]] folly::Future<folly::Unit> removexattr(folly::StringPiece name);
@@ -412,11 +427,11 @@ class InodeBase {
   }
 
   /**
-   * Used by Garbage Collection (GC) to determine if an inode
-   * is unused for the cutoff time and can be collected.
+   * When this inode was last referenced for the purposes of inode garbage
+   * collection; see lastGcRefTime_.
    */
-  EdenTimestamp getLastFsRequestTime() const {
-    return lastFsRequestTime_.load(std::memory_order_relaxed);
+  EdenTimestamp getLastGcRefTime() const {
+    return lastGcRefTime_.load(std::memory_order_relaxed);
   }
 
   struct LocationInfo {
@@ -513,12 +528,6 @@ class InodeBase {
   void updateJournal();
 
   /**
-   * Our prefetch heuristics (detection of recursive crawls) kick in when a
-   * child has been stat(). The parent inode must be notified by the children.
-   */
-  void notifyParentOfStat(bool isFile, const ObjectFetchContext& context);
-
-  /**
    * Log accesses via the ServerState's InodeAccessLogger.
    */
   void logAccess(const ObjectFetchContext& fetchContext);
@@ -548,8 +557,8 @@ class InodeBase {
   friend class InodeMap;
   friend class InodePtrTestHelper;
 
-  void restoreLastFsRequestTime(EdenTimestamp timestamp) {
-    lastFsRequestTime_.store(timestamp, std::memory_order_relaxed);
+  void restoreLastGcRefTime(EdenTimestamp timestamp) {
+    lastGcRefTime_.store(timestamp, std::memory_order_relaxed);
   }
 
   // Forbid copies and moves (we cannot be moved since we contain mutexes)
@@ -623,10 +632,11 @@ class InodeBase {
   }
 
   /**
-   * Updates the last fs request time for this inode. The value is only updated
-   * for this inode, it is not propagated to its parents.
+   * Records that this inode was just referenced, so that inode garbage
+   * collection leaves it alone for another cutoff period. The value is only
+   * updated for this inode, it is not propagated to its parents.
    */
-  void updateLastFsRequestTime();
+  void markGcRef();
 
  private:
   ParentInodeInfo getParentInfo() const;
@@ -768,9 +778,23 @@ class InodeBase {
   folly::Synchronized<LocationInfo> location_;
 
   /**
-   * The last time the kernel made a request involving this inode.
-   * Used by Garbage Collection (GC) to determine if an inode
-   * is unused for the cutoff time and can be collected.
+   * The filesystem released its last reference to this inode. As far as GC is
+   * concerned the inode has not been referenced since the beginning of time:
+   * it is eligible for the next sweep however recently it was used, unless
+   * something references it again first.
+   */
+  void fsReleasedLastReference() {
+    lastGcRefTime_.store(EdenTimestamp{timespec{}}, std::memory_order_relaxed);
+  }
+
+  /**
+   * The last time this inode was referenced, as far as inode garbage
+   * collection is concerned: every FUSE and NFS request involving the inode
+   * records one, and so does a status walk that compares it. When the
+   * filesystem releases its last reference to the inode the time is reset to
+   * zero, so the kernel's own eviction makes the inode eligible for the next
+   * sweep. GC treats an inode whose last reference is older than its cutoff
+   * as unused and collects it.
    *
    * Note1: This field is distinct from atime and is not persisted to disk via
    * InodeTable.
@@ -778,7 +802,7 @@ class InodeBase {
    * Note2: This field get updated for the inode itself and not propagate to its
    * parent.
    */
-  std::atomic<EdenTimestamp> lastFsRequestTime_{getNow()};
+  std::atomic<EdenTimestamp> lastGcRefTime_{getNow()};
 
   template <typename InodeState>
   friend class InodeBaseMetadata;

@@ -2,14 +2,13 @@ load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
 
-oncall("scm_server_treehugger")
+oncall("scm_server_infra")
 
 rust_library(
     name = "repo_event_publisher",
     srcs = glob(["src/**/*.rs"]),
     deps = [
         "fbsource//third-party/rust:anyhow",
-        "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:tokio",
         "//common/rust/shed/facet:facet",
         "//eden/mononoke/features/repo_update_logger:repo_update_logger",
@@ -18,15 +17,21 @@ rust_library(
         []
         if rust_oss.is_oss_build()
         else [
+            "//configerator/structs/serverless/event_router/catalog/events/schemas:mononoke_bookmark_event_notification-rust",
+            "//eden/mononoke/metaconfig:metaconfig_parser",
             "//eden/mononoke/metaconfig:metaconfig_types",
+            "//eden/mononoke/common/mononoke_configs:mononoke_configs",
             "//eden/mononoke/common/mononoke_macros:mononoke_macros",
             "//common/rust/shed/fbinit:fbinit",
             "//common/rust/shed/stats:stats",
             "//eden/mononoke/common/rust/justknobs_ext:justknobs",
             "//common/rust/scribe/consumer:scribe_api_consumer",
             "//common/rust/shed/cloned:cloned",
+            "//thrift/lib/rust:fbthrift",
             "fbsource//third-party/rust:bytes",
             "fbsource//third-party/rust:dashmap",
+            "fbsource//third-party/rust:hex",
+            "fbsource//third-party/rust:serde_json",
             "fbcode//dsi/logger/thrift_schemas/mononoke_git_content_ref:mononoke_git_content_ref_logger_schema-rust",
             "fbcode//dsi/logger/thrift_schemas/mononoke_bookmark:mononoke_bookmark_logger_schema-rust",
             "fbcode//dsi/logger/rust/deserializer:deserializer",
@@ -45,7 +50,10 @@ rust_unittest(
             ":repo_event_publisher",
             "//eden/mononoke/features/repo_update_logger:repo_update_logger",
             "fbsource//third-party/rust:anyhow",
+            "//eden/mononoke/common/mononoke_configs:mononoke_configs",
             "//eden/mononoke/common/mononoke_macros:mononoke_macros",
+            "//eden/mononoke/metaconfig:metaconfig_parser",
+            "//eden/mononoke/metaconfig:metaconfig_types",
             "//common/rust/shed/fbinit:fbinit",
             "//common/rust/shed/fbinit:fbinit-tokio",
             "//common/rust/scribe/api:scribe_api",

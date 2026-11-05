@@ -7,13 +7,10 @@ sl_rust_library(
     srcs = glob(["src/**/*.rs"]),
     autocargo = {
         "cargo_toml_config": {
-            "lib": {"name": "tracing-collector"},
-            "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
-                "license": "MIT",
-                "name": "sapling-tracing-collector",
-                "repository": "https://github.com/facebook/sapling",
+            "dependencies_override": {
+                "dependencies": {
+                    "indexmap": {"features": ["serde"]},
+                },
             },
         },
     },

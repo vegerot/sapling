@@ -11,17 +11,17 @@
 
 namespace facebook::eden {
 
+/**
+ * Values are logged as `overlay_type` in telemetry; keep them stable.
+ */
 enum class InodeCatalogType : uint8_t {
   Legacy = 0,
-  Sqlite = 1,
   InMemory = 2,
-  LMDB = 3,
-  LegacyDev = 4,
   LegacyEphemeral = 5,
 };
 
 constexpr InodeCatalogType kInodeCatalogTypeDefault =
-    folly::kIsWindows ? InodeCatalogType::Sqlite : InodeCatalogType::Legacy;
+    folly::kIsWindows ? InodeCatalogType::InMemory : InodeCatalogType::Legacy;
 
 folly::Expected<InodeCatalogType, std::string> inodeCatalogTypeFromString(
     std::string_view value);

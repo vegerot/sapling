@@ -10,8 +10,13 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/container:array",
+        "fbsource//xplat/folly/io:iobuf",
+        "fbsource//xplat/folly/memory:mallctl_helper",
+        "fbsource//xplat/folly/test:test_utils",
+        "//eden/fs/nfs:nfsd_rpc",
+        "//eden/fs/nfs/rpc:rpc",
         "//eden/fs/nfs/testharness:xdr_test_utils",
         "//eden/fs/nfs/xdr:xdr",
-        "//folly/container:array",
     ],
 )

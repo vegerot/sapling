@@ -93,6 +93,8 @@ use edenapi::types::UploadTreeResponse;
 use edenapi::types::make_hash_lookup_request;
 use edenapi_trait as edenapi;
 use edenapi_types::bookmark::Freshness;
+use format_util::HgCommitFields;
+use format_util::HgCommitLazyFields;
 use format_util::git_sha1_deserialize;
 use format_util::hg_sha1_deserialize;
 use futures::StreamExt;
@@ -109,6 +111,7 @@ use manifest_augmented_tree::AugmentedTreeWithDigest;
 use manifest_tree::Flag;
 use manifest_tree::TreeManifest;
 use minibytes::Bytes;
+use minibytes::Text;
 use mutationstore::MutationEntry;
 use nonblocking::non_blocking_result;
 use pathmatcher::AlwaysMatcher;
@@ -1336,7 +1339,9 @@ impl SaplingRemoteApi for EagerRepo {
         base: HgId,
         pushvars: HashMap<String, String>,
     ) -> Result<LandStackResponse, SaplingRemoteApiError> {
-        let _ = pushvars;
+        let mainline_parent_first = pushvars
+            .get("MAINLINE_PARENT_FIRST")
+            .is_some_and(|v| matches!(v.as_str(), "true" | "1"));
         let latest_bookmark_id = match self.get_bookmark(&bookmark) {
             Ok(Some(id)) => id,
             _ => {
@@ -1349,91 +1354,208 @@ impl SaplingRemoteApi for EagerRepo {
             }
         };
 
-        let roots = vec![base];
-        let heads = vec![head];
+        let commits = match commits_to_rebase(
+            self,
+            &bookmark,
+            head,
+            base,
+            latest_bookmark_id,
+            mainline_parent_first,
+        )
+        .await?
+        {
+            Ok(commits) => commits,
+            Err(e) => return Ok(LandStackResponse { data: Err(e) }),
+        };
 
-        let source_commits = self
-            .dag()
-            .await
-            .only(to_set(&heads), to_set(&roots))
-            .await
-            .map_err(map_dag_err)?;
-        let commits_stream = source_commits.iter_rev().await.map_err(map_dag_err)?;
-        let commits_stream: BoxStream<edenapi::Result<HgId>> = commits_stream
-            .then(|v| async move {
-                let v = v?;
-                let hgid = HgId::from_slice(v.as_ref()).unwrap();
-                Ok(hgid)
-            })
-            .map_err(map_dag_err)
-            .boxed();
-        let commits: Vec<HgId> = commits_stream.try_collect().await?;
-
-        if latest_bookmark_id == base {
+        if latest_bookmark_id == base && !mainline_parent_first {
             // no changes on server side, just move the bookmark
             EagerRepo::set_bookmark(self, &bookmark, Some(head)).unwrap();
-            let mut old_to_new_hgids = HashMap::new();
-            for commit in commits {
-                old_to_new_hgids.insert(
-                    HgId::from_slice(commit.as_ref()).unwrap(),
-                    HgId::from_slice(commit.as_ref()).unwrap(),
-                );
-            }
+            let old_to_new_hgids = commits.into_iter().map(|c| (c, c)).collect();
             let data = LandStackData {
                 new_head: head,
                 old_to_new_hgids,
             };
             self.flush_for_api("land_stack").await?;
             return Ok(LandStackResponse { data: Ok(data) });
-        } else {
-            let head_manifest = self.commit_to_manifest(head).await.map_err(map_crate_err)?;
-            let base_manifest = self.commit_to_manifest(base).await.map_err(map_crate_err)?;
-            let bookmark_manifest = self
-                .commit_to_manifest(latest_bookmark_id)
-                .await
-                .map_err(map_crate_err)?;
-
-            let conflicts =
-                pushrebase_conflicts(&base_manifest, &bookmark_manifest, &head_manifest)?;
-            if !conflicts.is_empty() {
-                let e =
-                    ServerError::generic(format!("Conflicts while pushrebasing: {conflicts:?}"));
-
-                return Ok(LandStackResponse { data: Err(e) });
-            }
-
-            let mut old_to_new_hgids = HashMap::new();
-            let mut base_commit = base;
-            let mut dest_commit = latest_bookmark_id;
-            for commit in commits {
-                let new_commit = pushrebase_one(self, base_commit, commit, dest_commit).await?;
-                old_to_new_hgids.insert(commit, new_commit);
-
-                base_commit = commit;
-                dest_commit = new_commit;
-            }
-
-            let new_head = old_to_new_hgids[&head];
-            EagerRepo::set_bookmark(self, &bookmark, Some(new_head)).map_err(map_crate_err)?;
-            let data = LandStackData {
-                new_head,
-                old_to_new_hgids,
-            };
-            self.flush_for_api("land_stack").await?;
-            return Ok(LandStackResponse { data: Ok(data) });
         }
 
+        let head_manifest = self.commit_to_manifest(head).await.map_err(map_crate_err)?;
+        let base_manifest = self.commit_to_manifest(base).await.map_err(map_crate_err)?;
+        let bookmark_manifest = self
+            .commit_to_manifest(latest_bookmark_id)
+            .await
+            .map_err(map_crate_err)?;
+
+        let conflicts = pushrebase_conflicts(&base_manifest, &bookmark_manifest, &head_manifest)?;
+        if !conflicts.is_empty() {
+            let e = ServerError::generic(format!("Conflicts while pushrebasing: {conflicts:?}"));
+
+            return Ok(LandStackResponse { data: Err(e) });
+        }
+
+        // Each commit is rebased onto the new version of its first parent
+        // that is `base` or in `commits`. Its other parents are kept: they
+        // are merged-in commits that land unchanged. With
+        // `mainline_parent_first`, that parent, the mainline parent, becomes
+        // the first parent, as in Mononoke.
+        let mut new_ids = HashMap::from([(base, latest_bookmark_id)]);
+        let mut old_to_new_hgids = HashMap::new();
+        for commit in commits {
+            let parents = parent_hgids(self, commit).await?;
+            let base_index = parents
+                .iter()
+                .position(|p| new_ids.contains_key(p))
+                .ok_or_else(|| {
+                    SaplingRemoteApiError::Other(anyhow!(
+                        "commit {commit} does not descend from {base}"
+                    ))
+                })?;
+            let base_commit = parents[base_index];
+            let mut new_parents: Vec<HgId> = parents
+                .iter()
+                .map(|p| new_ids.get(p).copied().unwrap_or(*p))
+                .collect();
+            let swapped = mainline_parent_first && base_index > 0;
+            if swapped {
+                new_parents[..=base_index].rotate_right(1);
+            }
+            let new_commit = pushrebase_one(
+                self,
+                base_commit,
+                commit,
+                new_ids[&base_commit],
+                &new_parents,
+                swapped,
+            )
+            .await?;
+            new_ids.insert(commit, new_commit);
+            old_to_new_hgids.insert(commit, new_commit);
+        }
+
+        let new_head = old_to_new_hgids[&head];
+        EagerRepo::set_bookmark(self, &bookmark, Some(new_head)).map_err(map_crate_err)?;
+        let data = LandStackData {
+            new_head,
+            old_to_new_hgids,
+        };
+        self.flush_for_api("land_stack").await?;
+        return Ok(LandStackResponse { data: Ok(data) });
+
+        /// Returns the commits that land_stack rebases from `base` onto the
+        /// bookmark at `onto`, parents first, after the checks Mononoke makes:
+        /// `base` must be the only merge base of `onto` and `head`, and none
+        /// of the commits may be public (an ancestor of a bookmark). Unless
+        /// `mainline_parent_first`, `base` must not be a second parent.
+        async fn commits_to_rebase(
+            repo: &EagerRepo,
+            bookmark: &str,
+            head: HgId,
+            base: HgId,
+            onto: HgId,
+            mainline_parent_first: bool,
+        ) -> Result<Result<Vec<HgId>, ServerError>, SaplingRemoteApiError> {
+            let dag = repo.dag().await;
+            let merge_bases = dag
+                .gca_all(to_set(&[onto, head]))
+                .await
+                .map_err(map_dag_err)?;
+            let merge_bases = to_hgids(merge_bases).await?;
+            if merge_bases.is_empty() {
+                return Ok(Err(ServerError::generic(format!(
+                    "cannot land {head} onto '{bookmark}': they have no common ancestor"
+                ))));
+            }
+            if merge_bases != [base] {
+                let reason = match merge_bases.as_slice() {
+                    [merge_base] => format!(
+                        "the merge base of '{bookmark}' and {head} is {merge_base}, but the push is based on {base}"
+                    ),
+                    _ => format!("'{bookmark}' and {head} have more than one merge base"),
+                };
+                return Ok(Err(ServerError::generic(format!(
+                    "bookmark '{bookmark}' has moved incompatibly with this push: {reason}. Pull and retry"
+                ))));
+            }
+
+            let commits = dag
+                .range(to_set(&[base]), to_set(&[head]))
+                .await
+                .map_err(map_dag_err)?
+                - to_set(&[base]);
+            let bookmarked: Vec<HgId> = repo
+                .get_bookmarks_map()
+                .map_err(map_crate_err)?
+                .into_values()
+                .collect();
+            let public = commits.clone()
+                & dag
+                    .ancestors(to_set(&bookmarked))
+                    .await
+                    .map_err(map_dag_err)?;
+            let public = to_hgids(public).await?;
+            if !public.is_empty() {
+                let public: Vec<String> = public.iter().map(|id| id.to_hex()).collect();
+                return Ok(Err(ServerError::generic(format!(
+                    "cannot rebase public commits: {}",
+                    public.join(", ")
+                ))));
+            }
+
+            let commits = to_hgids(commits).await?;
+            if commits.is_empty() {
+                return Ok(Err(ServerError::generic(format!(
+                    "nothing to land: {head} is already an ancestor of '{bookmark}'"
+                ))));
+            }
+            // As with Mononoke's default `forbid_p2_root_rebases`.
+            let base_vertex = Vertex::copy_from(base.as_ref());
+            for commit in &commits {
+                let parents = dag
+                    .parent_names(Vertex::copy_from(commit.as_ref()))
+                    .await
+                    .map_err(map_dag_err)?;
+                if !mainline_parent_first && parents[1..].contains(&base_vertex) {
+                    return Ok(Err(ServerError::generic(format!(
+                        "Forbid pushrebase because root ({base}) is not a p1 of {bookmark} bookmark"
+                    ))));
+                }
+            }
+            Ok(Ok(commits))
+        }
+
+        async fn parent_hgids(
+            repo: &EagerRepo,
+            commit: HgId,
+        ) -> Result<Vec<HgId>, SaplingRemoteApiError> {
+            let parents = repo
+                .dag()
+                .await
+                .parent_names(Vertex::copy_from(commit.as_ref()))
+                .await
+                .map_err(map_dag_err)?;
+            Ok(parents
+                .into_iter()
+                .map(|v| HgId::from_slice(v.as_ref()).unwrap())
+                .collect())
+        }
+
+        /// Creates a commit with `new_parents` that applies the changes from
+        /// `base_commit` to `source_commit` on top of `dest_commit`. In the Hg
+        /// format, `parents_swapped` marks it with the `parents_swapped`
+        /// extra, as Mononoke's pushrebase does.
         async fn pushrebase_one(
             repo: &EagerRepo,
             base_commit: HgId,
             source_commit: HgId,
             dest_commit: HgId,
+            new_parents: &[HgId],
+            parents_swapped: bool,
         ) -> anyhow::Result<HgId> {
             let base_manifest = repo.commit_to_manifest(base_commit).await?;
             let source_manifest = repo.commit_to_manifest(source_commit).await?;
-            let dest_manifest = repo.commit_to_manifest(dest_commit).await?;
+            let mut new_manifest = repo.commit_to_manifest(dest_commit).await?;
 
-            let mut new_manifest = dest_manifest.clone();
             let matcher = AlwaysMatcher::new();
 
             // generate new manifest
@@ -1454,8 +1576,12 @@ impl SaplingRemoteApi for EagerRepo {
 
             let new_tree_id = match repo.store.format() {
                 SerializationFormat::Hg => {
-                    let new_parents = vec![&dest_manifest];
-                    new_manifest.persist(&new_parents)?
+                    let mut parent_manifests = Vec::with_capacity(new_parents.len());
+                    for parent in new_parents {
+                        parent_manifests.push(repo.commit_to_manifest(*parent).await?);
+                    }
+                    let parent_manifests: Vec<&TreeManifest> = parent_manifests.iter().collect();
+                    new_manifest.persist(&parent_manifests)?
                 }
                 SerializationFormat::Git => {
                     Manifest::persist(&mut new_manifest, PersistOpts { parents: &[] })?
@@ -1472,12 +1598,39 @@ impl SaplingRemoteApi for EagerRepo {
                 }
                 Some(raw_text) => raw_text,
             };
-            let mut new_raw_text: Vec<u8> = Vec::new();
-            write!(new_raw_text, "{new_tree_id}")?;
-            new_raw_text.extend_from_slice(&old_raw_text[HgId::hex_len()..]);
+            let new_raw_text: Vec<u8> = match repo.store.format() {
+                SerializationFormat::Hg if parents_swapped => {
+                    let old_fields = HgCommitLazyFields::new(old_raw_text.into_text_lossy());
+                    let old_fields = old_fields.fields()?;
+                    let mut extras = old_fields.extras.clone();
+                    if extras
+                        .insert(Text::from_static("parents_swapped"), Text::from_static("1"))
+                        .is_some()
+                    {
+                        return Err(anyhow!(
+                            "commit {source_commit} already has the parents_swapped extra"
+                        ));
+                    }
+                    HgCommitFields {
+                        tree: new_tree_id,
+                        author: old_fields.author.clone(),
+                        date: old_fields.date,
+                        extras,
+                        files: old_fields.files.clone(),
+                        message: old_fields.message.clone(),
+                    }
+                    .to_text()?
+                    .into_bytes()
+                }
+                _ => {
+                    let mut new_raw_text = Vec::new();
+                    write!(new_raw_text, "{new_tree_id}")?;
+                    new_raw_text.extend_from_slice(&old_raw_text[HgId::hex_len()..]);
+                    new_raw_text
+                }
+            };
 
-            let commit_parents = vec![dest_commit];
-            let new_commit = repo.add_commit(&commit_parents, &new_raw_text).await?;
+            let new_commit = repo.add_commit(new_parents, &new_raw_text).await?;
 
             Ok(new_commit)
         }
@@ -1889,6 +2042,16 @@ fn to_vec_vertex(ids: &[HgId]) -> Vec<Vertex> {
 fn to_set(ids: &[HgId]) -> Set {
     let vertexes = to_vec_vertex(ids);
     Set::from_static_names(vertexes)
+}
+
+async fn to_hgids(set: Set) -> edenapi::Result<Vec<HgId>> {
+    set.iter_rev()
+        .await
+        .map_err(map_dag_err)?
+        .map_ok(|v| HgId::from_slice(v.as_ref()).unwrap())
+        .try_collect()
+        .await
+        .map_err(map_dag_err)
 }
 
 fn map_dag_err(e: dag::Error) -> SaplingRemoteApiError {

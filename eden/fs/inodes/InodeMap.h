@@ -23,6 +23,7 @@
 #include "eden/fs/inodes/InodeTimestamps.h"
 #include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/model/ObjectId.h"
+#include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/takeover/gen-cpp2/takeover_types.h"
 
 namespace folly {
@@ -179,8 +180,14 @@ class InodeMap {
    * will be fulfilled when the loaded Inode is ready.  The Future may be
    * invoked immediately in the calling thread (if the Inode is already
    * available), or it may be invoked later in a different thread.
+   *
+   * The context is used for the loads this call starts, including those of
+   * unloaded ancestors. A lookup that joins a load already in progress does
+   * not change that load's context.
    */
-  ImmediateFuture<InodePtr> lookupInode(InodeNumber number);
+  ImmediateFuture<InodePtr> lookupInode(
+      InodeNumber number,
+      const ObjectFetchContextPtr& context);
 
   /**
    * Lookup a TreeInode object by inode number.
@@ -189,7 +196,9 @@ class InodeMap {
    * The returned Future throws ENOTDIR if this inode number does not refer to
    * a directory.
    */
-  ImmediateFuture<TreeInodePtr> lookupTreeInode(InodeNumber number);
+  ImmediateFuture<TreeInodePtr> lookupTreeInode(
+      InodeNumber number,
+      const ObjectFetchContextPtr& context);
 
   /**
    * Lookup a FileInode object by inode number.
@@ -198,7 +207,9 @@ class InodeMap {
    * The returned Future throws EISDIR if this inode number refers to a
    * directory.
    */
-  ImmediateFuture<FileInodePtr> lookupFileInode(InodeNumber number);
+  ImmediateFuture<FileInodePtr> lookupFileInode(
+      InodeNumber number,
+      const ObjectFetchContextPtr& context);
 
   /**
    * Lookup an Inode object by inode number, if it already exists.
@@ -361,17 +372,28 @@ class InodeMap {
   // The following public APIs should only be used by TreeInode
   /////////////////////////////////////////////////////////////////////////
 
+  enum class ChildLoadResult { Started, Pending, Conflict };
+
   /**
    * startLoadingChildIfNotLoading() should only be called by TreeInode.
    *
    * startLoadingChildIfNotLoading() will be called when TreeInode wants to load
    * one of its child entries that already has an allocated inode number.  It
-   * returns true if the TreeInode should start loading the inode now, or false
-   * if the inode is already being loaded. If it will return true, the function
+   * returns Started if the TreeInode should start loading the inode now,
+   * Pending if it is already being loaded, or Conflict if the entry conflicts
+   * with another reference to this inode. On Conflict the promise is untouched,
+   * so the caller can repair the entry and retry or fulfill it with an error.
+   * If it will return Started, the function
    * publishes an event to tracebus marking the start of the inode load and
    * attaches an initial promise to the inode to resolve when the load ends.
    *
-   * If startLoadingChildIfNotLoading() returns true, the TreeInode will then
+   * An inode number that is already loaded under another directory entry is
+   * not loaded a second time: the function returns Conflict. Two entries
+   * share a number only when the overlay is
+   * damaged, for example by a rename that was interrupted after its first
+   * write.
+   *
+   * If startLoadingChildIfNotLoading() returns Started, the TreeInode will then
    * continue loading the child inode.  It must then call inodeLoadComplete() or
    * inodeLoadFailed() when it finishes loading the inode.
    *
@@ -383,17 +405,27 @@ class InodeMap {
    * @param childInode The inode number of the child.
    * @param mode The st_mode of the child.
    * @param promise A promise to fulfill when this inode is finished loading.
-   *   The InodeMap is responsible for fulfilling this promise.
+   *   The InodeMap takes ownership unless it returns Conflict.
    *
-   * @return Returns true if the TreeInode should continue loading this child
-   *   inode, or false if this child was already being loaded.
+   * @return Whether to start loading, wait for an existing load, or handle a
+   *   conflicting binding.
    */
-  bool startLoadingChildIfNotLoading(
-      const TreeInode* parent,
+  ChildLoadResult startLoadingChildIfNotLoading(
+      TreeInode* parent,
       PathComponentPiece name,
       InodeNumber childInode,
       mode_t mode,
-      folly::Promise<InodePtr> promise);
+      folly::Promise<InodePtr>& promise);
+
+  /**
+   * Report the two paths when startLoadingChildIfNotLoading() finds an inode
+   * number already loaded under another directory entry.
+   */
+  void reportDuplicateEntry(
+      TreeInode* parent,
+      PathComponentPiece name,
+      InodeNumber childInode,
+      const std::string& loadedAs);
 
   /**
    * inodeLoadComplete() should only be called by TreeInode.
@@ -414,10 +446,15 @@ class InodeMap {
    * inodeLoadFailed() should only be called by TreeInode (or startChildLookup)
    *
    * This should be called when an attempt to load a child inode fails.
+   * A failure that is the expected outcome of a race, such as a lookup of an
+   * inode that was removed meanwhile, passes logAsError=false to skip the
+   * error log and the error logger. The inode trace event is published
+   * either way.
    */
   void inodeLoadFailed(
       InodeNumber number,
-      const folly::exception_wrapper& exception);
+      const folly::exception_wrapper& exception,
+      bool logAsError = true);
 
   void inodeCreated(const InodePtr& inode);
 
@@ -459,7 +496,7 @@ class InodeMap {
 
   struct UnloadedInodeGcEntry {
     PathComponent name;
-    EdenTimestamp lastFsRequestTime;
+    EdenTimestamp lastGcRefTime;
     uint32_t numFsReferences;
   };
 
@@ -488,7 +525,7 @@ class InodeMap {
         InodeNumber parentNum,
         PathComponentPiece entryName,
         mode_t mode,
-        EdenTimestamp lastFsRequestTime);
+        EdenTimestamp lastGcRefTime);
 
     UnloadedInode(
         InodeNumber parentNum,
@@ -497,7 +534,7 @@ class InodeMap {
         mode_t mode,
         std::optional<ObjectId> id,
         uint32_t fsRefcount,
-        EdenTimestamp lastFsRequestTime);
+        EdenTimestamp lastGcRefTime);
     UnloadedInode(
         FileInode* inode,
         TreeInode* parent,
@@ -525,6 +562,13 @@ class InodeMap {
      */
     InodeType getInodeType() const;
 
+    // Match the linked binding and file type; permission bits may have changed
+    // since the parent's DirEntry recorded its initial mode.
+    bool matchesLinkedChild(
+        InodeNumber parentNumber,
+        PathComponentPiece entryName,
+        mode_t initialMode) const;
+
     /**
      * If the entry is not materialized, this contains the id
      * identifying the source control Tree (if this is a directory) or Blob
@@ -534,7 +578,7 @@ class InodeMap {
      */
     std::optional<ObjectId> const id;
 
-    EdenTimestamp const lastFsRequestTime;
+    EdenTimestamp const lastGcRefTime;
 
     /**
      * A list of promises waiting on this inode to be loaded.
@@ -667,14 +711,16 @@ class InodeMap {
       bool isUnlinked,
       InodeNumber childInodeNumber,
       std::optional<ObjectId> id,
-      mode_t mode);
+      mode_t mode,
+      const ObjectFetchContextPtr& context);
   void startChildLookup(
       const InodePtr& parent,
       PathComponentPiece childName,
       bool isUnlinked,
       InodeNumber childInodeNumber,
       std::optional<ObjectId> id,
-      mode_t mode);
+      mode_t mode,
+      const ObjectFetchContextPtr& context);
 
   /**
    * Create and return inode load start event that will later be published to

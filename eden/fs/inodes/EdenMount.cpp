@@ -27,7 +27,6 @@
 #include "eden/common/utils/Bug.h"
 #include "eden/common/utils/ErrnoUtils.h"
 #include "eden/common/utils/FaultInjector.h"
-#include "eden/common/utils/Future.h"
 #include "eden/common/utils/ImmediateFuture.h"
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/common/utils/SpawnedProcess.h"
@@ -45,7 +44,6 @@
 #include "eden/fs/inodes/InodeTable.h"
 #include "eden/fs/inodes/ServerState.h"
 #include "eden/fs/inodes/TreeInode.h"
-#include "eden/fs/inodes/TreePrefetchLease.h"
 #include "eden/fs/journal/Journal.h"
 #include "eden/fs/model/Hash.h"
 #include "eden/fs/model/Tree.h"
@@ -72,7 +70,10 @@
 #include "eden/fs/utils/EdenError.h"
 #include "eden/fs/utils/FsChannelTypes.h"
 #include "eden/fs/utils/NfsSocket.h"
+
+#ifdef _WIN32
 #include "eden/fs/utils/NotImplemented.h"
+#endif
 
 #include <chrono>
 #include <memory>
@@ -131,10 +132,6 @@ namespace {
 constexpr PathComponentPiece kDotEdenSymlinkName{"this-dir"_pc};
 } // namespace
 #endif
-
-namespace {
-constexpr PathComponentPiece kNfsdSocketName{"nfsd.socket"_pc};
-}
 
 /**
  * Helper for computing unclean paths when changing parents
@@ -257,7 +254,7 @@ std::shared_ptr<EdenMount> EdenMount::create(
     std::unique_ptr<Journal> journal,
     EdenStatsPtr stats,
     std::optional<InodeCatalogType> inodeCatalogType,
-    std::optional<InodeCatalogOptions> inodeCatalogOptions) {
+    std::shared_ptr<WalkDetector> walkDetector) {
   return std::shared_ptr<EdenMount>{
       new EdenMount{
           std::move(config),
@@ -267,8 +264,14 @@ std::shared_ptr<EdenMount> EdenMount::create(
           std::move(journal),
           std::move(stats),
           std::move(inodeCatalogType),
-          std::move(inodeCatalogOptions)},
+          std::move(walkDetector)},
       EdenMountDeleter{}};
+}
+
+void EdenMount::setWalkDetectorParent(const RootId& parent) {
+  if (walkDetector_) {
+    walkDetector_->workingCopyParentHint(parent);
+  }
 }
 
 EdenMount::EdenMount(
@@ -279,7 +282,7 @@ EdenMount::EdenMount(
     std::unique_ptr<Journal> journal,
     EdenStatsPtr stats,
     std::optional<InodeCatalogType> inodeCatalogType,
-    std::optional<InodeCatalogOptions> inodeCatalogOptions)
+    std::shared_ptr<WalkDetector> walkDetector)
     : checkoutConfig_{std::move(checkoutConfig)},
       serverState_{std::move(serverState)},
 #ifdef _WIN32
@@ -295,13 +298,13 @@ EdenMount::EdenMount(
       inodePathCache_{
           serverState_->getEdenConfig()->inodePathCacheSize.getValue()},
       objectStore_{std::move(objectStore)},
+      walkDetector_{std::move(walkDetector)},
       blobCache_{std::move(blobCache)},
       blobAccess_{objectStore_, blobCache_},
       overlay_{Overlay::create(
           checkoutConfig_->getOverlayPath(),
           checkoutConfig_->getCaseSensitive(),
           getInodeCatalogType(inodeCatalogType),
-          getInodeCatalogOptions(inodeCatalogOptions),
           serverState_->getEdenFsEventsLogger(),
           serverState_->getErrorLogger(),
           std::move(stats),
@@ -337,10 +340,7 @@ InodeCatalogType EdenMount::getInodeCatalogType(
   //        test code
   //   2. optional inode-catalog-type setting in CheckoutConfig
   //        (`checkoutConfig_->getInodeCatalogType()`)
-  //   3. enable-sqlite-overlay setting in CheckoutConfig
-  //        (`checkoutConfig_->getEnableSqliteOverlay()`)
-  //     a. True -> variant of Sqlite
-  //     b. False -> from EdenConfig
+  //   3. the EdenConfig default
 
   if (inodeCatalogType.has_value()) {
     return inodeCatalogType.value();
@@ -350,34 +350,7 @@ InodeCatalogType EdenMount::getInodeCatalogType(
     return checkoutConfig_->getInodeCatalogType().value();
   }
 
-  if (checkoutConfig_->getEnableSqliteOverlay()) {
-    return InodeCatalogType::Sqlite;
-  } else {
-    return serverState_->getEdenConfig()->inodeCatalogType.getValue();
-  }
-}
-
-InodeCatalogOptions EdenMount::getInodeCatalogOptions(
-    std::optional<InodeCatalogOptions> inodeCatalogOptions) {
-  if (inodeCatalogOptions.has_value()) {
-    return inodeCatalogOptions.value();
-  }
-
-  auto options = INODE_CATALOG_DEFAULT;
-
-  if (getEdenConfig()->unsafeInMemoryOverlay.getValue()) {
-    options |= INODE_CATALOG_UNSAFE_IN_MEMORY;
-  }
-
-  if (getEdenConfig()->overlaySynchronousMode.getValue() == "off") {
-    options |= INODE_CATALOG_SYNCHRONOUS_OFF;
-  }
-
-  if (getEdenConfig()->overlayBuffered.getValue()) {
-    options |= INODE_CATALOG_BUFFERED;
-  }
-
-  return options;
+  return serverState_->getEdenConfig()->inodeCatalogType.getValue();
 }
 
 [[nodiscard]] ImmediateFuture<folly::Unit> EdenMount::initialize(
@@ -390,6 +363,22 @@ InodeCatalogOptions EdenMount::getInodeCatalogOptions(
 
   transitionState(State::UNINITIALIZED, State::INITIALIZING);
 
+  return makeImmediateFutureWith([&] {
+           return initializeImpl(std::move(progressCallback), takeover);
+         })
+      .thenTry([this](auto&& result) {
+        if (result.hasException()) {
+          transitionState(State::INITIALIZING, State::INIT_ERROR);
+        } else {
+          transitionState(State::INITIALIZING, State::INITIALIZED);
+        }
+        return std::move(result);
+      });
+}
+
+ImmediateFuture<folly::Unit> EdenMount::initializeImpl(
+    OverlayChecker::ProgressCallback&& progressCallback,
+    const std::optional<SerializedInodeMap>& takeover) {
   auto parentCommit = checkoutConfig_->getParentCommit();
   auto parent =
       parentCommit.getLastCheckoutId(ParentCommit::RootIdPreference::To)
@@ -423,7 +412,7 @@ InodeCatalogOptions EdenMount::getInodeCatalogOptions(
             *parentState_.wlock() = ParentCommitState{
                 parent, parentTree.tree, wcParent, std::move(checkoutState)};
 
-            objectStore_->workingCopyParentHint(wcParent);
+            setWalkDetectorParent(wcParent);
 
             // Record the transition from no snapshot to the current snapshot in
             // the journal.  This also sets things up so that we can carry the
@@ -464,14 +453,6 @@ InodeCatalogOptions EdenMount::getInodeCatalogOptions(
         // allocating inode numbers for the Tree's entries. This would give the
         // .eden directory inode number 2.
         return setupDotEden(std::move(initTreeNode));
-      })
-      .thenTry([this](auto&& result) {
-        if (result.hasException()) {
-          transitionState(State::INITIALIZING, State::INIT_ERROR);
-        } else {
-          transitionState(State::INITIALIZING, State::INITIALIZED);
-        }
-        return std::move(result);
       });
 }
 
@@ -490,8 +471,8 @@ TreeInodePtr EdenMount::createRootInode(std::shared_ptr<const Tree> tree) {
 namespace {
 ImmediateFuture<Unit> ensureDotEdenSymlink(
     TreeInodePtr directory,
-    PathComponent symlinkName,
-    AbsolutePath symlinkTarget) {
+    const PathComponent& symlinkName,
+    const AbsolutePath& symlinkTarget) {
   enum class Action {
     Nothing,
     CreateSymlink,
@@ -688,7 +669,7 @@ folly::SemiFuture<Unit> EdenMount::performBindMounts() {
             "`: exited with status ",
             returnCode.str());
       })
-      .deferError([mountPath](folly::exception_wrapper err) {
+      .deferError([mountPath](const folly::exception_wrapper& err) {
         throw_<std::runtime_error>(
             "Failed to run `",
             FLAGS_edenfsctlPath,
@@ -927,7 +908,8 @@ ImmediateFuture<SetPathObjectIdResultAndTimes> EdenMount::setPathsToObjectIds(
         collectAllSafe(getTargetTreeInodeFuture, getRootTreeFuture)
             .thenValue(
                 [ctx, setPathObjectIdTime, stopWatch](
-                    std::tuple<TreeInodePtr, shared_ptr<const Tree>> results) {
+                    const std::tuple<TreeInodePtr, shared_ptr<const Tree>>&
+                        results) {
                   setPathObjectIdTime->didLookupTreesOrGetInodeByPath =
                       stopWatch.elapsed();
                   auto [targetTreeInode, incomingTree] = results;
@@ -1689,15 +1671,10 @@ struct EdenMount::CheckoutInProgressGuard {
 
  private:
   // Resets parentState_ out of CheckoutInProgress: restores the prior state for
-  // dry runs, leaves the mount interrupted on a propagated error, or clears the
-  // state otherwise. Returns true when the mount was left interrupted due to a
-  // propagated error, so the caller can surface that error to the user.
+  // dry runs, leaves the mount interrupted when the checkout failed, or clears
+  // the state otherwise. Returns true when the mount was left interrupted, so
+  // the caller can surface the error to the user.
   bool applyResetState(EdenMount* mount, bool hadException) {
-    bool propagateErrors = mount->getServerState()
-                               ->getReloadableConfig()
-                               ->getEdenConfig()
-                               ->propagateCheckoutErrors.getValue();
-
     auto parentLock = mount->parentState_.wlock();
     XCHECK(
         std::holds_alternative<ParentCommitState::CheckoutInProgress>(
@@ -1706,7 +1683,7 @@ struct EdenMount::CheckoutInProgressGuard {
       // Restore the prior state (possibly InterruptedCheckout) for dry runs.
       parentLock->checkoutState = oldState_;
       return false;
-    } else if (propagateErrors && hadException) {
+    } else if (hadException) {
       parentLock->checkoutState = ParentCommitState::InterruptedCheckout{
           oldParent_,
           snapshotId_,
@@ -2082,7 +2059,7 @@ ImmediateFuture<CheckoutResult> EdenMount::checkout(
   // checkout
   setLastCheckoutTime(EdenTimestamp{clock_->getRealtime()});
 
-  objectStore_->workingCopyParentHint(snapshotId);
+  setWalkDetectorParent(snapshotId);
 
   auto journalDiffCallback = std::make_shared<JournalDiffCallback>();
 
@@ -2274,7 +2251,7 @@ folly::coro::now_task<CheckoutResult> EdenMount::co_checkout(
       objectStore_->displayRootId(snapshotId));
 
   setLastCheckoutTime(EdenTimestamp{clock_->getRealtime()});
-  objectStore_->workingCopyParentHint(snapshotId);
+  setWalkDetectorParent(snapshotId);
 
   auto journalDiffCallback = std::make_shared<JournalDiffCallback>();
   bool resumingCheckout =
@@ -2405,7 +2382,8 @@ folly::coro::now_task<folly::Unit> EdenMount::co_flushInvalidations() {
 }
 
 #ifndef _WIN32
-ImmediateFuture<folly::Unit> EdenMount::chown(uid_t uid, gid_t gid) {
+ImmediateFuture<folly::Unit>
+EdenMount::chown(uid_t uid, gid_t gid, const ObjectFetchContextPtr& context) {
   // 1) Ensure we are running in either a fuse or nfs mount
   Nfsd3* nfsChannel = nullptr;
   FuseChannel* fuseChannel = getFuseChannel();
@@ -2446,7 +2424,7 @@ ImmediateFuture<folly::Unit> EdenMount::chown(uid_t uid, gid_t gid) {
     std::vector<ImmediateFuture<InodePtr>> futures;
     futures.reserve(inodesToInvalidate.size());
     for (const auto& ino : inodesToInvalidate) {
-      futures.emplace_back(inodeMap->lookupInode(ino));
+      futures.emplace_back(inodeMap->lookupInode(ino, context));
     }
 
     return collectAllSafe(std::move(futures))
@@ -2481,7 +2459,7 @@ ImmediateFuture<folly::Unit> EdenMount::chown(uid_t uid, gid_t gid) {
 
 std::unique_ptr<DiffContext> EdenMount::createDiffContext(
     DiffCallback* callback,
-    folly::CancellationToken cancellation,
+    const folly::CancellationToken& cancellation,
     const ObjectFetchContextPtr& fetchContext,
     bool listIgnored) const {
   return make_unique<DiffContext>(
@@ -2552,8 +2530,8 @@ folly::coro::now_task<std::unique_ptr<ScmStatus>> EdenMount::co_diff(
   }
 
   // Step 3: Create DiffContext
-  auto context = createDiffContext(
-      callbackPtr, std::move(cancellation), fetchContext, listIgnored);
+  auto context =
+      createDiffContext(callbackPtr, cancellation, fetchContext, listIgnored);
   DiffContext* ctxPtr = context.get();
 
   // Helper lambda to perform the inner diff as a coroutine
@@ -2566,10 +2544,13 @@ folly::coro::now_task<std::unique_ptr<ScmStatus>> EdenMount::co_diff(
     auto rootTree = co_await objectStore_->co_getRootTree(
         commitId, ctxPtr->getFetchContext());
     co_await co_waitForPendingWrites();
+    // GCC 11 hits an internal compiler error when this vector is built inside
+    // the co_await expression.
+    std::vector<TreePtr> trees{std::move(rootTree.tree)};
     co_await rootInode->co_diff(
         ctxPtr,
         RelativePathPiece{},
-        std::vector{std::move(rootTree.tree)},
+        std::move(trees),
         ctxPtr->getToplevelIgnore(),
         false);
   };
@@ -2624,7 +2605,7 @@ folly::coro::now_task<std::unique_ptr<ScmStatus>> EdenMount::co_diff(
                   folly::exception_wrapper{std::current_exception()}});
           {
             auto lockedCachePtr = scmStatusCache_.wlock();
-            (*lockedCachePtr)->dropPromise(key, curSequenceID);
+            (*lockedCachePtr)->dropPromise(key, promise);
           }
           throw;
         }
@@ -2633,7 +2614,7 @@ folly::coro::now_task<std::unique_ptr<ScmStatus>> EdenMount::co_diff(
           promise->setException(folly::OperationCancelled{});
           {
             auto lockedCachePtr = scmStatusCache_.wlock();
-            (*lockedCachePtr)->dropPromise(key, curSequenceID);
+            (*lockedCachePtr)->dropPromise(key, promise);
           }
           co_return std::make_unique<ScmStatus>(callback->extractStatus());
         }
@@ -2671,7 +2652,7 @@ folly::coro::now_task<std::unique_ptr<ScmStatus>> EdenMount::co_diff(
           serverState_->getFaultInjector().check(
               "scmStatusCache", "blocking dropPromise");
 
-          (*lockedCachePtr)->dropPromise(key, curSequenceID);
+          (*lockedCachePtr)->dropPromise(key, promise);
         }
         co_return std::make_unique<ScmStatus>(callback->extractStatus());
       }
@@ -2715,7 +2696,7 @@ void EdenMount::resetParent(const RootId& parent) {
 
   checkoutConfig_->setWorkingCopyParentCommit(parent);
   parentLock->workingCopyParentRootId = parent;
-  objectStore_->workingCopyParentHint(parent);
+  setWalkDetectorParent(parent);
 
   journal_->recordRootUpdate(oldParent, parent);
 }
@@ -2774,7 +2755,7 @@ EdenMount::getFsChannelCompletionFuture() {
   return fsChannelCompletionPromise_.getFuture();
 }
 
-#ifdef __linux__
+#ifndef _WIN32
 namespace {
 std::unique_ptr<FuseChannel, FsChannelDeleter> makeFuseChannel(
     EdenMount* mount,
@@ -2791,7 +2772,6 @@ std::unique_ptr<FuseChannel, FsChannelDeleter> makeFuseChannel(
       EdenDispatcherFactory::makeFuseDispatcher(mount),
       &mount->getStraceLogger(),
       mount->getServerState()->getProcessInfoCache(),
-      mount->getServerState()->getFsEventLogger(),
       mount->getServerState()->getEdenFsEventsLogger(),
       mount->getServerState()->getErrorLogger(),
       std::chrono::duration_cast<folly::Duration>(
@@ -2836,7 +2816,6 @@ folly::Future<NfsServer::NfsMountInfo> makeNfsChannel(
                    EdenDispatcherFactory::makeNfsDispatcher(mount),
                    &mount->getStraceLogger(),
                    mount->getServerState()->getProcessInfoCache(),
-                   mount->getServerState()->getFsEventLogger(),
                    mount->getServerState()->getEdenFsEventsLogger(),
                    mount->getServerState()->getErrorLogger(),
                    std::chrono::duration_cast<folly::Duration>(
@@ -2850,49 +2829,40 @@ folly::Future<NfsServer::NfsMountInfo> makeNfsChannel(
                    mount->getServerState()->getReloadableConfig(),
                    mount->getServerState()->getFaultInjector());
              })
-      .thenValue([mount,
-                  nfsServer,
-                  connectedSocket = std::move(connectedSocket)](
-                     NfsServer::NfsMountInfo mountInfo) mutable {
-        auto [channel, mountdAddr] = std::move(mountInfo);
+      .thenValue(
+          [mount, nfsServer, connectedSocket = std::move(connectedSocket)](
+              NfsServer::NfsMountInfo mountInfo) mutable {
+            auto [channel, mountdAddr] = std::move(mountInfo);
 
-        if (connectedSocket) {
-          XLOGF(
-              DBG4,
-              "Mount takeover: Initiating nfsd with socket: {}",
-              connectedSocket.value().fd());
-          channel->initialize(std::move(connectedSocket.value()));
-          // TODO: we should register the NFS server on takeover too. but
-          // we only transfer the connected socket not the listening socket.
-          // the listening one is the one we wanna register. So we need to
-          // transfer that socket to be able to register it.
-        } else {
-          // The kernel requires a checkout's mountd and nfsd sockets to be
-          // of the same type, so follow the running mountd rather than
-          // nfs:use-uds, which only applies when a mountd is created.
-          std::optional<AbsolutePath> unixSocketPath;
-          if (nfsServer->getMountdAddr().getFamily() == AF_UNIX) {
-            unixSocketPath = mount->getCheckoutConfig()->getClientDirectory() +
-                kNfsdSocketName;
-            XLOGF(
-                DBG4,
-                "Normal Start: Initiating nfsd from scratch: {}",
-                unixSocketPath.value());
-          }
-          channel->initialize(makeNfsSocket(std::move(unixSocketPath)), false);
-          // we can't register uds sockets with our portmapper (portmapper v2
-          // does not support those).
-          auto addr = channel->getAddr();
-          if (addr.isFamilyInet()) {
-            nfsServer->recordPortNumber(
-                channel->getProgramNumber(),
-                channel->getProgramVersion(),
-                addr.getPort());
-          }
-        }
-        return NfsServer::NfsMountInfo{
-            std::move(channel), std::move(mountdAddr)};
-      });
+            if (connectedSocket) {
+              XLOGF(
+                  DBG4,
+                  "Mount takeover: Initiating nfsd with socket: {}",
+                  connectedSocket.value().fd());
+              channel->initialize(std::move(connectedSocket.value()));
+              // TODO: we should register the NFS server on takeover too. but
+              // we only transfer the connected socket not the listening socket.
+              // the listening one is the one we wanna register. So we need to
+              // transfer that socket to be able to register it.
+            } else {
+              // The kernel requires a checkout's mountd and nfsd sockets to be
+              // of the same type, so follow the running mountd rather than
+              // nfs:use-uds, which only applies when a mountd is created.
+              std::optional<AbsolutePath> unixSocketPath;
+              if (nfsServer->getMountdAddr().getFamily() == AF_UNIX) {
+                unixSocketPath =
+                    mount->getCheckoutConfig()->getClientDirectory() +
+                    kNfsdSocketName;
+                XLOGF(
+                    DBG4,
+                    "Normal Start: Initiating nfsd from scratch: {}",
+                    unixSocketPath.value());
+              }
+              channel->initialize(makeNfsSocket(std::move(unixSocketPath)));
+            }
+            return NfsServer::NfsMountInfo{
+                std::move(channel), std::move(mountdAddr)};
+          });
 }
 } // namespace
 
@@ -3005,15 +2975,6 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
         // that mimics privhelper mount failing
         serverState_->getFaultInjector().check(
             "failMountInitialization", mountPath.view());
-#ifdef __APPLE__
-        (void)readOnly;
-        auto error = folly::make_exception_wrapper<std::system_error>(
-            ENOTSUP,
-            std::generic_category(),
-            "FUSE mounts are not supported on macOS");
-        mountPromise->setException(error);
-        return folly::makeFuture<folly::Unit>(std::move(error));
-#else
         return serverState_->getPrivHelper()
             ->fuseMount(
                 mountPath.view(), readOnly, edenConfig->fuseVfsType.getValue())
@@ -3054,7 +3015,6 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                       makeFuseChannel(this, std::move(fuseDevice).value()));
                   return folly::makeFuture(folly::unit);
                 });
-#endif
 #endif
       });
 }
@@ -3143,6 +3103,10 @@ void EdenMount::preparePostFsChannelCompletion(
             if (stopData->isUnmounted()) {
               inodeMap_->setUnmounted();
             }
+            *fsChannelStop_.wlock() = FsChannelStop{
+                stopData->getStopReason(),
+                stopData->stopRequestedAt.value_or(
+                    std::chrono::steady_clock::now())};
 
             fsChannelCompletionPromise_.setWith([&] {
               return TakeoverData::MountInfo{
@@ -3171,13 +3135,6 @@ void EdenMount::fsChannelInitSuccessful(
 folly::Future<folly::Unit> EdenMount::takeoverFuse(
     FuseChannelData takeoverData) {
 #ifndef _WIN32
-#ifdef __APPLE__
-  (void)takeoverData;
-  return folly::makeFuture<folly::Unit>(std::system_error(
-      ENOTSUP,
-      std::generic_category(),
-      "FUSE mounts are not supported on macOS"));
-#else
   transitionState(State::INITIALIZED, State::STARTING);
 
   try {
@@ -3204,7 +3161,6 @@ folly::Future<folly::Unit> EdenMount::takeoverFuse(
     return folly::makeFuture<folly::Unit>(
         folly::exception_wrapper(std::current_exception()));
   }
-#endif
 #else
   (void)takeoverData;
   return folly::makeFuture<folly::Unit>(
@@ -3365,22 +3321,8 @@ ImmediateFuture<TreeInodePtr> EdenMount::ensureDirectoryExists(
   return ensureDirectoryExistsHelper(getRootInode(), childName, rest, context);
 }
 
-std::optional<TreePrefetchLease> EdenMount::tryStartTreePrefetch(
-    TreeInodePtr treeInode,
-    const ObjectFetchContext& context) {
-  auto config = serverState_->getEdenConfig();
-  auto maxTreePrefetches = config->maxTreePrefetches.getValue();
-  auto numInProgress =
-      numPrefetchesInProgress_.fetch_add(1, std::memory_order_acq_rel);
-  if (numInProgress < maxTreePrefetches) {
-    return TreePrefetchLease{std::move(treeInode), context};
-  } else {
-    numPrefetchesInProgress_.fetch_sub(1, std::memory_order_acq_rel);
-    return std::nullopt;
-  }
-}
-
-std::optional<EdenMount::InodeGCLease> EdenMount::tryStartInodeGC() {
+std::optional<EdenMount::InodeGCLease> EdenMount::tryStartInodeGC(
+    bool pressureBased) {
   auto mount = shared_from_this();
   auto failureLimit = getEdenConfig()->gcMaxTreeLoadFailures.getValue();
   auto state = inodeGCState_.wlock();
@@ -3393,6 +3335,8 @@ std::optional<EdenMount::InodeGCLease> EdenMount::tryStartInodeGC() {
   state->remainingTreeLoadFailures = failureLimit;
   auto cancellationToken = state->cancellationSource.getToken();
   state->gcRunning = true;
+  state->pressureBased = pressureBased;
+  state->startTime = std::chrono::steady_clock::now();
   return InodeGCLease{
       std::move(mount),
       /*representsRunningGc=*/true,
@@ -3401,6 +3345,16 @@ std::optional<EdenMount::InodeGCLease> EdenMount::tryStartInodeGC() {
 
 bool EdenMount::isInodeGCRunning() const {
   return inodeGCState_.rlock()->gcRunning;
+}
+
+std::optional<EdenMount::RunningInodeGC> EdenMount::getRunningInodeGC() const {
+  auto state = inodeGCState_.rlock();
+  if (!state->gcRunning) {
+    return std::nullopt;
+  }
+  return RunningInodeGC{
+      std::chrono::steady_clock::now() - state->startTime,
+      state->pressureBased};
 }
 
 void EdenMount::recordInodeGCTreeLoadFailure() {
@@ -3468,12 +3422,6 @@ void EdenMount::releaseInodeGCLease(bool representsRunningGc) noexcept {
     XDCHECK_GT(state->inhibitorCount, 0u);
     --state->inhibitorCount;
   }
-}
-
-void EdenMount::treePrefetchFinished() noexcept {
-  auto oldValue =
-      numPrefetchesInProgress_.fetch_sub(1, std::memory_order_acq_rel);
-  XDCHECK_NE(uint64_t{0}, oldValue);
 }
 
 bool EdenMount::MountingUnmountingState::fsChannelMountStarted()

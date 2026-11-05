@@ -1,4 +1,3 @@
-#inprocess-hg-incompatible
 #require no-windows execbit
 
 Test replaying an executable file added and then modified in descendant commits
@@ -11,12 +10,118 @@ Test replaying an executable file added and then modified in descendant commits
   $ echo two >> executable
   $ sl ci -m "modify executable" -Aq
   $ echo amended >> target
-
-# FIXME: This should succeed and preserve the executable bit. The panic is
-# reported as a Python exception with a traceback; only check the key lines.
-  $ sl amend --to "desc(target)" 2>&1 | grep -E "panicked at|^not implemented|Rust panic"
-  thread 'main' (*) panicked at fbcode/eden/scm/lib/checkout/src/merge.rs:*: (glob)
-  not implemented
-  SystemError: Rust panic: not implemented
+  $ sl amend --to "desc(target)"
+  $ test -x executable
+  $ cat executable
+  one
+  two
   $ sl status
-  M target
+  $ sl manifest -v -r 'desc("add executable")'
+  755 * executable
+  644   target
+  $ sl manifest -v
+  755 * executable
+  644   target
+  $ sl cat -r . executable
+  one
+  two
+  $ sl cat -r 'desc("add executable")' executable
+  one
+  $ sl cat -r 'desc(target)' target
+  target
+  amended
+
+Replay additions, flag clears, and flag changes on existing files.
+
+#if symlink
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > C  # C/tail=tail\n
+  > |
+  > B  # B/exec-set=file\n (executable)
+  > |  # B/exec-clear=file\n
+  > |  # B/link-add=target (symlink)
+  > |  # B/link-set=target (symlink)
+  > |  # B/link-clear=target
+  > A  # A/exec-set=file\n
+  >    # A/exec-clear=file\n (executable)
+  >    # A/link-set=target
+  >    # A/link-clear=target (symlink)
+  >    # A/target=target\n
+  >    # drawdag.defaultfiles=false
+  > EOS
+  $ sl goto -q $C
+  $ echo amended >> target
+  $ sl amend --to 'desc(A)'
+  $ sl status
+  $ sl manifest -v -r 'desc(B)'
+  644   exec-clear
+  755 * exec-set
+  644 @ link-add
+  644   link-clear
+  644 @ link-set
+  644   target
+  $ sl manifest -v
+  644   exec-clear
+  755 * exec-set
+  644 @ link-add
+  644   link-clear
+  644 @ link-set
+  644   tail
+  644   target
+  $ sl cat -r . target
+  target
+  amended
+#endif
+
+Amend an executable-bit change across a descendant content change.
+  $ newclientrepo
+  $ setconfig diff.git=true
+  $ echo one > file
+  $ sl ci -Aqm A
+  $ echo two >> file
+  $ sl ci -m B
+  $ chmod +x file
+  $ sl amend --to 'desc(A)'
+  $ sl status
+  $ sl manifest -v -r 'desc(A)'
+  755 * file
+  $ sl manifest -v
+  755 * file
+  $ sl cat -r . file
+  one
+  two
+
+Amend a content change across a descendant clearing the executable bit.
+  $ newclientrepo
+  $ setconfig diff.git=true
+  $ echo one > file
+  $ chmod +x file
+  $ sl ci -Aqm A
+  $ chmod -x file
+  $ sl ci -m B
+  $ echo two >> file
+  $ sl amend --to 'desc(A)'
+  $ sl status
+  $ sl manifest -v -r 'desc(A)'
+  755 * file
+  $ sl manifest -v
+  644   file
+  $ sl cat -r . file
+  one
+  two
+
+Internal amend patches preserve permissions, paths, and whitespace despite diff
+preferences.
+  $ newclientrepo
+  $ setconfig diff.git=false diff.noprefix=true diff.ignorews=true
+  $ echo 'one two' > file
+  $ sl ci -Aqm A
+  $ chmod +x file
+  $ echo 'one  two' > file
+  $ sl amend --to .
+  $ sl status
+  $ sl manifest -v
+  755 * file
+  $ sl cat -r . file
+  one  two

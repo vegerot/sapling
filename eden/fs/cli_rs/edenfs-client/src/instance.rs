@@ -21,7 +21,6 @@ use std::sync::Arc;
 use edenfs_core::daemon::EdenFsDaemon;
 pub use edenfs_core::instance::DEFAULT_CONFIG_DIR;
 pub use edenfs_core::instance::DEFAULT_ETC_EDEN_DIR;
-use fbinit::expect_init;
 
 use crate::client::EdenFsClient;
 use crate::use_case::UseCase;
@@ -56,7 +55,7 @@ impl EdenFsInstance {
     ) -> EdenFsInstance {
         let socketfile = config_dir.join("socket");
         let use_case = Arc::new(UseCase::new(&config_dir, use_case_id));
-        let client = Arc::new(EdenFsClient::new(expect_init(), use_case, socketfile));
+        let client = Arc::new(EdenFsClient::new(use_case, socketfile));
         let daemon: Arc<dyn EdenFsDaemon> = client.clone();
         Self {
             core: edenfs_core::instance::EdenFsInstance::with_daemon(
@@ -83,5 +82,44 @@ impl std::ops::Deref for EdenFsInstance {
 
     fn deref(&self) -> &Self::Target {
         &self.core
+    }
+}
+
+#[cfg(test)]
+mod client_name_tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use crate::instance::EdenFsInstance;
+    use crate::use_case::UseCaseId;
+
+    #[fbinit::test]
+    fn test_client_name_with_nested_checkouts() {
+        let tmp = tempdir().unwrap();
+        let config_dir = tmp.path().join("eden");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let outer = tmp.path().join("outer");
+        let inner = outer.join("inner");
+        fs::create_dir_all(inner.join("src")).unwrap();
+
+        let mut map = BTreeMap::new();
+        map.insert(outer.to_string_lossy().to_string(), "outer".to_string());
+        map.insert(inner.to_string_lossy().to_string(), "inner".to_string());
+        let json = serde_json::to_string_pretty(&map).unwrap();
+        fs::write(config_dir.join("config.json"), json).unwrap();
+
+        let instance = EdenFsInstance::new(
+            UseCaseId::ExampleUseCase,
+            config_dir.clone(),
+            config_dir.clone(),
+            None,
+        );
+
+        assert_eq!(instance.client_name(&outer).unwrap(), "outer");
+        assert_eq!(instance.client_name(&inner).unwrap(), "inner");
+        assert_eq!(instance.client_name(&inner.join("src")).unwrap(), "inner");
     }
 }

@@ -256,6 +256,61 @@ Custom platforms can be implemented either by:
 - including platform code in the build process (the VS Code extension does this)
 - adding a new platform to isl-server for use by `run-proxy`'s `--platform` option (Android Studio does this)
 
+### AgentCloud theme handoff
+
+`agentCloud.html` accepts `theme=light|dark` and an optional `themeColors` query parameter:
+JSON with canonical Astryx `--color-*` keys. The host sends concrete colors for the resolved mode
+and reloads the frame when its mode or palette changes. Missing or invalid modes retain the legacy
+system-theme behavior; missing or invalid colors retain the existing mode-specific palette.
+
+The inline head bootstrap validates the bounded palette with the browser's CSS color parser and
+accepts only hex and numeric `rgb`, `rgba`, `hsl`, `hsla`, `oklch`, `oklab`, `lab`, or `lch` values.
+It sets only allowlisted `--agentcloud-*` properties, the root background, and `color-scheme`.
+The loaded platform reuses that theme result and ignores a stale standalone theme preference.
+Other entry points do not run this bootstrap. Semantic colors without an equivalent Astryx role
+(such as the missing-file hue and error-background wash) keep their existing values. Signal badges
+also retain their existing palette because ISL gives all statuses a single shared foreground token.
+
+Phabricator diff status pills take the host's own pill palette from `--color-status-<hue>-background`
+and `--color-status-<hue>-text`, for the badge colors `gray`, `green`, `orange`, `pink`, `purple`,
+`teal` and `blue`. ISL's yellow pill takes the orange pair and its red pair paints the pink states.
+Without them the pills keep tinted fallbacks matching that palette, not ISL's standard pastel fills.
+
+The host and Sapling-served guest ship separately: an older guest ignores `themeColors`, and an older
+host receives the guest's existing palette fallback until both sides are updated.
+
+### AgentCloud settings handoff
+
+ISL keeps its settings in `localStorage`, which belongs to one origin, and AgentCloud frames each
+machine's ISL from that machine's own origin. A host that keeps ISL's settings across machines
+passes them to `agentCloud.html` in `portableSettings`, a JSON object mapping each setting's key to
+its value as ISL stores it (JSON text), beside its own exact origin in `hostOrigin` and
+`portableSettingsNonce`: when it built the frame URL (`Date.now()`), a `-`, and a random id of up to
+64 letters, digits, `-` or `_`.
+
+Settings opt in where they are defined: `localStorageBackedAtom(key, defaultValue, {portable:
+true})`. A portable setting takes the host's value when the page loads and writes it to
+`localStorage`, unless this browser's copy is newer than the frame URL: a reload of the same URL, or
+another pane's URL built earlier, carries the values the host had then. The page keeps, in
+`agentcloud.portable-setting-times`, when its copy of each setting was last current: when it changed
+here, once stored, or the build time of the URL its value came from. The host and the page run in
+the same browser, so their clocks agree. A value whose JSON type differs from the default's, or that
+the setting's own `validate` refuses (the UI zoom's range, a setting's options), is ignored.
+
+Each change to a portable setting is posted to `window.parent` at the host's origin as `{type:
+'agentcloud-isl/setting-changed', v: 2, key, value}`: the new value as JSON text, the default
+included, so a reset reaches the other machines too, or null when the value was cleared or is one
+the other machines would refuse. Values longer than 1024 characters of JSON are neither read nor
+posted.
+
+The frame URL is not a secret, so the page reads and posts settings, and hands file and link opening
+to the host, only for a host origin it trusts, and only when the browser reports the page that
+framed it (`location.ancestorOrigins`, else the referrer) at that origin; settings also need
+`portableSettings` and a nonce. Otherwise nothing changes. The host builds the frame's URL when it
+frames the page, so a change made on another machine reaches an open page when the host frames it
+again. A host should accept messages only from the frame's own window at the frame's origin, and
+must not strip the referrer from the frame's request (`referrerpolicy="no-referrer"`).
+
 ## Syncing repository state
 
 ISL started as a way to automatically re-run `sl status` and `sl smartlog` in a loop.

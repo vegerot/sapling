@@ -73,7 +73,6 @@ NFS_MOUNT_PROTOCOL_STRING = "nfs"
 FUSE_MOUNT_PROTOCOL_STRING = "fuse"
 PRJFS_MOUNT_PROTOCOL_STRING = "prjfs"
 
-INODE_CATALOG_TYPE_IN_MEMORY_STRING = "inmemory"
 CHEF_LOG_PATH_DARWIN = "/var/chef/outputs/chef.last.run_stats"
 CHEF_LOG_PATH_LINUX = "/var/chef/outputs/chef.last.run_stats"
 CHEF_LOG_PATH_WIN32 = "C:\\chef\\outputs\\chef.last.run_stats"
@@ -498,25 +497,6 @@ class HgRepo(Repo):
         return out.strip().decode("utf-8")
 
 
-class GitRepo(Repo):
-    HEAD = "HEAD"
-
-    def __init__(self, source: str, working_dir: Optional[str] = None) -> None:
-        super(GitRepo, self).__init__("git", source, working_dir)
-
-    def __repr__(self) -> str:
-        return f"GitRepo(source={self.source!r}, working_dir={self.working_dir!r})"
-
-    def _run_git(self, args: List[str]) -> bytes:
-        cmd = ["git"] + args
-        out = subprocess.check_output(cmd, cwd=self.source)
-        return out
-
-    def get_commit_hash(self, commit: str) -> str:
-        out = self._run_git(["rev-parse", commit])
-        return out.strip().decode("utf-8")
-
-
 class ReCasRepo(Repo):
     HEAD = "HEAD"
 
@@ -555,29 +535,6 @@ def mkscratch_bin() -> Path:
     # it via the PATH.  In the integration test environment we'll set the
     # MKSCRATCH_BIN to point to the binary under test
     return Path(os.environ.get("MKSCRATCH_BIN", "mkscratch"))
-
-
-def is_git_dir(path: str) -> bool:
-    return (
-        os.path.isdir(os.path.join(path, "objects"))
-        and os.path.isdir(os.path.join(path, "refs"))
-        and os.path.exists(os.path.join(path, "HEAD"))
-    )
-
-
-def _get_git_repo(path: str) -> Optional[GitRepo]:
-    """
-    If path points to a git repository, return a GitRepo object.
-    Otherwise, if the path is not a git repository, return None.
-    """
-    if path.endswith(".git") and is_git_dir(path):
-        return GitRepo(path)
-
-    git_subdir = os.path.join(path, ".git")
-    if is_git_dir(git_subdir):
-        return GitRepo(git_subdir, path)
-
-    return None
 
 
 def get_hg_repo(path: str, backing_type: Optional[str] = None) -> Optional[HgRepo]:
@@ -647,9 +604,6 @@ def get_repo(path: str, backing_store_type: Optional[str] = None) -> Optional[Re
         hg_repo = get_hg_repo(path, backing_store_type)
         if hg_repo is not None:
             return hg_repo
-        git_repo = _get_git_repo(path)
-        if git_repo is not None:
-            return git_repo
 
         parent = os.path.dirname(path)
         if parent == path:
@@ -809,15 +763,29 @@ def is_edenfs_mount_device(device: bytes) -> bool:
     return device == b"eden" or device == b"edenfs" or device.startswith(b"edenfs:")
 
 
+def is_edenfs_unix_socket_nfs_device(device: bytes) -> bool:
+    """Whether the device of an NFS mount names EdenFS's nfsd socket.
+
+    macOS reports an NFS mount served over a Unix domain socket as
+    "<socket path>:<mount path>". Keep in sync with
+    is_edenfs_unix_socket_nfs_source() in eden/common/utils/FSDetect.h.
+    """
+    return device.startswith(b"<") and b"/edenfs-nfsd.socket>:" in device
+
+
 def is_edenfs_mount(device: bytes, vfstype: bytes) -> bool:
     """Whether a mount table entry is an EdenFS checkout.
 
     On macOS the kernel replaces the device of an NFS mount served over a
-    Unix domain socket with the socket path, so the device alone does not
-    identify EdenFS there; the filesystem type, which EdenFS overrides to
-    "edenfs:", still does.
+    Unix domain socket with the socket path, so the "edenfs:" device alone
+    does not identify EdenFS there. The socket name does, and so does the
+    filesystem type when EdenFS overrides it to "edenfs:".
     """
-    return is_edenfs_mount_device(device) or vfstype == b"edenfs:"
+    return (
+        is_edenfs_mount_device(device)
+        or vfstype == b"edenfs:"
+        or (vfstype == b"nfs" and is_edenfs_unix_socket_nfs_device(device))
+    )
 
 
 def get_eden_cli_cmd(argv: List[str] = sys.argv) -> List[str]:
@@ -1047,14 +1015,6 @@ def create_filtered_rootid(root_id: str, filter_id: bytes) -> bytes:
     original_len = len(root_id)
     varint = encode_varint(original_len)
     return varint + root_id.encode() + filter_id
-
-
-def get_enable_sqlite_overlay(overlay_type: Optional[str]) -> bool:
-    if overlay_type is None:
-        # The sqlite backed overlay is default only on Windows
-        return sys.platform == "win32"
-
-    return overlay_type == "sqlite"
 
 
 def maybe_edensparse_migration(

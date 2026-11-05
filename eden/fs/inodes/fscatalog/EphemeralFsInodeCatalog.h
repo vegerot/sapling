@@ -9,7 +9,6 @@
 
 #include <folly/File.h>
 #include <folly/Range.h>
-#include <gtest/gtest_prod.h>
 #include <optional>
 #include "eden/fs/inodes/InodeCatalog.h"
 #include "eden/fs/inodes/InodeNumber.h"
@@ -49,8 +48,6 @@ class EphemeralFsInodeCatalog : public InodeCatalog {
   bool supportsWal() const override {
     return false;
   }
-
-  std::vector<InodeNumber> getAllParentInodeNumbers() override;
 
   /**
    * Returns the next inode number to start at when allocating new inodes.
@@ -102,8 +99,6 @@ class EphemeralFsInodeCatalog : public InodeCatalog {
       InodeNumber dst,
       PathComponentPiece srcName,
       PathComponentPiece dstName) override;
-
-  void maintenance() override {}
 
   std::optional<fsck::InodeInfo> loadInodeInfo(InodeNumber number) override;
 

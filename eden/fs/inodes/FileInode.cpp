@@ -10,6 +10,8 @@
 #include <fmt/format.h>
 #include <optional>
 
+#include <folly/ExceptionWrapper.h>
+#include <folly/Try.h>
 #include <folly/coro/Collect.h>
 #include <folly/coro/Invoke.h>
 #include <folly/coro/Task.h>
@@ -37,6 +39,7 @@
 #include "eden/fs/store/BackingStore.h"
 #include "eden/fs/store/BlobAccess.h"
 #include "eden/fs/store/ObjectStore.h"
+#include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/utils/Clock.h"
 #include "eden/fs/utils/FileHash.h"
 #include "eden/fs/utils/NotImplemented.h"
@@ -180,9 +183,13 @@ class FileInodeState::BlobLoadingPromise {
    * truncated. In the second case, the future will return with a nullptr
    */
   ImmediateFuture<BlobPtr> getImmediateFuture() {
-    return ImmediateFuture{
-        promise.getSemiFuture().deferError<folly::BrokenPromise>(
-            [](auto&&) -> BlobPtr { return nullptr; })};
+    return ImmediateFuture<BlobPtr>{promise.getSemiFuture()}.thenError(
+        [](folly::exception_wrapper&& ew) -> ImmediateFuture<BlobPtr> {
+          if (ew.is_compatible_with<folly::BrokenPromise>()) {
+            return BlobPtr{nullptr};
+          }
+          return makeImmediateFuture<BlobPtr>(std::move(ew));
+        });
   }
 
   /**
@@ -307,37 +314,37 @@ FileInode::runWhileMaterialized(
             getMount(), BlobCache::Interest::UnlikelyNeededAgain);
       }
       if (blob) {
+        logAccess(*fetchContext);
         // We have the blob data loaded.
         // Materialize the file now.
         materializeNow(state, blob, fetchContext);
-        // Call materializeInParent before we return, after we are
-        // sure the state lock has been released.  This does mean that our
-        // parent won't have updated our state until after the caller's function
-        // runs, but this is okay.  There is always a brief gap between when we
-        // materialize ourself and when our parent gets updated to indicate
-        // this. If we do crash during this period it is not too unreasonable
-        // that recent change right before the crash might be reverted to their
-        // non-materialized state.
-        SCOPE_EXIT {
-          XCHECK(state.isNull());
-          materializeInParent();
-          // Add materialize event after parent finishes its materialization
-          getMount()->publishInodeTraceEvent(InodeTraceEvent(
-              startTime.value(),
-              getNodeId(),
-              InodeType::FILE,
-              InodeEventType::MATERIALIZE,
-              InodeEventProgress::END,
-              getNameRacy()));
-        };
-        logAccess(*fetchContext);
         // Note that we explicitly create a temporary LockedState object
         // to pass to the caller to ensure that the state lock will be released
         // when they return, even if the caller's function accepts the state as
         // an rvalue-reference and does not release it themselves.
-        return makeImmediateFutureWith([&] {
+        auto result = makeImmediateFutureWith([&] {
           return std::forward<Fn>(fn)(LockedState{std::move(state)});
         });
+        XCHECK(state.isNull());
+        // Update our parent now that the state lock has been released.  This
+        // does mean that our parent won't have updated our state until after
+        // the caller's function runs, but this is okay.  There is always a
+        // brief gap between when we materialize ourself and when our parent
+        // gets updated to indicate this. If we do crash during this period it
+        // is not too unreasonable that recent change right before the crash
+        // might be reverted to their non-materialized state.
+        //
+        // The parent's overlay save can throw, so this must not run inside a
+        // noexcept scope guard: the error is returned to the caller instead,
+        // unless the caller's function already failed.
+        if (auto parentError = completeMaterialization(startTime.value())) {
+          return std::move(result).thenValue(
+              [parentError = std::move(parentError)](
+                  auto&&) -> std::invoke_result_t<Fn, LockedState&&> {
+                parentError.throw_exception();
+              });
+        }
+        return result;
       }
 
       // The blob must be loaded, so kick that off. There's no point in caching
@@ -413,30 +420,29 @@ FileInode::truncateAndRun(LockedState state, Fn&& fn) {
 
       // Now that materializeAndTruncate() has succeeded, extract the
       // blobLoadingPromise, it'll be fulfilled with a BrokenPromise on scope
-      // exit.
+      // exit, after the parent has been updated below.
       auto loadingPromise = std::move(state->blobLoadingPromise);
       state->blobLoadingPromise.reset();
-      // Also call materializeInParent() as we exit, before fulfilling the
-      // blobLoadingPromise.
-      SCOPE_EXIT {
-        XCHECK(state.isNull());
-        materializeInParent();
-        // Publish to TraceBus after parent finishes its materialization
-        getMount()->publishInodeTraceEvent(InodeTraceEvent(
-            startTime,
-            getNodeId(),
-            InodeType::FILE,
-            InodeEventType::MATERIALIZE,
-            InodeEventProgress::END,
-            getNameRacy()));
-      };
 
       // Now invoke the input function.
       // Note that we explicitly create a temporary LockedState object
       // to pass to the caller to ensure that the state lock will be released
       // when they return, even if the caller's function accepts the state as
       // an rvalue-reference and does not release it themselves.
-      return std::forward<Fn>(fn)(LockedState{std::move(state)});
+      auto result = folly::makeTryWith(
+          [&] { return std::forward<Fn>(fn)(LockedState{std::move(state)}); });
+      XCHECK(state.isNull());
+
+      // Update our parent now that the state lock has been released. The
+      // parent's overlay save can throw, so this must not run inside a
+      // noexcept scope guard: the error is returned to the caller instead,
+      // unless the caller's function already failed.
+      if (auto parentError = completeMaterialization(startTime)) {
+        if (!result.hasException()) {
+          result.emplaceException(std::move(parentError));
+        }
+      }
+      return std::move(result).value();
     }
     case State::MATERIALIZED_IN_OVERLAY:
       // We are already materialized.
@@ -519,6 +525,7 @@ Hash20 FileInodeState::MaterializedState::getSha1(FileInode& inode) {
   if (sha1_.has_value()) {
     return sha1_.value();
   }
+  inode.getMount()->getStats()->increment(&OverlayStats::fileHashComputed);
 
 #ifdef _WIN32
   auto sha1 = getFileSha1(inode.getMaterializedFilePath());
@@ -687,7 +694,15 @@ ImmediateFuture<std::string> FileInode::readlink(
   }
 
   // The symlink contents are simply the file contents!
-  return readAll(fetchContext, cacheHint);
+  return readAll(fetchContext, cacheHint)
+      .thenValue([self = inodePtrFromThis()](std::string target) {
+        // Conflict recovery leaves an empty target so the link can be removed.
+        // Linux can interpret an empty target as its parent during traversal.
+        if (target.empty()) {
+          throw InodeError(EIO, self, "empty symlink target");
+        }
+        return target;
+      });
 }
 #endif // !_WIN32
 
@@ -839,28 +854,33 @@ folly::coro::now_task<bool> FileInode::co_isSameAs(
     co_return result.value();
   }
 
-  // Run the SHA-1 fetches in parallel via folly::coro::collectAllTry.
-  auto results = co_await folly::coro::collectAllTry(
-      folly::coro::co_invoke(
-          [self = this,
-           fetchContext = fetchContext.copy()]() -> folly::coro::Task<Hash20> {
-            co_return co_await self->co_getSha1(fetchContext);
-          }),
-      folly::coro::co_invoke(
-          [&store = getObjectStore(),
-           blobID,
-           fetchContext = fetchContext.copy()]() -> folly::coro::Task<Hash20> {
-            co_return co_await store.co_getBlobSha1(blobID, fetchContext);
-          }));
-  auto& [t1, t2] = results;
-  if (t1.hasException() || t2.hasException()) {
-    XLOGF(
-        DBG2,
-        "Assuming changed: {}",
-        t1.hasException() ? t1.exception() : t2.exception());
+  // The blob's size arrives together with its SHA-1, and the size of a
+  // materialized file is at most an fstat away, so a size mismatch settles
+  // the comparison without reading and hashing the file.
+  auto auxTry = co_await folly::coro::co_awaitTry(
+      getObjectStore().co_getBlobAuxData(blobID, fetchContext));
+  if (auxTry.hasException()) {
+    XLOGF(DBG2, "Assuming changed: {}", auxTry.exception());
     co_return false;
   }
-  co_return t1.value() == t2.value();
+  auto sizeTry = folly::makeTryWith([&] { return getMaterializedSize(); });
+  if (sizeTry.hasException()) {
+    XLOGF(DBG2, "Assuming changed: {}", sizeTry.exception());
+    co_return false;
+  }
+  if (sizeTry.value().has_value() && *sizeTry.value() != auxTry->size) {
+    co_return false;
+  }
+  co_return co_await co_isSameAsSlowImpl(
+      this, auxTry->sha1, fetchContext.copy());
+}
+
+std::optional<uint64_t> FileInode::getMaterializedSize() {
+  auto state = LockedState{this};
+  if (state->tag != State::MATERIALIZED_IN_OVERLAY) {
+    return std::nullopt;
+  }
+  return state->materializedState.getSize(*this);
 }
 
 #ifndef _WIN32
@@ -909,6 +929,28 @@ void FileInode::materializeInParent() {
     loc.parent->childMaterialized(renameLock, loc.name);
   }
 }
+
+#ifndef _WIN32
+folly::exception_wrapper FileInode::completeMaterialization(
+    std::chrono::system_clock::time_point startTime) {
+  auto parentError = folly::try_and_catch([this] { materializeInParent(); });
+  if (parentError) {
+    XLOGF(
+        ERR,
+        "failed to record the materialization of {} in its parent: {}",
+        getLogPath(),
+        folly::exceptionStr(parentError));
+  }
+  getMount()->publishInodeTraceEvent(InodeTraceEvent(
+      startTime,
+      getNodeId(),
+      InodeType::FILE,
+      InodeEventType::MATERIALIZE,
+      InodeEventProgress::END,
+      getNameRacy()));
+  return parentError;
+}
+#endif // !_WIN32
 
 #ifndef _WIN32
 ImmediateFuture<vector<string>> FileInode::listxattr() {
@@ -1066,7 +1108,6 @@ std::optional<BlobAuxData> FileInode::tryGetCachedBlobAuxData(
 
 ImmediateFuture<struct stat> FileInode::stat(
     const ObjectFetchContextPtr& context) {
-  notifyParentOfStat(/*isFile=*/true, *context);
   logAccess(*context);
 
   auto built = buildStatUnderLock(false);
@@ -1092,7 +1133,6 @@ folly::coro::now_task<struct stat> FileInode::co_stat(
     const ObjectFetchContextPtr& context) {
   // Keep this FileInode alive across the co_await.
   [[maybe_unused]] auto self = inodePtrFromThis();
-  notifyParentOfStat(/*isFile=*/true, *context);
   logAccess(*context);
 
   auto built = buildStatUnderLock(false);
@@ -1584,11 +1624,23 @@ class FileInode::LoadingOngoing {
   FileInodePtr inode_;
 };
 
+void FileInode::attachParentDirEntryCounts(
+    const ObjectFetchContextPtr& fetchContext) {
+  if (!getMount()->getEdenConfig()->walkDirSizeHints.getValue()) {
+    return;
+  }
+  if (auto parent = getParentRacy()) {
+    fetchContext->setParentDirEntryCounts(parent->loadTimeEntryCounts());
+  }
+}
+
 ImmediateFuture<BlobPtr> FileInode::startLoadingData(
     LockedState state,
     BlobCache::Interest interest,
     const ObjectFetchContextPtr& fetchContext) {
   XDCHECK_EQ(state->tag, State::BLOB_NOT_LOADING);
+
+  attachParentDirEntryCounts(fetchContext);
 
   // Start the blob load first in case this throws an exception.
   // Ideally the state transition is no-except in tandem with the
@@ -1636,13 +1688,23 @@ ImmediateFuture<BlobPtr> FileInode::startLoadingData(
   // collect short-circuiting in that case. However, when loadingFuture
   // completes, it'll set the loadingPromise which will then complete the
   // collect below.
-  return ImmediateFuture{
-      folly::collect(std::move(resultFuture), std::move(loadingFuture).semi())
-          .deferValue([](std::tuple<BlobPtr, folly::Unit>&& res) {
-            return std::get<BlobPtr>(std::move(res));
-          })
-          .deferError<folly::BrokenPromise>(
-              [](auto&&) -> BlobPtr { return nullptr; })};
+  //
+  // The continuations are ImmediateFuture ones rather than deferValue and
+  // deferError: when the blob came from a local cache, collect is already
+  // complete here, and a deferred callback would hide that behind a future
+  // that only completes once an executor drives it, pushing the read reply
+  // onto the thread pool.
+  return ImmediateFuture<std::tuple<BlobPtr, folly::Unit>>{
+      folly::collect(std::move(resultFuture), std::move(loadingFuture).semi())}
+      .thenValue([](std::tuple<BlobPtr, folly::Unit>&& res) {
+        return std::get<BlobPtr>(std::move(res));
+      })
+      .thenError([](folly::exception_wrapper&& ew) -> ImmediateFuture<BlobPtr> {
+        if (ew.is_compatible_with<folly::BrokenPromise>()) {
+          return BlobPtr{nullptr};
+        }
+        return makeImmediateFuture<BlobPtr>(std::move(ew));
+      });
 }
 
 folly::coro::now_task<BlobPtr> FileInode::co_startLoadingData(
@@ -1663,6 +1725,8 @@ folly::coro::now_task<BlobPtr> FileInode::co_startLoadingData(
 
   // Unlock state_ while we wait on the blob data to load
   state.unlock();
+
+  attachParentDirEntryCounts(fetchContext);
 
   // Load the blob and fulfill the promise. LoadingOngoing RAII ensures that
   // if the coroutine is cancelled, completeDataLoad(BrokenPromise) is called

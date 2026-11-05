@@ -45,7 +45,7 @@ impl Display for BundleVersion {
     }
 }
 
-/// Struct responsible for writing a Git bundle with format https://git-scm.com/docs/bundle-format
+/// Struct responsible for writing a Git bundle with format <https://git-scm.com/docs/bundle-format>
 /// to the underlying writer.
 pub struct BundleWriter<T>
 where
@@ -118,7 +118,7 @@ impl<T: AsyncWrite + Unpin> BundleWriter<T> {
         // Newline before starting packfile
         writer.write_all(b"\n").await?;
         bytes_written += 1;
-        let pack_writer = PackfileWriter::new(writer, num_objects, concurrency, delta_form);
+        let pack_writer = PackfileWriter::new(writer, num_objects, concurrency, delta_form, None);
         Ok(Self {
             version: BundleVersion::V2,
             refs,

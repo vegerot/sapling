@@ -9,11 +9,24 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
+#include <vector>
+
 namespace facebook::eden {
 
 TEST(DeadConfigKeysTest, matchesExactSectionAndKey) {
   EXPECT_TRUE(isDeadConfigKey("experimental", "prefetch-optimizations-v2"));
   EXPECT_TRUE(isDeadConfigKey("coroutines", "enable-phase1"));
+  EXPECT_TRUE(
+      isDeadConfigKey("thrift", "leak-outstanding-requests-when-server-stops"));
+}
+
+TEST(DeadConfigKeysTest, ignoresLegacyLoggerSelectors) {
+  EXPECT_TRUE(isDeadConfigKey("telemetry", "enable-xplatlogger-fileaccess"));
+  EXPECT_TRUE(isDeadConfigKey("telemetry", "enable-xplatlogger-events"));
+  EXPECT_TRUE(isDeadConfigKey("telemetry", "enable-xplatlogger-errors"));
+  EXPECT_TRUE(isDeadConfigKey("telemetry", "enable-xplatlogger-cli-usage"));
+  EXPECT_TRUE(isDeadConfigKey("telemetry", "enable-xplatlogger-rollouts"));
 }
 
 TEST(DeadConfigKeysTest, doesNotMatchPartialOrShiftedKeys) {
@@ -22,6 +35,14 @@ TEST(DeadConfigKeysTest, doesNotMatchPartialOrShiftedKeys) {
   EXPECT_FALSE(isDeadConfigKey("core", "edenDirectory"));
   // The section/key split must line up with the ':' in the dead key.
   EXPECT_FALSE(isDeadConfigKey("coroutines:enable", "phase1"));
+}
+
+TEST(DeadConfigKeysTest, sectionIsDeadOnlyWhenEveryKeyIs) {
+  using Keys = std::vector<std::string>;
+  EXPECT_TRUE(
+      isDeadConfigSection("log", Keys{"max-file-size", "num-rotated-logs"}));
+  EXPECT_FALSE(isDeadConfigSection("log", Keys{"max-file-size", "level"}));
+  EXPECT_FALSE(isDeadConfigSection("log", Keys{}));
 }
 
 } // namespace facebook::eden

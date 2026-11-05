@@ -22,6 +22,8 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/test:test_utils",
+        "//eden/common/utils:fault_injector",
         "//eden/fs/journal:journal",
         "//eden/fs/model:model",
     ],

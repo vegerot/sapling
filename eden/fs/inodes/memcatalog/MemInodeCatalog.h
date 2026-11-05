@@ -36,8 +36,6 @@ class MemInodeCatalog : public InodeCatalog {
     return false;
   }
 
-  std::vector<InodeNumber> getAllParentInodeNumbers() override;
-
   /**
    * Returns the next inode number to start at when allocating new inodes.
    */
@@ -100,8 +98,6 @@ class MemInodeCatalog : public InodeCatalog {
       std::shared_ptr<ReloadableConfig> config,
       AbsolutePathPiece mountPath,
       InodeCatalog::LookupCallback& callback) override;
-
-  void maintenance() override {}
 
   std::optional<fsck::InodeInfo> loadInodeInfo(InodeNumber number) override;
 

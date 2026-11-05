@@ -233,18 +233,7 @@ mock! {
             params: &ReaddirParams,
         ) -> BoxFuture<'static, Result<ReaddirResult, ReaddirError>>;
 
-        fn glob(
-            &self,
-            mount_point: &PathString,
-            globs: &[String],
-        ) -> BoxFuture<'static, Result<Vec<PathString>, GlobError>>;
-
         fn globFiles(&self, params: &GlobParams) -> BoxFuture<'static, Result<Glob, GlobFilesError>>;
-
-        fn prefetchFiles(
-            &self,
-            params: &PrefetchParams,
-        ) -> BoxFuture<'static, Result<(), PrefetchFilesError>>;
 
         fn prefetchFilesV2(
             &self,
@@ -255,18 +244,6 @@ mock! {
             &self,
             request: &PreloadProgressRequest,
         ) -> BoxFuture<'static, Result<PreloadProgressResponse, QueryPreloadProgressError>>;
-
-        fn predictiveGlobFiles(
-            &self,
-            params: &GlobParams,
-        ) -> BoxFuture<'static, Result<Glob, PredictiveGlobFilesError>>;
-
-        fn chown(
-            &self,
-            mount_point: &PathString,
-            uid: i32,
-            gid: i32,
-        ) -> BoxFuture<'static, Result<(), ChownError>>;
 
         fn changeOwnership(
             &self,
@@ -307,13 +284,6 @@ mock! {
         ) -> BoxFuture<'static, Result<EdenConfigData, GetConfigError>>;
 
         fn reloadConfig(&self) -> BoxFuture<'static, Result<(), ReloadConfigError>>;
-
-        fn debugGetScmTree(
-            &self,
-            mount_point: &PathString,
-            id: &ThriftObjectId,
-            local_store_only: bool,
-        ) -> BoxFuture<'static, Result<Vec<ScmTreeEntry>, DebugGetScmTreeError>>;
 
         fn debugGetTree(
             &self,
@@ -404,18 +374,6 @@ mock! {
         fn stopRecordingBackingStoreFetch(
             &self,
         ) -> BoxFuture<'static, Result<GetFetchedFilesResult, StopRecordingBackingStoreFetchError>>;
-
-        fn clearAndCompactLocalStore(
-            &self,
-        ) -> BoxFuture<'static, Result<(), ClearAndCompactLocalStoreError>>;
-
-        fn debugClearLocalStoreCaches(
-            &self,
-        ) -> BoxFuture<'static, Result<(), DebugClearLocalStoreCachesError>>;
-
-        fn debugCompactLocalStorage(
-            &self,
-        ) -> BoxFuture<'static, Result<(), DebugCompactLocalStorageError>>;
 
         fn debugDropAllPendingRequests(
             &self,
@@ -541,10 +499,6 @@ mock! {
         fn getActiveRequests(
             &self,
         ) -> BoxFuture<'static, Result<GetActiveRequestsResponse, GetActiveRequestsError>>;
-
-        fn debugLogError(
-            &self,
-        ) -> BoxFuture<'static, Result<bool, DebugLogErrorError>>;
     }
 
     #[allow(non_snake_case)]

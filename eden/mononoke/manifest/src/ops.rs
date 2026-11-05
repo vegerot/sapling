@@ -25,6 +25,7 @@ use futures::stream::Stream;
 use mononoke_macros::mononoke;
 use mononoke_types::NonRootMPath;
 use mononoke_types::path::MPath;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::Entry;
 use crate::Manifest;
@@ -96,7 +97,11 @@ where
                         if !filter(&path, manifest_id.clone()) {
                             return Ok((Vec::new(), Vec::new()));
                         }
-                        mononoke::spawn_task(async move {
+                        // DO NOT REMOVE THIS SPAWN: Git boundary filtering has a downstream
+                        // async buffer that can stop polling this traversal while full.
+                        // Its metadata lookups may depend on in-flight directory reads;
+                        // those reads must keep progressing to avoid a subexecutor deadlock.
+                        AbortOnDropHandle::new(mononoke::spawn_task(async move {
                             let manifest = manifest_id.load(&ctx, &store).await?;
                             let mut output = Vec::new();
                             let mut recurse = Vec::new();
@@ -136,7 +141,7 @@ where
                             }
 
                             Ok::<_, Error>((output, recurse))
-                        }).await?
+                        })).await?
                     }.boxed()
                 },
             )
@@ -335,7 +340,7 @@ where
 
     /// Do a diff, but with knobs to filter_map output and prune some subtrees.
     /// `output_filter` lets us configure what will be returned from filtered_diff. it accepts
-    /// every diff entry and returns Option<Out>, so it acts similar to filter_map() function
+    /// every diff entry and returns `Option<Out>`, so it acts similar to `filter_map()` function
     /// recurse_pruner is a function that allows us to skip iterating over some subtrees
     ///
     /// Identical sub-shards are pruned by their content-addressed IDs without
@@ -390,7 +395,7 @@ where
             }
         };
 
-        if this == other {
+        if this == other && child_replacements.is_empty() {
             return stream::empty().boxed();
         }
 

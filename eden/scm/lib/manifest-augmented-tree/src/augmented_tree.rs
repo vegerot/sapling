@@ -292,7 +292,6 @@ impl AugmentedTree {
         .lines()
         .map(|line| {
             let line = line?;
-            let line = line.trim();
 
             let (path, rest) = line
                 .split_once('\0')
@@ -540,6 +539,30 @@ mod tests {
         );
         // validate that the size calculation is correct
         assert_eq!(buf.len(), augmented_tree_entry.sapling_tree_blob_size);
+    }
+
+    #[test]
+    fn test_augmented_manifest_parsing_leading_whitespace_names() {
+        let tree = concat!(
+            "v1 1111111111111111111111111111111111111111 - - -\n",
+            " 01.png\x004444444444444444444444444444444444444444r 4444444444444444444444444444444444444444444444444444444444444444 10 4444444444444444444444444444444444444444 -\n",
+            " secure_pipes\x003333333333333333333333333333333333333333t 3333333333333333333333333333333333333333333333333333333333333333 10\n",
+        );
+        let augmented_tree_entry =
+            AugmentedTree::try_deserialize(std::io::Cursor::new(tree)).expect("parsing failed");
+
+        let names: Vec<&str> = augmented_tree_entry
+            .entries
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert_eq!(names, vec![" 01.png", " secure_pipes"]);
+
+        let mut buf: Vec<u8> = Vec::new();
+        augmented_tree_entry
+            .try_serialize(&mut buf)
+            .expect("writing failed");
+        assert_eq!(std::str::from_utf8(&buf), Ok(tree));
     }
 
     #[test]

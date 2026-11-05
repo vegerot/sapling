@@ -10,7 +10,7 @@ license = "GPLv2+"
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
-aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
+aws-config = { version = "1.13.0", features = ["behavior-version-latest"] }
 aws-sdk-secretsmanager = "1.119.0"
 base64 = { version = "0.23.1", features = ["alloc"] }
 bincode = { version = "2", features = ["serde"] }
@@ -35,7 +35,7 @@ sapling-clientinfo = { version = "0.1.0", path = "../../../../scm/lib/clientinfo
 scuba_ext = { version = "0.1.0", path = "../../scuba_ext" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_cbor = "0.11.2"
-serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sql_common = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sql_ext_proc_macros = { version = "0.1.0", path = "proc_macros" }
@@ -45,9 +45,9 @@ stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.21"
 time_measuring = { version = "0.1.0", path = "../../time_measuring" }
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
-twox-hash = "2.1.4"
+twox-hash = "2.1.5"
 vec1 = { version = "1.12.1", features = ["serde"] }
 
 [dev-dependencies]
@@ -58,3 +58,6 @@ mononoke_macros = { version = "0.1.0", path = "../../mononoke_macros" }
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
 sql_tests_lib = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 tempfile = "3.27.0"
+
+[lints]
+workspace = true

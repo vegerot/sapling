@@ -57,6 +57,17 @@ def enabled(repo):
     return repo.ui.configbool("mutation", "enabled")
 
 
+def allow_divergence(ui):
+    """Whether operations may deliberately create divergent (obsolete) commits.
+
+    ``experimental.evolution.allowdivergence`` is the pre-mutation name, still
+    honored for callers that set it by hand.
+    """
+    return ui.configbool("mutation", "allow-divergence") or ui.configbool(
+        "experimental", "evolution.allowdivergence"
+    )
+
+
 def makemutationstore(repo):
     return mutationstore.mutationstore(repo.svfs.join("mutation"))
 
@@ -160,20 +171,44 @@ def recordentries(repo, entries, skipexisting: bool = True, raw: bool = False) -
     return count
 
 
-def getdag(repo, *nodes, predecessors: bool = True, successors: bool = True):
-    """Get 1:1 mutation subgraph for selected nodes
+def getdag(
+    repo,
+    *nodes,
+    predecessors: bool = True,
+    successors: bool = True,
+    splits: bool = False,
+):
+    """Get the mutation subgraph for selected nodes
 
     If successors is True, follow successors.
     If predecessors is True, follow predecessors.
-    Non 1:1 mutations like split, fold are ignored.
+    A fold's commit has every folded commit as a parent. If splits is True,
+    every part of a split has the split commit as a parent; otherwise only
+    the last part does.
 
     Performance note: predecessors might be too many if a commit
     is changed many times. In some cases it's possible to only
     use successors and that might be faster.
     """
     return repo._mutationstore.getdag(
-        nodes, predecessors=predecessors, successors=successors
+        nodes, predecessors=predecessors, successors=successors, splits=splits
     )
+
+
+def historynodes(repo, nodes):
+    """The commits available locally in the mutation history of ``nodes``.
+
+    That is ``nodes``, the visible commits connected to them by mutations in
+    either direction (including other folded commits and other parts of a
+    split), and every commit those were created from. A hidden commit that
+    only leads to hidden commits is left out, unless ``--hidden`` makes every
+    commit visible.
+    """
+    cl = repo.changelog
+    dag = getdag(repo, *nodes, splits=True)
+    isvisible = getisvisiblefunc(repo)
+    visible = [n for n in cl.filternodes(list(dag.all()), local=True) if isvisible(n)]
+    return cl.filternodes(list(dag.ancestors(visible + list(nodes))), local=True)
 
 
 def lookup(repo, node):
@@ -266,6 +301,35 @@ class obsoletecache:
         # If true, then the full set of obsolete commits is known for this
         # filter level, and is stored in ``self.obsolete``.
         self.complete = defaultdict(bool)
+
+        # Whether a commit is visible or leads to a visible commit through its
+        # successors, for the mutation histories ``isdivergent`` has looked at.
+        self.live = {}
+
+    def isdivergent(self, repo, node):
+        """Returns true if more than one of the mutations that replaced the
+        node lead to visible commits."""
+        succsets = lookupsuccessors(repo, node)
+        if len(succsets) < 2:
+            return False
+        live = sum(any(self._islive(repo, s) for s in ss) for ss in succsets)
+        return live > 1
+
+    def _islive(self, repo, node):
+        """Returns true if the node is visible or leads to a visible commit
+        through its successors.
+
+        The answer is worked out for the node's whole mutation history at
+        once: in its mutation graph, those commits are the ancestors of the
+        visible ones.
+        """
+        if node not in self.live:
+            dag = getdag(repo, node, splits=True)
+            isvisible = getisvisiblefunc(repo)
+            nodes = list(dag.all())
+            live = set(dag.ancestors([n for n in nodes if isvisible(n)]))
+            self.live.update((n, n in live) for n in nodes)
+        return self.live[node]
 
     def isobsolete(self, repo, node):
         """Returns true if the node is obsolete in the repository."""
@@ -363,6 +427,14 @@ def isobsolete(repo, node):
     if not hasattr(repo, "_mutationobsolete"):
         repo._mutationobsolete = obsoletecache()
     return repo._mutationobsolete.isobsolete(repo, node)
+
+
+def isdivergent(repo, node):
+    """Returns true if more than one of the mutations that replaced the node
+    lead to visible commits. A split is one mutation."""
+    if not hasattr(repo, "_mutationobsolete"):
+        repo._mutationobsolete = obsoletecache()
+    return repo._mutationobsolete.isdivergent(repo, node)
 
 
 def obsoletenodes(repo):

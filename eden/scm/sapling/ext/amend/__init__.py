@@ -58,6 +58,7 @@ from sapling import (
     extensions,
     hintutil,
     lock as lockmod,
+    mdiff,
     patch,
     registrar,
     rewriteutil,
@@ -114,6 +115,32 @@ RESTACK_VALUES = [
 ]
 
 RESTACK_DEFAULT = RESTACK_ONLY_TRIVIAL
+
+
+def autorestackconf(ui):
+    """The ``amend.autorestack`` mode in effect, one of ``RESTACK_VALUES``."""
+    conf = ui.config("amend", "autorestack", RESTACK_DEFAULT)
+
+    # RESTACK_NO_CONFLICT requires IMM.
+    if conf == RESTACK_NO_CONFLICT and not ui.configbool(
+        "rebase", "experimental.inmemory"
+    ):
+        conf = RESTACK_DEFAULT
+
+    # If they explicitly disabled the old behavior, disable the new behavior
+    # too, for now.
+    # internal config: commands.amend.autorebase
+    if ui.configbool("commands", "amend.autorebase", True) is False:
+        # In the future we'll add a nag message here.
+        conf = RESTACK_NEVER
+
+    if conf not in RESTACK_VALUES:
+        ui.warn(
+            _('invalid amend.autorestack config of "%s"; falling back to %s\n')
+            % (conf, RESTACK_DEFAULT)
+        )
+        conf = RESTACK_DEFAULT
+    return conf
 
 
 @hint("strip-hide")
@@ -299,7 +326,15 @@ def amend(ui, repo, *pats, **opts):
             # Strip the interactive flag to avoid infinite recursive loop
             opts.pop("interactive")
             cmdutil.dorecord(
-                ui, repo, amend, None, False, cmdutil.recordfilter, *pats, **opts
+                ui,
+                repo,
+                amend,
+                None,
+                False,
+                cmdutil.recordfilter,
+                *pats,
+                inmemory=True,
+                **opts,
             )
             return
 
@@ -366,28 +401,8 @@ def amend(ui, repo, *pats, **opts):
 
         cmdutil.commitstatus(repo, node, opts=opts, predecessor=old)
 
-        conf = ui.config("amend", "autorestack", RESTACK_DEFAULT)
+        conf = autorestackconf(ui)
         noconflict = None
-
-        # RESTACK_NO_CONFLICT requires IMM.
-        if conf == RESTACK_NO_CONFLICT and not ui.configbool(
-            "rebase", "experimental.inmemory"
-        ):
-            conf = RESTACK_DEFAULT
-
-        # If they explicitly disabled the old behavior, disable the new behavior
-        # too, for now.
-        # internal config: commands.amend.autorebase
-        if ui.configbool("commands", "amend.autorebase", True) is False:
-            # In the future we'll add a nag message here.
-            conf = RESTACK_NEVER
-
-        if conf not in RESTACK_VALUES:
-            ui.warn(
-                _('invalid amend.autorestack config of "%s"; falling back to %s\n')
-                % (conf, RESTACK_DEFAULT)
-            )
-            conf = RESTACK_DEFAULT
 
         if haschildren and rebase is None and not _histediting(repo):
             if conf == RESTACK_ALWAYS:
@@ -502,9 +517,16 @@ def amendtocommit(ui, repo, commitspec, pats=None, opts=None):
 
         store = patch.mempatchstore(mergedctx)
         backend = patch.mempatchbackend(ui, mergedctx, store)
+        diff = patch.diff(
+            repo,
+            wctx.p1(),
+            wctx,
+            match=matcher,
+            opts=mdiff.diffopts(git=True),
+        )
         ret = patch.applydiff(
             ui,
-            io.BytesIO(b"".join(list(wctx.diff(match=matcher, opts=opts)))),
+            io.BytesIO(b"".join(diff)),
             backend,
             store,
         )
@@ -533,10 +555,14 @@ def amendtocommit(ui, repo, commitspec, pats=None, opts=None):
         scmutil.cleanupnodes(repo, {dest.node(): mapping.pop(dest.node())}, "amend")
         scmutil.cleanupnodes(repo, mapping, "rebase")
 
+        amendedfiles = wctx.files()
+        if matcher is not None:
+            amendedfiles = [f for f in amendedfiles if matcher(f)]
         with repo.dirstate.parentchange():
-            # Update dirstate status of amended files.
+            # Unmatched files have the same content in the new parent, so their
+            # pending adds, removes and copies are still valid and must be kept.
             repo.dirstate.rebuild(
-                parentnode, repo[parentnode].manifest(), wctx.files(), exact=True
+                parentnode, repo[parentnode].manifest(), amendedfiles, exact=True
             )
 
     if amendednode != dest.node():
@@ -565,8 +591,17 @@ def inmemorymerge(ui, repo, src, dest, base):
 
     mergedctx = context.memctx.mirrorformutation(src, "rebase", parents=[dest])
 
-    for path in manifestbuilder.removed():
-        mergedctx[path] = None
+    for path, (
+        action,
+        (flags, _backup),
+        _msg,
+    ) in manifestbuilder.pymerge_actions().items():
+        if action == "r":
+            mergedctx[path] = None
+        else:
+            # Content updates come from src; permission-only updates retain dest.
+            fctx = dest[path] if action == "e" else src[path]
+            mergedctx[path] = context.overlayfilectx(fctx, flags=flags, ctx=mergedctx)
 
     for path, merged in resolved.items():
         mergedctx[path] = context.overlayfilectx(

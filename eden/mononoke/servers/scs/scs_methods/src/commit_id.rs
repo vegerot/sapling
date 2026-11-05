@@ -13,6 +13,7 @@ use anyhow::Result;
 use cloned::cloned;
 use futures_util::FutureExt;
 use futures_util::future;
+use maplit::btreemap;
 use maplit::btreeset;
 use metaconfig_types::CommitIdentityScheme;
 use mononoke_api::ChangesetContext;
@@ -21,6 +22,23 @@ use mononoke_api::MononokeError;
 use mononoke_api::Repo;
 use mononoke_api::RepoContext;
 use source_control as thrift;
+
+type IdMap = BTreeMap<ChangesetId, BTreeMap<thrift::CommitIdentityScheme, thrift::CommitId>>;
+
+/// Ids in the requested schemes, or just the bonsai id if the lookup
+/// produced nothing for this commit.
+pub(crate) fn ids_for(
+    map: &IdMap,
+    cs_id: ChangesetId,
+) -> BTreeMap<thrift::CommitIdentityScheme, thrift::CommitId> {
+    match map.get(&cs_id) {
+        Some(ids) => ids.clone(),
+        None => btreemap! {
+            thrift::CommitIdentityScheme::BONSAI =>
+                thrift::CommitId::bonsai(cs_id.as_ref().into()),
+        },
+    }
+}
 
 /// Generate a mapping for a commit's identity into the requested identity
 /// schemes.
@@ -70,6 +88,20 @@ pub(crate) async fn map_commit_identity(
                 let result: Result<Option<_>, MononokeError> = Ok(Some((
                     thrift::CommitIdentityScheme::SVNREV,
                     thrift::CommitId::svnrev(svnrev.id() as i64),
+                )));
+                result
+            } else {
+                Ok(None)
+            }
+        };
+        scheme_identities.push(identity.boxed());
+    }
+    if schemes.contains(&thrift::CommitIdentityScheme::P4_CHANGELIST) {
+        let identity = async {
+            if let Some(cl) = changeset_ctx.p4_changelist_id().await? {
+                let result: Result<Option<_>, MononokeError> = Ok(Some((
+                    thrift::CommitIdentityScheme::P4_CHANGELIST,
+                    thrift::CommitId::p4_changelist(cl.id() as i64),
                 )));
                 result
             } else {
@@ -183,6 +215,7 @@ pub(crate) async fn map_commit_identities(
         scheme_identities.push(identities.boxed());
     }
     if schemes.contains(&thrift::CommitIdentityScheme::SVNREV) {
+        cloned!(ids);
         let identities = async {
             let bonsai_svnrev_ids = repo_ctx
                 .many_changeset_svnrev_ids(ids)
@@ -197,6 +230,25 @@ pub(crate) async fn map_commit_identities(
                 })
                 .collect::<Vec<_>>();
             let result: Result<_, MononokeError> = Ok(bonsai_svnrev_ids);
+            result
+        };
+        scheme_identities.push(identities.boxed());
+    }
+    if schemes.contains(&thrift::CommitIdentityScheme::P4_CHANGELIST) {
+        let identities = async {
+            let bonsai_p4_ids = repo_ctx
+                .many_changeset_p4_changelist_ids(ids)
+                .await?
+                .into_iter()
+                .map(|(cs_id, cl)| {
+                    (
+                        cs_id,
+                        thrift::CommitIdentityScheme::P4_CHANGELIST,
+                        thrift::CommitId::p4_changelist(cl.id() as i64),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let result: Result<_, MononokeError> = Ok(bonsai_p4_ids);
             result
         };
         scheme_identities.push(identities.boxed());
@@ -231,6 +283,7 @@ fn fall_back_to_default_identity_scheme<'a>(
         CommitIdentityScheme::HG => Some(thrift::CommitIdentityScheme::HG),
         CommitIdentityScheme::GIT => Some(thrift::CommitIdentityScheme::GIT),
         CommitIdentityScheme::BONSAI => Some(thrift::CommitIdentityScheme::BONSAI),
+        CommitIdentityScheme::P4 => Some(thrift::CommitIdentityScheme::P4_CHANGELIST),
         _ => None,
     };
     match maybe_translated_scheme {
@@ -254,6 +307,7 @@ impl CommitIdExt for thrift::CommitId {
             thrift::CommitId::git(_) => thrift::CommitIdentityScheme::GIT,
             thrift::CommitId::globalrev(_) => thrift::CommitIdentityScheme::GLOBALREV,
             thrift::CommitId::svnrev(_) => thrift::CommitIdentityScheme::SVNREV,
+            thrift::CommitId::p4_changelist(_) => thrift::CommitIdentityScheme::P4_CHANGELIST,
             thrift::CommitId::UnknownField(t) => (*t).into(),
         }
     }

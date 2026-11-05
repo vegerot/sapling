@@ -5,8 +5,7 @@
  * GNU General Public License version 2.
  */
 
-#![feature(error_generic_member_access)]
-#![feature(string_from_utf8_lossy_owned)]
+#![cfg_attr(fbcode_build, feature(error_generic_member_access))]
 
 pub mod mode;
 

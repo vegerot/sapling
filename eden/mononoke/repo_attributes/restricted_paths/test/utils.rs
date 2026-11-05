@@ -44,6 +44,7 @@ use metadata::Metadata;
 use mononoke_api::MononokeError;
 use mononoke_api::Repo as TestRepo;
 use mononoke_api::RepoContext;
+use mononoke_api::RestrictedPathsPolicy;
 use mononoke_api_hg::HgDataId;
 use mononoke_api_hg::RepoContextHgExt;
 use mononoke_types::ChangesetId;
@@ -123,6 +124,8 @@ pub struct RestrictedPathsTestDataBuilder {
     repo_regions_config: Vec<(String, Vec<String>)>,
     groups_config: Vec<(String, Vec<String>)>,
     server_side_tenting: bool,
+    partial_responses_opt_in: bool,
+    partial_responses_opt_out: bool,
     client_identity: Option<MononokeIdentity>,
     client_machine_tier_identity: Option<MononokeIdentity>,
     file_path_changes: Vec<(String, Option<String>)>,
@@ -360,6 +363,8 @@ impl RestrictedPathsTestDataBuilder {
             groups_config: vec![],
             repo_regions_config: vec![],
             server_side_tenting: false,
+            partial_responses_opt_in: false,
+            partial_responses_opt_out: false,
             client_identity: None,
             client_machine_tier_identity: None,
             file_path_changes: vec![],
@@ -491,6 +496,16 @@ impl RestrictedPathsTestDataBuilder {
         self
     }
 
+    pub fn with_partial_responses_opt_in(mut self, partial_responses_opt_in: bool) -> Self {
+        self.partial_responses_opt_in = partial_responses_opt_in;
+        self
+    }
+
+    pub fn with_partial_responses_opt_out(mut self, partial_responses_opt_out: bool) -> Self {
+        self.partial_responses_opt_out = partial_responses_opt_out;
+        self
+    }
+
     pub fn with_file_path_changes(mut self, file_path_changes: Vec<(&str, Option<&str>)>) -> Self {
         self.file_path_changes = file_path_changes
             .into_iter()
@@ -562,6 +577,8 @@ impl RestrictedPathsTestDataBuilder {
             )
             .await;
             md.add_client_info(client_info);
+            md.add_partial_responses_opt_in(self.partial_responses_opt_in);
+            md.add_partial_responses_opt_out(self.partial_responses_opt_out);
             Arc::new(md)
         };
         let session_container = SessionContainer::builder(fb)
@@ -739,8 +756,7 @@ impl RestrictedPathsTestData {
         let was_denied = match result {
             Ok(()) => false,
             Err(RestrictedPathsError::AuthorizationError(_)) => true,
-            Err(RestrictedPathsError::AclFileAuthorizationError(err))
-            | Err(RestrictedPathsError::InvalidRequest(err)) => return Err(anyhow::anyhow!(err)),
+            Err(RestrictedPathsError::AclFileChangeRejected(err)) => return Err(err.into()),
             Err(RestrictedPathsError::InternalError(err)) => return Err(err),
         };
 
@@ -769,12 +785,43 @@ impl RestrictedPathsTestData {
         let was_denied = match result {
             Ok(()) => false,
             Err(RestrictedPathsError::AuthorizationError(_)) => true,
-            Err(RestrictedPathsError::AclFileAuthorizationError(err))
-            | Err(RestrictedPathsError::InvalidRequest(err)) => return Err(anyhow::anyhow!(err)),
+            Err(RestrictedPathsError::AclFileChangeRejected(err)) => return Err(err.into()),
             Err(RestrictedPathsError::InternalError(err)) => return Err(err),
         };
 
         Ok(was_denied)
+    }
+
+    /// Creates the configured test commit, then runs both combined path checking
+    /// and spawned enforcement against that same repository state.
+    pub async fn observe_path_check_and_enforcement_after_commit(
+        &self,
+        path: NonRootMPath,
+        enforcement_condition_sets: &[EnforcementConditionSet],
+    ) -> Result<(Vec<PathRestrictionCheckResult>, bool)> {
+        let scenario = self.setup_scenario_repo(enforcement_condition_sets).await?;
+        let bcs_id = self.create_configured_changeset(&scenario.repo).await?;
+
+        let checks = scenario
+            .repo
+            .restricted_paths()
+            .get_path_restriction_check(&self.ctx, Some(bcs_id), std::slice::from_ref(&path))
+            .await?;
+        let result = spawn_enforce_restricted_path_access(
+            &self.ctx,
+            scenario.repo.restricted_paths_arc().clone(),
+            &MPath::from(path),
+            "restricted_paths_test",
+            Some(bcs_id),
+        )
+        .await;
+        let was_denied = match result {
+            Ok(()) => false,
+            Err(RestrictedPathsError::AuthorizationError(_)) => true,
+            Err(err) => return Err(err.into()),
+        };
+
+        Ok((checks, was_denied))
     }
 
     /// Run restricted paths testing for a single scenario.
@@ -942,7 +989,10 @@ impl RestrictedPathsTestData {
             .map(|path| MPath::from(path.clone()))
             .collect::<BTreeSet<_>>();
 
-        match cs_ctx.paths_with_content(paths.clone().into_iter()).await {
+        match cs_ctx
+            .paths_with_content(paths.clone().into_iter(), &RestrictedPathsPolicy::Strict)
+            .await
+        {
             Ok(stream) => {
                 let results: Vec<Result<_, MononokeError>> = stream.collect().await;
                 for result in results {
@@ -961,7 +1011,10 @@ impl RestrictedPathsTestData {
             Err(e) => return Err(e.into()),
         }
 
-        match cs_ctx.paths_with_history(paths.iter().cloned()).await {
+        match cs_ctx
+            .paths_with_history(paths.iter().cloned(), &RestrictedPathsPolicy::Strict)
+            .await
+        {
             Ok(stream) => {
                 let results: Vec<Result<(), MononokeError>> = stream
                     .map(|r| async move {

@@ -106,10 +106,16 @@ where
             node: line.node,
             merge: line.merge,
             separator_line,
+            style: Default::default(),
+            is_head: false,
+            is_root: false,
+            node_column: 0,
+            parent_columns: Vec::new(),
             node_line: line.node_line,
             link_line: line.link_line,
+            link_line_from_node: None,
             term_line: line.term_line,
-            pad_lines: line.pad_lines,
+            ancestry_line: line.pad_lines,
         };
         let prefix_lines = self.prefix_lines.next_prefix_lines(&row_shape);
         self.text.next_text(
@@ -445,6 +451,7 @@ mod tests {
             ╷
             o    D
             ├─╮
+            │ ╷
             │ o  C
             │ ╷
             o ╷  B
@@ -460,8 +467,10 @@ mod tests {
             r#"
                   o  E
             ╭─┬─┬─┤
+            ╷ │ │ ╷
             ╷ o │ ╷  D
             ╭─┴─╮ ╷
+            │   │ ╷
             │   o ╷  C
             │   ├─╯
             o   │  B

@@ -26,6 +26,7 @@ use source_control_services::errors::source_control_service as service;
 use crate::from_request::FromRequest;
 use crate::from_request::convert_pushvars;
 use crate::into_response::AsyncIntoResponseWith;
+use crate::into_response::IntoResponse;
 use crate::source_control_impl::SourceControlServiceImpl;
 
 pub(crate) enum LandStackError {
@@ -80,6 +81,15 @@ fn convert_rejection(rejection: HookRejection) -> thrift::HookRejection {
         reason: thrift::HookOutcomeRejected {
             description: rejection.reason.description.to_string(),
             long_description: rejection.reason.long_description,
+            message_name: rejection
+                .reason
+                .message
+                .as_ref()
+                .map(|message| message.name.clone()),
+            message_params: rejection
+                .reason
+                .message
+                .map(|message| message.params.into_iter().collect()),
             ..Default::default()
         },
         ..Default::default()
@@ -102,11 +112,7 @@ impl From<LandStackError> for RepoLandStackExn {
                     reason: reason_conflicts(&conflicts),
                     conflicts: conflicts
                         .into_iter()
-                        .map(|c| thrift::PushrebaseConflict {
-                            left: c.left.to_string(),
-                            right: c.right.to_string(),
-                            ..Default::default()
-                        })
+                        .map(IntoResponse::into_response)
                         .collect(),
                     ..Default::default()
                 })

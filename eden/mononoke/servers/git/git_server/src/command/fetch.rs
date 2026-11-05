@@ -13,6 +13,7 @@ use gix_object::Kind;
 use gix_packetline::PacketLineRef;
 use gix_packetline::blocking_io::StreamingPeekableIter;
 use gix_transport::bstr::ByteSlice;
+use packfile::pack::DeltaForm;
 use protocol::types::ChainBreakingMode;
 use protocol::types::FetchFilter;
 use protocol::types::FetchRequest;
@@ -82,7 +83,7 @@ pub struct FetchArgs {
     pub deepen_relative: bool,
     /// Requests that the shallow clone/fetch should be cut at a specific time,
     /// instead of depth. The timestamp provided should be in the same format
-    /// as is expected for git rev-list --max-age <timestamp>
+    /// as is expected for `git rev-list --max-age <timestamp>`
     pub deepen_since: Option<usize>,
     /// Requests that the shallow clone/fetch should be cut at a specific revision
     /// instead of a depth, i.e. the specified oid becomes the boundary at which the
@@ -341,13 +342,17 @@ impl FetchArgs {
         concurrency: PackfileConcurrency,
         shallow_info: Option<ShallowInfoResponse>,
         bypass_cache: bool,
+        delta_form: DeltaForm,
     ) -> FetchRequest {
+        let shallow_variant = self.shallow_variant();
         FetchRequest {
             heads: self.wants,
             bases: self.haves,
             include_out_of_pack_deltas: self.thin_pack,
             include_annotated_tags: self.include_tag,
             offset_delta: self.ofs_delta,
+            delta_form,
+            shallow_variant,
             filter: self.filter.map(FilterArgs::into_fetch_filter),
             concurrency,
             shallow_info,
@@ -359,9 +364,8 @@ impl FetchArgs {
         }
     }
 
-    /// Convert the fetch command args into ShallowInfoRequest instance
-    pub fn into_shallow_request(&self) -> ShallowInfoRequest {
-        let variant = if let Some(timestamp) = self.deepen_since.as_ref() {
+    fn shallow_variant(&self) -> ShallowVariant {
+        if let Some(timestamp) = self.deepen_since.as_ref() {
             ShallowVariant::FromServerWithTime(timestamp.clone())
         } else if !self.deepen_not.is_empty() {
             ShallowVariant::FromServerExcludingRefs(self.deepen_not.clone())
@@ -373,12 +377,16 @@ impl FetchArgs {
             }
         } else {
             ShallowVariant::None
-        };
+        }
+    }
+
+    /// Convert the fetch command args into ShallowInfoRequest instance
+    pub fn into_shallow_request(&self) -> ShallowInfoRequest {
         ShallowInfoRequest {
             heads: self.wants.clone(),
             bases: self.haves.clone(),
             shallow: self.shallow.clone(),
-            variant,
+            variant: self.shallow_variant(),
         }
     }
 }
@@ -393,6 +401,46 @@ mod tests {
     use mononoke_macros::mononoke;
 
     use super::*;
+
+    #[mononoke::test]
+    fn fetch_request_preserves_effective_writer_and_shallow_mode() {
+        for thin_pack in [false, true] {
+            for delta_form in [DeltaForm::RefAndOffset, DeltaForm::OnlyOffset] {
+                let args = FetchArgs {
+                    thin_pack,
+                    deepen: Some(10),
+                    deepen_relative: true,
+                    ..Default::default()
+                };
+                let request = args.into_request(
+                    PackfileConcurrency::new(1, 1, 1, 1, None),
+                    None,
+                    false,
+                    delta_form,
+                );
+                assert_eq!(request.include_out_of_pack_deltas, thin_pack);
+                assert_eq!(request.delta_form, delta_form);
+                assert!(matches!(
+                    request.shallow_variant,
+                    ShallowVariant::FromClientWithDepth(10)
+                ));
+            }
+        }
+        let args = FetchArgs {
+            deepen: Some(10),
+            ..Default::default()
+        };
+        let request = args.into_request(
+            PackfileConcurrency::new(1, 1, 1, 1, None),
+            None,
+            false,
+            DeltaForm::RefAndOffset,
+        );
+        assert!(matches!(
+            request.shallow_variant,
+            ShallowVariant::FromServerWithDepth(10)
+        ));
+    }
 
     #[mononoke::test]
     fn test_fetch_command_args_parsing() -> Result<()> {

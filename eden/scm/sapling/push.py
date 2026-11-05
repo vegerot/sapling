@@ -14,6 +14,13 @@ from .node import bin, hex, nullhex, short
 
 MUTATION_KEYS = {"mutpred", "mutuser", "mutdate", "mutop", "mutsplit"}
 
+# `ServerError` code for a request that the repo's access control denied.
+CODE_PERMISSION_DENIED = 4
+
+# Pushvar that asks pushrebase to land a merge that descends from the
+# destination through a parent other than its first with that parent first.
+PUSHVAR_MAINLINE_PARENT_FIRST = "MAINLINE_PARENT_FIRST"
+
 CFG_SECTION = "push"
 CFG_KEY_ENABLE_DEBUG_INFO = "enable_debug_info"
 CFG_KEY_USE_LOCAL_BOOKMARK_VALUE = "use_local_bookmark_value"
@@ -96,7 +103,15 @@ def push(
         )
     else:
         # update the exiting bookmark with push rebase
-        return push_rebase(repo, dest, head_node, draft_nodes, remote_bookmark, opargs)
+        return push_rebase(
+            repo,
+            dest,
+            head_node,
+            draft_nodes,
+            remote_bookmark,
+            curr_bookmark_val.node,
+            opargs,
+        )
 
 
 def is_plain_push(repo, head_node, force):
@@ -139,7 +154,9 @@ def get_draft_nodes(repo, dest, head_node, remote_bookmark, curr_bookmark_val):
     # Must come before the generic merge check below: that one makes the
     # caller fall back to the bundle path instead of aborting.
     check_no_noconflict_merges(repo, draft_nodes)
-    if repo.dageval(lambda: merges(draft_nodes)):
+    if repo.dageval(lambda: merges(draft_nodes)) and not repo.ui.configbool(
+        "experimental", "edenapi-push-merges"
+    ):
         raise error.UnsupportedEdenApiPush(
             _("merge commit is not supported by EdenApi push yet")
         )
@@ -213,6 +230,7 @@ def plain_push(repo, edenapi, bookmark, to_node, curr_bookmark_val, force, oparg
     if not _is_noop_plain_push(repo, from_node, to_node):
         result = edenapi.setbookmark(bookmark, to_node, from_node, pushvars)["data"]
         if "Err" in result:
+            check_permission_denied(repo.ui, result["Err"])
             hint = gen_hint(
                 repo.ui,
                 result["Err"]["message"],
@@ -237,7 +255,9 @@ def _is_noop_plain_push(repo, from_node, to_node):
         return False
 
 
-def push_rebase(repo, dest, head_node, stack_nodes, remote_bookmark, opargs=None):
+def push_rebase(
+    repo, dest, head_node, stack_nodes, remote_bookmark, bookmark_node, opargs=None
+):
     """Update the remote bookmark with server side rebase.
 
     For updating the existing remote bookmark, push_rebase allows the server to
@@ -248,43 +268,50 @@ def push_rebase(repo, dest, head_node, stack_nodes, remote_bookmark, opargs=None
     any files that have been modified in the target bookmark. Put another way,
     push_rebase will not perform any file content merges. It only performs the
     rebase when there is no chance of a file merge.
+
+    The server rebases the commits between `base`, the merge base of the head
+    and the remote bookmark at `bookmark_node`, and the head. The other draft
+    commits in `stack_nodes`, the other side of a merge, land unchanged.
     """
     ui, edenapi = repo.ui, repo.edenapi
     bookmark = remote_bookmark
     wnode = repo["."].node()
 
-    # according to the Mononoke API (D23813368), base is the parent of the bottom of the stack
-    # that is to be landed.
-    # It's guaranteed there is only one base for a linear stack of draft nodes
-    base = repo.dageval(lambda: parents(roots(stack_nodes))).last()
     pushvars = parse_pushvars(opargs.get("pushvars"))
+    # Servers that do not know the pushvar ignore it.
+    if repo.dageval(lambda: merges(stack_nodes)):
+        pushvars.setdefault(PUSHVAR_MAINLINE_PARENT_FIRST, "true")
 
+    base = get_merge_base(repo, head_node, bookmark_node, remote_bookmark)
+    rebased_nodes = repo.dageval(lambda: range([base], [head_node]) - [base])
+    check_no_public_commits(repo, rebased_nodes)
     ui.status(
         _n(
             "pushrebasing stack (%s, %s] (%d commit) to remote bookmark %s\n",
             "pushrebasing stack (%s, %s] (%d commits) to remote bookmark %s\n",
-            len(stack_nodes),
+            len(rebased_nodes),
         )
-        % (short(base), short(head_node), len(stack_nodes), remote_bookmark)
+        % (short(base), short(head_node), len(rebased_nodes), remote_bookmark)
     )
 
     response = edenapi.landstack(bookmark, head=head_node, base=base, pushvars=pushvars)
 
     result = response["data"]
     if "Err" in result:
+        check_permission_denied(ui, result["Err"])
         raise error.Abort(_("Server error: %s") % result["Err"]["message"])
 
     data = result["Ok"]
     new_head = data["new_head"]
     old_to_new_hgids = data["old_to_new_hgids"]
 
-    if len(stack_nodes) != len(old_to_new_hgids):
+    if len(rebased_nodes) != len(old_to_new_hgids):
         ui.warn(
             _(
                 "server returned unexpected number of commits after pushrebase: "
                 "length of commits to be pushed (%d) != length of pushed commits (%d)\n"
             )
-            % (len(stack_nodes), len(old_to_new_hgids))
+            % (len(rebased_nodes), len(old_to_new_hgids))
         )
 
     with repo.wlock(), repo.lock(), repo.transaction("pushrebase"):
@@ -297,6 +324,17 @@ def push_rebase(repo, dest, head_node, stack_nodes, remote_bookmark, opargs=None
         # to make the graph aware of the hashes, this is needed for the mutation
         # change below.
         repo.changelog.filternodes(list(old_to_new_hgids.values()))
+
+        unlanded = [
+            n
+            for n in repo.dageval(lambda: stack_nodes - ancestors([new_head]))
+            if n not in old_to_new_hgids
+        ]
+        if unlanded:
+            ui.warn(
+                _("server did not land commits: %s\n")
+                % ", ".join(short(n) for n in unlanded)
+            )
 
         if not ui.configbool("push", "skip-cleanup-commits"):
             if wnode in old_to_new_hgids:
@@ -314,6 +352,41 @@ def push_rebase(repo, dest, head_node, stack_nodes, remote_bookmark, opargs=None
 
         ui.status(_("updated remote bookmark %s to %s\n") % (bookmark, short(new_head)))
         return 0
+
+
+def get_merge_base(repo, head_node, bookmark_node, remote_bookmark):
+    """The merge base of `head_node` and the remote bookmark at
+    `bookmark_node`, which the server rebases the push from."""
+    merge_bases = repo.dageval(lambda: gcaall([head_node, bookmark_node]))
+    if len(merge_bases) != 1:
+        raise error.Abort(
+            _("cannot pushrebase %s onto remote bookmark %s: %s")
+            % (
+                short(head_node),
+                remote_bookmark,
+                _("they have no common ancestor")
+                if not merge_bases
+                else _("they have more than one merge base (%s)")
+                % ", ".join(short(n) for n in merge_bases),
+            ),
+            hint=_("rebase the stack onto %s first") % remote_bookmark,
+        )
+    return merge_bases.first()
+
+
+def check_no_public_commits(repo, nodes):
+    """Abort if any of `nodes`, which the server would rebase, is public.
+
+    The server rejects rebasing public commits only when
+    `scm/mononoke:pushrebase_land_stack_validation` is 2, so this check keeps a
+    push to a server that does not enforce it from rebasing them.
+    """
+    public_nodes = repo.dageval(lambda: nodes & public())
+    if public_nodes:
+        shown = [short(n) for n in public_nodes.iterrev()][:3]
+        if len(public_nodes) > 3:
+            shown.append("...")
+        raise error.Abort(_("cannot rebase public changesets: %s") % ", ".join(shown))
 
 
 def get_remote_bookmark_value(repo, edenapi, bookmark, force) -> RemoteBookmarkValue:
@@ -369,6 +442,7 @@ def create_remote_bookmark(
     pushvars = parse_pushvars(opargs.get("pushvars"))
     result = edenapi.setbookmark(bookmark, node, None, pushvars=pushvars)["data"]
     if "Err" in result:
+        check_permission_denied(ui, result["Err"])
         hint = gen_hint(
             ui,
             result["Err"]["message"],
@@ -400,6 +474,7 @@ def record_remote_bookmark(repo, bookmark, new_node) -> None:
 
 def delete_remote_bookmark(repo, edenapi, bookmark, force, pushvars_strs) -> None:
     def handle_error(ui, edenapi, bookmark, curr_bookmark_val, err):
+        check_permission_denied(ui, err)
         hint = ""
 
         if curr_bookmark_val.source == RemoteBookmarkValueSource.LOCAL:
@@ -489,6 +564,13 @@ def check_mutation_metadata(repo, to_node):
                 % ctx,
                 hint=hint,
             )
+
+
+def check_permission_denied(ui, err) -> None:
+    """Abort with the repo access hint if the in-band SLAPI error `err` is an
+    access control denial."""
+    if err.get("code") == CODE_PERMISSION_DENIED:
+        raise error.Abort(err["message"], hint=scmutil.repoaccesshint(ui))
 
 
 def is_true(s: Optional[str]) -> bool:

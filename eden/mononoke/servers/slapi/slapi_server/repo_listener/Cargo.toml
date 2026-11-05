@@ -51,7 +51,7 @@ sapling-cats-constants = { version = "0.1.0", path = "../../../../../scm/lib/cat
 sapling-clientinfo = { version = "0.1.0", path = "../../../../../scm/lib/clientinfo" }
 scribe_ext = { version = "0.1.0", path = "../../../../common/scribe_ext" }
 scuba_ext = { version = "0.1.0", path = "../../../../common/scuba_ext" }
-serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 session_id = { version = "0.1.0", path = "../../../../common/session_id" }
 sha1 = "0.10.7"
 slapi_service = { version = "0.1.0", path = "../../slapi_service" }
@@ -60,8 +60,11 @@ stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust
 textwrap = { version = "0.16.3", features = ["terminal_size"] }
 thiserror = "2.0.21"
 time_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tokio-openssl = "0.6.5"
-tokio-util = { version = "0.7.19", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["full"] }
 tower-service = "0.3.3"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
+
+[lints]
+workspace = true

@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use async_process_traits::Child;
 use async_process_traits::Command;
 use async_process_traits::CommandSpawner;
+use async_process_traits::ExitStatus;
 use async_process_traits::TokioCommandSpawner;
 use lru_cache::LruCache;
 use tokio::io::AsyncBufReadExt;
@@ -150,6 +151,14 @@ where
             }
         }
 
+        let exit_status = child.wait().await?;
+        if !exit_status.success() {
+            return Err(SaplingError::Other(format!(
+                "'sl debugdiffdirs' exited with status {:?}",
+                exit_status.code()
+            )));
+        }
+
         SaplingGetDiffDirsResult::Normal(status)
     };
 
@@ -192,6 +201,26 @@ mod tests {
 
     const FIRST_COMMIT_ID: &str = "0000111122223333444455556666777788889999";
     const SECOND_COMMIT_ID: &str = "999988887777666655554444333322221100000";
+
+    #[tokio::test]
+    pub async fn test_get_diff_dirs_when_sl_exits_non_zero() -> Result<()> {
+        let spawner = get_mock_spawner(
+            get_sapling_executable_path(),
+            None,
+            Some((255, Some(Vec::new()))),
+        );
+        let params = GetDiffDirsParams {
+            first: "bbbb111122223333444455556666777788889999".to_string(),
+            second: Some("bbbb999988887777666655554444333322221111".to_string()),
+            limit_results: 1000,
+            root: None,
+            included_roots: None,
+            excluded_roots: None,
+        };
+        let result = get_diff_dirs_impl(&spawner, params).await;
+        assert!(result.is_err());
+        Ok(())
+    }
 
     #[tokio::test]
     pub async fn test_get_diff_dirs_basic() -> Result<()> {

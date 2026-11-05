@@ -7,8 +7,6 @@
 
 #![type_length_limit = "2097152"]
 
-use std::fs::File;
-use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +17,6 @@ use clap::Parser;
 use clap::ValueEnum;
 use clientinfo::ClientEntryPoint;
 use cmdlib_logging::ScribeLoggingArgs;
-use connection_security_checker::ConnectionSecurityChecker;
 use environment::BookmarkCacheDerivedData;
 use environment::BookmarkCacheKind;
 use environment::BookmarkCacheOptions;
@@ -27,49 +24,38 @@ use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
 use executor_lib::args::ShardedExecutorArgs;
 use fbinit::FacebookInit;
-use git_source_of_truth::GitSourceOfTruthConfig;
-use git_source_of_truth::SqlGitSourceOfTruthConfigBuilder;
 use megarepo_api::MegarepoApi;
 use metaconfig_types::ShardedService;
 use mononoke_api::CoreContext;
 use mononoke_api::repo::Repo;
-use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_app::MononokeReposManager;
 use mononoke_app::args::HooksAppExtension;
 use mononoke_app::args::RepoFilterAppExtension;
 use mononoke_app::args::ShutdownTimeoutArgs;
 use mononoke_app::args::WarmBookmarksCacheExtension;
-use mysql_client::ConnectionOptions;
-use mysql_client::ConnectionPoolOptions;
+use mononoke_thrift_server::DEFAULT_THRIFT_HOST;
+use mononoke_thrift_server::LoadMonitorConfig;
+use mononoke_thrift_server::ThriftServerBuilder;
 use panichandler::Fate;
 use scs_methods::source_control_impl::SourceControlServiceImpl;
-use service_framework_load_monitor_module::LoadMonitorModule;
 use sharding_ext::RepoShard;
 use source_control_services::make_SourceControlService_server;
-use sql_construct::SqlConstruct;
-use sql_storage::Destination;
-use sql_storage::XdbFactory;
-use srserver::BetterOverloadHandlerConfig;
-use srserver::BohPidConfig;
-use srserver::BohResourceConfig;
-use srserver::ThriftServer;
-use srserver::ThriftServerBuilder;
-use srserver_service_framework_light::BuildModule;
-use srserver_service_framework_light::ContextPropModule;
-use srserver_service_framework_light::Fb303Module;
-use srserver_service_framework_light::ProfileModule;
-use srserver_service_framework_light::ServiceFramework;
-use srserver_service_framework_light::ThriftStatsModule;
-use thrift_factory::ThriftFactoryBuilder;
 use tokio::task;
 use tracing::info;
 
-mod metadata;
+#[cfg(fbcode_build)]
+mod facebook;
 mod monitoring;
+#[cfg(not(fbcode_build))]
+mod oss;
+
+#[cfg(fbcode_build)]
+use facebook as platform;
+#[cfg(not(fbcode_build))]
+use oss as platform;
 
 const SERVICE_NAME: &str = "mononoke_scs_server";
-const MONONOKE_PRODUCTION_SHARD_NAME: &str = "xdb.mononoke_production";
 const SM_CLEANUP_TIMEOUT_SECS: u64 = 60;
 
 /// Mononoke Source Control Service Server
@@ -83,7 +69,7 @@ struct ScsServerArgs {
     #[clap(long, default_value = "false")]
     trace: bool,
     /// Thrift host
-    #[clap(long, short = 'H', default_value = "::")]
+    #[clap(long, short = 'H', default_value = DEFAULT_THRIFT_HOST)]
     host: String,
     /// Thrift port
     #[clap(long, short = 'p', default_value_t = 8367)]
@@ -158,7 +144,14 @@ impl RepoShardedProcess for ScsServerProcess {
         // shallow-sharded repo, in which case it would already be initialized during service startup.
         if self.repos_mgr.repos().get_by_name(repo_name).is_none() {
             // The input repo is a deep-sharded repo, so it needs to be added now.
-            self.repos_mgr.add_repo(repo_name).await.with_context(|| {
+            let added = if lazy_repo_build_enabled() {
+                self.repos_mgr
+                    .add_repo_for_service(repo_name, Some(ShardedService::SourceControlService))
+                    .await
+            } else {
+                self.repos_mgr.add_repo(repo_name).await.map(|_| ())
+            };
+            added.with_context(|| {
                 format!("Failure in setting up repo {repo_name} in SCS service")
             })?;
             info!("Completed repo {} setup in SCS service", repo_name);
@@ -170,6 +163,11 @@ impl RepoShardedProcess for ScsServerProcess {
             repos_mgr: self.repos_mgr.clone(),
         }))
     }
+}
+
+/// Whether `setup` may register a repo unbuilt, for its first request to build.
+fn lazy_repo_build_enabled() -> bool {
+    justknobs::eval("scm/mononoke:enable_scs_lazy_repo_build", None, None)
 }
 
 /// Struct representing the execution of the source control service for a
@@ -217,22 +215,6 @@ impl RepoShardedProcessExecutor for ScsServerProcessExecutor {
     }
 }
 
-async fn create_git_source_of_truth_config(
-    fb: FacebookInit,
-) -> Result<Arc<dyn GitSourceOfTruthConfig>, Error> {
-    let pool_options = ConnectionPoolOptions::default();
-    let conn_options = ConnectionOptions::default();
-    let destination = Destination::Prod;
-    let xdb_factory = XdbFactory::new(fb, destination, pool_options, conn_options)?;
-    let mononoke_production_xdb = xdb_factory
-        .create_or_get_shard(MONONOKE_PRODUCTION_SHARD_NAME)
-        .await?;
-    let connections = mononoke_production_xdb.write_conns().await?;
-    Ok(Arc::new(
-        SqlGitSourceOfTruthConfigBuilder::from_sql_connections(connections).build(),
-    ))
-}
-
 #[fbinit::main]
 fn main(fb: FacebookInit) -> Result<(), Error> {
     panichandler::set_panichandler(Fate::Abort);
@@ -272,11 +254,6 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         memory::set_max_memory(max_memory);
     }
 
-    let security_checker = runtime.block_on(ConnectionSecurityChecker::new(
-        app.environment().acl_provider.as_ref(),
-        &app.repo_configs().common,
-    ))?;
-
     let async_requests_queue_client = if args.disable_async_requests {
         None
     } else {
@@ -284,7 +261,8 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         Some(Arc::new(queue_client))
     };
 
-    let git_source_of_truth_config = runtime.block_on(create_git_source_of_truth_config(fb))?;
+    let git_source_of_truth_config =
+        runtime.block_on(platform::create_git_source_of_truth_config(fb))?;
 
     let source_control_server = runtime.block_on(SourceControlServiceImpl::new(
         fb,
@@ -293,9 +271,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         megarepo_api,
         scuba_builder,
         args.scribe_logging_args.get_scribe(fb)?,
-        security_checker,
         app.configs(),
-        &app.repo_configs().common,
         async_requests_queue_client,
         git_source_of_truth_config,
         args.watchdog_method_max_poll,
@@ -307,51 +283,40 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     };
     runtime.spawn(monitoring_forever);
 
-    let (factory, _processing_handle) = runtime.block_on(async move {
-        ThriftFactoryBuilder::new(fb, "main-thrift-incoming", args.thrift_workers_num)
-            .with_queueing_limit(args.thrift_queue_size)
-            .with_queueing_timeout(Some(Duration::from_millis(args.thrift_queue_timeout)))
-            .build()
-            .await
-            .expect("Failed to build thrift factory")
-    });
-    let thrift = setup_thrift_server(&app, &args, source_control_server, factory)
-        .context("Failed to set up Thrift server")?;
+    let service = {
+        move |proto| make_SourceControlService_server(proto, source_control_server.thrift_server())
+    };
 
-    let mut service_framework = ServiceFramework::from_server(SERVICE_NAME, thrift)
-        .context("Failed to create service framework server")?;
+    let factory = runtime.block_on(platform::ServerFactory::new(
+        fb,
+        args.thrift_workers_num,
+        args.thrift_queue_size,
+        Duration::from_millis(args.thrift_queue_timeout),
+    ));
 
-    service_framework.add_module(BuildModule)?;
-    service_framework.add_module(ThriftStatsModule)?;
-    service_framework.add_module(Fb303Module)?;
-    service_framework.add_module(ProfileModule)?;
-    service_framework.add_module(ContextPropModule)?;
-    service_framework.add_module(
-        LoadMonitorModule::builder()
-            .fb(fb)
-            .memory_stats_ttl(Duration::from_millis(50))
-            .cgroup_stats_ttl(Duration::from_millis(50))
-            .counters_update_interval(Duration::from_millis(100))
-            .cgroup_root_path("/cgroup2".into())
-            .build(),
-    )?;
+    let builder = ThriftServerBuilder::new(fb)
+        .service_name(SERVICE_NAME)
+        .host(&args.host)
+        .port(args.port)
+        .with_handle(runtime.clone())
+        .with_tls()
+        .with_cancel_on_client_disconnect()
+        .with_profile_module()
+        .with_load_monitor(LoadMonitorConfig {
+            memory_stats_ttl: Duration::from_millis(50),
+            cgroup_stats_ttl: Duration::from_millis(50),
+            counters_update_interval: Duration::from_millis(100),
+            cgroup_root_path: "/cgroup2".to_string(),
+        });
+    let mut server = platform::configure_server(builder, &app)
+        .factory(factory.executor(), move || service)
+        .build()?;
 
-    service_framework
-        .serve_background()
-        .expect("failed to start thrift service");
-
-    let bound_addr = format!(
-        "{}:{}",
-        args.host,
-        service_framework.get_address()?.get_port()?
-    );
-    info!("Listening on {}", bound_addr);
+    info!("Listening on {}", server.bound_address()?);
 
     // Write out the bound address if requested, this is helpful in tests when using automatic binding with :0
-    if let Some(bound_addr_path) = args.bound_address_file {
-        let mut writer = File::create(bound_addr_path)?;
-        writer.write_all(bound_addr.as_bytes())?;
-        writer.write_all(b"\n")?;
+    if let Some(bound_addr_path) = &args.bound_address_file {
+        server.write_bound_address(bound_addr_path)?;
     }
 
     if let Some(executor) = args.sharded_executor_args.build_executor(
@@ -370,6 +335,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     // stats aggregation.
     app.start_stats_aggregation()?;
 
+    let handle = server.into_shutdown_handle();
     app.wait_until_terminated(
         move || {
             let _ = sm_shutdown_sender.send(true);
@@ -378,7 +344,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         async {
             let _ = task::spawn_blocking(move || {
                 // Calling `stop` blocks until the service has completed all requests.
-                service_framework.stop();
+                handle.stop();
             })
             .await;
         },
@@ -389,51 +355,4 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
     info!("Exiting...");
     Ok(())
-}
-
-fn setup_thrift_server(
-    app: &MononokeApp,
-    args: &ScsServerArgs,
-    source_control_server: SourceControlServiceImpl,
-    exec: thrift_factory::ThriftFactory,
-) -> anyhow::Result<ThriftServer> {
-    let service = {
-        move |proto| make_SourceControlService_server(proto, source_control_server.thrift_server())
-    };
-
-    // BetterOverloadHandler: memory-based overload protection at the Thrift
-    // layer, before requests are dispatched to Rust. This is a safety net
-    // against OOMs from large request payloads (see S627561).
-    // PID values from recommended starting config:
-    // https://www.internalfb.com/wiki/Users/sazonovk/Thrift/BetterOverloadHandler/
-    let mem_limit = 0.9;
-    let mem_boh_config = BohResourceConfig {
-        setpoint: 0.8,
-        limit: Some(&mem_limit),
-        pid_config: BohPidConfig {
-            k_p: 4.0,
-            k_i: 0.3,
-            k_d: 0.1,
-            dt: 0.1,
-        },
-    };
-    let boh_config = BetterOverloadHandlerConfig {
-        interval_ms: 100,
-        cpu_config: None,
-        mem_config: Some(&mem_boh_config),
-        net_config: None,
-    };
-
-    Ok(ThriftServerBuilder::new(app.fb)
-        .with_name(SERVICE_NAME)
-        .expect("failed to set name")
-        .with_address(&args.host, args.port, false)?
-        .with_tls()
-        .expect("failed to enable TLS")
-        .with_cancel_if_client_disconnected()
-        .with_custom_status_impl(app.server_status())
-        .with_static_better_overload_handler(&boh_config)
-        .context("Failed to configure BetterOverloadHandler")?
-        .add_factory(exec, move || service, Some(metadata::create_metadata()))
-        .build())
 }

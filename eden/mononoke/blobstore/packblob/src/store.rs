@@ -430,4 +430,30 @@ mod tests {
         );
         Ok(())
     }
+
+    #[mononoke::fbinit_test]
+    async fn get_short_inner_blob(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        borrowed!(ctx);
+        let inner = Arc::new(Memblob::default());
+        let packblob = PackBlob::new(inner.clone(), PackFormat::Raw);
+
+        // A 3-byte blob under the envelope key, as a corrupt or foreign write would leave it.
+        let outer_key = "repo0000.short";
+        inner
+            .put(
+                ctx,
+                format!("{outer_key}{ENVELOPE_SUFFIX}"),
+                BlobstoreBytes::from_bytes(Bytes::from_static(b"abc")),
+            )
+            .await?;
+
+        let res = packblob.get(ctx, outer_key).await;
+        assert!(
+            res.is_err(),
+            "expected an error for a too-short envelope, got {:?}",
+            res.map(|v| v.map(|d| d.len()))
+        );
+        Ok(())
+    }
 }

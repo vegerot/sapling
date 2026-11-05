@@ -8,10 +8,20 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
+#[cfg(unix)]
+use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::future::Future;
 #[cfg(unix)]
+use std::io;
+#[cfg(unix)]
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt as MetadataLinuxExt;
 #[cfg(unix)]
@@ -21,6 +31,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitStatus;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::str::FromStr;
 
 use anyhow::Context;
@@ -31,6 +43,7 @@ use edenfs_error::Result;
 use edenfs_error::ResultExt;
 use edenfs_utils::metadata::MetadataExt;
 use edenfs_utils::remove_symlink;
+use edenfs_utils::trace_env;
 use hg_util::no_follow::NoFollowRoot;
 #[cfg(target_os = "windows")]
 use mkscratch::zzencode;
@@ -39,18 +52,6 @@ use psutil::disk::disk_usage;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
-#[cfg(unix)]
-use subprocess::CommunicateError;
-#[cfg(unix)]
-use subprocess::Exec;
-#[cfg(unix)]
-use subprocess::ExitStatus as SubprocessExitStatus;
-#[cfg(unix)]
-use subprocess::NullFile;
-#[cfg(unix)]
-use subprocess::PopenError;
-#[cfg(unix)]
-use subprocess::Redirection as SubprocessRedirection;
 use toml::value::Value;
 
 use crate::checkout::EdenFsCheckout;
@@ -326,6 +327,8 @@ enum BackingCleanupAction {
         scratch_root_parent: NoFollowRoot,
         scratch_root_name: PathBuf,
         parent: NoFollowRoot,
+        /// `parent`'s path relative to `scratch_root_parent`.
+        parent_path: PathBuf,
         name: PathBuf,
     },
     #[cfg(target_os = "macos")]
@@ -354,6 +357,7 @@ impl RedirectionBackingCleanupAction {
                 scratch_root_parent,
                 scratch_root_name,
                 parent,
+                parent_path,
                 name,
             } => {
                 match parent.remove_dir_all(&name) {
@@ -371,6 +375,7 @@ impl RedirectionBackingCleanupAction {
                 // Windows can't delete a directory while a handle to it is open, and in the
                 // default scratch layout `parent` is the scratch root.
                 drop(parent);
+                remove_empty_scratch_dirs(&scratch_root_parent, &scratch_root_name, &parent_path);
                 if let Err(error) =
                     remove_unused_scratch_root(&scratch_root_parent, &scratch_root_name)
                     && error.kind() != std::io::ErrorKind::NotFound
@@ -437,6 +442,34 @@ fn remove_unused_scratch_root(
         scratch_root_parent.remove_file(scratch_root_name.join(SCRATCH_README).as_path())?;
     }
     scratch_root_parent.remove_dir(scratch_root_name)
+}
+
+/// Delete the directories between a deleted target and its scratch root, which mkscratch's
+/// mirror style creates, up to the first one that isn't empty.
+fn remove_empty_scratch_dirs(
+    scratch_root_parent: &NoFollowRoot,
+    scratch_root_name: &Path,
+    parent_path: &Path,
+) {
+    let result = parent_path
+        .ancestors()
+        .take_while(|dir| *dir != scratch_root_name)
+        .try_for_each(|dir| {
+            // On Windows, every cleanup action that hasn't run yet holds these directories
+            // open, so deleting one that isn't empty fails with a sharing violation instead.
+            if !scratch_root_parent.list_dir(Some(dir))?.is_empty() {
+                return Err(std::io::ErrorKind::DirectoryNotEmpty.into());
+            }
+            scratch_root_parent.remove_dir(dir)
+        });
+    if let Err(error) = result
+        && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
+    {
+        tracing::warn!(
+            "failed to delete an empty scratch directory under {}: {error}",
+            parent_path.display()
+        );
+    }
 }
 
 /// Remove every entry in `dir` without following symlinks, attempting all of them before
@@ -550,14 +583,13 @@ impl Redirection {
 
     #[cfg(unix)]
     fn classify_mkscratch_recovery(
-        status: SubprocessExitStatus,
+        status: Option<ExitStatus>,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     ) -> Result<MkscratchOutput> {
-        if !matches!(
-            status,
-            SubprocessExitStatus::Exited(0) | SubprocessExitStatus::Undetermined
-        ) {
+        // None means another thread reaped the child; the marker is still
+        // required to prove that the command succeeded.
+        if status.is_some_and(|status| !status.success()) {
             return Err(EdenFsError::Other(anyhow!(
                 "mkscratch recovery wrapper failed with status {status:?}; an underlying signal may be encoded as 128 + signal; stderr: {}",
                 String::from_utf8_lossy(&stderr),
@@ -581,58 +613,127 @@ impl Redirection {
 
     #[cfg(unix)]
     fn finish_mkscratch_recovery(
-        mut read_output: impl FnMut() -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), CommunicateError>,
-        mut wait: impl FnMut() -> Result<SubprocessExitStatus, PopenError>,
+        mut read_output: impl FnMut(&mut [Vec<u8>; 2]) -> io::Result<()>,
+        mut wait: impl FnMut() -> io::Result<ExitStatus>,
     ) -> Result<MkscratchOutput> {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+        // Keep bytes already consumed from the pipes across interrupted reads,
+        // including a partially read success marker.
+        let mut output = [Vec::new(), Vec::new()];
         loop {
-            let ((out, err), finished) = match read_output() {
-                Ok(capture) => (capture, true),
-                Err(error) if error.kind() == ErrorKind::Interrupted => {
-                    // These bytes have already been consumed from the pipes,
-                    // and may include only part of the success marker.
-                    (error.capture, false)
+            match read_output(&mut output) {
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                result => {
+                    result.from_err()?;
+                    break;
                 }
-                Err(error) => return Err(error).from_err(),
-            };
-            stdout.extend(out.into_iter().flatten());
-            stderr.extend(err.into_iter().flatten());
-            if finished {
-                break;
             }
         }
 
         let status = loop {
             match wait() {
-                Err(PopenError::IoError(error)) if error.kind() == ErrorKind::Interrupted => {
-                    continue;
-                }
-                result => break result.from_err()?,
+                Ok(status) => break Some(status),
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => break None,
+                Err(error) => return Err(error).from_err(),
             }
         };
+        let [stdout, stderr] = output;
         Self::classify_mkscratch_recovery(status, stdout, stderr)
     }
 
     #[cfg(unix)]
+    fn read_mkscratch_output(
+        pipes: &mut [Option<File>; 2],
+        output: &mut [Vec<u8>; 2],
+    ) -> io::Result<()> {
+        while pipes.iter().any(Option::is_some) {
+            let mut fds = pipes.each_ref().map(|pipe| libc::pollfd {
+                fd: pipe.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            // SAFETY: fds is a writable array of the indicated length;
+            // pipes owns every nonnegative descriptor throughout poll.
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            for ((pipe, fd), bytes) in pipes.iter_mut().zip(fds).zip(output.iter_mut()) {
+                if fd.revents & libc::POLLNVAL != 0 {
+                    return Err(io::Error::from_raw_os_error(libc::EBADF));
+                }
+                if fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+                    continue;
+                }
+                let Some(reader) = pipe else {
+                    continue;
+                };
+                // One bounded read per ready pipe prevents either writer
+                // from blocking behind a full stdout or stderr pipe.
+                let mut buffer = [0; 8192];
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    *pipe = None;
+                } else {
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     fn retry_mkscratch_after_reap(mkscratch: &Path, args: &[&OsStr]) -> Result<MkscratchOutput> {
-        let mut child = Exec::cmd("/bin/sh")
+        // Keep this command eligible for std's posix_spawn path: pre_exec
+        // callbacks would run daemon at-fork handlers before the shell exec.
+        let mut child = Command::new("/bin/sh")
+            .envs(trace_env("mkscratch"))
             .arg("-c")
             .arg(MKSCRATCH_WRAPPER)
             .arg("--")
             .arg(mkscratch)
             .args(args)
-            .stdin(NullFile)
-            .stdout(SubprocessRedirection::Pipe)
-            .stderr(SubprocessRedirection::Pipe)
-            .popen()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .from_err()?;
-        let mut communicator = child.communicate_start(None);
-        Self::finish_mkscratch_recovery(|| communicator.read(), || child.wait())
+        let mut pipes = [
+            child
+                .stdout
+                .take()
+                .map(|pipe| File::from(OwnedFd::from(pipe))),
+            child
+                .stderr
+                .take()
+                .map(|pipe| File::from(OwnedFd::from(pipe))),
+        ];
+        let result = Self::finish_mkscratch_recovery(
+            |output| Self::read_mkscratch_output(&mut pipes, output),
+            || child.wait(),
+        );
+        // Child does not reap on drop. Close readers before waiting on an
+        // error so the child cannot remain blocked on its output pipes.
+        drop(pipes);
+        if result.is_err() {
+            loop {
+                match child.wait() {
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(error) if error.raw_os_error() != Some(libc::ECHILD) => {
+                        tracing::warn!(%error, "failed to reap mkscratch recovery child");
+                    }
+                    _ => {}
+                }
+                break;
+            }
+        }
+        result
     }
 
     fn run_mkscratch(mkscratch: &Path, args: &[&OsStr]) -> Result<MkscratchOutput> {
-        let output = Command::new(mkscratch).args(args).output();
+        let output = Command::new(mkscratch)
+            .envs(trace_env("mkscratch"))
+            .args(args)
+            .output();
         match output {
             Ok(output) => Ok(MkscratchOutput {
                 status: MkscratchExitStatus::Exited(output.status),
@@ -835,6 +936,7 @@ impl Redirection {
             .with_context(|| format!("Failed to create directory {}", &mount_path.display()))?;
         let args = &["mount", &mount_path.to_string_lossy()];
         let output = Command::new(APFS_HELPER)
+            .envs(trace_env("apfs_helper"))
             .args(args)
             .output()
             .from_err()
@@ -903,6 +1005,7 @@ impl Redirection {
                 &image_file_name,
             ];
             let create_output = Command::new("hdiutil")
+                .envs(trace_env("hdiutil"))
                 .args(args)
                 .output()
                 .from_err()
@@ -941,6 +1044,7 @@ impl Redirection {
                 .with_context(|| format!("Failed to create directory {}", &mount_path.display()))?;
         }
         let attach_output = Command::new("hdiutil")
+            .envs(trace_env("hdiutil"))
             .args(args)
             .output()
             .from_err()
@@ -1059,6 +1163,7 @@ impl Redirection {
         // by unmounting unrelated apfs volumes in the past. See S325232.
         let args = &["unmount", "force", &mount_path.to_string_lossy()];
         let output = Command::new("diskutil")
+            .envs(trace_env("diskutil"))
             .args(args)
             .output()
             .from_err()
@@ -1711,17 +1816,17 @@ fn scratch_cleanup_action(
     let name = PathBuf::from(
         relative_target
             .file_name()
-            .expect("validated target has a name"),
+            .context("scratch target has no filename")?,
     );
+    let parent_path = relative_target
+        .parent()
+        .context("scratch target has no parent")?
+        .to_path_buf();
     let open_parents = || -> std::io::Result<(NoFollowRoot, NoFollowRoot)> {
         // Only the configured scratch prefix may traverse aliases. Keep the
         // target's real parent open across checkout removal.
         let scratch_root_parent = NoFollowRoot::new(root_parent)?;
-        let parent = scratch_root_parent.open_root(
-            relative_target
-                .parent()
-                .expect("target is below scratch root"),
-        )?;
+        let parent = scratch_root_parent.open_root(parent_path.as_path())?;
         if !parent.symlink_metadata(Some(&name))?.is_dir() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1746,6 +1851,7 @@ fn scratch_cleanup_action(
             scratch_root_parent,
             scratch_root_name: PathBuf::from(root_name),
             parent,
+            parent_path,
             name,
         },
     }))
@@ -2221,10 +2327,13 @@ pub mod scratch {
     use std::ffi::OsStr;
     use std::fs;
     use std::fs::DirEntry;
+    use std::io::ErrorKind;
     use std::path::Path;
     use std::path::PathBuf;
 
+    use anyhow::Context;
     use anyhow::Result;
+    use anyhow::anyhow;
     use edenfs_utils::metadata::MetadataExt;
     use rayon::prelude::*;
 
@@ -2359,9 +2468,19 @@ pub mod scratch {
             )
         };
 
+        // mkscratch only prints the path, so the scratch root may not exist yet.
+        let scratch_root_entries = match fs::read_dir(scratch_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to read scratch root {}", scratch_root.display())
+                });
+            }
+        };
         let mut orphaned_redirections = Vec::new();
         if is_scratch_mirrored {
-            for dirent in fs::read_dir(scratch_root)? {
+            for dirent in scratch_root_entries {
                 let dirent_path = dirent?.path();
                 let redirection_path = dirent_path.join(&prefix);
                 if redirection_path.exists() {
@@ -2373,7 +2492,7 @@ pub mod scratch {
                 }
             }
         } else {
-            for dirent in fs::read_dir(scratch_root)? {
+            for dirent in scratch_root_entries {
                 let dirent_path = dirent?.path();
                 if !dirent_path.is_dir() {
                     continue;
@@ -2400,7 +2519,16 @@ pub mod scratch {
     pub fn get_orphaned_redirection_targets(
         existing_redirections: &BTreeSet<PathBuf>,
     ) -> Result<Vec<PathBuf>> {
-        let mkscratch = Redirection::mkscratch_bin();
+        get_orphaned_redirection_targets_with_mkscratch(
+            &Redirection::mkscratch_bin(),
+            existing_redirections,
+        )
+    }
+
+    fn get_orphaned_redirection_targets_with_mkscratch(
+        mkscratch: &Path,
+        existing_redirections: &BTreeSet<PathBuf>,
+    ) -> Result<Vec<PathBuf>> {
         let scratch_subdir = Redirection::scratch_subdir();
         let scratch_subdir_str = scratch_subdir.to_string_lossy();
         let home_dir = match dirs::home_dir() {
@@ -2417,27 +2545,20 @@ pub mod scratch {
             &*scratch_subdir_str,
         ]
         .map(OsStr::new);
-        let mkscratch_res = Redirection::run_mkscratch(&mkscratch, &mkscratch_args);
+        let mkscratch_res = Redirection::run_mkscratch(mkscratch, &mkscratch_args);
 
         let scratch_path = match mkscratch_res {
             Ok(output) if output.status.success() => {
                 Redirection::parse_mkscratch_stdout(&output.stdout)?
             }
             Ok(output) => {
-                tracing::warn!(
-                    status = ?output.status,
-                    stderr = %String::from_utf8_lossy(&output.stderr),
-                    "failed to query mkscratch path while finding orphaned redirections"
-                );
-                return Ok(vec![]);
+                return Err(anyhow!(
+                    "mkscratch exited with {:?} while resolving the scratch root: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
             }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "failed to run mkscratch while finding orphaned redirections"
-                );
-                return Ok(vec![]);
-            }
+            Err(error) => return Err(error).context("failed to run mkscratch"),
         };
 
         get_orphaned_redirection_targets_impl(scratch_path, scratch_subdir, existing_redirections)
@@ -2459,6 +2580,48 @@ pub mod scratch {
         ) -> Result<()> {
             create_dir_all(path.as_ref())?;
             existing_redirections.insert(path.as_ref().to_path_buf());
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn test_get_orphaned_redirection_targets_propagates_mkscratch_failure() -> Result<()> {
+            use std::os::unix::fs::PermissionsExt;
+
+            let tempdir = TempDir::new()?;
+            let fake_mkscratch = tempdir.path().join("mkscratch");
+            std::fs::write(
+                &fake_mkscratch,
+                "#!/bin/sh\necho 'scratch config broken' >&2\nexit 1\n",
+            )?;
+            std::fs::set_permissions(&fake_mkscratch, std::fs::Permissions::from_mode(0o755))?;
+
+            let error =
+                get_orphaned_redirection_targets_with_mkscratch(&fake_mkscratch, &BTreeSet::new())
+                    .expect_err(
+                        "a failing mkscratch must surface an error, not an empty orphan list",
+                    );
+            assert!(
+                error.to_string().contains("scratch config broken"),
+                "error should carry mkscratch's stderr: {error:#}"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn test_get_orphaned_redirection_targets_missing_scratch_root() -> Result<()> {
+            let tempdir = TempDir::new()?;
+            let scratch_path = tempdir.path().join("missing/repository/fooZbar");
+
+            let res = get_orphaned_redirection_targets_impl(
+                scratch_path,
+                Path::new("foo/bar").to_path_buf(),
+                &BTreeSet::new(),
+            )?;
+            assert!(
+                res.is_empty(),
+                "a scratch root that doesn't exist has no orphans"
+            );
             Ok(())
         }
 
@@ -2620,13 +2783,27 @@ mod tests {
     #[cfg(unix)]
     use std::ffi::OsStr;
     #[cfg(unix)]
+    use std::fs::File;
+    #[cfg(unix)]
+    use std::io;
+    #[cfg(unix)]
     use std::io::ErrorKind;
     #[cfg(unix)]
     use std::iter::once;
     #[cfg(unix)]
+    use std::os::fd::OwnedFd;
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
     use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::process::Command;
+    #[cfg(unix)]
+    use std::process::ExitStatus;
+    #[cfg(unix)]
+    use std::process::Stdio;
 
     #[cfg(unix)]
     use edenfs_error::EdenFsError;
@@ -2636,14 +2813,12 @@ mod tests {
     use rand::distr::SampleString;
     use serde_test::Token;
     use serde_test::assert_ser_tokens;
-    #[cfg(unix)]
-    use subprocess::CommunicateError;
-    #[cfg(unix)]
-    use subprocess::PopenError;
     use tempfile::tempdir;
 
     #[cfg(unix)]
     use crate::redirect::MKSCRATCH_SUCCESS_MARKER;
+    #[cfg(unix)]
+    use crate::redirect::MKSCRATCH_WRAPPER;
     #[cfg(unix)]
     use crate::redirect::MkscratchExitStatus;
     use crate::redirect::REPO_SOURCE;
@@ -2653,8 +2828,6 @@ mod tests {
     use crate::redirect::RedirectionType;
     use crate::redirect::RepoPathDisposition;
     use crate::redirect::SCRATCH_README;
-    #[cfg(unix)]
-    use crate::redirect::SubprocessExitStatus;
     use crate::redirect::ValidatedRepoPath;
     use crate::redirect::plan_redirection_backing_cleanup;
     use crate::redirect::redirection_uses_symlink;
@@ -2718,7 +2891,7 @@ mod tests {
     #[test]
     fn test_mkscratch_recovery_requires_success_marker() {
         let success = Redirection::classify_mkscratch_recovery(
-            SubprocessExitStatus::Undetermined,
+            None,
             b"/tmp/scratch\n".to_vec(),
             [b"warning".as_slice(), MKSCRATCH_SUCCESS_MARKER].concat(),
         )
@@ -2738,7 +2911,7 @@ mod tests {
 
         assert!(
             Redirection::classify_mkscratch_recovery(
-                SubprocessExitStatus::Undetermined,
+                None,
                 b"/tmp/scratch\n".to_vec(),
                 b"warning".to_vec(),
             )
@@ -2746,15 +2919,17 @@ mod tests {
             "unmarked output must not turn an unknown exit status into success",
         );
 
-        assert!(
-            Redirection::classify_mkscratch_recovery(
-                SubprocessExitStatus::Exited(7),
-                b"/tmp/scratch\n".to_vec(),
-                [b"warning".as_slice(), MKSCRATCH_SUCCESS_MARKER].concat(),
-            )
-            .is_err(),
-            "a marker must not hide a known failure",
-        );
+        for raw in [7 << 8, libc::SIGTERM] {
+            assert!(
+                Redirection::classify_mkscratch_recovery(
+                    Some(ExitStatus::from_raw(raw)),
+                    b"/tmp/scratch\n".to_vec(),
+                    [b"warning".as_slice(), MKSCRATCH_SUCCESS_MARKER].concat(),
+                )
+                .is_err(),
+                "a marker must not hide a known failure",
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2763,29 +2938,33 @@ mod tests {
         let (marker_start, marker_end) =
             MKSCRATCH_SUCCESS_MARKER.split_at(MKSCRATCH_SUCCESS_MARKER.len() / 2);
         let mut reads = [
-            Err(CommunicateError {
-                error: ErrorKind::Interrupted.into(),
-                capture: (Some(b"/tmp/".to_vec()), Some(b"war".to_vec())),
-            }),
-            Err(CommunicateError {
-                error: ErrorKind::Interrupted.into(),
-                capture: (
-                    Some(b"scratch\n".to_vec()),
-                    Some([b"ning".as_slice(), marker_start].concat()),
-                ),
-            }),
-            Ok((None, Some(marker_end.to_vec()))),
+            (
+                b"/tmp/".to_vec(),
+                b"war".to_vec(),
+                Err(ErrorKind::Interrupted.into()),
+            ),
+            (
+                b"scratch\n".to_vec(),
+                [b"ning".as_slice(), marker_start].concat(),
+                Err(ErrorKind::Interrupted.into()),
+            ),
+            (Vec::new(), marker_end.to_vec(), Ok(())),
         ]
         .into_iter();
         let mut waits = [
-            Err(PopenError::IoError(ErrorKind::Interrupted.into())),
-            Err(PopenError::IoError(ErrorKind::Interrupted.into())),
-            Ok(SubprocessExitStatus::Undetermined),
+            Err(ErrorKind::Interrupted.into()),
+            Err(ErrorKind::Interrupted.into()),
+            Err(io::Error::from_raw_os_error(libc::ECHILD)),
         ]
         .into_iter();
 
         let output = Redirection::finish_mkscratch_recovery(
-            || reads.next().expect("must stop reading at EOF"),
+            |output| {
+                let (stdout, stderr, result) = reads.next().expect("must stop reading at EOF");
+                output[0].extend(stdout);
+                output[1].extend(stderr);
+                result
+            },
             || waits.next().expect("must stop waiting after completion"),
         )
         .expect("interrupted I/O must preserve the complete output and marker");
@@ -2801,26 +2980,24 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_mkscratch_recovery_preserves_read_errors() {
-        let mut reads = once(Err(CommunicateError {
-            error: ErrorKind::PermissionDenied.into(),
-            capture: (
-                Some(b"/tmp/scratch\n".to_vec()),
-                Some(MKSCRATCH_SUCCESS_MARKER.to_vec()),
-            ),
-        }));
+        let mut reads = once(Err(ErrorKind::PermissionDenied.into()));
         let error = Redirection::finish_mkscratch_recovery(
-            || reads.next().expect("must not retry a non-interrupted read"),
+            |output| {
+                output[0].extend_from_slice(b"/tmp/scratch\n");
+                output[1].extend_from_slice(MKSCRATCH_SUCCESS_MARKER);
+                reads.next().expect("must not retry a non-interrupted read")
+            },
             || panic!("must propagate a read error before collecting exit status"),
         )
         .expect_err("even marked output must not hide an I/O failure");
 
         let EdenFsError::Other(error) = error else {
-            panic!("expected the original communication error");
+            panic!("expected the original I/O error");
         };
         assert_eq!(
             error
-                .downcast_ref::<CommunicateError>()
-                .expect("must preserve the communication error")
+                .downcast_ref::<io::Error>()
+                .expect("must preserve the I/O error")
                 .kind(),
             ErrorKind::PermissionDenied,
         );
@@ -2829,24 +3006,28 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_mkscratch_recovery_preserves_wait_errors() {
-        let mut reads = once(Ok((
-            Some(b"/tmp/scratch\n".to_vec()),
-            Some(MKSCRATCH_SUCCESS_MARKER.to_vec()),
-        )));
-        let mut waits = once(Err(PopenError::IoError(ErrorKind::PermissionDenied.into())));
+        let mut reads = once(Ok(()));
+        let mut waits = once(Err(ErrorKind::PermissionDenied.into()));
         let error = Redirection::finish_mkscratch_recovery(
-            || reads.next().expect("must not reread output while waiting"),
+            |output| {
+                output[0].extend_from_slice(b"/tmp/scratch\n");
+                output[1].extend_from_slice(MKSCRATCH_SUCCESS_MARKER);
+                reads.next().expect("must not reread output while waiting")
+            },
             || waits.next().expect("must not retry a non-interrupted wait"),
         )
         .expect_err("even marked output must not hide a wait failure");
 
         let EdenFsError::Other(error) = error else {
-            panic!("expected the original process error");
+            panic!("expected the original I/O error");
         };
-        assert!(matches!(
-            error.downcast_ref::<PopenError>(),
-            Some(PopenError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
-        ));
+        assert_eq!(
+            error
+                .downcast_ref::<io::Error>()
+                .expect("must preserve the I/O error")
+                .kind(),
+            ErrorKind::PermissionDenied,
+        );
     }
 
     #[cfg(unix)]
@@ -2872,6 +3053,177 @@ mod tests {
             .is_err(),
             "a failed retry must remain a failure",
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_mkscratch_recovery_avoids_atfork_callbacks() {
+        const CHILD_MODE: &str = "EDEN_MKSCRATCH_ATFORK_TEST";
+        const READY: &[u8] = b"mkscratch atfork observer ready\n";
+        const CALLED: &[u8] = b"mkscratch atfork observer called\n";
+        const DONE: &[u8] = b"mkscratch atfork observer done\n";
+
+        fn write_marker(marker: &[u8]) {
+            // SAFETY: The static bytes remain valid, write is async-signal-safe,
+            // and failure exits without unwinding across the callback's C ABI.
+            unsafe {
+                if libc::write(libc::STDERR_FILENO, marker.as_ptr().cast(), marker.len())
+                    != marker.len() as isize
+                {
+                    libc::_exit(101);
+                }
+            }
+        }
+
+        extern "C" fn observe_fork() {
+            write_marker(CALLED);
+        }
+
+        if let Ok(mode) = std::env::var(CHILD_MODE) {
+            // SAFETY: Only this isolated subprocess registers the static,
+            // async-signal-safe callback and changes its own alarm.
+            unsafe {
+                libc::alarm(30);
+                assert_eq!(libc::pthread_atfork(None, None, Some(observe_fork)), 0);
+            }
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let worker = std::thread::spawn(move || wait.recv());
+            write_marker(READY);
+            match mode.as_str() {
+                "control" => {
+                    // SAFETY: The child only calls async-signal-safe _exit;
+                    // the parent waits for this exact child, retrying EINTR.
+                    unsafe {
+                        let pid = libc::fork();
+                        assert!(pid >= 0);
+                        if pid == 0 {
+                            libc::_exit(0);
+                        }
+                        let mut status = 0;
+                        loop {
+                            let waited = libc::waitpid(pid, &mut status, 0);
+                            if waited == -1
+                                && std::io::Error::last_os_error().kind() == ErrorKind::Interrupted
+                            {
+                                continue;
+                            }
+                            assert_eq!(waited, pid);
+                            assert_eq!(status, 0);
+                            break;
+                        }
+                    }
+                }
+                "recovery" => {
+                    let output = Redirection::retry_mkscratch_after_reap(
+                        Path::new("/bin/sh"),
+                        &["-c", "printf '/tmp/scratch\\n'; printf warning >&2"].map(OsStr::new),
+                    )
+                    .expect("recovery should retain the command output");
+                    assert!(output.status.success());
+                    assert_eq!(output.stdout, b"/tmp/scratch\n");
+                    assert_eq!(output.stderr, b"warning");
+                }
+                _ => panic!("unexpected atfork test mode: {mode}"),
+            }
+            drop(release);
+            assert!(worker.join().unwrap().is_err());
+            write_marker(DONE);
+            std::process::exit(0);
+        }
+
+        for mode in ["control", "recovery"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "redirect::tests::test_mkscratch_recovery_avoids_atfork_callbacks",
+                    "--nocapture",
+                ])
+                .env(CHILD_MODE, mode)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{mode}: {output:?}");
+            for marker in [READY, DONE] {
+                assert!(
+                    output.stderr.windows(marker.len()).any(|w| w == marker),
+                    "{mode}: missing observer checkpoint: {output:?}",
+                );
+            }
+            let called = output.stderr.windows(CALLED.len()).any(|w| w == CALLED);
+            assert_eq!(called, mode == "control", "{mode}: {output:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_mkscratch_recovery_preserves_output_after_external_reap() {
+        for (script, succeeds) in [
+            ("printf '/tmp/scratch\\n'; printf warning >&2", true),
+            (
+                "printf '/tmp/scratch\\n'; printf warning >&2; exit 7",
+                false,
+            ),
+        ] {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", MKSCRATCH_WRAPPER, "--", "/bin/sh", "-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut status = 0;
+            loop {
+                // SAFETY: status is writable and waitpid targets only the
+                // child owned by this test, simulating the daemon's reaper.
+                let waited = unsafe { libc::waitpid(child.id() as libc::pid_t, &mut status, 0) };
+                if waited == -1 && io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                assert_eq!(waited, child.id() as libc::pid_t);
+                break;
+            }
+            assert_eq!(ExitStatus::from_raw(status).success(), succeeds);
+            assert_eq!(child.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
+            let mut pipes = [
+                child
+                    .stdout
+                    .take()
+                    .map(|pipe| File::from(OwnedFd::from(pipe))),
+                child
+                    .stderr
+                    .take()
+                    .map(|pipe| File::from(OwnedFd::from(pipe))),
+            ];
+            let output = Redirection::finish_mkscratch_recovery(
+                |output| Redirection::read_mkscratch_output(&mut pipes, output),
+                || child.wait(),
+            );
+            if succeeds {
+                let output = output.expect("ECHILD must not discard the captured success marker");
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"/tmp/scratch\n");
+                assert_eq!(output.stderr, b"warning");
+            } else {
+                let error = output.expect_err("ECHILD without a marker must not imply success");
+                assert!(error.to_string().contains("without a success marker"));
+            }
+            assert!(pipes.iter().all(Option::is_none));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_mkscratch_recovery_drains_both_output_pipes() {
+        let output = Redirection::retry_mkscratch_after_reap(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "i=0; while [ \"$i\" -lt 16384 ]; do printf 'stdout\\n'; printf 'stderr\\n' >&2; i=$((i+1)); done",
+            ].map(OsStr::new),
+        )
+        .expect("both output pipes must be drained without deadlocking");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"stdout\n".repeat(16384));
+        assert_eq!(output.stderr, b"stderr\n".repeat(16384));
     }
 
     #[test]
@@ -3397,6 +3749,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scratch_cleanup_deletes_mirrored_scratch_directories() {
+        // mkscratch's mirror style, which Windows uses, nests a redirection's backing under
+        // `edenfs/redirections` instead of flattening its name.
+        let temp_dir = tempdir().expect("temporary directory should be created");
+        let scratch = temp_dir.path().join("scratch");
+        let target = scratch.join("edenfs").join("redirections").join("buck-out");
+        std::fs::create_dir_all(&target).expect("backing directory should be created");
+        std::fs::write(scratch.join(SCRATCH_README), "mkscratch")
+            .expect("README should be created");
+        let action = scratch_cleanup_action(&scratch, target.clone())
+            .expect("scratch target should be safe")
+            .expect("scratch target should exist");
+
+        action.execute().expect("scratch cleanup should succeed");
+
+        assert!(!target.exists(), "the backing target should be deleted");
+        assert!(
+            !scratch.exists(),
+            "the empty mirrored directories and the scratch root should be deleted"
+        );
+    }
+
+    #[test]
+    fn scratch_cleanup_keeps_mirrored_directories_in_use() {
+        let temp_dir = tempdir().expect("temporary directory should be created");
+        let scratch = temp_dir.path().join("scratch");
+        let redirections = scratch.join("edenfs").join("redirections");
+        let target = redirections.join("buck-out");
+        let other = redirections.join("other");
+        std::fs::create_dir_all(&target).expect("backing directory should be created");
+        std::fs::create_dir(&other).expect("another backing directory should be created");
+        std::fs::write(scratch.join(SCRATCH_README), "mkscratch")
+            .expect("README should be created");
+        let action = scratch_cleanup_action(&scratch, target.clone())
+            .expect("scratch target should be safe")
+            .expect("scratch target should exist");
+
+        action.execute().expect("scratch cleanup should succeed");
+
+        assert!(!target.exists(), "the backing target should be deleted");
+        assert!(other.is_dir(), "another redirection's backing should stay");
+        assert!(
+            scratch.join(SCRATCH_README).exists(),
+            "the scratch root stays while another target is in it"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn scratch_contents_cleanup_keeps_target_and_does_not_follow_symlinks() {
@@ -3431,6 +3831,49 @@ mod tests {
             std::fs::read_to_string(outside.join("artifact"))
                 .expect("data behind a symlink must survive"),
             "keep"
+        );
+    }
+
+    #[test]
+    fn scratch_cleanup_deletes_read_only_files() {
+        let temp_dir = tempdir().expect("temporary directory should be created");
+        let target = temp_dir.path().join("target");
+        let contents = temp_dir.path().join("contents");
+        for backing in [&target, &contents] {
+            std::fs::create_dir_all(backing.join("nested"))
+                .expect("backing tree should be created");
+            for file in [backing.join("artifact"), backing.join("nested/artifact")] {
+                std::fs::write(&file, "data").expect("backing file should be created");
+                let mut permissions = std::fs::metadata(&file)
+                    .expect("backing file metadata should be readable")
+                    .permissions();
+                permissions.set_readonly(true);
+                std::fs::set_permissions(&file, permissions)
+                    .expect("backing file should become read-only");
+            }
+        }
+
+        scratch_cleanup_action(temp_dir.path(), target.clone())
+            .expect("scratch target should be safe")
+            .expect("scratch target should exist")
+            .execute()
+            .expect("scratch cleanup should delete read-only files");
+        scratch_cleanup_action(temp_dir.path(), contents.clone())
+            .expect("scratch target should be safe")
+            .expect("scratch target should exist")
+            .execute_contents()
+            .expect("contents cleanup should delete read-only files");
+
+        assert!(
+            !target.exists(),
+            "resolved backing target should be deleted"
+        );
+        assert_eq!(
+            std::fs::read_dir(&contents)
+                .expect("target should be readable")
+                .count(),
+            0,
+            "every entry in the target should be deleted"
         );
     }
 

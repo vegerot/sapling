@@ -21,17 +21,15 @@ use cloned::cloned;
 use context::CoreContext;
 use derived_data::prefetch_content_metadata;
 use derived_data_manager::DerivationContext;
+use derived_data_manager::ManifestDerivation;
 use digest::Digest;
-use futures::future::FutureExt;
 use futures::stream::FuturesOrdered;
 use futures::stream::FuturesUnordered;
 use futures::stream::TryStreamExt;
 use manifest::Entry;
 use manifest::LeafInfo;
 use manifest::ManifestChanges;
-use manifest::ManifestParentReplacement;
 use manifest::TreeInfo;
-use manifest::derive_manifest_with_known_entries;
 use manifest::derive_manifests_for_simple_stack_of_commits;
 use manifest::flatten_subentries;
 use mononoke_types::BlobstoreKey;
@@ -119,28 +117,18 @@ pub(crate) async fn derive_fsnodes_stack(
     Ok(res.into_iter().collect())
 }
 
-/// Derives the raw fsnode entry for bonsai_changeset `cs_id` given parent
-/// fsnodes. Returns the entry produced by `derive_manifest_with_known_entries`
-/// directly, without handling the None/tree extraction.
+/// Derive an entry from parent entries and completed child stages.
 pub(crate) async fn derive_fsnode_entry(
     ctx: &CoreContext,
     derivation_ctx: &DerivationContext,
-    parents: Vec<Entry<FsnodeId, FsnodeFile>>,
+    input: ManifestDerivation<FsnodeId, FsnodeFile>,
     changes: Vec<(NonRootMPath, Option<(ContentId, FileType)>)>,
-    subtree_changes: Vec<ManifestParentReplacement<FsnodeId, FsnodeFile>>,
-    known_entries: HashMap<MPath, Option<Entry<FsnodeId, FsnodeFile>>>,
-    prefix: MPath,
 ) -> Result<Option<Entry<FsnodeId, FsnodeFile>>> {
     let blobstore = derivation_ctx.blobstore();
     let restricted_paths = derivation_ctx.restricted_paths();
     let content_ids = changes
         .iter()
-        .filter(|(mpath, _)| {
-            prefix.is_prefix_of(mpath)
-                && !known_entries
-                    .keys()
-                    .any(|known_path| known_path.is_prefix_of(mpath))
-        })
+        .filter(|(mpath, _)| input.contains_change(mpath))
         .filter_map(|(_, content_id_and_file_type)| {
             content_id_and_file_type.map(|(content_id, _file_type)| content_id)
         })
@@ -149,30 +137,26 @@ pub(crate) async fn derive_fsnode_entry(
     let prefetched_content_metadata =
         Arc::new(prefetch_content_metadata(ctx, &blobstore, content_ids).await?);
 
-    // We must box and store the derivation future, otherwise lifetime
-    // analysis is unable to see that the blobstore lasts long enough.
-    let derive_fut = derive_manifest_with_known_entries(
-        ctx.clone(),
-        blobstore.clone(),
-        parents,
-        changes,
-        subtree_changes,
-        known_entries,
-        prefix,
-        {
-            cloned!(blobstore, ctx, restricted_paths);
-            move |tree_info| {
+    input
+        .derive(
+            ctx.clone(),
+            blobstore.clone(),
+            changes,
+            {
                 cloned!(blobstore, ctx, restricted_paths);
-                async move { create_fsnode(&ctx, &blobstore, &restricted_paths, tree_info).await }
-            }
-        },
-        move |leaf_info| {
-            cloned!(prefetched_content_metadata);
-            async move { check_fsnode_leaf(prefetched_content_metadata, leaf_info).await }
-        },
-    )
-    .boxed();
-    derive_fut.await
+                move |tree_info| {
+                    cloned!(blobstore, ctx, restricted_paths);
+                    async move {
+                        create_fsnode(&ctx, &blobstore, &restricted_paths, tree_info).await
+                    }
+                }
+            },
+            move |leaf_info| {
+                cloned!(prefetched_content_metadata);
+                async move { check_fsnode_leaf(prefetched_content_metadata, leaf_info).await }
+            },
+        )
+        .await
 }
 
 /// Derives fsnodes for bonsai_changeset `cs_id` given parent fsnodes. Note
@@ -185,7 +169,6 @@ pub(crate) async fn derive_fsnode(
     derivation_ctx: &DerivationContext,
     parents: Vec<FsnodeId>,
     changes: Vec<(NonRootMPath, Option<(ContentId, FileType)>)>,
-    subtree_changes: Vec<ManifestParentReplacement<FsnodeId, FsnodeFile>>,
 ) -> Result<FsnodeId> {
     let blobstore = derivation_ctx.blobstore();
     let restricted_paths = derivation_ctx.restricted_paths();
@@ -194,11 +177,12 @@ pub(crate) async fn derive_fsnode(
     let maybe_entry = derive_fsnode_entry(
         ctx,
         derivation_ctx,
-        parent_entries,
+        ManifestDerivation {
+            parents: parent_entries,
+            known_entries: HashMap::new(),
+            path: MPath::ROOT,
+        },
         changes,
-        subtree_changes,
-        HashMap::new(),
-        MPath::ROOT,
     )
     .await?;
 
@@ -555,13 +539,7 @@ mod test {
                 .await
                 .unwrap();
 
-            let f = derive_fsnode(
-                &ctx,
-                &derivation_ctx,
-                vec![],
-                get_file_changes(&bcs),
-                Vec::new(),
-            );
+            let f = derive_fsnode(&ctx, &derivation_ctx, vec![], get_file_changes(&bcs));
 
             let root_fsnode_id = f.await.unwrap();
 
@@ -617,7 +595,6 @@ mod test {
                 &derivation_ctx,
                 vec![parent_fsnode_id.clone()],
                 get_file_changes(&bcs),
-                Vec::new(),
             );
 
             let root_fsnode_id = f.await.unwrap();
@@ -677,13 +654,7 @@ mod test {
             let (_bcs_id, bcs) = bonsai_changeset_from_hg(&ctx, &repo, parent_hg_cs)
                 .await
                 .unwrap();
-            let f = derive_fsnode(
-                &ctx,
-                &derivation_ctx,
-                vec![],
-                get_file_changes(&bcs),
-                Vec::new(),
-            );
+            let f = derive_fsnode(&ctx, &derivation_ctx, vec![], get_file_changes(&bcs));
             f.await.unwrap()
         };
 
@@ -697,7 +668,6 @@ mod test {
                 &derivation_ctx,
                 vec![parent_fsnode_id.clone()],
                 get_file_changes(&bcs),
-                Vec::new(),
             );
             f.await.unwrap()
         };
@@ -713,7 +683,6 @@ mod test {
                 &derivation_ctx,
                 vec![parent_fsnode_id.clone()],
                 get_file_changes(&bcs),
-                Vec::new(),
             );
 
             let root_fsnode_id = f.await.unwrap();
@@ -900,7 +869,6 @@ mod test {
                 &derivation_ctx,
                 vec![parent_fsnode_id.clone()],
                 get_file_changes(&bcs),
-                Vec::new(),
             );
 
             let root_fsnode_id = f.await.unwrap();
@@ -965,15 +933,9 @@ mod test {
             let (_bcs_id, bcs) = bonsai_changeset_from_hg(&ctx, &repo, parent_hg_cs)
                 .await
                 .unwrap();
-            derive_fsnode(
-                &ctx,
-                &derivation_ctx,
-                vec![],
-                get_file_changes(&bcs),
-                Vec::new(),
-            )
-            .await
-            .unwrap()
+            derive_fsnode(&ctx, &derivation_ctx, vec![], get_file_changes(&bcs))
+                .await
+                .unwrap()
         };
 
         // Commit B adds: "2", "dir1/file_1_in_dir1", "dir1/file_2_in_dir1",
@@ -990,7 +952,6 @@ mod test {
             &derivation_ctx,
             vec![parent_fsnode_id],
             changes.clone(),
-            Vec::new(),
         )
         .await
         .unwrap();
@@ -1007,11 +968,12 @@ mod test {
         let dir1_entry = derive_fsnode_entry(
             &ctx,
             &derivation_ctx,
-            dir1_parents,
+            ManifestDerivation {
+                parents: dir1_parents,
+                known_entries: HashMap::new(),
+                path: MPath::new("dir1").unwrap(),
+            },
             changes.clone(),
-            Default::default(),
-            HashMap::new(),
-            MPath::new("dir1").unwrap(),
         )
         .await
         .unwrap()
@@ -1029,11 +991,12 @@ mod test {
         let dir2_entry = derive_fsnode_entry(
             &ctx,
             &derivation_ctx,
-            dir2_parents,
+            ManifestDerivation {
+                parents: dir2_parents,
+                known_entries: HashMap::new(),
+                path: MPath::new("dir2").unwrap(),
+            },
             changes.clone(),
-            Default::default(),
-            HashMap::new(),
-            MPath::new("dir2").unwrap(),
         )
         .await
         .unwrap()
@@ -1047,11 +1010,12 @@ mod test {
         let root_entry = derive_fsnode_entry(
             &ctx,
             &derivation_ctx,
-            vec![Entry::Tree(parent_fsnode_id)],
+            ManifestDerivation {
+                parents: vec![Entry::Tree(parent_fsnode_id)],
+                known_entries,
+                path: MPath::ROOT,
+            },
             changes,
-            Default::default(),
-            known_entries,
-            MPath::ROOT,
         )
         .await
         .unwrap()
@@ -1079,15 +1043,9 @@ mod test {
             let (_bcs_id, bcs) = bonsai_changeset_from_hg(&ctx, &repo, hg_cs_a)
                 .await
                 .unwrap();
-            derive_fsnode(
-                &ctx,
-                &derivation_ctx,
-                vec![],
-                get_file_changes(&bcs),
-                Vec::new(),
-            )
-            .await
-            .unwrap()
+            derive_fsnode(&ctx, &derivation_ctx, vec![], get_file_changes(&bcs))
+                .await
+                .unwrap()
         };
         let parent_fsnode_id = {
             let hg_cs_b = "2f866e7e549760934e31bf0420a873f65100ad63";
@@ -1099,7 +1057,6 @@ mod test {
                 &derivation_ctx,
                 vec![parent_fsnode_id],
                 get_file_changes(&bcs),
-                Vec::new(),
             )
             .await
             .unwrap()
@@ -1119,7 +1076,6 @@ mod test {
             &derivation_ctx,
             vec![parent_fsnode_id],
             changes.clone(),
-            Vec::new(),
         )
         .await
         .unwrap();
@@ -1140,11 +1096,12 @@ mod test {
         let subdir1_entry = derive_fsnode_entry(
             &ctx,
             &derivation_ctx,
-            subdir1_parents,
+            ManifestDerivation {
+                parents: subdir1_parents,
+                known_entries: HashMap::new(),
+                path: MPath::new("dir1/subdir1").unwrap(),
+            },
             changes.clone(),
-            Default::default(),
-            HashMap::new(),
-            MPath::new("dir1/subdir1").unwrap(),
         )
         .await
         .unwrap()
@@ -1164,11 +1121,12 @@ mod test {
         let dir1_entry = derive_fsnode_entry(
             &ctx,
             &derivation_ctx,
-            dir1_parents,
+            ManifestDerivation {
+                parents: dir1_parents,
+                known_entries: dir1_known_entries,
+                path: MPath::new("dir1").unwrap(),
+            },
             changes.clone(),
-            Default::default(),
-            dir1_known_entries,
-            MPath::new("dir1").unwrap(),
         )
         .await
         .unwrap()
@@ -1180,191 +1138,12 @@ mod test {
         let root_entry = derive_fsnode_entry(
             &ctx,
             &derivation_ctx,
-            vec![Entry::Tree(parent_fsnode_id)],
+            ManifestDerivation {
+                parents: vec![Entry::Tree(parent_fsnode_id)],
+                known_entries: root_known_entries,
+                path: MPath::ROOT,
+            },
             changes,
-            Default::default(),
-            root_known_entries,
-            MPath::ROOT,
-        )
-        .await
-        .unwrap()
-        .expect("root stage should produce an entry");
-
-        let pipeline_id = root_entry.into_tree().expect("root entry should be a tree");
-
-        // Content-addressed: if FsnodeIds match, the trees are identical.
-        assert_eq!(pipeline_id, expected_id);
-    }
-
-    /// Derivation pipeline with subtree copy: construct a ManifestParentReplacement
-    /// that replaces dir2 with dir1's content, then verify that both normal
-    /// derivation (with subtree_changes) and pipeline derivation (with prefix +
-    /// known_entries + subtree_changes) produce the same result.
-    #[mononoke::fbinit_test]
-    async fn test_derivation_pipeline_with_subtree_copy(fb: FacebookInit) {
-        let repo: TestRepo = ManyFilesDirs::get_repo(fb).await;
-        let derivation_ctx = repo.repo_derived_data().manager().derivation_context(None);
-        let ctx = CoreContext::test_mock(fb);
-        let blobstore = repo.repo_blobstore().clone();
-
-        // Derive parent fsnodes for commits A and B (same as nested_directories_test).
-        let parent_fsnode_id = {
-            let hg_cs_a = "5a28e25f924a5d209b82ce0713d8d83e68982bc8";
-            let (_bcs_id, bcs) = bonsai_changeset_from_hg(&ctx, &repo, hg_cs_a)
-                .await
-                .unwrap();
-            derive_fsnode(
-                &ctx,
-                &derivation_ctx,
-                vec![],
-                get_file_changes(&bcs),
-                Vec::new(),
-            )
-            .await
-            .unwrap()
-        };
-        let parent_fsnode_id = {
-            let hg_cs_b = "2f866e7e549760934e31bf0420a873f65100ad63";
-            let (_bcs_id, bcs) = bonsai_changeset_from_hg(&ctx, &repo, hg_cs_b)
-                .await
-                .unwrap();
-            derive_fsnode(
-                &ctx,
-                &derivation_ctx,
-                vec![parent_fsnode_id],
-                get_file_changes(&bcs),
-                Vec::new(),
-            )
-            .await
-            .unwrap()
-        };
-
-        // Look up the dir1 entry from the parent fsnode — this is the source
-        // of our subtree copy.
-        let dir1_entry = parent_fsnode_id
-            .find_entry(ctx.clone(), blobstore.clone(), MPath::new("dir1").unwrap())
-            .await
-            .unwrap()
-            .expect("dir1 should exist in parent");
-
-        // Build a ManifestParentReplacement that replaces dir2 with dir1's tree.
-        let subtree_changes = vec![ManifestParentReplacement {
-            path: MPath::new("dir2").unwrap(),
-            replacements: vec![dir1_entry.clone()],
-        }];
-
-        // Get a valid (ContentId, FileType) from an existing file in the repo
-        // to use for the new file we'll add.
-        let dir1_file = parent_fsnode_id
-            .find_entry(
-                ctx.clone(),
-                blobstore.clone(),
-                MPath::new("dir1/file_1_in_dir1").unwrap(),
-            )
-            .await
-            .unwrap()
-            .expect("file should exist")
-            .into_leaf()
-            .expect("should be a leaf");
-
-        // Changes applied on top of the subtree replacement:
-        // - delete dir2/file_1_in_dir1 (exists in dir1, proving deletions work on replaced subtree)
-        // - add dir2/new_file (proving additions work on replaced subtree)
-        let changes: Vec<(NonRootMPath, Option<(ContentId, FileType)>)> = vec![
-            (NonRootMPath::new("dir2/file_1_in_dir1").unwrap(), None),
-            (
-                NonRootMPath::new("dir2/new_file").unwrap(),
-                Some((*dir1_file.content_id(), *dir1_file.file_type())),
-            ),
-        ];
-
-        // --- Normal derivation with subtree_changes ---
-        let expected_id = derive_fsnode(
-            &ctx,
-            &derivation_ctx,
-            vec![parent_fsnode_id],
-            changes.clone(),
-            subtree_changes.clone(),
-        )
-        .await
-        .unwrap();
-
-        // Verify dir2 has the subtree replacement applied with changes on top:
-        // - file_2_in_dir1 exists (from subtree replacement, proves it worked)
-        // - file_1_in_dir1 absent (deleted by file change)
-        // - new_file exists (added by file change)
-        let file_2 = expected_id
-            .find_entry(
-                ctx.clone(),
-                blobstore.clone(),
-                MPath::new("dir2/file_2_in_dir1").unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            file_2.is_some(),
-            "dir2/file_2_in_dir1 should exist from subtree replacement"
-        );
-        let file_1 = expected_id
-            .find_entry(
-                ctx.clone(),
-                blobstore.clone(),
-                MPath::new("dir2/file_1_in_dir1").unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            file_1.is_none(),
-            "dir2/file_1_in_dir1 should be deleted by file change"
-        );
-        let new_file = expected_id
-            .find_entry(
-                ctx.clone(),
-                blobstore.clone(),
-                MPath::new("dir2/new_file").unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            new_file.is_some(),
-            "dir2/new_file should exist from file change"
-        );
-
-        // --- Pipeline derivation: derive dir2 stage with prefix, then root ---
-
-        // Stage dir2: derive with the subtree_changes and prefix "dir2".
-        let dir2_parent = parent_fsnode_id
-            .find_entry(ctx.clone(), blobstore.clone(), MPath::new("dir2").unwrap())
-            .await
-            .unwrap();
-        let dir2_parents = match dir2_parent {
-            Some(entry) => vec![entry],
-            None => vec![],
-        };
-        let dir2_entry = derive_fsnode_entry(
-            &ctx,
-            &derivation_ctx,
-            dir2_parents,
-            changes.clone(),
-            subtree_changes.clone(),
-            HashMap::new(),
-            MPath::new("dir2").unwrap(),
-        )
-        .await
-        .unwrap()
-        .expect("dir2 stage should produce an entry");
-
-        // Stage root: assemble with known_entries for dir2.
-        let root_known_entries: HashMap<MPath, Option<Entry<FsnodeId, FsnodeFile>>> =
-            HashMap::from([(MPath::new("dir2").unwrap(), Some(dir2_entry))]);
-        let root_entry = derive_fsnode_entry(
-            &ctx,
-            &derivation_ctx,
-            vec![Entry::Tree(parent_fsnode_id)],
-            changes,
-            subtree_changes,
-            root_known_entries,
-            MPath::ROOT,
         )
         .await
         .unwrap()

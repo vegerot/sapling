@@ -6,6 +6,7 @@
  */
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use anyhow::anyhow;
@@ -30,6 +31,8 @@ use mononoke_api::MononokeError;
 use mononoke_api::StoreRequest;
 use mononoke_api::SubmoduleExpansionUpdate;
 use mononoke_api::SubmoduleExpansionUpdateCommitInfo;
+use mononoke_api::repo::Stack;
+use mononoke_types::ChangesetId;
 use mononoke_types::DateTime as MononokeDateTime;
 use mononoke_types::NonRootMPath;
 use mononoke_types::hash::GitSha1;
@@ -55,6 +58,7 @@ const CONCURRENCY_LIMIT: usize = 100;
 mod create_commit;
 mod land_stack;
 mod rebase_stack;
+mod resolve_p4_file_revision;
 
 impl SourceControlServiceImpl {
     /// Detailed repo info.
@@ -80,6 +84,7 @@ impl SourceControlServiceImpl {
             CommitIdentityScheme::HG => thrift::CommitIdentityScheme::HG,
             CommitIdentityScheme::GIT => thrift::CommitIdentityScheme::GIT,
             CommitIdentityScheme::BONSAI => thrift::CommitIdentityScheme::BONSAI,
+            CommitIdentityScheme::P4 => thrift::CommitIdentityScheme::P4_CHANGELIST,
             CommitIdentityScheme::UNKNOWN => thrift::CommitIdentityScheme::UNKNOWN,
         };
         // Repo might not be found due to deep sharding. However all push_redirected repos are shallow sharded, so this should be safe because
@@ -380,7 +385,11 @@ impl SourceControlServiceImpl {
         .collect::<Vec<_>>();
 
         // get stack
-        let stack = repo.stack(heads_ids, limit).await?;
+        let stack = repo.stack(heads_ids.clone(), limit).await?;
+
+        if stack_limit_too_low(&stack, &heads_ids) {
+            Err(scs_errors::limit_too_low(limit))?;
+        }
 
         // The ids in `stack` were just produced by walking the commit graph in
         // `repo.stack`, so they are guaranteed to exist. Skip the redundant
@@ -400,10 +409,6 @@ impl SourceControlServiceImpl {
             .into_iter()
             .map(|cs_id| repo.changeset_from_existing_id(cs_id))
             .collect();
-
-        if draft_commits.len() <= params.heads.len() && !leftover_heads.is_empty() {
-            Err(scs_errors::limit_too_low(limit))?;
-        }
 
         // generate response
         let schemes = &params.identity_schemes;
@@ -698,5 +703,74 @@ impl SourceControlServiceImpl {
             ids: commit_ids,
             ..Default::default()
         })
+    }
+}
+
+fn stack_limit_too_low(stack: &Stack, heads: &[ChangesetId]) -> bool {
+    let public: HashSet<&ChangesetId> = stack.public.iter().collect();
+    let draft_heads = heads.iter().filter(|cs_id| !public.contains(cs_id)).count();
+    stack.draft.len() <= draft_heads && !stack.leftover_heads.is_empty()
+}
+
+#[cfg(test)]
+mod stack_info_tests {
+    use std::sync::Arc;
+
+    use anyhow::Result;
+    use context::CoreContext;
+    use fbinit::FacebookInit;
+    use mononoke_api::Repo;
+    use mononoke_api::RepoContext;
+    use mononoke_macros::mononoke;
+    use phases::PhasesRef;
+    use tests_utils::drawdag::extend_from_dag_with_actions;
+
+    use super::*;
+
+    /// `repo_stack_info` must only report `limit_too_low` when the stack made no progress, i.e.
+    /// when no draft commit beyond the draft heads it started from fits into the limit. Public
+    /// heads (and heads that do not exist, which are skipped before the stack is built) are not
+    /// draft heads and must not be counted.
+    #[mononoke::fbinit_test]
+    async fn test_repo_stack_info_public_head_counts_toward_limit_too_low(
+        fb: FacebookInit,
+    ) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
+        let (commits, _) = extend_from_dag_with_actions(
+            &ctx,
+            &repo,
+            r##"
+                P-A-B-C
+            "##,
+        )
+        .await?;
+        repo.phases()
+            .add_reachable_as_public(&ctx, vec![commits["P"]])
+            .await?;
+        let repo_ctx = RepoContext::new_test(ctx.clone(), Arc::new(repo)).await?;
+
+        // heads = [C (draft), P (public)], limit = 2: C and its parent B are returned and the
+        // client can continue from B.
+        let heads = vec![commits["C"], commits["P"]];
+        let stack = repo_ctx.stack(heads.clone(), 2).await?;
+        assert_eq!(stack.draft, vec![commits["C"], commits["B"]]);
+        assert_eq!(stack.public, vec![commits["P"]]);
+        assert_eq!(stack.leftover_heads, vec![commits["B"]]);
+        assert!(!stack_limit_too_low(&stack, &heads));
+
+        // heads = [C, <missing>] resolve to [C] (missing changesets are skipped) before the
+        // stack is built and the limit is checked.
+        let stack = repo_ctx.stack(vec![commits["C"]], 2).await?;
+        assert_eq!(stack.draft, vec![commits["C"], commits["B"]]);
+        assert_eq!(stack.leftover_heads, vec![commits["B"]]);
+        assert!(!stack_limit_too_low(&stack, &[commits["C"]]));
+
+        // Control: with limit = 1 only the head C itself fits, so the limit really is too low.
+        let stack = repo_ctx.stack(heads.clone(), 1).await?;
+        assert_eq!(stack.draft, vec![commits["C"]]);
+        assert_eq!(stack.leftover_heads, vec![commits["C"]]);
+        assert!(stack_limit_too_low(&stack, &heads));
+        Ok(())
     }
 }

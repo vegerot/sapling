@@ -22,13 +22,11 @@ namespace facebook::eden {
 
 class EdenFsEventsLogger;
 class ErrorLogger;
-class FsEventLogger;
 class Notifier;
 class NfsDispatcher;
 class ProcessInfoCache;
 class PrivHelper;
 class ReloadableConfig;
-class Rpcbindd;
 class Nfsd3;
 class FaultInjector;
 
@@ -49,7 +47,6 @@ class NfsServer {
       PrivHelper* privHelper,
       folly::EventBase* evb,
       std::shared_ptr<folly::Executor> threadPool,
-      bool shouldRunOurOwnRpcbindServer,
       const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       size_t maximumInFlightRequests,
       std::chrono::nanoseconds highNfsRequestsLogInterval,
@@ -57,10 +54,8 @@ class NfsServer {
 
   /**
    * Bind the NfsServer to the passed in socket.
-   *
-   * See Mountd::initialize for the meaning of registerMountdWithRpcbind.
    */
-  void initialize(folly::SocketAddress addr, bool registerMountdWithRpcbind);
+  void initialize(folly::SocketAddress addr);
   void initialize(folly::File socket);
   void resumeMountdAccepting();
   folly::SocketAddress getMountdAddr() const;
@@ -88,7 +83,6 @@ class NfsServer {
       std::unique_ptr<NfsDispatcher> dispatcher,
       const folly::Logger* straceLogger,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
-      std::shared_ptr<FsEventLogger> fsEventLogger,
       const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       ErrorLogger& errorLogger,
       folly::Duration requestTimeout,
@@ -100,11 +94,6 @@ class NfsServer {
       bool fastPathRPCs,
       std::shared_ptr<ReloadableConfig> config,
       FaultInjector& faultInjector);
-
-  /**
-   * Registers an RPC service running a certain protocol version on port.
-   */
-  void recordPortNumber(uint32_t protocol, uint32_t version, uint32_t port);
 
   /**
    * Unregister the mount point matching the path.
@@ -149,7 +138,6 @@ class NfsServer {
   PrivHelper* const privHelper_;
   folly::EventBase* evb_;
   std::shared_ptr<folly::Executor> threadPool_;
-  std::shared_ptr<Rpcbindd> rpcbindd_;
   Mountd mountd_;
   size_t maximumInFlightRequests_;
   std::chrono::nanoseconds highNfsRequestsLogInterval_;

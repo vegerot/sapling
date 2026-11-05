@@ -11,7 +11,7 @@
 #include <folly/Range.h>
 #include <folly/Synchronized.h>
 #include <folly/container/EvictingCacheMap.h>
-#include <gtest/gtest_prod.h>
+#include <folly/portability/GTestProd.h>
 #include <algorithm>
 #include <array>
 #include <map>
@@ -96,7 +96,7 @@ class FsFileContentStore : public FileContentStore {
   /**
    * Helper function that creates an overlay file for a new FileInode.
    */
-  std::variant<folly::File, InodeNumber> createOverlayFile(
+  folly::File createOverlayFile(
       InodeNumber inodeNumber,
       folly::ByteRange contents) override;
 
@@ -104,7 +104,7 @@ class FsFileContentStore : public FileContentStore {
    * Helper function to write an overlay file for a FileInode with existing
    * contents.
    */
-  std::variant<folly::File, InodeNumber> createOverlayFile(
+  folly::File createOverlayFile(
       InodeNumber inodeNumber,
       const folly::IOBuf& contents) override;
 
@@ -117,15 +117,13 @@ class FsFileContentStore : public FileContentStore {
    * Helper function that opens an existing overlay file,
    * checks if the file has valid header, and returns the file.
    */
-  std::variant<folly::File, InodeNumber> openFile(
-      InodeNumber inodeNumber,
-      folly::StringPiece headerId) override;
+  folly::File openFile(InodeNumber inodeNumber, folly::StringPiece headerId)
+      override;
 
   /**
    * Open an existing overlay file without verifying the header.
    */
-  std::variant<folly::File, InodeNumber> openFileNoVerify(
-      InodeNumber inodeNumber) override;
+  folly::File openFileNoVerify(InodeNumber inodeNumber) override;
 
   bool hasOverlayFile(InodeNumber inodeNumber) override;
 
@@ -310,7 +308,7 @@ class FsFileContentStore : public FileContentStore {
   static constexpr size_t kMaxDecimalInodeNumberLength = 20;
 
  private:
-  FRIEND_TEST(OverlayFilePathTest, getFilePath);
+  FOLLY_GTEST_FRIEND_TEST(OverlayFilePathTest, getFilePath);
   friend class RawOverlayTest;
   friend class FsInodeCatalog;
 
@@ -462,10 +460,6 @@ class FsInodeCatalog : public InodeCatalog {
     return true;
   }
 
-  std::vector<InodeNumber> getAllParentInodeNumbers() override {
-    return {};
-  }
-
   /**
    * Returns the next inode number to start at when allocating new inodes.
    * If the overlay was not shutdown cleanly by the previous user then
@@ -513,8 +507,6 @@ class FsInodeCatalog : public InodeCatalog {
   void removeOverlayDir(InodeNumber inodeNumber) override;
 
   bool hasOverlayDir(InodeNumber inodeNumber) override;
-
-  void maintenance() override {}
 
   std::optional<fsck::InodeInfo> loadInodeInfo(InodeNumber number) override;
 

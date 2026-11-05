@@ -30,10 +30,10 @@ futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimen
 git_ref_content_mapping = { version = "0.1.0", path = "../../repo_attributes/git_ref_content_mapping" }
 git_symbolic_refs = { version = "0.1.0", path = "../../repo_attributes/git_symbolic_refs" }
 git_types = { version = "0.1.0", path = "../git_types" }
-gix-features = { version = "0.48.1", features = ["parallel"] }
-gix-hash = { version = "0.25.1", features = ["sha1"] }
-gix-object = "0.60.0"
-gix-pack = "0.70.0"
+gix-features = { version = "0.49.1", features = ["parallel"] }
+gix-hash = { version = "0.26.2", features = ["sha1"] }
+gix-object = "0.64.1"
+gix-pack = "0.74.2"
 justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 manifest = { version = "0.1.0", path = "../../manifest" }
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
@@ -49,7 +49,20 @@ rustc-hash = "2.1.3"
 scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }
 sha1 = "0.10.7"
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tokio-stream = { version = "0.1.19", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.20", features = ["full"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 weight_observer = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+
+[dev-dependencies]
+derived_data_manager = { version = "0.1.0", path = "../../derived_data/manager" }
+facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
+fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+mononoke_types-mocks = { version = "0.1.0", path = "../../mononoke_types/mocks" }
+sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
+test_repo_factory = { version = "0.1.0", path = "../../repo_factory/test_repo_factory" }
+
+[lints]
+workspace = true

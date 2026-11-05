@@ -45,6 +45,7 @@ use facet::facet;
 #[cfg(fbcode_build)]
 use futures_stats::futures03::TimedFutureExt;
 use metaconfig_types::CommitCloudConfig;
+#[cfg(fbcode_build)]
 use mononoke_macros::mononoke;
 use mononoke_types::DateTime;
 use mononoke_types::Timestamp;
@@ -71,6 +72,30 @@ use crate::sql::ops::Get;
 use crate::sql::ops::Insert;
 use crate::sql::ops::SqlCommitCloud;
 use crate::sql::ops::Update;
+
+/// Checks that a request based on `base_version` refers to a version the
+/// workspace has had, given that its latest version is `latest_version`.
+fn check_base_version(
+    cc_ctx: &CommitCloudContext,
+    base_version: u64,
+    latest_version: u64,
+) -> Result<(), CommitCloudUserError> {
+    if base_version <= latest_version {
+        return Ok(());
+    }
+    if latest_version == 0 {
+        return Err(CommitCloudUserError::WorkspaceWasRemoved(
+            cc_ctx.workspace.clone(),
+            cc_ctx.reponame.clone(),
+        ));
+    }
+    Err(CommitCloudUserError::InvalidVersions(
+        base_version,
+        latest_version,
+        cc_ctx.workspace.clone(),
+        cc_ctx.reponame.clone(),
+    ))
+}
 
 #[facet]
 pub struct CommitCloud {
@@ -112,7 +137,6 @@ pub enum Phase {
 }
 
 const HISTORY_KEEP_VERSIONS: u64 = 100;
-const HISTORY_KEEP_DAYS: u64 = 30;
 
 impl Display for Phase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -192,23 +216,7 @@ impl CommitCloud {
             version_timestamp = workspace_version.timestamp.timestamp_seconds();
         }
 
-        if base_version > latest_version && latest_version == 0 {
-            return Err(CommitCloudUserError::WorkspaceWasRemoved(
-                cc_ctx.workspace.clone(),
-                cc_ctx.reponame.clone(),
-            )
-            .into());
-        }
-
-        if base_version > latest_version {
-            return Err(CommitCloudUserError::InvalidVersions(
-                base_version,
-                latest_version,
-                cc_ctx.workspace.clone(),
-                cc_ctx.reponame.clone(),
-            )
-            .into());
-        }
+        check_base_version(cc_ctx, base_version, latest_version)?;
 
         if base_version == latest_version {
             return Ok(ReferencesData {
@@ -274,6 +282,9 @@ impl CommitCloud {
             latest_version = workspace_version.version;
             version_timestamp = workspace_version.timestamp.timestamp_seconds();
         }
+
+        check_base_version(cc_ctx, params.version, latest_version)?;
+
         let raw_references_data = fetch_references(&self.ctx, cc_ctx, &self.storage)
             .await
             .map_err(CommitCloudInternalError::Error)?;
@@ -394,7 +405,6 @@ impl CommitCloud {
                 HistoryDeleteArgs {
                     latest_version,
                     keep_version: HISTORY_KEEP_VERSIONS,
-                    keep_days: HISTORY_KEEP_DAYS,
                     delete_limit,
                 },
             )

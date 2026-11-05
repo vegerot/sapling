@@ -5,7 +5,6 @@
  * GNU General Public License version 2.
  */
 
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -19,6 +18,7 @@ use cloned::cloned;
 use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use derived_data_manager::DerivationContext;
+use derived_data_manager::ManifestDerivation;
 use filestore::fetch_concat;
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -28,16 +28,13 @@ use itertools::EitherOrBoth;
 use manifest::Entry;
 use manifest::LeafInfo;
 use manifest::ManifestOps;
-use manifest::ManifestParentReplacement;
 use manifest::PathOrPrefix;
 use manifest::TreeInfo;
 use manifest::TreeInfoSubentries;
 use manifest::derive_manifest;
-use manifest::derive_manifest_with_known_entries;
 use metaconfig_types::RestrictedPathsAclFile;
 use mononoke_types::BlobstoreValue;
 use mononoke_types::BonsaiChangeset;
-use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::FileContents;
 use mononoke_types::MPath;
@@ -89,7 +86,6 @@ pub(crate) async fn derive_single(
     derivation_ctx: &DerivationContext,
     bonsai: BonsaiChangeset,
     parents: Vec<RootAclManifestId>,
-    known: Option<&HashMap<ChangesetId, RootAclManifestId>>,
 ) -> Result<RootAclManifestId> {
     let blobstore = derivation_ctx.blobstore();
     let acl_file_name = derivation_ctx
@@ -111,21 +107,9 @@ pub(crate) async fn derive_single(
     )
     .await?;
 
-    // Get subtree changes (for subtree copies/merges).
-    let subtree_changes =
-        get_acl_manifest_subtree_changes(ctx, derivation_ctx, &bonsai, known).await?;
-
     let derive_changes = prepare_acl_file_changes(ctx, blobstore, changes, &acl_file_name).await?;
 
-    let result = inner_derive(
-        ctx,
-        blobstore,
-        parent_ids,
-        derive_changes,
-        subtree_changes,
-        &acl_file_name,
-    )
-    .await?;
+    let result = inner_derive(ctx, blobstore, parent_ids, derive_changes, &acl_file_name).await?;
 
     match result {
         Some(id) => Ok(RootAclManifestId(id)),
@@ -205,15 +189,7 @@ pub(crate) async fn derive_from_scratch(
             .await?;
 
     // Call derive_manifest with empty parents.
-    let result = inner_derive(
-        ctx,
-        blobstore,
-        vec![],
-        derive_changes,
-        vec![],
-        &acl_file_name,
-    )
-    .await?;
+    let result = inner_derive(ctx, blobstore, vec![], derive_changes, &acl_file_name).await?;
 
     match result {
         Some(id) => Ok(RootAclManifestId(id)),
@@ -278,7 +254,6 @@ async fn inner_derive(
     blobstore: &Arc<dyn KeyedBlobstore>,
     parents: Vec<AclManifestId>,
     changes: Vec<(NonRootMPath, Option<RestrictedPathsAclFile>)>,
-    subtree_changes: Vec<ManifestParentReplacement<AclManifestId, AclManifestRestriction>>,
     acl_file_name: &str,
 ) -> Result<Option<AclManifestId>> {
     let acl_file_bytes: Vec<u8> = acl_file_name.as_bytes().to_vec();
@@ -288,41 +263,30 @@ async fn inner_derive(
         blobstore.clone(),
         parents,
         changes,
-        subtree_changes,
         acl_create_tree_callback(ctx.clone(), blobstore.clone(), acl_file_bytes),
         acl_create_leaf_callback(ctx.clone(), blobstore.clone()),
     )
     .await
 }
 
-/// Derive the raw AclManifest entry for a single bonsai changeset at a given
-/// `stage_path`, reusing already-derived subtree entries via `known_entries`.
-/// Returns the entry produced by `derive_manifest_with_known_entries`
-/// directly, without the None/tree extraction.
 pub(crate) async fn derive_acl_manifest_entry(
     ctx: &CoreContext,
     blobstore: &Arc<dyn KeyedBlobstore>,
-    parents: Vec<Entry<AclManifestId, AclManifestRestriction>>,
+    input: ManifestDerivation<AclManifestId, AclManifestRestriction>,
     changes: Vec<(NonRootMPath, Option<RestrictedPathsAclFile>)>,
-    subtree_changes: Vec<ManifestParentReplacement<AclManifestId, AclManifestRestriction>>,
-    known_entries: HashMap<MPath, Option<Entry<AclManifestId, AclManifestRestriction>>>,
-    stage_path: MPath,
     acl_file_name: &str,
 ) -> Result<Option<Entry<AclManifestId, AclManifestRestriction>>> {
     let acl_file_bytes: Vec<u8> = acl_file_name.as_bytes().to_vec();
 
-    derive_manifest_with_known_entries(
-        ctx.clone(),
-        blobstore.clone(),
-        parents,
-        changes,
-        subtree_changes,
-        known_entries,
-        stage_path,
-        acl_create_tree_callback(ctx.clone(), blobstore.clone(), acl_file_bytes),
-        acl_create_leaf_callback(ctx.clone(), blobstore.clone()),
-    )
-    .await
+    input
+        .derive(
+            ctx.clone(),
+            blobstore.clone(),
+            changes,
+            acl_create_tree_callback(ctx.clone(), blobstore.clone(), acl_file_bytes),
+            acl_create_leaf_callback(ctx.clone(), blobstore.clone()),
+        )
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -487,16 +451,24 @@ pub(crate) async fn get_acl_file_changes(
 
     // Implicit deletes: file additions (non-ACL) that replace directories
     // containing .slacl files in parent manifests. The parent manifests are
-    // rooted at `stage_path`, so prefixes are made relative to it (and only
-    // those under the stage are relevant); resolved leaves are re-prefixed back
-    // to absolute paths.
+    // rooted at `stage_path`; an addition above it replaces the entire stage.
+    // Resolved leaves are re-prefixed back to absolute paths.
     let stage_prefix = stage_path.clone();
     let addition_prefixes: Vec<PathOrPrefix> = bonsai
         .file_changes()
         .filter(|(path, change)| change.is_changed() && path.basename().as_ref() != acl_file_bytes)
         .map(|(path, _)| MPath::from(path.clone()))
-        .filter(|abs_path| stage_prefix.is_prefix_of(abs_path))
-        .map(|abs_path| PathOrPrefix::Prefix(abs_path.remove_prefix_component(stage_prefix.iter())))
+        .filter_map(|abs_path| {
+            if abs_path.is_prefix_of(&stage_prefix) {
+                Some(PathOrPrefix::Prefix(MPath::ROOT))
+            } else if stage_prefix.is_prefix_of(&abs_path) {
+                Some(PathOrPrefix::Prefix(
+                    abs_path.remove_prefix_component(&stage_prefix),
+                ))
+            } else {
+                None
+            }
+        })
         .collect();
 
     let implicit_deletes: Vec<(NonRootMPath, AclFileChange)> =
@@ -543,47 +515,6 @@ pub(crate) async fn get_acl_file_changes(
         .into_iter()
         .chain(implicit_deletes)
         .collect())
-}
-
-/// Collect subtree changes for subtree copies/merges.
-pub(crate) async fn get_acl_manifest_subtree_changes(
-    ctx: &CoreContext,
-    derivation_ctx: &DerivationContext,
-    bonsai: &BonsaiChangeset,
-    known: Option<&HashMap<ChangesetId, RootAclManifestId>>,
-) -> Result<Vec<ManifestParentReplacement<AclManifestId, AclManifestRestriction>>> {
-    let copy_sources: Vec<_> = bonsai
-        .subtree_changes()
-        .iter()
-        .filter_map(|(path, change)| {
-            let (from_cs_id, from_path) = change.copy_source()?;
-            Some((path.clone(), from_cs_id, from_path.clone()))
-        })
-        .collect();
-
-    stream::iter(copy_sources)
-        .then(|(path, from_cs_id, from_path)| {
-            cloned!(ctx);
-            let blobstore = derivation_ctx.blobstore().clone();
-            async move {
-                let root_id = derivation_ctx
-                    .fetch_unknown_dependency::<RootAclManifestId>(&ctx, known, from_cs_id)
-                    .await?
-                    .into_inner_id();
-                // The subtree copy source may not exist in the AclManifest if
-                // the source path has no .slacl files. In that case, use an
-                // empty replacement to clear any existing entries at the
-                // destination path.
-                let replacements = root_id
-                    .find_entry(ctx, blobstore, from_path.clone())
-                    .await?
-                    .into_iter()
-                    .collect();
-                Ok(ManifestParentReplacement { path, replacements })
-            }
-        })
-        .try_collect()
-        .await
 }
 
 // ---------------------------------------------------------------------------

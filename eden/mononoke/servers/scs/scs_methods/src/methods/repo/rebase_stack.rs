@@ -5,13 +5,10 @@
  * GNU General Public License version 2.
  */
 
-use std::collections::BTreeMap;
-
 use borrowed::borrowed;
 use context::CoreContext;
 use futures::try_join;
 use futures_watchdog::WatchdogExt;
-use maplit::btreemap;
 use mononoke_api::ChangesetSpecifier;
 use mononoke_api::MononokeError;
 use mononoke_api::repo::rebase_stack::RebaseStackMergeResolution;
@@ -24,8 +21,10 @@ use service::RepoRebaseStackExn;
 use source_control as thrift;
 use source_control_services::errors::source_control_service as service;
 
+use crate::commit_id::ids_for;
 use crate::commit_id::map_commit_identities;
 use crate::from_request::FromRequest;
+use crate::into_response::IntoResponse;
 use crate::source_control_impl::SourceControlServiceImpl;
 
 pub(crate) enum RebaseStackError {
@@ -67,11 +66,7 @@ impl From<RebaseStackError> for RepoRebaseStackExn {
                     reason: reason_conflicts(&conflicts),
                     conflicts: conflicts
                         .into_iter()
-                        .map(|c| thrift::PushrebaseConflict {
-                            left: c.left.to_string(),
-                            right: c.right.to_string(),
-                            ..Default::default()
-                        })
+                        .map(IntoResponse::into_response)
                         .collect(),
                     ..Default::default()
                 })
@@ -88,23 +83,6 @@ impl LoggableError for RebaseStackError {
                 (Status::RequestError, reason_conflicts(conflicts))
             }
         }
-    }
-}
-
-type IdMap = BTreeMap<ChangesetId, BTreeMap<thrift::CommitIdentityScheme, thrift::CommitId>>;
-
-/// Ids in the requested schemes, or just the bonsai id if the lookup
-/// produced nothing for this commit.
-fn ids_for(
-    map: &IdMap,
-    cs_id: ChangesetId,
-) -> BTreeMap<thrift::CommitIdentityScheme, thrift::CommitId> {
-    match map.get(&cs_id) {
-        Some(ids) => ids.clone(),
-        None => btreemap! {
-            thrift::CommitIdentityScheme::BONSAI =>
-                thrift::CommitId::bonsai(cs_id.as_ref().into()),
-        },
     }
 }
 
@@ -138,18 +116,7 @@ impl SourceControlServiceImpl {
             .await
             .context("failed to resolve onto commit")?
             .ok_or_else(|| scs_errors::commit_not_found(onto.to_string()))?;
-        let merge_resolution = match params.merge_resolution {
-            thrift::RepoRebaseStackMergeResolution::DEFAULT => RebaseStackMergeResolution::Default,
-            thrift::RepoRebaseStackMergeResolution::DISABLED => {
-                RebaseStackMergeResolution::Disabled
-            }
-            other => {
-                return Err(scs_errors::invalid_request(format!(
-                    "unknown merge_resolution {other:?}"
-                ))
-                .into());
-            }
-        };
+        let merge_resolution = RebaseStackMergeResolution::from_request(&params.merge_resolution)?;
 
         let outcome = repo
             .rebase_stack(base.id(), head.id(), onto.id(), merge_resolution)

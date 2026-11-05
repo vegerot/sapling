@@ -20,7 +20,6 @@ use async_trait::async_trait;
 use blobstore::LoadableError;
 use bytes::Bytes;
 use context::CoreContext;
-use derived_data_manager::DerivableType;
 use encoding_rs::Encoding;
 use futures::stream;
 use futures::stream::BoxStream;
@@ -30,6 +29,7 @@ use futures::stream::TryStreamExt;
 use gix_hash::ObjectId;
 use gix_object::bstr::BString;
 use gix_object::tree;
+use import_common::BackfillDerivation;
 use manifest::BonsaiDiffFileChange;
 use manifest::Entry;
 use manifest::Manifest;
@@ -237,10 +237,8 @@ pub fn oid_to_sha1(oid: &gix_hash::oid) -> Result<hash::GitSha1, Error> {
 
 /// Determines which commits to import
 pub struct GitimportTarget {
-    // If both are empty, we'll grab all commits
-    // TODO: The None case is only used by Mononoke - see if we can get the Mononoke team
-    // to let us remove this and just store the ObjectId directly
-    wanted: Option<ObjectId>,
+    // None imports all refs; Some imports only these heads and their missing history.
+    wanted: Option<Vec<ObjectId>>,
     known: HashMap<ObjectId, ChangesetId>,
 }
 
@@ -254,6 +252,18 @@ impl GitimportTarget {
     }
 
     pub fn new(wanted: ObjectId, known: HashMap<ObjectId, ChangesetId>) -> Result<Self, Error> {
+        Self::try_new_with_heads(vec![wanted], known)
+    }
+
+    /// Import the union of these heads' histories, excluding known ancestors.
+    pub fn try_new_with_heads(
+        wanted: Vec<ObjectId>,
+        known: HashMap<ObjectId, ChangesetId>,
+    ) -> Result<Self, Error> {
+        anyhow::ensure!(
+            !wanted.is_empty(),
+            "An import target must contain at least one head"
+        );
         Ok(Self {
             wanted: Some(wanted),
             known,
@@ -266,10 +276,10 @@ impl GitimportTarget {
         &self.known
     }
 
-    /// Returns true if wanted commit is already imported
+    /// Returns true if every wanted commit is already imported.
     pub fn is_already_imported(&self) -> bool {
         if let Some(wanted) = self.wanted.as_ref() {
-            self.known.contains_key(wanted)
+            wanted.iter().all(|commit| self.known.contains_key(commit))
         } else {
             false
         }
@@ -307,7 +317,9 @@ impl GitimportTarget {
     async fn write_filter_list(&self, rev_list: &mut Child) -> Result<(), Error> {
         if let Some(wanted) = self.wanted.as_ref() {
             let mut stdin = rev_list.stdin.take().context("stdin not set up properly")?;
-            stdin.write_all(format!("{wanted}\n").as_bytes()).await?;
+            for commit in wanted {
+                stdin.write_all(format!("{commit}\n").as_bytes()).await?;
+            }
             for commit in self.known.keys() {
                 stdin.write_all(format!("^{commit}\n").as_bytes()).await?;
             }
@@ -384,7 +396,7 @@ impl TagMetadata {
                     None => decode_message(tag.name, &None)?,
                 };
                 let pgp_signature = tag
-                    .pgp_signature
+                    .signature
                     .map(|signature| Bytes::from(signature.to_vec()));
                 let target_is_tag = tag.target_kind == gix_object::Kind::Tag;
                 Result::<_, Error>::Ok(TagMetadata {
@@ -645,27 +657,6 @@ impl ExtractedCommit {
         } else {
             self.diff_root_for_submodules::<false>(ctx, reader)
                 .right_stream()
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum BackfillDerivation {
-    AllConfiguredTypes,
-    OnlySpecificTypes(Vec<DerivableType>),
-    No,
-}
-
-impl BackfillDerivation {
-    pub fn types(&self, configured_types: &HashSet<DerivableType>) -> Vec<DerivableType> {
-        match self {
-            BackfillDerivation::AllConfiguredTypes => configured_types.iter().cloned().collect(),
-            BackfillDerivation::OnlySpecificTypes(derived_data_types) => derived_data_types
-                .iter()
-                .filter(|ty| configured_types.contains(ty))
-                .cloned()
-                .collect(),
-            BackfillDerivation::No => Vec::new(),
         }
     }
 }

@@ -7,11 +7,15 @@
 
 #include "eden/fs/inodes/InodeMap.h"
 
+#include <folly/Portability.h>
 #include <folly/String.h>
 #include <folly/test/TestUtils.h>
 #include <gtest/gtest.h>
+#include <thread>
 
 #include "eden/common/utils/Bug.h"
+#include "eden/common/utils/FaultInjector.h"
+#include "eden/common/utils/RefPtr.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
 #include "eden/fs/inodes/EdenMount.h"
@@ -19,6 +23,7 @@
 #include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/store/ObjectFetchContext.h"
+#include "eden/fs/store/StatsFetchContext.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
 #include "eden/fs/telemetry/test/CapturingXplatLogger.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
@@ -41,10 +46,246 @@ TEST(InodeMap, invalidInodeNumber) {
 
   EdenBugDisabler noCrash;
   auto* inodeMap = testMount.getEdenMount()->getInodeMap();
-  auto future = inodeMap->lookupFileInode(0x12345678_ino);
+  auto future = inodeMap->lookupFileInode(
+      0x12345678_ino, ObjectFetchContext::getNullContext());
   EXPECT_THROW_RE(
       std::move(future).get(), std::runtime_error, "unknown inode number");
 }
+
+TEST(InodeMap, forgetOnUnknownInodeFromUserspaceFsPeer) {
+  // NFS and FSKit peers are userspace processes whose lookup-reference
+  // accounting can race the wire contract in ways a kernel client cannot;
+  // like lookups of unknown inode numbers (throwEstaleIfInodeIsMissing),
+  // their forgets must never abort the daemon.
+  TestMount testMount;
+  testMount.setMountProtocol(MountProtocol::NFS);
+  FakeTreeBuilder builder;
+  builder.setFile("file.txt", "contents\n");
+  testMount.initialize(builder);
+
+  // Tolerated: logged and counted, no abort. The mount keeps working.
+  auto* inodeMap = testMount.getEdenMount()->getInodeMap();
+  inodeMap->decFsRefcount(0x12345678_ino, 1);
+  auto root = testMount.getEdenMount()->getRootInode();
+  EXPECT_NE(nullptr, root.get());
+}
+
+TEST(InodeMap, loadFaultFailsAllPendingLookupsAndAllowsRetry) {
+  FakeTreeBuilder builder;
+  builder.setFile("file.txt", "contents");
+  TestMount mount{builder, true, false};
+  auto inode = mount.getFileInode("file.txt"_relpath);
+  auto number = inode->getNodeId();
+  inode->incFsRefcount();
+  auto* inodeMap = mount.getEdenMount()->getInodeMap();
+  auto& injector = mount.getServerState()->getFaultInjector();
+  const auto key = fmt::format("{}", number);
+  injector.injectError("inodemap-load", key, std::runtime_error("loaded"));
+  EXPECT_EQ(
+      inode,
+      inodeMap->lookupFileInode(number, ObjectFetchContext::getNullContext())
+          .get(0ms));
+  injector.removeFault("inodemap-load", key);
+  inode.reset();
+  mount.getEdenMount()->getRootInode()->unloadChildrenNow();
+  ASSERT_FALSE(inodeMap->lookupLoadedInode(number));
+  injector.injectError("inodemap-load", "0", std::runtime_error("wrong key"));
+  EXPECT_EQ(
+      number,
+      inodeMap->lookupInode(number, ObjectFetchContext::getNullContext())
+          .get(0ms)
+          ->getNodeId());
+  injector.removeFault("inodemap-load", "0");
+  mount.getEdenMount()->getRootInode()->unloadChildrenNow();
+  ASSERT_FALSE(inodeMap->lookupLoadedInode(number));
+  injector.injectBlock("inodemap-load", key, 1);
+  std::optional<std::string> firstError;
+  std::thread request([&] {
+    try {
+      inodeMap->lookupInode(number, ObjectFetchContext::getNullContext())
+          .get(5s);
+    } catch (const std::exception& ex) {
+      firstError = ex.what();
+    }
+  });
+  const auto reached = injector.waitUntilBlocked("inodemap-load", 5s);
+  const auto blocked = injector.getBlockedFaults("inodemap-load");
+  auto second =
+      inodeMap->lookupInode(number, ObjectFetchContext::getNullContext());
+  injector.removeFault("inodemap-load", key);
+  const auto unblocked = injector.unblockWithError(
+      "inodemap-load", key, std::runtime_error("inode load blocked"));
+  request.join();
+  EXPECT_TRUE(reached);
+  EXPECT_EQ(std::vector<std::string>{key}, blocked);
+  EXPECT_EQ(1, unblocked);
+  EXPECT_EQ(std::optional<std::string>{"inode load blocked"}, firstError);
+  EXPECT_THROW_RE(
+      std::move(second).get(5s), std::runtime_error, "inode load blocked");
+  EXPECT_EQ(
+      number,
+      inodeMap->lookupInode(number, ObjectFetchContext::getNullContext())
+          .get(0ms)
+          ->getNodeId());
+}
+
+TEST(InodeMap, rejectsConflictingConcurrentChildLoad) {
+  FakeTreeBuilder builder;
+  TestMount testMount{builder};
+  auto* inodeMap = testMount.getEdenMount()->getInodeMap();
+  auto parent = testMount.getEdenMount()->getRootInode();
+  const InodeNumber child{1234};
+
+  folly::Promise<InodePtr> firstPromise;
+  auto firstFuture = firstPromise.getSemiFuture();
+  EXPECT_EQ(
+      InodeMap::ChildLoadResult::Started,
+      inodeMap->startLoadingChildIfNotLoading(
+          parent.get(), "first"_pc, child, S_IFREG | 0644, firstPromise));
+
+  folly::Promise<InodePtr> conflictingPromise;
+  auto conflictingFuture = conflictingPromise.getSemiFuture();
+  EXPECT_EQ(
+      InodeMap::ChildLoadResult::Conflict,
+      inodeMap->startLoadingChildIfNotLoading(
+          parent.get(),
+          "second"_pc,
+          child,
+          S_IFREG | 0644,
+          conflictingPromise));
+  EXPECT_FALSE(conflictingFuture.isReady());
+
+  inodeMap->inodeLoadFailed(
+      child,
+      folly::make_exception_wrapper<std::runtime_error>("stop test load"));
+  EXPECT_THROW(std::move(firstFuture).get(), std::runtime_error);
+}
+
+TEST(InodeMap, repairsConflictingBindingWithoutJoiningOtherLoad) {
+  if (folly::kIsWindows) {
+    GTEST_SKIP() << "online fsck is only supported by the Legacy Unix overlay";
+  }
+  FakeTreeBuilder builder;
+  builder.setFiles({{"A/f", "f"}, {"B/g", "g"}});
+  TestMount testMount{
+      true, kPathMapDefaultCaseSensitive, nullptr, [](EdenConfig& config) {
+        config.overlayOnlineFsck.setValue(true, ConfigSourceType::CommandLine);
+      }};
+  testMount.initialize(builder);
+  auto* inodeMap = testMount.getEdenMount()->getInodeMap();
+  auto root = testMount.getEdenMount()->getRootInode();
+  auto number = root->getChildInodeNumber("A"_pc);
+  {
+    auto contents = root->getContentsUnchecked().wlock();
+    auto& entry = contents->entries.find("B"_pc)->second;
+    entry = DirEntry{
+        entry.getInitialMode(),
+        number,
+        entry.getObjectId(),
+        entry.aclRootState()};
+  }
+  folly::Promise<InodePtr> firstPromise;
+  auto firstFuture = firstPromise.getSemiFuture();
+  ASSERT_EQ(
+      InodeMap::ChildLoadResult::Started,
+      inodeMap->startLoadingChildIfNotLoading(
+          root.get(), "A"_pc, number, S_IFDIR | 0755, firstPromise));
+
+  auto child = testMount.getTreeInode("B");
+  EXPECT_NE(number, child->getNodeId());
+  EXPECT_EQ(
+      std::vector<PathComponent>{PathComponent{"g"}}, child->getChildNames());
+  EXPECT_FALSE(firstFuture.isReady());
+  inodeMap->inodeLoadFailed(
+      number,
+      folly::make_exception_wrapper<std::runtime_error>("stop first load"));
+  EXPECT_THROW_RE(
+      std::move(firstFuture).get(), std::runtime_error, "stop first load");
+}
+
+TEST(InodeMap, failedConflictRepairRestoresBindingBeforeRetry) {
+  if (folly::kIsWindows) {
+    GTEST_SKIP() << "online fsck is only supported by the Legacy Unix overlay";
+  }
+  FakeTreeBuilder builder;
+  builder.setFiles({{"A", "original"}, {"B", "other"}});
+  TestMount mount{
+      builder,
+      true,
+      true,
+      kPathMapDefaultCaseSensitive,
+      nullptr,
+      [](EdenConfig& config) {
+        config.overlayOnlineFsck.setValue(true, ConfigSourceType::CommandLine);
+      }};
+  auto original = mount.overwriteFile("A", "original");
+  auto root = mount.getEdenMount()->getRootInode();
+  auto overlay = mount.getEdenMount()->getOverlay();
+  const auto number = original->getNodeId();
+  {
+    auto contents = root->getContentsUnchecked().wlock();
+    contents->entries.find("B"_pc)->second = DirEntry{S_IFREG | 0644, number};
+    overlay->saveOverlayDir(root->getNodeId(), contents->entries);
+  }
+  mount.getServerState()->getFaultInjector().injectError(
+      "recoverConflictingBindingSaveOverlay",
+      "B",
+      std::system_error{ENOSPC, std::generic_category(), "parent save failed"},
+      1);
+  EXPECT_THROW_RE(mount.readFile("B"), std::system_error, "parent save failed");
+  EXPECT_EQ(number, root->getChildInodeNumber("B"_pc));
+  EXPECT_EQ(
+      number,
+      overlay->loadOverlayDir(root->getNodeId())
+          .find("B"_pc)
+          ->second.getInodeNumber());
+
+  EXPECT_EQ("", mount.readFile("B"));
+  EXPECT_NE(number, root->getChildInodeNumber("B"_pc));
+  mount.overwriteFile("B", "new contents");
+  original.reset();
+  root.reset();
+  mount.remount();
+  EXPECT_EQ("new contents", mount.readFile("B"));
+  EXPECT_EQ("original", mount.readFile("A"));
+}
+
+#ifndef _WIN32
+TEST(InodeMap, repairedMaterializedSymlinkCanBeRemovedButNotFollowed) {
+  FakeTreeBuilder builder;
+  builder.setFile("B", "other");
+  TestMount mount{
+      builder,
+      true,
+      true,
+      kPathMapDefaultCaseSensitive,
+      nullptr,
+      [](EdenConfig& config) {
+        config.overlayOnlineFsck.setValue(true, ConfigSourceType::CommandLine);
+      }};
+  mount.addSymlink("A", "original-target");
+  auto original = mount.getFileInode("A");
+  auto root = mount.getEdenMount()->getRootInode();
+  const auto number = original->getNodeId();
+  {
+    auto contents = root->getContentsUnchecked().wlock();
+    contents->entries.find("B"_pc)->second = DirEntry{S_IFLNK | 0777, number};
+    mount.getEdenMount()->getOverlay()->saveOverlayDir(
+        root->getNodeId(), contents->entries);
+  }
+  auto repaired = mount.getFileInode("B");
+  EXPECT_NE(number, repaired->getNodeId());
+  EXPECT_THROW_RE(
+      repaired->readlink(ObjectFetchContext::getNullContext()).get(),
+      std::system_error,
+      "empty symlink target");
+  EXPECT_NO_THROW(mount.deleteFile("B"));
+  EXPECT_THROW(root->getChildInodeNumber("B"_pc), std::system_error);
+  EXPECT_EQ(
+      "original-target",
+      original->readlink(ObjectFetchContext::getNullContext()).get());
+}
+#endif
 
 #ifdef __linux__
 TEST(InodeMap, forgetMultipleReferencesFromLoadedInode) {
@@ -59,6 +300,40 @@ TEST(InodeMap, forgetMultipleReferencesFromLoadedInode) {
   EXPECT_EQ(0, file->debugGetFsRefcount());
 }
 #endif
+
+TEST(InodeMap, decFsRefcountOnRememberedInodeWithoutReference) {
+  if (folly::kIsLinux) {
+    GTEST_SKIP() << "FUSE reference counts are exact";
+  }
+  auto builder = FakeTreeBuilder();
+  builder.setFile("src/test.txt", "this is a test file");
+  TestMount testMount{builder, false};
+
+  // Leave the load of "src" pending so the InodeMap remembers the inode
+  // without an FS reference.
+  auto rootInode = testMount.getEdenMount()->getRootInode();
+  auto srcFuture =
+      rootInode->getOrLoadChild("src"_pc, ObjectFetchContext::getNullContext())
+          .semi()
+          .via(testMount.getServerExecutor().get());
+  testMount.drainServerExecutor();
+  ASSERT_FALSE(srcFuture.isReady());
+
+  auto* inodeMap = testMount.getEdenMount()->getInodeMap();
+  const auto srcIno = rootInode->getChildInodeNumber("src"_pc);
+  ASSERT_TRUE(inodeMap->isInodeRemembered(srcIno));
+
+  // A PrjFS invalidation of an entry without an on-disk placeholder reaches
+  // this call while the load is in flight.
+  inodeMap->decFsRefcount(srcIno);
+  EXPECT_TRUE(inodeMap->isInodeRemembered(srcIno));
+
+  builder.setReady("src");
+  testMount.drainServerExecutor();
+  ASSERT_TRUE(srcFuture.isReady());
+  auto srcTree = std::move(srcFuture).get(std::chrono::seconds(1));
+  EXPECT_EQ(srcIno, srcTree->getNodeId());
+}
 
 TEST(InodeMap, simpleLookups) {
   // Test simple lookups that succeed immediately from the LocalStore
@@ -78,9 +353,12 @@ TEST(InodeMap, simpleLookups) {
   auto srcTree = std::move(srcTreeFut).get(0ms);
 
   // Next look up the tree by inode number
-  auto tree2Fut = inodeMap->lookupTreeInode(srcTree->getNodeId())
-                      .semi()
-                      .via(testMount.getServerExecutor().get());
+  auto tree2Fut =
+      inodeMap
+          ->lookupTreeInode(
+              srcTree->getNodeId(), ObjectFetchContext::getNullContext())
+          .semi()
+          .via(testMount.getServerExecutor().get());
   testMount.drainServerExecutor();
   auto tree2 = std::move(tree2Fut).get(0ms);
   EXPECT_EQ(srcTree, tree2);
@@ -96,20 +374,32 @@ TEST(InodeMap, simpleLookups) {
   EXPECT_NE(srcTree->getNodeId(), noop->getNodeId());
 
   // And look up src/noop.c by inode ID
-  auto noop2Fut = inodeMap->lookupFileInode(noop->getNodeId())
-                      .semi()
-                      .via(testMount.getServerExecutor().get());
+  auto noop2Fut =
+      inodeMap
+          ->lookupFileInode(
+              noop->getNodeId(), ObjectFetchContext::getNullContext())
+          .semi()
+          .via(testMount.getServerExecutor().get());
   testMount.drainServerExecutor();
   auto noop2 = std::move(noop2Fut).get(0ms);
   EXPECT_EQ(noop, noop2);
   EXPECT_EQ(RelativePath{"src/noop.c"}, noop2->getPath());
 
-  // lookupTreeInode() and lookupFileInode() should fail
-  // when called on the wrong file type.
+  // lookupTreeInode(, ObjectFetchContext::getNullContext()) and
+  // lookupFileInode(, ObjectFetchContext::getNullContext()) should fail when
+  // called on the wrong file type.
   EXPECT_THROW_ERRNO(
-      inodeMap->lookupFileInode(srcTree->getNodeId()).get(), EISDIR);
+      inodeMap
+          ->lookupFileInode(
+              srcTree->getNodeId(), ObjectFetchContext::getNullContext())
+          .get(),
+      EISDIR);
   EXPECT_THROW_ERRNO(
-      inodeMap->lookupTreeInode(noop->getNodeId()).get(), ENOTDIR);
+      inodeMap
+          ->lookupTreeInode(
+              noop->getNodeId(), ObjectFetchContext::getNullContext())
+          .get(),
+      ENOTDIR);
 }
 
 TEST(InodeMap, asyncLookup) {
@@ -443,10 +733,14 @@ TEST(InodeMap, lookingUpAnUnloadedInodeAddsLoadsToTraceBus) {
   EXPECT_TRUE(isInodeMaterializedInQueue(queue, InodeEventProgress::END, bn));
 
   // Finally, we lookup the inodes by InodeNumber
-  auto secondAFuture = inodeMap->lookupTreeInode(an).semi().via(
-      testMount.getServerExecutor().get());
-  auto secondBFuture = inodeMap->lookupTreeInode(bn).semi().via(
-      testMount.getServerExecutor().get());
+  auto secondAFuture =
+      inodeMap->lookupTreeInode(an, ObjectFetchContext::getNullContext())
+          .semi()
+          .via(testMount.getServerExecutor().get());
+  auto secondBFuture =
+      inodeMap->lookupTreeInode(bn, ObjectFetchContext::getNullContext())
+          .semi()
+          .via(testMount.getServerExecutor().get());
   testMount.drainServerExecutor();
   std::move(secondAFuture).get(0ms);
   std::move(secondBFuture).get(0ms);
@@ -565,6 +859,47 @@ TEST(InodeMap, unloadedUnlinkedFilesAreRemovedFromOverlay) {
   EXPECT_FALSE(overlay->hasOverlayFile(file2ino));
 }
 
+TEST(InodeMap, lookupOfRemovedUnloadedInodeWhoseNameWasReused) {
+  TestMount mount{FakeTreeBuilder{}};
+  auto edenMount = mount.getEdenMount();
+  auto* inodeMap = edenMount->getInodeMap();
+  auto root = edenMount->getRootInode();
+
+  auto file =
+      root->mknod("file"_pc, S_IFREG | 0644, 0, InvalidationRequired::No);
+  const auto oldIno = file->getNodeId();
+  file->incFsRefcount();
+  file.reset();
+  root->unloadChildrenNow();
+  ASSERT_TRUE(inodeMap->isInodeRemembered(oldIno));
+
+  // Recursive removal drops an unloaded child without loading it, and the
+  // InodeMap keeps remembering the inode for the FS reference.
+  root->removeRecursively(
+          "file"_pc,
+          InvalidationRequired::No,
+          ObjectFetchContext::getNullContext())
+      .get(0ms);
+  auto newFile =
+      root->mknod("file"_pc, S_IFREG | 0644, 0, InvalidationRequired::No);
+  ASSERT_NE(oldIno, newFile->getNodeId());
+
+  // Looking the old inode up by number must fail instead of loading the new
+  // file under the old number.
+  auto lookup =
+      inodeMap->lookupInode(oldIno, ObjectFetchContext::getNullContext())
+          .semi()
+          .via(mount.getServerExecutor().get());
+  mount.drainServerExecutor();
+  EXPECT_THROW_ERRNO(std::move(lookup).get(0ms), ENOENT);
+  EXPECT_EQ(newFile->getNodeId(), root->getChildInodeNumber("file"_pc));
+
+  // The old inode stays remembered until its FS reference is released.
+  EXPECT_TRUE(inodeMap->isInodeRemembered(oldIno));
+  inodeMap->decFsRefcount(oldIno);
+  EXPECT_FALSE(inodeMap->isInodeRemembered(oldIno));
+}
+
 TEST(InodeMap, unloadedFileMetadataIsForgotten) {
   FakeTreeBuilder builder;
   builder.setFile("dir1/file.txt", "contents");
@@ -620,6 +955,10 @@ struct InodePersistenceTreeTest : ::testing::Test {
   FakeTreeBuilder builder;
 };
 
+// Inode numbers only survive a remount when the overlay is durable. The
+// Windows overlay is rebuilt from the on-disk PrjFS state, so these tests
+// only apply to Linux and macOS.
+#ifndef _WIN32
 struct InodePersistenceTakeoverTest : InodePersistenceTreeTest {
   InodePersistenceTakeoverTest()
       : testMount{builder}, edenMount{testMount.getEdenMount()} {}
@@ -644,15 +983,7 @@ struct InodePersistenceTakeoverTest : InodePersistenceTreeTest {
     tree.reset();
     file1.reset();
     file2.reset();
-#ifdef _WIN32
-    // Windows doesn't support graceful restart yet. Here these tests help
-    // test the consistency of the overlay. On Windows we are using Sqlite
-    // Overlay which maintains the same inode number for each inode, after
-    // remounts.
-    testMount.remount();
-#else
     testMount.remountGracefully();
-#endif
     edenMount = testMount.getEdenMount();
   }
 
@@ -672,11 +1003,9 @@ TEST_F(
   auto file2 = testMount.getInode("dir/file2.txt"_relpath);
   auto file1 = testMount.getInode("dir/file1.txt"_relpath);
 
-#ifndef _WIN32
   EXPECT_EQ(1, tree->debugGetFsRefcount());
   EXPECT_EQ(1, file1->debugGetFsRefcount());
   EXPECT_EQ(1, file2->debugGetFsRefcount());
-#endif // !1
 
   EXPECT_EQ(oldTreeId, tree->getNodeId());
   EXPECT_EQ(oldFile1Id, file1->getNodeId());
@@ -685,36 +1014,43 @@ TEST_F(
   // Now try looking up by inode number.
   EXPECT_EQ(
       "dir",
-      edenMount->getInodeMap()->lookupInode(oldTreeId).get()->getLogPath());
+      edenMount->getInodeMap()
+          ->lookupInode(oldTreeId, ObjectFetchContext::getNullContext())
+          .get()
+          ->getLogPath());
   EXPECT_EQ(
       "dir/file1.txt",
-      edenMount->getInodeMap()->lookupInode(oldFile1Id).get()->getLogPath());
+      edenMount->getInodeMap()
+          ->lookupInode(oldFile1Id, ObjectFetchContext::getNullContext())
+          .get()
+          ->getLogPath());
   EXPECT_EQ(
       "dir/file2.txt",
-      edenMount->getInodeMap()->lookupInode(oldFile2Id).get()->getLogPath());
+      edenMount->getInodeMap()
+          ->lookupInode(oldFile2Id, ObjectFetchContext::getNullContext())
+          .get()
+          ->getLogPath());
 }
 
-// The following test will not work on Windows, because on Windows we remount
-// instead of remountGracefully and remount doesn't pre-populate the InodeMap.
-// The lookupFirstByName above will work because checking by name will populate
-// the InodeMap for us.
-
-#ifndef _WIN32
 TEST_F(
     InodePersistenceTakeoverTest,
     preservesInodeNumbersForLoadedInodesDuringTakeover_lookupFirstByNumber) {
   // Look up by number first.
   auto oldTreeIdFut =
-      edenMount->getInodeMap()->lookupInode(oldTreeId).semi().via(
-          testMount.getServerExecutor().get());
-  auto oldFile1IdFut = edenMount->getInodeMap()
-                           ->lookupInode(oldFile1Id)
-                           .semi()
-                           .via(testMount.getServerExecutor().get());
-  auto oldFile2IdFut = edenMount->getInodeMap()
-                           ->lookupInode(oldFile2Id)
-                           .semi()
-                           .via(testMount.getServerExecutor().get());
+      edenMount->getInodeMap()
+          ->lookupInode(oldTreeId, ObjectFetchContext::getNullContext())
+          .semi()
+          .via(testMount.getServerExecutor().get());
+  auto oldFile1IdFut =
+      edenMount->getInodeMap()
+          ->lookupInode(oldFile1Id, ObjectFetchContext::getNullContext())
+          .semi()
+          .via(testMount.getServerExecutor().get());
+  auto oldFile2IdFut =
+      edenMount->getInodeMap()
+          ->lookupInode(oldFile2Id, ObjectFetchContext::getNullContext())
+          .semi()
+          .via(testMount.getServerExecutor().get());
   testMount.drainServerExecutor();
 
   EXPECT_EQ("dir", std::move(oldTreeIdFut).get(0ms)->getLogPath());
@@ -726,17 +1062,14 @@ TEST_F(
   auto file2 = testMount.getInode("dir/file2.txt"_relpath);
   auto file1 = testMount.getInode("dir/file1.txt"_relpath);
 
-#ifndef _WIN32
   EXPECT_EQ(1, tree->debugGetFsRefcount());
   EXPECT_EQ(1, file1->debugGetFsRefcount());
   EXPECT_EQ(1, file2->debugGetFsRefcount());
-#endif // !_WIN32
 
   EXPECT_EQ(oldTreeId, tree->getNodeId());
   EXPECT_EQ(oldFile1Id, file1->getNodeId());
   EXPECT_EQ(oldFile2Id, file2->getNodeId());
 }
-#endif
 
 /**
  * clang and gcc use the inode number of a header to determine whether it's the
@@ -772,15 +1105,7 @@ TEST_F(
   tree.reset();
   file1.reset();
   file2.reset();
-#ifdef _WIN32
-  // Windows doesn't support graceful restart yet. Here these tests help
-  // test the consistency of the overlay. On Windows we are using Sqlite
-  // Overlay which maintains the same inode number for each inode, after
-  // remounts.
-  testMount.remount();
-#else
   testMount.remountGracefully();
-#endif
 
   edenMount = testMount.getEdenMount();
 
@@ -794,14 +1119,13 @@ TEST_F(
   EXPECT_EQ(oldFile2Id, file2->getNodeId());
 }
 
-#ifndef _WIN32
-TEST_F(InodePersistenceTreeTest, preservesLastFsRequestTimeDuringTakeover) {
+TEST_F(InodePersistenceTreeTest, preservesLastGcRefTimeDuringTakeover) {
   TestMount testMount{builder};
   auto edenMount = testMount.getEdenMount();
   auto file = testMount.getInode("dir/file1.txt"_relpath);
   file->incFsRefcount();
   const auto inodeNumber = file->getNodeId();
-  const auto expectedLastFsRequestTime = file->getLastFsRequestTime();
+  const auto expectedLastGcRefTime = file->getLastGcRefTime();
 
   testMount.getClock().advance(120s);
   edenMount.reset();
@@ -809,8 +1133,11 @@ TEST_F(InodePersistenceTreeTest, preservesLastFsRequestTimeDuringTakeover) {
   testMount.remountGracefully();
 
   auto reloaded =
-      testMount.getEdenMount()->getInodeMap()->lookupInode(inodeNumber).get();
-  EXPECT_EQ(expectedLastFsRequestTime, reloaded->getLastFsRequestTime());
+      testMount.getEdenMount()
+          ->getInodeMap()
+          ->lookupInode(inodeNumber, ObjectFetchContext::getNullContext())
+          .get();
+  EXPECT_EQ(expectedLastGcRefTime, reloaded->getLastGcRefTime());
 }
 #endif
 
@@ -926,7 +1253,7 @@ TEST(InodeMap, forgottenCountExcludesReloadedInodes) {
   ASSERT_TRUE(inodeMap->isInodeRemembered(ino));
   const auto before = inodeMap->getInodeCounts().forgottenInodeCount;
 
-  file = inodeMap->lookupInode(ino).get();
+  file = inodeMap->lookupInode(ino, ObjectFetchContext::getNullContext()).get();
   EXPECT_EQ(before, inodeMap->getInodeCounts().forgottenInodeCount);
   file.reset();
   mount->getRootInode()->unloadChildrenNow();
@@ -970,4 +1297,61 @@ TEST(InodeMap, inodeLoadFailureLogsError) {
   const auto& strings = xplatLogger.events()[0].event.getStringMap();
   EXPECT_EQ(strings.at("component"), "object_store");
   EXPECT_EQ(strings.at("error_type"), "inode_loading_failed");
+}
+
+TEST(InodeMap, loadingASecondNameForALoadedInodeFails) {
+  FakeTreeBuilder builder;
+  builder.setFile("dir/a.txt", "a\n");
+  TestMount testMount{builder};
+
+  auto dir = testMount.getTreeInode("dir");
+  auto a = testMount.getFileInode("dir/a.txt");
+
+  // The directory state an interrupted rename leaves on disk: a second entry
+  // carries a.txt's inode number.
+  dir->lockContentsWrite()->entries.emplace(
+      "b.txt"_pc, S_IFREG | 0644, a->getNodeId());
+
+  EXPECT_THROW_ERRNO(
+      dir->getOrLoadChild("b.txt"_pc, ObjectFetchContext::getNullContext())
+          .get(0ms),
+      EIO);
+  EXPECT_EQ(
+      a->getNodeId(),
+      dir->getOrLoadChild("a.txt"_pc, ObjectFetchContext::getNullContext())
+          .get(0ms)
+          ->getNodeId());
+}
+
+TEST(InodeMap, lookupByNumberLoadsWithCallerContext) {
+  FakeTreeBuilder builder;
+  builder.setFile("a/b/file.txt", "contents\n");
+  TestMount testMount{builder};
+  auto* inodeMap = testMount.getEdenMount()->getInodeMap();
+
+  // Remember a, b and the file by number, then unload all three.
+  auto a = testMount.getTreeInode("a");
+  auto b = testMount.getTreeInode("a/b");
+  auto file = testMount.getFileInode("a/b/file.txt");
+  const auto fileNumber = file->getNodeId();
+  a->incFsRefcount();
+  b->incFsRefcount();
+  file->incFsRefcount();
+  a.reset();
+  b.reset();
+  file.reset();
+  testMount.getEdenMount()->getRootInode()->unloadChildrenNow();
+  ASSERT_FALSE(inodeMap->lookupLoadedInode(fileNumber));
+
+  // Looking the file up by number loads a and b first, each from its tree;
+  // both loads are fetched with the caller's context.
+  auto context = makeRefPtr<StatsFetchContext>(
+      std::nullopt,
+      ObjectFetchContext::Cause::Thrift,
+      ObjectFetchContext::StaticCauseDetail::fromLiteral("InodeMapTest"),
+      nullptr);
+  EXPECT_EQ(
+      fileNumber,
+      inodeMap->lookupInode(fileNumber, context.copy()).get(0ms)->getNodeId());
+  EXPECT_EQ(2, context->countFetchesOfType(ObjectFetchContext::Tree));
 }

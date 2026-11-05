@@ -6,14 +6,15 @@
  */
 
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Result;
+use anyhow::bail;
 use clap::Args;
-use cloned::cloned;
 use context::CoreContext;
+use ephemeral_blobstore::UnlinkPolicy;
 use futures::StreamExt;
-use futures::TryStreamExt;
-use futures::stream;
+use mononoke_macros::mononoke;
 
 use super::Repo;
 
@@ -65,21 +66,44 @@ pub async fn clean_bubbles(
         );
     }
     if !args.dryrun {
-        stream::iter(expired_bubbles)
-            .map(Ok)
-            .map_ok(|id| {
-                cloned!(ctx, repo);
-                async move {
-                    let count = repo.repo_ephemeral_store.delete_bubble(&ctx, id).await?;
-                    println!(
-                        "Cleaned up bubble {id} and deleted {count} blob keys contained in it"
-                    );
-                    anyhow::Ok(())
-                }
-            })
-            .try_buffer_unordered(args.concurrency)
-            .try_collect::<Vec<_>>()
-            .await?;
+        let total = expired_bubbles.len();
+        let started = Instant::now();
+        let deletions = repo
+            .repo_ephemeral_store
+            .delete_bubbles(
+                ctx,
+                expired_bubbles,
+                args.concurrency,
+                UnlinkPolicy::default(),
+            )
+            .fold(
+                (0, 0, 0),
+                |(finished, already_deleted, failed), (id, result)| async move {
+                    match result {
+                        Ok(outcome) => {
+                            println!(
+                                "Cleaned up bubble {id} and deleted {} blob keys contained in it",
+                                outcome.keys_deleted
+                            );
+                            let already_deleted =
+                                already_deleted + usize::from(outcome.keys_already_deleted > 0);
+                            (finished + 1, already_deleted, failed)
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to clean up bubble {id}: {err:#}");
+                            (finished, already_deleted, failed + 1)
+                        }
+                    }
+                },
+            );
+        let (finished, already_deleted, failed) = mononoke::spawn_task(deletions).await?;
+        println!(
+            "Deleted {finished} of {total} expired bubbles in {:.1?}, {already_deleted} of them had blob keys that were already deleted, {failed} failed",
+            started.elapsed()
+        );
+        if failed > 0 {
+            bail!("Failed to clean up {failed} of {total} expired bubbles");
+        }
     } else {
         println!(
             "Executing cleanup in dry-run mode. The following bubbles were fetched for deletion:"

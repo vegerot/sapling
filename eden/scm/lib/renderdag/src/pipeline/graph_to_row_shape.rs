@@ -11,6 +11,7 @@ use std::ops::Range;
 use crate::column::Column;
 use crate::column::ColumnsExt;
 use crate::pipeline::types::Ancestor;
+use crate::pipeline::types::DashStyle;
 use crate::pipeline::types::GraphRowShape;
 use crate::pipeline::types::GraphRowShapeOptions;
 use crate::pipeline::types::LinkLine;
@@ -134,6 +135,9 @@ where
     pub fn next_row_shape(&mut self, node: N, parents: Vec<Ancestor<N>>) -> GraphRowShape<N> {
         let existing_column = self.columns.find(&node);
         let column = existing_column.unwrap_or_else(|| self.find_column_for_unallocated_node());
+        let is_head = existing_column
+            .is_none_or(|index| matches!(self.columns.get(index), Some(Column::Reserved(_))));
+        let is_root = parents.is_empty();
         self.columns[column] = Column::Empty;
 
         let merge = parents.len() > 1;
@@ -142,12 +146,14 @@ where
         node_line[column] = NodeLine::Node;
 
         let mut link_line: Vec<_> = self.columns.iter().map(column_to_link_line).collect();
+        let mut link_line_from_node: Vec<_> =
+            self.columns.iter().map(|_| LinkLine::default()).collect();
         let mut need_link_line = false;
 
         let mut term_line: Vec<_> = self.columns.iter().map(|_| false).collect();
         let mut need_term_line = false;
 
-        let mut pad_lines: Vec<_> = self.columns.iter().map(column_to_pad_line).collect();
+        let mut ancestry_line: Vec<_> = self.columns.iter().map(column_to_pad_line).collect();
 
         let mut parent_columns = BTreeMap::new();
         for parent in parents.iter() {
@@ -167,8 +173,9 @@ where
 
             parent_columns.insert(self.columns.len(), parent);
             node_line.push(NodeLine::Blank);
-            pad_lines.push(PadLine::Blank);
+            ancestry_line.push(PadLine::Blank);
             link_line.push(LinkLine::default());
+            link_line_from_node.push(LinkLine::default());
             term_line.push(false);
             self.columns.push(ancestor_to_column(parent));
         }
@@ -195,88 +202,149 @@ where
                     }
 
                     let was_direct = link_line[parent_column].contains(LinkLine::VERT_PARENT);
-                    link_line[column] |= if was_direct {
-                        LinkLine::RIGHT_FORK_PARENT
-                    } else {
-                        LinkLine::RIGHT_FORK_ANCESTOR
-                    };
+                    link_both(
+                        &mut link_line,
+                        &mut link_line_from_node,
+                        column,
+                        if was_direct {
+                            LinkLine::RIGHT_FORK_PARENT
+                        } else {
+                            LinkLine::RIGHT_FORK_ANCESTOR
+                        },
+                    );
                     #[allow(clippy::needless_range_loop)]
                     for i in column + 1..parent_column {
-                        link_line[i] |= if was_direct {
-                            LinkLine::HORIZ_PARENT
-                        } else {
-                            LinkLine::HORIZ_ANCESTOR
-                        };
+                        link_both(
+                            &mut link_line,
+                            &mut link_line_from_node,
+                            i,
+                            if was_direct {
+                                LinkLine::HORIZ_PARENT
+                            } else {
+                                LinkLine::HORIZ_ANCESTOR
+                            },
+                        );
                     }
-                    link_line[parent_column] = if was_direct {
+                    let value = if was_direct {
                         LinkLine::LEFT_MERGE_PARENT
                     } else {
                         LinkLine::LEFT_MERGE_ANCESTOR
                     };
+                    link_line[parent_column] = value;
+                    link_line_from_node[parent_column] |= value;
                     need_link_line = true;
-                    pad_lines[parent_column] = PadLine::Blank;
+                    ancestry_line[parent_column] = PadLine::Blank;
                 }
             }
         }
 
         if let Some(bounds) = AncestorColumnBounds::new(&parent_columns, column) {
             for i in bounds.range() {
-                link_line[i] |= bounds.horizontal_line(i);
+                link_both(
+                    &mut link_line,
+                    &mut link_line_from_node,
+                    i,
+                    bounds.horizontal_line(i),
+                );
                 need_link_line = true;
             }
 
             if bounds.max_parent > column {
-                link_line[column] |= LinkLine::RIGHT_MERGE_PARENT;
+                link_both(
+                    &mut link_line,
+                    &mut link_line_from_node,
+                    column,
+                    LinkLine::RIGHT_MERGE_PARENT,
+                );
                 need_link_line = true;
             } else if bounds.max_ancestor > column {
-                link_line[column] |= LinkLine::RIGHT_MERGE_ANCESTOR;
+                link_both(
+                    &mut link_line,
+                    &mut link_line_from_node,
+                    column,
+                    LinkLine::RIGHT_MERGE_ANCESTOR,
+                );
                 need_link_line = true;
             }
 
             if bounds.min_parent < column {
-                link_line[column] |= LinkLine::LEFT_MERGE_PARENT;
+                link_both(
+                    &mut link_line,
+                    &mut link_line_from_node,
+                    column,
+                    LinkLine::LEFT_MERGE_PARENT,
+                );
                 need_link_line = true;
             } else if bounds.min_ancestor < column {
-                link_line[column] |= LinkLine::LEFT_MERGE_ANCESTOR;
+                link_both(
+                    &mut link_line,
+                    &mut link_line_from_node,
+                    column,
+                    LinkLine::LEFT_MERGE_ANCESTOR,
+                );
                 need_link_line = true;
             }
 
             #[allow(clippy::comparison_chain)]
             for (&index, parent) in parent_columns.iter() {
-                pad_lines[index] = column_to_pad_line(&self.columns[index]);
+                ancestry_line[index] = column_to_pad_line(&self.columns[index]);
                 if index < column {
-                    link_line[index] |= ancestor_to_link_line(
-                        parent,
-                        LinkLine::RIGHT_FORK_PARENT,
-                        LinkLine::RIGHT_FORK_ANCESTOR,
+                    link_both(
+                        &mut link_line,
+                        &mut link_line_from_node,
+                        index,
+                        ancestor_to_link_line(
+                            parent,
+                            LinkLine::RIGHT_FORK_PARENT,
+                            LinkLine::RIGHT_FORK_ANCESTOR,
+                        ),
                     );
                 } else if index == column {
-                    link_line[index] |= LinkLine::CHILD
-                        | ancestor_to_link_line(
-                            parent,
-                            LinkLine::VERT_PARENT,
-                            LinkLine::VERT_ANCESTOR,
-                        );
+                    link_both(
+                        &mut link_line,
+                        &mut link_line_from_node,
+                        index,
+                        LinkLine::CHILD
+                            | ancestor_to_link_line(
+                                parent,
+                                LinkLine::VERT_PARENT,
+                                LinkLine::VERT_ANCESTOR,
+                            ),
+                    );
                 } else {
-                    link_line[index] |= ancestor_to_link_line(
-                        parent,
-                        LinkLine::LEFT_FORK_PARENT,
-                        LinkLine::LEFT_FORK_ANCESTOR,
+                    link_both(
+                        &mut link_line,
+                        &mut link_line_from_node,
+                        index,
+                        ancestor_to_link_line(
+                            parent,
+                            LinkLine::LEFT_FORK_PARENT,
+                            LinkLine::LEFT_FORK_ANCESTOR,
+                        ),
                     );
                 }
             }
         }
 
+        if self.options.graph_row_shape_style.dash_style == DashStyle::Once {
+            self.columns.convert_ancestor_to_parent();
+        }
         self.columns.reset();
         self.previous_node_column = Some(column);
 
         GraphRowShape {
             node,
             merge,
+            is_head,
+            is_root,
+            style: self.options.graph_row_shape_style,
+            node_column: column,
+            parent_columns: parent_columns.keys().copied().collect(),
             node_line,
             link_line: Some(link_line).filter(|_| need_link_line),
+            link_line_from_node: Some(link_line_from_node).filter(|_| need_link_line),
             term_line: Some(term_line).filter(|_| need_term_line),
-            pad_lines,
+            ancestry_line,
             separator_line,
         }
     }
@@ -373,6 +441,17 @@ impl AncestorColumnBounds {
             LinkLine::empty()
         }
     }
+}
+
+// Update both link_line and link_line_from_node.
+fn link_both(
+    link_line: &mut [LinkLine],
+    link_line_from_node: &mut [LinkLine],
+    index: usize,
+    value: LinkLine,
+) {
+    link_line[index] |= value;
+    link_line_from_node[index] |= value;
 }
 
 fn ancestor_to_column<N>(ancestor: &Ancestor<N>) -> Column<N>

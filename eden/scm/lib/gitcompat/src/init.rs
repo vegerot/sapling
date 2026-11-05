@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::cmp::max;
 use std::collections::BTreeMap;
 use std::env;
 use std::io;
@@ -18,53 +19,71 @@ use filetime::set_file_mtime;
 use fs_err as fs;
 use identity::Identity;
 use identity::dotgit::follow_dotgit_path;
+use identity::dotgit::resolve_git_common_dir;
 use tracing::debug;
 use types::HgId;
 
 use crate::BareGit;
 use crate::refs::ReferenceValue;
 
-/// Initialize and update Sapling's dotdir inside `.git/`.
+/// Initialize and update Sapling's dotdir inside `.git/` (or other `GIT_DIR`).
 /// - Write requirements, on demand.
 /// - Update config files from translated Git config, on demand.
 /// - Update "bookmarks.current".
 ///
 /// Skip if `ident` is not using `.git/sl` dot dir.
 ///
-/// `dot_dir` is expected to be something like `<prefix>/.git/sl`.
+/// Layout:
+/// - `$GIT_DIR/sl/`: local state
+///   - requirements, dirstate, translated config, bookmarks.current
+///   - with linked worktree, typically, `$GIT_COMMON_DIR/worktrees/<name>/sl/`
+/// - `$GIT_COMMON_DIR/sl/store/`: shared store
+///   - without linked worktree, same as `$GIT_DIR/sl/store/`
+///
+/// Git config translation and `bookmarks.current` are refreshed on demand.
+/// This function does nothing if `ident` is not using the `.git/sl` layout.
 pub fn maybe_init_inside_dotgit(root_path: &Path, ident: Identity) -> Result<()> {
     if !ident.is_dot_git() {
         return Ok(());
     }
 
+    // Git's GIT_DIR. For a linked worktree this is `<GIT_COMMON_DIR>/worktrees/<name>`.
     let dot_git_path = follow_dotgit_path(root_path.join(".git"));
     let dot_dir = dot_git_path.join("sl");
-    let store_dir = dot_dir.join("store");
+    let store_dir = resolve_git_common_dir(&dot_git_path)?
+        .join("sl")
+        .join("store");
 
-    // Check for existence of "requires" file so we can fix repo dirs that already exist but are missing requires file.
+    // Check for existence of "requires" files so we can fix repo dirs that already exist but are
+    // missing them. The dot dir and store are initialized independently because they can have
+    // different lifetimes when the store is shared by multiple worktrees. Write each "requires"
+    // file last so its presence indicates that initialization completed.
+    if !dot_dir.join("requires").exists() {
+        fs::create_dir_all(&dot_dir)?;
+
+        // Write an empty eden dirstate so it can be loaded.
+        init_empty_dirstate(&dot_dir)?;
+        fs::write(dot_dir.join("requires"), "store\ndotgit\n")?;
+    }
+
     if !store_dir.join("requires").exists() {
         fs::create_dir_all(&store_dir)?;
-
-        fs::write(dot_dir.join("requires"), "store\ndotgit\n")?;
+        fs::write(store_dir.join("gitdir"), format!("..{SEP}.."))?;
         fs::write(
             store_dir.join("requires"),
             "narrowheads\nvisibleheads\ngit\ngit-store\ndotgit\n",
         )?;
-        fs::write(store_dir.join("gitdir"), format!("..{SEP}.."))?;
-
-        // Write an empty eden dirstate so it can be loaded.
-        init_empty_dirstate(&dot_dir)?;
     }
 
     // Sync git config to "config-git-user", "config-git-repo".
     // Skip if file mtime is up to date (since shelling out to `git config` might take time).
     let user_config_path = translated_git_user_config_path(&dot_dir, ident);
     let repo_config_path = translated_git_repo_config_path(&dot_dir, ident);
-    let git_repo_mtime = git_repo_config_mtime(&dot_git_path);
-    let git_user_mtime = git_user_config_mtime();
 
     // NOTE: At this point no sapling config is loaded. For simplicity, this does not respect `ui.git`.
     let git = BareGit::from_git_dir_and_config(dot_git_path, &BTreeMap::<String, String>::new());
+    let git_repo_mtime = git_repo_config_mtime(&git);
+    let git_user_mtime = git_user_config_mtime();
 
     if git_repo_mtime != try_mtime(&repo_config_path)
         || git_user_mtime != try_mtime(&user_config_path)
@@ -110,8 +129,11 @@ pub fn init_empty_dirstate(dot_dir: &Path) -> Result<()> {
     )
 }
 
-fn git_repo_config_mtime(dot_git_path: &Path) -> FileTime {
-    try_mtime(&dot_git_path.join("config"))
+fn git_repo_config_mtime(git: &BareGit) -> FileTime {
+    max(
+        try_mtime(&git.common_dir().join("config")),
+        try_mtime(&git.git_dir().join("config.worktree")),
+    )
 }
 
 // NOTE: This currently does not consider corner cases, including:

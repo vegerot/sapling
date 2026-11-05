@@ -5,23 +5,14 @@ oncall("sapling")
 sl_rust_library(
     name = "edenapi",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {
-        "cargo_toml_config": {
-            "lib": {"name": "edenapi"},
-            "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
-                "license": "MIT",
-                "name": "sapling-edenapi",
-                "repository": "https://github.com/facebook/sapling",
-            },
-        },
-    },
+    autocargo = {},
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-trait",
+        "fbsource//third-party/rust:blake3",
         "fbsource//third-party/rust:chrono",
         "fbsource//third-party/rust:futures",
+        "fbsource//third-party/rust:hashbrown",
         "fbsource//third-party/rust:itertools",
         "fbsource//third-party/rust:parking_lot",
         "fbsource//third-party/rust:serde",
@@ -37,6 +28,7 @@ sl_rust_library(
         "//eden/scm/lib/edenapi/trait:edenapi_trait",
         "//eden/scm/lib/edenapi/types:edenapi_types",
         "//eden/scm/lib/hg-http:hg-http",
+        "//eden/scm/lib/hg-metrics:hg-metrics",
         "//eden/scm/lib/http-client:http-client",
         "//eden/scm/lib/metrics:metrics",
         "//eden/scm/lib/minibytes:minibytes",

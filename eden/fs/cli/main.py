@@ -114,6 +114,7 @@ class ForegroundColor(Enum):
     RESET = "\033[0m"
 
 
+from eden.fs.cli import agent_tracing
 from eden.fs.cli.version import VersionInfo
 
 try:
@@ -158,11 +159,7 @@ from eden.fs.cli.util import (
 from eden.fs.service.eden.thrift_types import EdenError
 from eden.thrift.client import EdenNotRunningError
 from fb303_core.thrift_types import fb303_status
-from thrift.python.exceptions import (
-    ApplicationError,
-    ApplicationErrorType,
-    TransportError,
-)
+from thrift.python.exceptions import TransportError
 
 from . import (
     config as config_mod,
@@ -170,6 +167,7 @@ from . import (
     daemon_util,
     debug as debug_mod,
     doctor as doctor_mod,
+    error_report,
     filesystem as fs_mod,
     mtab,
     prefetch as prefetch_mod,
@@ -248,6 +246,12 @@ except AttributeError:  # On a non-unix system
 # The Rust CLI depends on this value staying constant. Instead of fetching it
 # from the os library, let's just define it here.
 EX_USAGE: int = 64
+
+# `eden rm` was asked to remove something that is not an EdenFS checkout: a
+# path that does not exist, a plain file or directory, or a path inside a
+# checkout. Nothing is wrong with EdenFS, so this is not reported as a failure
+# of it. Defined here, like EX_USAGE, so the value is the same on every platform.
+EX_NOINPUT: int = 66
 
 
 # We have different mitigations on different platforms due to cmd differences
@@ -1525,8 +1529,9 @@ class FsckCmd(Subcmd):
     ) -> int:
         print(f"Checking {checkout_path}...")
         overlay_path = state_dir / "local"
-        num_threads = args.num_error_discovery_threads
-        instance.get_config_int("fsck.num-error-discovery-threads", num_threads)
+        num_threads = instance.get_config_int(
+            "fsck.num-error-discovery-threads", args.num_error_discovery_threads
+        )
         return subprocess.call(
             [
                 get_fsck_command(),
@@ -1598,16 +1603,11 @@ class ChownCmd(Subcmd):
         instance, checkout, _rel_path = require_checkout(args, args.path)
         with instance.get_thrift_client() as client:
             print("Chowning EdenFS repository...", end="", flush=True)
-            try:
-                request = ChangeOwnershipRequest(
+            client.changeOwnership(
+                ChangeOwnershipRequest(
                     mountPoint=os.fsencode(args.path), uid=uid, gid=gid
                 )
-                client.changeOwnership(request)
-            except ApplicationError as exc:
-                if exc.type == ApplicationErrorType.UNKNOWN_METHOD:
-                    client.chown(args.path, uid, gid)
-                else:
-                    raise exc
+            )
             print("done")
 
         if not args.skip_redirection:
@@ -1957,6 +1957,36 @@ def remove_checkout_impl(
     return result
 
 
+# Values of the `failure_kind` field of the `rm` telemetry sample. `user_error`
+# means `eden rm` was asked to remove something that is not an EdenFS checkout;
+# the other kinds name the removal step that failed.
+FAILURE_KIND_USER_ERROR = "user_error"
+FAILURE_KIND_LOOKUP = "lookup"
+FAILURE_KIND_AUX_PROCESSES = "aux_processes"
+FAILURE_KIND_UNMOUNT = "unmount"
+FAILURE_KIND_DESTROY = "destroy"
+FAILURE_KIND_CLEANUP = "cleanup"
+
+
+def _is_registered_checkout(path: str, configured_mounts: List[str]) -> bool:
+    """True when config.json lists `path`, as given or with its links resolved."""
+    return path in configured_mounts or os.path.realpath(path) in configured_mounts
+
+
+def _path_is_missing(path: str) -> bool:
+    """True only when nothing exists at `path`: no entry, or a parent that is a
+    plain file. `os.path.exists` is also False for a stale mount left by a dead
+    daemon (`stat` fails with ENOTCONN); that is an EdenFS failure the later
+    lookup reports, not a caller error."""
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
 # Types of removal
 #
 # * ACTIVE_MOUNT: removing a mounted repository, we need to talk with EdenFS
@@ -1967,11 +1997,20 @@ def remove_checkout_impl(
 # mount that failed to clean up. We try to clean it up again in this case.
 # NON_EDEN: removing a non-EdenFS directory or file using eden rm - in this
 # case we want to skip the Eden housekeeping after removing it
+# * ACTIVE_UNREGISTERED: removing a repository the daemon has mounted but
+# config.json does not list (`eden list` shows it as "(unconfigured)"). When the
+# mount's `.eden/client` link names one of our unused client directories we
+# register the checkout first and remove it as an ACTIVE_MOUNT, so that a
+# removal that stops half-way leaves a registered checkout a retry can finish;
+# otherwise we unmount it and delete the mount point only. A checkout that the
+# instance named by its `.eden` links does list (`eden rm` ran without that
+# instance's --config-dir) is removed from that instance as an ACTIVE_MOUNT.
 class RemoveType(enum.Enum):
     ACTIVE_MOUNT = 0
     INACTIVE_MOUNT = 1
     CLEANUP_ONLY = 2
     NON_EDEN = 3
+    ACTIVE_UNREGISTERED = 4
 
 
 @subcmd("remove", "Remove an EdenFS checkout", aliases=["rm"])
@@ -2022,6 +2061,84 @@ class RemoveCmd(Subcmd):
                 "Rerun 'eden remove' with --debug to see full traceback (required to report issues; please do so if the error is unexpected or ambiguous)"
             )
 
+    def _prepare_checkout_for_removal(
+        self, args: argparse.Namespace, mount: str, default_instance: EdenInstance
+    ) -> EdenInstance:
+        """Return the instance that serves `mount`.
+
+        Rewrites the checkout config without its redirection targets so the
+        redirected paths can be deleted. A checkout whose state cannot be
+        located (a mount config.json does not list) or whose config cannot be
+        read or written must not stop the removal: the checkout is being
+        deleted anyway.
+        """
+        try:
+            instance, checkout, _rel_path = require_checkout(args, mount)
+        except subcmd_mod.CmdError:
+            return default_instance
+        except Exception as ex:
+            print_stderr(
+                f"warning: cannot find the checkout state of {mount}, removing it "
+                f"anyway: {ex}"
+            )
+            return default_instance
+        try:
+            config = checkout.get_config()._replace(redirection_targets={})
+            checkout.save_config(config)
+        except (config_mod.CheckoutConfigCorruptedError, OSError) as ex:
+            print_stderr(
+                f"warning: cannot update the config of {mount} before removing "
+                f"it, removing it anyway: {ex}"
+            )
+        return instance
+
+    def _register_before_removal(
+        self, instance: EdenInstance, mount: str
+    ) -> Optional[RemoveType]:
+        """Register a mount config.json does not list, so that it is removed like
+        any other checkout and a removal that stops half-way leaves a
+        registered checkout. Returns the removal type to use, or None when
+        EdenFS does not serve the path: its `.eden` links are then stale or
+        hand-made, and nothing under it may be deleted.
+
+        `instance` is the one the mount's `.eden` links name. When `eden rm`
+        ran without the `--config-dir` of a daemon with its own state
+        directory, that instance is not the one the mount was classified
+        against and lists the checkout already: it is removed from there
+        whole, not unmounted and left registered."""
+        info = instance.get_mounts().get(Path(mount))
+        if info is None or info.state is None:
+            return None
+        if _is_registered_checkout(mount, instance.get_mount_paths()):
+            return RemoveType.ACTIVE_MOUNT
+        if instance.can_register_running_mount(Path(mount), info.data_dir):
+            instance.register_running_mount(Path(mount), info.data_dir)
+            return RemoveType.ACTIVE_MOUNT
+        print_stderr(
+            f"warning: {mount} is not listed in Eden's configuration file and its "
+            f"client directory {info.data_dir} is not one of this EdenFS "
+            "instance's; unmounting it and removing the mount point only."
+        )
+        return RemoveType.ACTIVE_UNREGISTERED
+
+    def _fail(
+        self,
+        telemetry_sample: TelemetrySample,
+        kind: str,
+        msg: str,
+        exit_code: int = 1,
+    ) -> int:
+        """Record a failed removal in telemetry, print it, and return the exit code.
+
+        `exit_code` is a column of the Hive copy of the telemetry table, so the
+        DSU pipeline can tell a caller error (EX_NOINPUT) from a failed
+        removal; `failure_kind` names the step for the Scuba table."""
+        telemetry_sample.fail(msg.strip())
+        telemetry_sample.add_string("failure_kind", kind)
+        telemetry_sample.add_int("exit_code", exit_code)
+        print_stderr(msg)
+        return exit_code
+
     def delete_file_with_confirmation(self, path: str) -> int:
         prompt = f"""\
 Warning: the following is a file, not a directory or an EdenFS mount: {path}
@@ -2050,20 +2167,30 @@ Do you still want to delete {path}?"""
                     if args.prompt and sys.stdin.isatty():
                         return self.delete_file_with_confirmation(path)
                     else:
-                        print(
+                        return self._fail(
+                            telemetry_sample,
+                            FAILURE_KIND_USER_ERROR,
                             f"error: {path} exists but it's a file; remove it manually.",
-                            file=sys.stderr,
+                            EX_NOINPUT,
                         )
-                        return 1
 
-                if not os.path.exists(path):
-                    msg = f"error: {path} is neither an EdenFS mount nor an existing directory"
-                    telemetry_sample.fail(msg)
-                    print(msg, file=sys.stderr)
-                    return 1
+                if _path_is_missing(path):
+                    # A registered checkout whose folder is gone can still be removed.
+                    mount_path = os.path.realpath(path)
+                    if mount_path in configured_mounts:
+                        mounts.append((mount_path, RemoveType.INACTIVE_MOUNT))
+                        continue
+                    return self._fail(
+                        telemetry_sample,
+                        FAILURE_KIND_USER_ERROR,
+                        f"error: {path} is neither an EdenFS mount nor an existing directory",
+                        EX_NOINPUT,
+                    )
                 try:
                     mount_path = util.get_eden_mount_name(path)
                     remove_type = RemoveType.ACTIVE_MOUNT
+                    if not _is_registered_checkout(mount_path, configured_mounts):
+                        remove_type = RemoveType.ACTIVE_UNREGISTERED
                 except util.NotAnEdenMountError as ex:
                     remove_type = RemoveType.NON_EDEN
                     # This is not an active mount point.
@@ -2088,10 +2215,11 @@ Do you still want to delete {path}?"""
                                     fs_mod.new().rmdir(path, args.preserve_mount_point)
                                 except Exception as ex:
                                     if sys.platform != "win32":
-                                        msg = f"Error: cannot remove contents of {path}: {ex}"
-                                        telemetry_sample.fail(msg)
-                                        print(msg)
-                                        return 1
+                                        return self._fail(
+                                            telemetry_sample,
+                                            FAILURE_KIND_CLEANUP,
+                                            f"Error: cannot remove contents of {path}: {ex}",
+                                        )
                                     else:
                                         winhr = WinFileHandlerReleaser(instance)
                                         maybe_succeeded = winhr.try_release(path)
@@ -2102,29 +2230,41 @@ Do you still want to delete {path}?"""
                                                     path, args.preserve_mount_point
                                                 )
                                             else:
-                                                return 1
+                                                return self._fail(
+                                                    telemetry_sample,
+                                                    FAILURE_KIND_CLEANUP,
+                                                    f"Error: cannot remove contents of {path}: {ex}",
+                                                )
                                         except Exception as ex:
-                                            msg = f"Error: cannot remove contents of {path} even after trying to kill processes holding resources: {ex}"
-                                            telemetry_sample.fail(msg)
-                                            print(msg)
-                                            return 1
+                                            return self._fail(
+                                                telemetry_sample,
+                                                FAILURE_KIND_CLEANUP,
+                                                f"Error: cannot remove contents of {path} even after trying to kill processes holding resources: {ex}",
+                                            )
                         else:
                             # We can't ask the user what their true intentions are,
                             # so let's fail by default.
-                            print(f"error: {ex}")
-                            return 1
+                            return self._fail(
+                                telemetry_sample,
+                                FAILURE_KIND_USER_ERROR,
+                                f"error: {ex}",
+                                EX_NOINPUT,
+                            )
 
                 except Exception as ex:
-                    msg = f"error: cannot determine mount point for {path}: {ex}"
-                    telemetry_sample.fail(msg)
-                    print(msg)
-                    return 1
+                    return self._fail(
+                        telemetry_sample,
+                        FAILURE_KIND_LOOKUP,
+                        f"error: cannot determine mount point for {path}: {ex}",
+                    )
 
                 if os.path.realpath(mount_path) != os.path.realpath(path):
-                    msg = f"error: {path} is not the root of checkout {mount_path}, not deleting"
-                    telemetry_sample.fail(msg)
-                    print(msg)
-                    return 1
+                    return self._fail(
+                        telemetry_sample,
+                        FAILURE_KIND_USER_ERROR,
+                        f"error: {path} is not the root of checkout {mount_path}, not deleting",
+                        EX_NOINPUT,
+                    )
                 if remove_type != RemoveType.NON_EDEN:
                     mounts.append((mount_path, remove_type))
 
@@ -2151,23 +2291,37 @@ Do you still want to delete {path}?"""
             )
             for mount, remove_type in mounts:
                 print(f"Removing {mount}...")
-                # Removing reidrection targets from checkout config to allow deletion of redirected paths
-                instance, checkout, _rel_path = require_checkout(args, mount)
-                config = checkout.get_config()
-                config._replace(
-                    redirection_targets={},
+                mount_instance = self._prepare_checkout_for_removal(
+                    args, mount, instance
                 )
-                checkout.save_config(config)
+                if remove_type == RemoveType.ACTIVE_UNREGISTERED:
+                    registered_type = self._register_before_removal(
+                        mount_instance, mount
+                    )
+                    if registered_type is None:
+                        return self._fail(
+                            telemetry_sample,
+                            FAILURE_KIND_LOOKUP,
+                            f"error: EdenFS does not report {mount} as a mounted "
+                            "checkout; its .eden links may be stale",
+                        )
+                    remove_type = registered_type
 
                 result = remove_checkout_impl(
-                    instance=instance,
+                    instance=mount_instance,
                     path=mount,
-                    is_mounted=(remove_type == RemoveType.ACTIVE_MOUNT),
+                    is_mounted=(
+                        remove_type
+                        in (RemoveType.ACTIVE_MOUNT, RemoveType.ACTIVE_UNREGISTERED)
+                    ),
                     output=ui.get_output(),
                     preserve_mount_point=args.preserve_mount_point,
                     use_force=not args.no_force,
                     complain_about_redirections=(sys.platform != "win32"),
-                    skip_destroy=(remove_type == RemoveType.CLEANUP_ONLY),
+                    skip_destroy=(
+                        remove_type
+                        in (RemoveType.CLEANUP_ONLY, RemoveType.ACTIVE_UNREGISTERED)
+                    ),
                     debug=args.debug,
                     proceed_on_unmount_failure=False,
                     aux_timeout=aux_timeout,
@@ -2175,17 +2329,17 @@ Do you still want to delete {path}?"""
 
                 # Handle aux process error (log but continue)
                 if result.aux_process_error:
-                    msg = f"error stopping auxiliary processes {mount}: {result.aux_process_error}"
-                    telemetry_sample.fail(msg)
-                    print_stderr(msg)
-                    exit_code = 1
+                    exit_code = self._fail(
+                        telemetry_sample,
+                        FAILURE_KIND_AUX_PROCESSES,
+                        f"error stopping auxiliary processes {mount}: {result.aux_process_error}",
+                    )
                     # We intentionally fall through here - unmount may still work
 
                 # Handle unmount error (return early with suggestions)
                 if result.unmount_error:
                     msg = f"error unmounting {mount}: {result.unmount_error}"
-                    telemetry_sample.fail(msg)
-                    print_stderr(f"\n{msg}\n\n")
+                    self._fail(telemetry_sample, FAILURE_KIND_UNMOUNT, f"\n{msg}\n")
                     print_stderr(
                         f"For unmount timeouts, you can try:\n{_get_unmount_timeout_suggestions(mount)}"
                     )
@@ -2193,24 +2347,25 @@ Do you still want to delete {path}?"""
 
                 # Handle destroy error
                 if result.destroy_error:
-                    msg = f"error deleting configuration for {mount}: {result.destroy_error}"
-                    telemetry_sample.fail(msg)
-                    print_stderr(msg)
-                    exit_code = 1
+                    exit_code = self._fail(
+                        telemetry_sample,
+                        FAILURE_KIND_DESTROY,
+                        f"error deleting configuration for {mount}: {result.destroy_error}",
+                    )
                     # pyre-fixme[6]: Pyre doesn't narrow Optional type after if guard
                     self.optional_traceback(result.destroy_error, args.debug)
                 else:
                     # Handle cleanup errors if destroy succeeded
                     if result.cleanup_error:
                         msg = f"error cleaning up mount {mount}: {result.cleanup_error}"
-                        telemetry_sample.fail(msg)
                         if (
                             isinstance(result.cleanup_error, OSError)
                             and result.cleanup_error.errno == errno.ENOTEMPTY
                         ):
                             msg += "\nPlease remove the entries and re-run eden rm."
-                        print_stderr(msg)
-                        exit_code = 1
+                        exit_code = self._fail(
+                            telemetry_sample, FAILURE_KIND_CLEANUP, msg
+                        )
                         # pyre-fixme[6]: Pyre doesn't narrow Optional type after if guard
                         self.optional_traceback(result.cleanup_error, args.debug)
 
@@ -2439,8 +2594,6 @@ class StartCmd(Subcmd):
                 instance, daemon_binary, args.edenfs_args, args.preserved_vars
             )
 
-        if config_mod.should_migrate_inode_catalog_to_in_memory(instance):
-            config_mod._do_in_memory_inode_catalog_migration(instance)
         result = daemon.start_edenfs_service(
             instance, daemon_binary, args.edenfs_args, args.preserved_vars
         )
@@ -2698,6 +2851,11 @@ RESTART_MODE_GRACEFUL = "graceful"
 RESTART_MODE_FORCE = "force"
 
 
+def _fail_restart(telemetry_sample: TelemetrySample, message: str) -> None:
+    telemetry_sample.fail(message)
+    error_report.record(message)
+
+
 @subcmd("restart", "Restart the EdenFS service")
 class RestartCmd(Subcmd):
     # pyre-fixme[13]: Attribute `args` is never initialized.
@@ -2730,8 +2888,19 @@ class RestartCmd(Subcmd):
             dest="force_restart",
             default=False,
             action="store_true",
-            help="Force a full restart, even if the existing edenfs daemon is "
-            "still in the middle of starting or stopping.",
+            help="With --graceful, make a busy daemon cancel its in-flight "
+            "requests instead of refusing the takeover. Without --graceful, "
+            "force a full restart even if the existing edenfs daemon is still "
+            "in the middle of starting or stopping.",
+        )
+        parser.add_argument(
+            "--only-if-idle",
+            action="store_true",
+            default=False,
+            help="With --graceful, let the running edenfs daemon refuse the "
+            "restart while it has served a checkout or a mount within the last "
+            "few minutes, on top of refusing while requests are in flight. Meant "
+            "for unattended restarts.",
         )
         parser.add_argument(
             "--daemon-binary", "-d", help="Path to the binary for the edenfs daemon."
@@ -2792,6 +2961,10 @@ class RestartCmd(Subcmd):
         if args.restart_type is None:
             # Default to a full restart for now
             args.restart_type = RESTART_MODE_FULL
+
+        if args.only_if_idle and args.restart_type != RESTART_MODE_GRACEFUL:
+            print("error: --only-if-idle requires --graceful", file=sys.stderr)
+            return 1
 
         if args.migrate_to is not None:
             if args.restart_type == RESTART_MODE_GRACEFUL:
@@ -2864,6 +3037,10 @@ class RestartCmd(Subcmd):
                 print(
                     "Use `eden restart --force` if you want to forcibly restart the current daemon"
                 )
+                error_report.record(
+                    f"edenfs daemon is not healthy (status {health.status.name}) "
+                    "and --force was not given"
+                )
                 return 4
             return self._force_restart(instance, edenfs_pid, stop_timeout)
 
@@ -2877,7 +3054,9 @@ class RestartCmd(Subcmd):
             print(
                 "The daemon is not running after failed graceful restart, starting it"
             )
-            telemetry_sample.fail("EdenFS was not running after graceful restart")
+            _fail_restart(
+                telemetry_sample, "EdenFS was not running after graceful restart"
+            )
             return self._start(instance)
 
         print(
@@ -2891,9 +3070,28 @@ class RestartCmd(Subcmd):
             # waiting for in process thrift calls to finish, so we
             # want to wait for a reasonable time before we force
             # kill the process (if it is stuck somewhere)
-            wait_for_instance_healthy(instance, 600)
-            telemetry_sample.fail(
-                "Graceful restart failed, and old EdenFS process resumed"
+            if not daemon.takeover_was_refused():
+                wait_for_instance_healthy(instance, 600)
+            if daemon.takeover_was_refused():
+                _fail_restart(
+                    telemetry_sample,
+                    "Graceful restart refused by the running EdenFS",
+                )
+                hint = (
+                    ""
+                    if self.args.force_restart
+                    else " Retry later, or pass --force to have it cancel its "
+                    "in-flight requests."
+                )
+                print(
+                    "error: the running edenfs daemon refused the graceful "
+                    f"restart and kept serving.{hint}",
+                    file=sys.stderr,
+                )
+                return daemon.TAKEOVER_REFUSED_EXIT_CODE
+            _fail_restart(
+                telemetry_sample,
+                "Graceful restart failed, and old EdenFS process resumed",
             )
             print(
                 "error: failed to perform graceful restart. The old "
@@ -2916,15 +3114,17 @@ class RestartCmd(Subcmd):
             # continue on with the restart
             pass
         if self._finish_restart(instance) == 0:
-            telemetry_sample.fail(
+            _fail_restart(
+                telemetry_sample,
                 "EdenFS was not healthy after graceful restart; performed a "
-                "hard restart"
+                "hard restart",
             )
             return 2
         else:
-            telemetry_sample.fail(
+            _fail_restart(
+                telemetry_sample,
                 "EdenFS was not healthy after graceful restart, and we failed "
-                "to restart it"
+                "to restart it",
             )
             return 3
 
@@ -2998,8 +3198,9 @@ class RestartCmd(Subcmd):
                 health = instance.check_health()
                 edenfs_pid = health.pid
                 if edenfs_pid is None:
-                    telemetry_sample.fail(
-                        "Transport mismatch required a full restart, but EdenFS was not running"
+                    _fail_restart(
+                        telemetry_sample,
+                        "Transport mismatch required a full restart, but EdenFS was not running",
                     )
                     return self._start(instance)
 
@@ -3016,8 +3217,9 @@ class RestartCmd(Subcmd):
                     triggered_by=reason,
                 )
                 if status != 0:
-                    telemetry_sample.fail(
-                        "Transport mismatch fallback full restart failed"
+                    _fail_restart(
+                        telemetry_sample,
+                        "Transport mismatch fallback full restart failed",
                     )
                 return status
 
@@ -3037,6 +3239,8 @@ class RestartCmd(Subcmd):
                 instance,
                 daemon_binary=self.args.daemon_binary,
                 preserved_env=self.args.preserved_vars,
+                force_takeover=self.args.force_restart,
+                only_if_idle=self.args.only_if_idle,
             )
             success = status == 0
             if success:
@@ -3150,6 +3354,7 @@ re-open these files after EdenFS is restarted.
         )
         if exit_code != 0:
             print("Failed to start edenfs daemon!", file=sys.stderr)
+            error_report.record("Failed to start edenfs daemon during restart")
             return exit_code
 
         print()
@@ -3515,6 +3720,7 @@ def set_working_directory(args: argparse.Namespace) -> Optional[int]:
         os.chdir(args.checkout_dir)
     except OSError as e:
         print(f"Unable to change to checkout directory: {e}", file=sys.stderr)
+        error_report.record(f"Unable to change to checkout directory: {e}", e)
         return EX_OSFILE
 
 
@@ -3537,6 +3743,7 @@ def check_for_stale_working_directory() -> Optional[int]:
             f"error: unable to determine current working directory: {ex}",
             file=sys.stderr,
         )
+        error_report.record(f"unable to determine current working directory: {ex}", ex)
         return EX_OSFILE
 
     # See if we can figure out what the current working directory should be
@@ -3560,6 +3767,7 @@ mount point from a previous edenfs daemon instance.
 Please run "cd / && cd -" to update your shell's working directory."""
     if not can_continue:
         print(f"Error: {msg}", file=sys.stderr)
+        error_report.record(msg)
         return EX_OSFILE
 
     print(f"Warning: {msg}", file=sys.stderr)
@@ -3597,12 +3805,15 @@ async def async_main(parser: argparse.ArgumentParser, args: argparse.Namespace) 
         return result
     except subcmd_mod.CmdError as ex:
         print(f"error: {ex}", file=sys.stderr)
+        error_report.record(str(ex), ex)
         return EX_SOFTWARE
     except daemon_util.DaemonBinaryNotFound as ex:
         print(f"error: {ex}", file=sys.stderr)
+        error_report.record(str(ex), ex)
         return EX_UNAVAILABLE
     except config_mod.UsageError as ex:
         print(f"error: {ex}", file=sys.stderr)
+        error_report.record(str(ex), ex)
         return EX_USAGE
 
 
@@ -3615,6 +3826,18 @@ except AttributeError:
 
 
 def main() -> int:
+    error_report.init()
+    try:
+        ret = _main()
+    except Exception as ex:
+        error_report.record(str(ex), ex)
+        error_report.write(1)
+        raise
+    error_report.write(ret)
+    return ret
+
+
+def _main() -> int:
     # Ensure stdout/stderr use UTF-8 encoding. On Windows, Python defaults to
     # the system code page (e.g. cp1252) which cannot encode non-Latin paths.
     # This matches Sapling's utf8_mode=1 pre-initialization (python.rs).
@@ -3664,7 +3887,7 @@ def main() -> int:
         if args.debug:
             raise
 
-        os._exit(130)
+        agent_tracing.exit_interrupted()
         # Pyre doesn't understand that os._exit is noreturn.
         return 130
 
@@ -3673,6 +3896,7 @@ def zipapp_main() -> None:
     """zipapp_main() is used when running edenfsctl as a Python 3 zipapp executable.
     The zipapp module expects the main function to call sys.exit() on its own if it
     wants to exit with a non-zero status."""
+    agent_tracing.trace()
     retcode = main()
     sys.exit(retcode)
 

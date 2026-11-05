@@ -8,7 +8,6 @@
 #include "eden/fs/testharness/TestServer.h"
 
 #include <folly/io/async/EventBase.h>
-#include <gflags/gflags.h>
 
 #include "eden/common/telemetry/SessionInfo.h"
 #include "eden/common/testharness/TempFile.h"
@@ -18,7 +17,6 @@
 #include "eden/fs/service/StartupLogger.h"
 #include "eden/fs/store/BackingStore.h"
 #include "eden/fs/telemetry/IActivityRecorder.h"
-#include "eden/fs/telemetry/IScribeLogger.h"
 #include "eden/fs/testharness/FakePrivHelper.h"
 
 using std::make_shared;
@@ -70,14 +68,6 @@ unique_ptr<EdenServer> TestServer::createServer(
   auto edenDir = tmpDir + "eden"_pc;
   ensureDirectoryExists(edenDir);
 
-  // Always use an in-memory local store during tests.
-  // TODO: in the future we should build a better mechanism for controlling this
-  // rather than having to update a command line flag.
-  GFLAGS_NAMESPACE::SetCommandLineOptionWithMode(
-      "local_storage_engine_unsafe",
-      "memory",
-      GFLAGS_NAMESPACE::SET_FLAG_IF_DEFAULT);
-
   auto userInfo = UserInfo::lookup();
   userInfo.setHomeDirectory(tmpDir + "home"_pc);
   auto config = make_shared<EdenConfig>(
@@ -92,6 +82,18 @@ unique_ptr<EdenServer> TestServer::createServer(
   config->edenDir.setValue(edenDir, ConfigSourceType::CommandLine);
   config->enableNfsServer.setValue(
       options.enableNfsServer, ConfigSourceType::CommandLine);
+  if (options.takeoverRequestGrace) {
+    config->takeoverRequestGrace.setValue(
+        *options.takeoverRequestGrace, ConfigSourceType::CommandLine);
+  }
+  if (options.takeoverWaitsForRequests) {
+    config->takeoverWaitsForRequests.setValue(
+        *options.takeoverWaitsForRequests, ConfigSourceType::CommandLine);
+  }
+  if (options.takeoverRecentActivityWindow) {
+    config->takeoverRecentActivityWindow.setValue(
+        *options.takeoverRecentActivityWindow, ConfigSourceType::CommandLine);
+  }
   // Unit tests must never reach production Scuba, whatever the build mode.
   config->enableScribeLogging.setValue(false, ConfigSourceType::CommandLine);
 #ifdef _WIN32
@@ -108,8 +110,8 @@ unique_ptr<EdenServer> TestServer::createServer(
       [](std::shared_ptr<const EdenMount>) {
         return std::make_unique<NullActivityRecorder>();
       },
-      &gEmptyBackingStoreFactory,
-      make_shared<NullScribeLogger>(),
+      options.backingStoreFactory ? options.backingStoreFactory
+                                  : &gEmptyBackingStoreFactory,
       std::move(startupSubscriberChannel),
       "test server");
 }

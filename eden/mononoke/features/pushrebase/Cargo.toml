@@ -9,6 +9,7 @@ license = "GPLv2+"
 
 [dependencies]
 anyhow = "1.0.104"
+async-trait = "0.1.92"
 blobrepo_utils = { version = "0.1.0", path = "../../blobrepo_utils" }
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 bonsai_git_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_git_mapping" }
@@ -45,11 +46,10 @@ stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.21"
 three_way_merge = { version = "0.1.0", path = "../../common/three_way_merge" }
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-async-trait = "0.1.92"
 blobrepo_hg = { version = "0.1.0", path = "../../blobrepo/blobrepo_hg" }
 bonsai_hg_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_hg_mapping" }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -58,8 +58,14 @@ facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fixtures = { version = "0.1.0", path = "../../tests/fixtures" }
+memblob = { version = "0.1.0", path = "../../blobstore/memblob" }
 mutable_counters = { version = "0.1.0", path = "../../repo_attributes/mutable_counters" }
 rand = "0.10.3"
+restricted_paths = { version = "0.1.0", path = "../../repo_attributes/restricted_paths" }
+samplingblob = { version = "0.1.0", path = "../../blobstore/samplingblob" }
 sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 test_repo_factory = { version = "0.1.0", path = "../../repo_factory/test_repo_factory" }
 tests_utils = { version = "0.1.0", path = "../../tests/utils" }
+
+[lints]
+workspace = true

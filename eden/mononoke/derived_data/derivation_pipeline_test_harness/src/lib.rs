@@ -239,16 +239,10 @@ async fn verify_pipeline_matches_canonical_impl<F: PipelineTestFixture + Send>(
         pipeline_boundary,
     );
     with_just_knobs_async(
-        JustKnobsInMemory::new(HashMap::from([
-            (
-                "scm/mononoke:enable_subtree_changes".to_string(),
-                KnobVal::Bool(true),
-            ),
-            (
-                "scm/mononoke:enable_manifest_altering_subtree_changes".to_string(),
-                KnobVal::Bool(true),
-            ),
-        ])),
+        JustKnobsInMemory::new(HashMap::from([(
+            "scm/mononoke:enable_subtree_changes".to_string(),
+            KnobVal::Bool(true),
+        )])),
         run.boxed(),
     )
     .await?;
@@ -308,23 +302,56 @@ async fn verify_pipeline_first_then_canonical_with_repo<F: PipelineTestFixture +
         .await?;
     all_commits.reverse();
 
-    let run = run_pipeline_first_then_canonical::<F>(
-        ctx,
-        &repo,
-        manager,
-        &config,
-        types,
-        &all_commits,
-        head,
-    );
+    let run = async {
+        if !use_terminal_mapping {
+            return run_pipeline_first_then_canonical::<F>(
+                ctx,
+                &repo,
+                manager,
+                &config,
+                types,
+                &all_commits,
+                head,
+            )
+            .await;
+        }
+
+        let plan = plan_pipeline(ctx, &repo, manager, &config, types, head, vec![]).await?;
+        run_pipeline(manager, ctx, &config, &plan).await?;
+
+        // A separate blobstore and mapping database keep canonical derivation
+        // from reusing or filling in the pipeline's terminal outputs.
+        let (canonical_repo, _, _) = F::get_repo_and_dag::<TestRepo>(fb).await;
+        let canonical = canonical_repo.repo_derived_data().manager();
+        canonical
+            .derive_bulk_locally(ctx, &all_commits, None, types, None, None)
+            .await?;
+        for &derived_type in types {
+            let expected = BulkDerivation::fetch_derived_batch(
+                canonical,
+                ctx,
+                &all_commits,
+                None,
+                derived_type,
+            )
+            .await?;
+            let actual =
+                BulkDerivation::fetch_derived_batch(manager, ctx, &all_commits, None, derived_type)
+                    .await?;
+            assert_eq!(expected.len(), all_commits.len());
+            assert_eq!(
+                actual,
+                expected,
+                "terminal mappings for {derived_type:?} in {}",
+                F::REPO_NAME
+            );
+        }
+        Ok(())
+    };
     with_just_knobs_async(
         JustKnobsInMemory::new(HashMap::from([
             (
                 "scm/mononoke:enable_subtree_changes".to_string(),
-                KnobVal::Bool(true),
-            ),
-            (
-                "scm/mononoke:enable_manifest_altering_subtree_changes".to_string(),
                 KnobVal::Bool(true),
             ),
             (
@@ -428,6 +455,7 @@ async fn verify_pipeline_output<F: PipelineTestFixture>(
     all_commits: &[ChangesetId],
     plan: &PipelinePlan,
 ) -> Result<()> {
+    let mut mismatches = Vec::new();
     for &cs_id in all_commits {
         if !plan.pipeline_commits.contains(&cs_id) {
             continue;
@@ -443,10 +471,9 @@ async fn verify_pipeline_output<F: PipelineTestFixture>(
                 )
                 .await?;
                 if !matches {
-                    bail!(
-                        "pipeline output diverged from canonical: fixture={} cs_id={cs_id} type={derivable_type:?} stage={stage_path:?}",
-                        F::REPO_NAME,
-                    );
+                    mismatches.push(format!(
+                        "cs_id={cs_id} type={derivable_type:?} stage={stage_path:?}"
+                    ));
                 }
             }
         }
@@ -466,12 +493,18 @@ async fn verify_pipeline_output<F: PipelineTestFixture>(
             )
             .await?;
             if !matches {
-                bail!(
-                    "pipeline finalize output diverged from canonical: fixture={} cs_id={cs_id} type={derivable_type:?}",
-                    F::REPO_NAME,
-                );
+                mismatches.push(format!(
+                    "cs_id={cs_id} type={derivable_type:?} stage=Finalize"
+                ));
             }
         }
+    }
+    if !mismatches.is_empty() {
+        bail!(
+            "pipeline output diverged from canonical: fixture={}\n{}",
+            F::REPO_NAME,
+            mismatches.join("\n"),
+        );
     }
     Ok(())
 }
@@ -536,6 +569,9 @@ async fn run_pipeline_first_then_canonical<F: PipelineTestFixture + Send>(
 mod tests {
     use bonsai_hg_mapping::BonsaiHgMappingRef;
     use fixtures::AclNestedDirectories;
+    use fixtures::AncestorDirectoryReplacement;
+    use fixtures::AugmentedManifestSuppliedRoot;
+    use fixtures::AugmentedManifestSuppliedRootAcl;
     use fixtures::AugmentedManifestV2AbsentParentStageNoHgMapping;
     use fixtures::AugmentedManifestV2AclNoHgMapping;
     use fixtures::AugmentedManifestV2DuplicateParentEntriesNoHgMapping;
@@ -543,10 +579,8 @@ mod tests {
     use fixtures::AugmentedManifestV2P3PlusParentsNoHgMapping;
     use fixtures::CrossStageDirectoryCopy;
     use fixtures::CrossStageFileCopy;
-    use fixtures::NestedAncestorSubtreeCopy;
     use fixtures::NestedDirectories;
     use fixtures::NestedSubtreeCopy;
-    use fixtures::SubtreeCopyRemovesStage;
     use mononoke_macros::mononoke;
 
     use super::*;
@@ -568,13 +602,9 @@ mod tests {
     /// pipeline derivation is self-sufficient for every dependency still in the
     /// transitionary state.
     const PIPELINE_FIRST_TYPES: [DerivableType; 1] = [DerivableType::HgChangesets];
-    const AUGMENTED_MANIFEST_V1_TYPES: [DerivableType; 2] = [
+    const AUGMENTED_MANIFEST_TYPES: [DerivableType; 2] = [
         DerivableType::AclManifests,
         DerivableType::HgAugmentedManifests,
-    ];
-    const AUGMENTED_MANIFEST_V2_TYPES: [DerivableType; 2] = [
-        DerivableType::AclManifests,
-        DerivableType::HgAugmentedManifestsV2,
     ];
 
     impl PipelineTestFixture for NestedDirectories {
@@ -638,12 +668,35 @@ mod tests {
         }
     }
 
+    impl PipelineTestFixture for AncestorDirectoryReplacement {
+        fn pipeline_stages() -> Vec<(&'static str, Vec<&'static str>)> {
+            vec![("", vec!["a"]), ("a", vec!["b"]), ("a/b", vec![])]
+        }
+    }
+
     impl PipelineTestFixture for AugmentedManifestV2AclNoHgMapping {
         fn pipeline_stages() -> Vec<(&'static str, Vec<&'static str>)> {
             vec![
                 ("", vec!["top1"]),
                 ("top1", vec!["docs"]),
                 ("top1/docs", vec![]),
+            ]
+        }
+    }
+
+    impl PipelineTestFixture for AugmentedManifestSuppliedRoot {
+        fn pipeline_stages() -> Vec<(&'static str, Vec<&'static str>)> {
+            vec![("", vec!["dir", "new"]), ("dir", vec![]), ("new", vec![])]
+        }
+    }
+
+    impl PipelineTestFixture for AugmentedManifestSuppliedRootAcl {
+        fn pipeline_stages() -> Vec<(&'static str, Vec<&'static str>)> {
+            vec![
+                ("", vec!["dir", "new", "restricted"]),
+                ("dir", vec![]),
+                ("new", vec![]),
+                ("restricted", vec![]),
             ]
         }
     }
@@ -678,28 +731,6 @@ mod tests {
         }
     }
 
-    impl PipelineTestFixture for NestedAncestorSubtreeCopy {
-        fn pipeline_stages() -> Vec<(&'static str, Vec<&'static str>)> {
-            vec![
-                ("", vec!["top1", "top2"]),
-                ("top1", vec!["sub"]),
-                ("top1/sub", vec![]),
-                ("top2", vec![]),
-            ]
-        }
-    }
-
-    impl PipelineTestFixture for SubtreeCopyRemovesStage {
-        fn pipeline_stages() -> Vec<(&'static str, Vec<&'static str>)> {
-            vec![
-                ("", vec!["top1", "top2"]),
-                ("top1", vec!["sub"]),
-                ("top1/sub", vec![]),
-                ("top2", vec![]),
-            ]
-        }
-    }
-
     #[mononoke::fbinit_test]
     async fn test_pipeline_matches_canonical(fb: FacebookInit) -> Result<()> {
         verify_pipeline_matches_canonical::<NestedDirectories>(fb).await
@@ -710,7 +741,14 @@ mod tests {
         verify_pipeline_matches_canonical::<AclNestedDirectories>(fb).await
     }
 
-    async fn verify_augmented_manifest_v2_pipeline_first_without_hg_mapping<
+    #[mononoke::fbinit_test]
+    async fn test_pipeline_matches_canonical_ancestor_directory_replacement(
+        fb: FacebookInit,
+    ) -> Result<()> {
+        verify_pipeline_matches_canonical::<AncestorDirectoryReplacement>(fb).await
+    }
+
+    async fn verify_augmented_manifest_pipeline_first_without_hg_mapping<
         F: PipelineTestFixture + Send,
     >(
         fb: FacebookInit,
@@ -718,7 +756,7 @@ mod tests {
         let ctx = &CoreContext::test_mock(fb);
         let (repo, commits) = verify_pipeline_first_then_canonical_with_repo::<F>(
             fb,
-            &AUGMENTED_MANIFEST_V2_TYPES,
+            &AUGMENTED_MANIFEST_TYPES,
             false,
         )
         .await?;
@@ -728,85 +766,136 @@ mod tests {
                 .get(ctx, commits.into())
                 .await?
                 .is_empty(),
-            "pipeline and canonical direct V2 should not create Bonsai-Hg mappings for {}",
+            "pipeline and canonical augmented manifest derivation should not create Bonsai-Hg mappings for {}",
             F::REPO_NAME,
         );
         Ok(())
     }
 
     #[mononoke::fbinit_test]
-    async fn test_pipeline_first_augmented_manifest_v2_without_hg_mapping(
+    async fn test_pipeline_first_augmented_manifest_without_hg_mapping(
         fb: FacebookInit,
     ) -> Result<()> {
-        verify_augmented_manifest_v2_pipeline_first_without_hg_mapping::<
+        verify_augmented_manifest_pipeline_first_without_hg_mapping::<
             AugmentedManifestV2NoHgMapping,
         >(fb)
         .await
     }
 
     #[mononoke::fbinit_test]
-    async fn test_pipeline_first_augmented_manifest_v2_duplicate_parent_entries(
+    async fn test_pipeline_first_augmented_manifest_duplicate_parent_entries(
         fb: FacebookInit,
     ) -> Result<()> {
-        verify_augmented_manifest_v2_pipeline_first_without_hg_mapping::<
+        verify_augmented_manifest_pipeline_first_without_hg_mapping::<
             AugmentedManifestV2DuplicateParentEntriesNoHgMapping,
         >(fb)
         .await
     }
 
     #[mononoke::fbinit_test]
-    async fn test_pipeline_first_augmented_manifest_v2_absent_parent_stage(
+    async fn test_pipeline_first_augmented_manifest_absent_parent_stage(
         fb: FacebookInit,
     ) -> Result<()> {
-        verify_augmented_manifest_v2_pipeline_first_without_hg_mapping::<
+        verify_augmented_manifest_pipeline_first_without_hg_mapping::<
             AugmentedManifestV2AbsentParentStageNoHgMapping,
         >(fb)
         .await
     }
 
     #[mononoke::fbinit_test]
-    async fn test_pipeline_first_augmented_manifest_v2_p3_plus_parents(
+    async fn test_pipeline_first_augmented_manifest_p3_plus_parents(
         fb: FacebookInit,
     ) -> Result<()> {
-        verify_augmented_manifest_v2_pipeline_first_without_hg_mapping::<
+        verify_augmented_manifest_pipeline_first_without_hg_mapping::<
             AugmentedManifestV2P3PlusParentsNoHgMapping,
         >(fb)
         .await
     }
 
     #[mononoke::fbinit_test]
-    async fn test_pipeline_augmented_manifest_v2_with_canonical_ancestor(
+    async fn test_pipeline_first_hg_parent_identity(fb: FacebookInit) -> Result<()> {
+        verify_pipeline_first_then_canonical::<AugmentedManifestV2AbsentParentStageNoHgMapping>(
+            fb,
+            &PIPELINE_FIRST_TYPES,
+        )
+        .await?;
+        verify_pipeline_first_then_canonical::<AugmentedManifestV2DuplicateParentEntriesNoHgMapping>(
+            fb, &PIPELINE_FIRST_TYPES,
+        ).await?;
+        verify_pipeline_first_then_canonical::<AugmentedManifestV2P3PlusParentsNoHgMapping>(
+            fb,
+            &PIPELINE_FIRST_TYPES,
+        )
+        .await
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_pipeline_first_hg_stage_transitions(fb: FacebookInit) -> Result<()> {
+        verify_pipeline_first_then_canonical::<NestedDirectories>(fb, &PIPELINE_FIRST_TYPES)
+            .await?;
+        verify_pipeline_first_then_canonical::<AugmentedManifestV2NoHgMapping>(
+            fb,
+            &PIPELINE_FIRST_TYPES,
+        )
+        .await
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_pipeline_terminal_mappings(fb: FacebookInit) -> Result<()> {
+        verify_pipeline_first_then_canonical_with_repo::<NestedDirectories>(
+            fb,
+            &PIPELINE_TYPES,
+            true,
+        )
+        .await?;
+        verify_pipeline_first_then_canonical_with_repo::<AugmentedManifestV2NoHgMapping>(
+            fb,
+            &PIPELINE_FIRST_TYPES,
+            true,
+        )
+        .await?;
+        verify_pipeline_first_then_canonical_with_repo::<CrossStageFileCopy>(
+            fb,
+            &PIPELINE_FIRST_TYPES,
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_pipeline_augmented_manifest_with_canonical_ancestor(
         fb: FacebookInit,
     ) -> Result<()> {
         // Given: commit A and its ancestors are derived only canonically.
         let ctx = &CoreContext::test_mock(fb);
 
-        // When: the pipeline starts at A's children with exactly ACL and V2.
+        // When: the pipeline starts at A's children with exactly ACL and augmented manifests.
         let (repo, commits) =
             verify_pipeline_matches_canonical_with_canonical_ancestors_and_repo::<
                 AugmentedManifestV2NoHgMapping,
             >(
                 fb,
                 "A",
-                &AUGMENTED_MANIFEST_V2_TYPES,
-                &AUGMENTED_MANIFEST_V2_TYPES,
+                &AUGMENTED_MANIFEST_TYPES,
+                &AUGMENTED_MANIFEST_TYPES,
             )
             .await?;
 
-        // Then: V2 extracts A's stage entries and remains canonical-equivalent
-        // without creating a Bonsai-Hg mapping.
+        // Then: the pipeline extracts A's stage entries and remains
+        // canonical-equivalent without creating a Bonsai-Hg mapping.
         assert!(
             repo.bonsai_hg_mapping()
                 .get(ctx, commits.into())
                 .await?
                 .is_empty(),
-            "canonical and pipeline direct V2 should not create Bonsai-Hg mappings",
+            "canonical and pipeline augmented manifests should not create Bonsai-Hg mappings",
         );
         Ok(())
     }
 
     #[mononoke::fbinit_test]
-    async fn test_pipeline_first_augmented_manifest_v2_empty_root_terminal_publication(
+    async fn test_pipeline_first_augmented_manifest_empty_root_terminal_publication(
         fb: FacebookInit,
     ) -> Result<()> {
         // Given: both forms of an empty repository root.
@@ -814,7 +903,7 @@ mod tests {
         // Then: each empty root is a directory that terminal storage accepts.
         verify_pipeline_first_then_canonical_with_repo::<AugmentedManifestV2NoHgMapping>(
             fb,
-            &AUGMENTED_MANIFEST_V2_TYPES,
+            &AUGMENTED_MANIFEST_TYPES,
             true,
         )
         .await
@@ -822,16 +911,43 @@ mod tests {
     }
 
     #[mononoke::fbinit_test]
-    async fn test_pipeline_first_augmented_manifest_v2_non_root_acl(
-        fb: FacebookInit,
-    ) -> Result<()> {
+    async fn test_pipeline_first_augmented_manifest_non_root_acl(fb: FacebookInit) -> Result<()> {
         // Given: nested ACL stages, a no-change merge that rebuilds directories,
         // and a final commit that removes the repository's only ACL.
-        // When: ACL and V2 run pipeline-first with ACL pointers enabled.
-        // Then: every stage and terminal root matches canonical direct V2.
-        verify_augmented_manifest_v2_pipeline_first_without_hg_mapping::<
+        // When: ACL and augmented manifests run pipeline-first with ACL pointers enabled.
+        // Then: every stage and terminal root matches canonical derivation.
+        verify_augmented_manifest_pipeline_first_without_hg_mapping::<
             AugmentedManifestV2AclNoHgMapping,
         >(fb)
+        .await
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_pipeline_augmented_manifest_reuses_supplied_root(fb: FacebookInit) -> Result<()> {
+        // Given: commit S, whose Hg root is stored under a client-supplied id,
+        // derived only canonically, and descendants for which Hg reuses it.
+        // When: the pipeline derives S's descendants from Bonsai.
+        // Then: every stage, including each root, matches canonical
+        // derivation from the Hg manifests.
+        verify_pipeline_matches_canonical_with_canonical_ancestors::<AugmentedManifestSuppliedRoot>(
+            fb,
+            "S",
+            &AUGMENTED_MANIFEST_TYPES,
+        )
+        .await
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_pipeline_augmented_manifest_reuses_supplied_root_with_acl(
+        fb: FacebookInit,
+    ) -> Result<()> {
+        // Given: the supplied-root history with an ACL restriction root.
+        // When: the pipeline derives S's descendants from Bonsai.
+        // Then: every stage, including each root and its ACL pointer, matches
+        // canonical derivation from the Hg manifests.
+        verify_pipeline_matches_canonical_with_canonical_ancestors::<
+            AugmentedManifestSuppliedRootAcl,
+        >(fb, "S", &AUGMENTED_MANIFEST_TYPES)
         .await
     }
 
@@ -857,31 +973,18 @@ mod tests {
     }
 
     #[mononoke::fbinit_test]
-    async fn test_pipeline_augmented_manifest_v2_subtree_copy(fb: FacebookInit) -> Result<()> {
+    async fn test_pipeline_augmented_manifest_subtree_copy(fb: FacebookInit) -> Result<()> {
         // Given: a subtree copy whose source and destination are separate stages.
-        // When: ACL and V2 run through the existing global chokepoint.
-        // Then: every V2 stage matches canonical without scheduling HgChangesets.
+        // When: ACL and augmented manifests run through the existing global chokepoint.
+        // Then: every stage matches canonical without scheduling HgChangesets.
         verify_pipeline_matches_canonical_impl::<NestedSubtreeCopy>(
             fb,
             vec![],
-            &AUGMENTED_MANIFEST_V2_TYPES,
-            &AUGMENTED_MANIFEST_V2_TYPES,
+            &AUGMENTED_MANIFEST_TYPES,
+            &AUGMENTED_MANIFEST_TYPES,
         )
         .await
         .map(|_| ())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn test_pipeline_matches_canonical_ancestor_subtree_copy(fb: FacebookInit) -> Result<()> {
-        verify_pipeline_matches_canonical::<NestedAncestorSubtreeCopy>(fb).await
-    }
-
-    // A subtree copy that removes a deeper stage's subtree entirely, exercising
-    // the stage-subtree-absent branch of the deleted-manifest subtree-op change
-    // set (`top1/sub` is deleted because the copied `top2` has no `sub`).
-    #[mononoke::fbinit_test]
-    async fn test_pipeline_subtree_copy_removes_stage(fb: FacebookInit) -> Result<()> {
-        verify_pipeline_matches_canonical::<SubtreeCopyRemovesStage>(fb).await
     }
 
     // Regression coverage for cross-stage copy-source resolution: the tip commit
@@ -894,17 +997,17 @@ mod tests {
     }
 
     #[mononoke::fbinit_test]
-    async fn test_pipeline_augmented_manifest_v2_drops_invalid_copy_sources(
+    async fn test_pipeline_augmented_manifest_drops_invalid_copy_sources(
         fb: FacebookInit,
     ) -> Result<()> {
         // Given: cross-stage copies whose source is a directory or is missing.
-        // When: ACL and V2 derive the fixture through the pipeline.
-        // Then: V2 drops the invalid copy metadata and matches canonical output.
+        // When: ACL and augmented manifests derive the fixture through the pipeline.
+        // Then: the pipeline drops the invalid copy metadata and matches canonical output.
         verify_pipeline_matches_canonical_impl::<CrossStageDirectoryCopy>(
             fb,
             vec![],
-            &AUGMENTED_MANIFEST_V2_TYPES,
-            &AUGMENTED_MANIFEST_V2_TYPES,
+            &AUGMENTED_MANIFEST_TYPES,
+            &AUGMENTED_MANIFEST_TYPES,
         )
         .await
         .map(|_| ())
@@ -918,46 +1021,26 @@ mod tests {
     }
 
     #[mononoke::fbinit_test]
-    async fn test_pipeline_first_augmented_manifest_v2_copy_sources(
-        fb: FacebookInit,
-    ) -> Result<()> {
+    async fn test_pipeline_first_augmented_manifest_copy_sources(fb: FacebookInit) -> Result<()> {
         // Given: stage-local, file-valued stage-root, and cross-stage copies.
-        // When: ACL and V2 run pipeline-first across the stage-shape transitions.
-        // Then: every stage matches canonical direct V2 without a Bonsai-Hg mapping.
-        verify_augmented_manifest_v2_pipeline_first_without_hg_mapping::<NestedDirectories>(fb)
-            .await
+        // When: ACL and augmented manifests run pipeline-first across the stage-shape transitions.
+        // Then: every stage matches canonical derivation without a Bonsai-Hg mapping.
+        verify_augmented_manifest_pipeline_first_without_hg_mapping::<NestedDirectories>(fb).await
     }
 
     #[mononoke::fbinit_test]
-    async fn test_pipeline_augmented_manifest_v2_copy_from_canonical_parent(
+    async fn test_pipeline_augmented_manifest_copy_from_canonical_parent(
         fb: FacebookInit,
     ) -> Result<()> {
-        // Given: the copy source parent exists only in canonical V2.
+        // Given: the copy source parent exists only in canonical derived data.
         // When: the pipeline derives the cross-stage copy in its child.
-        // Then: V2 falls back to the canonical parent root and remains equivalent.
+        // Then: the pipeline falls back to the canonical parent root and remains equivalent.
         verify_pipeline_matches_canonical_with_canonical_ancestors::<CrossStageFileCopy>(
             fb,
             "P",
-            &AUGMENTED_MANIFEST_V2_TYPES,
+            &AUGMENTED_MANIFEST_TYPES,
         )
         .await
-    }
-
-    #[mononoke::fbinit_test]
-    async fn test_pipeline_augmented_manifest_v2_uses_shared_v1_external_parent(
-        fb: FacebookInit,
-    ) -> Result<()> {
-        // Given: the first pipeline parent has only the shared V1 root.
-        // When: ACL and V2 derive the descendants without a V2 parent checkpoint.
-        // Then: V2 extracts the parent stage entries and matches the V1 roots.
-        verify_pipeline_matches_canonical_with_canonical_ancestors_and_repo::<CrossStageFileCopy>(
-            fb,
-            "P",
-            &AUGMENTED_MANIFEST_V2_TYPES,
-            &AUGMENTED_MANIFEST_V1_TYPES,
-        )
-        .await
-        .map(|_| ())
     }
 
     // Pipeline-first: derives the pipeline before any canonical derivation, so a

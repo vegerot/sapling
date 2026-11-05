@@ -77,10 +77,6 @@ class TakeoverTestBase(TakeoverTestCase):
         self.repo.write_file("src/test/test2.py", "test2")
         self.commit2 = self.repo.commit("Initial commit.")
 
-    def select_storage_engine(self) -> str:
-        """we need to persist data across restarts"""
-        return "sqlite"
-
     def edenfs_logging_settings(self) -> Dict[str, str]:
         if self._testMethodName == "test_takeover_with_io":
             # test_takeover_with_io causes lots of I/O, so do not enable
@@ -341,16 +337,6 @@ class TakeoverTest(TakeoverTestBase):
             sorted(os.listdir(os.path.join(self.mount, "src", "test"))),
         )
 
-    def test_takeover_doesnt_send_ping(self) -> None:
-        """
-        tests that if we try a takeover with a version that doesn't know
-        how to accept a ping, we don't send one. This test should not fail
-        in either case since it is running against a client that knows how
-        to listen for a ping. It just is used to look at logs to make sure
-        the correct code path is entered.
-        """
-        self.eden.fake_takeover_with_version(3)
-
     def test_takeover_failure(self) -> None:
         print("=== beginning restart ===", file=sys.stderr)
         self.eden.takeover_without_ping_response()
@@ -518,6 +504,20 @@ class TakeoverTest(TakeoverTestBase):
 
         self.eden.assert_running_fuse_transports()
 
+    def test_takeover_with_checkout_missing_snapshot(self) -> None:
+        broken_mount = Path(self.mounts_dir) / "missing-snapshot"
+        self.eden.clone(self.repo.path, broken_mount)
+        client_dir = self.eden.client_dir_for_mount(broken_mount)
+        self.eden.shutdown()
+        (client_dir / "SNAPSHOT").unlink()
+        self.eden.start()
+
+        self.assertEqual(
+            {self.mount: "RUNNING", str(broken_mount): "NOT_RUNNING"},
+            self.eden.list_cmd_simple(),
+        )
+        self.eden.graceful_restart()
+
 
 @testcase.eden_repo_test(run_on_nfs=False)
 class TakeoverTestNoNFSServer(TakeoverTestBase):
@@ -528,6 +528,59 @@ class TakeoverTestNoNFSServer(TakeoverTestBase):
         return self.do_takeover_test()
 
 
+@testcase.eden_repo_test(run_coroutines=False, run_io_uring=False)
+class TakeoverNfsServerDisabledTest(TakeoverTestCase):
+    """
+    The old daemon hands an NFS-mounted checkout over regardless of the new
+    daemon's `experimental:enable-nfs-server`, so a config change between the
+    two daemons must not take the daemon down.
+    """
+
+    git_test_supported = False
+    nfs_server_enabled: bool = True
+
+    def setUp(self) -> None:
+        if not self.use_nfs():
+            self.skipTest("needs an NFS-mounted checkout")
+        super().setUp()
+
+    def populate_repo(self) -> None:
+        self.repo.write_file("hello", "hola\n")
+        self.repo.commit("Initial commit.")
+
+    def edenfs_extra_config(self) -> Optional[Dict[str, List[str]]]:
+        configs = super().edenfs_extra_config() or {}
+        configs["experimental"] = [
+            setting
+            for setting in configs["experimental"]
+            if not setting.startswith("enable-nfs-server")
+        ] + [f"enable-nfs-server = {'true' if self.nfs_server_enabled else 'false'}"]
+        return configs
+
+    def _restart_with_nfs_server(self, enabled: bool) -> None:
+        self.nfs_server_enabled = enabled
+        self.write_edenfs_system_config()
+        self.eden.graceful_restart()
+
+    def _assert_nfs_mount_served(self) -> None:
+        self.assertEqual("hola\n", self.read_file("hello"))
+        with self.get_thrift_client() as client:
+            mounts = [
+                m for m in client.listMounts() if m.mountPoint == self.mount_path_bytes
+            ]
+        self.assertEqual(1, len(mounts))
+        self.assertEqual(MountState.RUNNING, mounts[0].state)
+        self.assertIsNotNone(mounts[0].nfsTransport)
+
+    def test_takeover_keeps_nfs_mount_with_nfs_server_enabled(self) -> None:
+        self._restart_with_nfs_server(enabled=True)
+        self._assert_nfs_mount_served()
+
+    def test_takeover_keeps_nfs_mount_with_nfs_server_disabled(self) -> None:
+        self._restart_with_nfs_server(enabled=False)
+        self._assert_nfs_mount_served()
+
+
 @testcase.eden_repo_test
 class TakeoverRocksDBStressTest(TakeoverTestCase):
     enable_fault_injection: bool = True
@@ -536,9 +589,6 @@ class TakeoverRocksDBStressTest(TakeoverTestCase):
         self.repo.write_file("test-directory/file", "")
         # pyre-fixme[16]: `TakeoverRocksDBStressTest` has no attribute `commit1`.
         self.commit1 = self.repo.commit("Initial commit.")
-
-    def select_storage_engine(self) -> str:
-        return "rocksdb"
 
     async def test_takeover_with_tree_inode_loading_from_local_store(self) -> None:
         """

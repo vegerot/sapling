@@ -12,13 +12,17 @@
 #include <folly/coro/Task.h>
 #include <folly/coro/Timeout.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/InlineExecutor.h>
 #include <folly/logging/xlog.h>
 #include <folly/testing/TestUtil.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <optional>
+#include <string_view>
+#include <utility>
 
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/fs/config/EdenConfig.h"
@@ -43,10 +47,24 @@ namespace facebook::eden {
 namespace {
 const auto kTestTimeout = 10s;
 
+constexpr std::array<std::string_view, 2> kBlobFetchFaultPoints{
+    "SaplingBackingStore::getBlobEnqueue",
+    "SaplingBackingStore::co_getBlobEnqueue",
+};
+
+template <typename Future>
+void expectRuntimeError(Future&& future, std::string_view message) {
+  try {
+    std::forward<Future>(future).get(kTestTimeout);
+    FAIL() << "expected std::runtime_error";
+  } catch (const std::runtime_error& ex) {
+    EXPECT_EQ(message, ex.what());
+  }
+}
+
 struct TestRepo {
   folly::test::TemporaryDirectory testDir{"eden_queued_hg_backing_store_test"};
   AbsolutePath testPath = canonicalPath(testDir.path().string());
-  AbsolutePath clientPath = testPath + "client"_pc;
   HgRepo repo{testPath + "repo"_pc};
   RootId commit1;
   Hash20 manifest1;
@@ -112,8 +130,6 @@ bool checkRestrictedTreePermission(std::optional<folly::StringPiece> mode) {
   ErrorLogger noopErrorLogger{};
   auto backingStore = std::make_shared<SaplingBackingStore>(
       testRepo.repo.path(),
-      testRepo.repo.path(),
-      testRepo.clientPath,
       kPathMapDefaultCaseSensitive,
       stats.copy(),
       &executor,
@@ -130,7 +146,8 @@ bool checkRestrictedTreePermission(std::optional<folly::StringPiece> mode) {
       nullptr,
       nullptr,
       edenConfig,
-      CaseSensitivity::Sensitive);
+      CaseSensitivity::Sensitive,
+      folly::getKeepAliveToken(&executor));
 
   auto rootTree =
       objectStore
@@ -167,8 +184,6 @@ struct SaplingBackingStoreNoFaultInjectorTest : SaplingBackingStoreTestBase {
   std::shared_ptr<SaplingBackingStore> queuedBackingStore =
       std::make_shared<SaplingBackingStore>(
           repo.path(),
-          repo.path(),
-          clientPath,
           kPathMapDefaultCaseSensitive,
           stats.copy(),
           &executor,
@@ -192,8 +207,6 @@ struct SaplingBackingStoreWithFaultInjectorTest : SaplingBackingStoreTestBase {
   std::shared_ptr<SaplingBackingStore> queuedBackingStore =
       std::make_shared<SaplingBackingStore>(
           repo.path(),
-          repo.path(),
-          clientPath,
           kPathMapDefaultCaseSensitive,
           stats.copy(),
           &executor,
@@ -218,8 +231,6 @@ struct SaplingBackingStoreWithFaultInjectorIgnoreConfigTest
   std::shared_ptr<SaplingBackingStore> queuedBackingStore =
       std::make_shared<SaplingBackingStore>(
           repo.path(),
-          repo.path(),
-          clientPath,
           kPathMapDefaultCaseSensitive,
           stats.copy(),
           &executor,
@@ -231,6 +242,17 @@ struct SaplingBackingStoreWithFaultInjectorIgnoreConfigTest
           &faultInjector);
 };
 
+template <typename Future, typename Duration>
+std::string completionError(Future&& future, Duration timeout) {
+  try {
+    (void)std::forward<Future>(future).get(timeout);
+    return "completed with a value";
+  } catch (const folly::FutureTimeout&) {
+    return "never completed";
+  } catch (const std::exception& ex) {
+    return ex.what();
+  }
+}
 } // namespace
 
 TEST_F(SaplingBackingStoreNoFaultInjectorTest, getTree) {
@@ -260,7 +282,8 @@ TEST_F(
       nullptr,
       nullptr,
       edenConfig,
-      CaseSensitivity::Sensitive);
+      CaseSensitivity::Sensitive,
+      folly::getKeepAliveToken(&executor));
   auto rootTree =
       objectStore->getRootTree(commit1, ObjectFetchContext::getNullContext())
           .get(kTestTimeout);
@@ -376,6 +399,76 @@ TEST_F(SaplingBackingStoreWithFaultInjectorTest, getBlob) {
       EXPECT_EQ(blob->getContents().cloneAsValue().moveToFbString(), "bar\n");
     }
   }
+}
+
+TEST_F(
+    SaplingBackingStoreWithFaultInjectorTest,
+    blobFetchCheckpointsAreReachable) {
+  const auto rootTree = folly::coro::blockingWait(
+      folly::coro::timeout(
+          queuedBackingStore->co_getRootTree(
+              commit1, ObjectFetchContext::getNullContext()),
+          kTestTimeout));
+
+  std::optional<SlOid> blobOid;
+  for (const auto& [name, entry] : *rootTree.tree) {
+    if (name == "foo.txt" && !entry.isTree()) {
+      blobOid.emplace(entry.getObjectId());
+      break;
+    }
+  }
+  ASSERT_TRUE(blobOid.has_value());
+  const auto key = blobOid->node().toString();
+
+  faultInjector.injectBlock(kBlobFetchFaultPoints[0], key, 1);
+  auto future = queuedBackingStore->getBlobEnqueue(
+      *blobOid,
+      ObjectFetchContext::getNullContext(),
+      SaplingImportRequest::FetchType::Fetch);
+  ASSERT_TRUE(
+      faultInjector.waitUntilBlocked(kBlobFetchFaultPoints[0], kTestTimeout));
+  EXPECT_EQ(
+      1,
+      faultInjector.unblockWithError(
+          kBlobFetchFaultPoints[0],
+          key,
+          std::runtime_error("future blob checkpoint reached")));
+  expectRuntimeError(std::move(future), "future blob checkpoint reached");
+
+  faultInjector.injectBlock(kBlobFetchFaultPoints[1], key, 1);
+  folly::CPUThreadPoolExecutor pool{1};
+  auto coroFuture =
+      folly::coro::co_withExecutor(
+          &pool,
+          folly::coro::co_invoke(
+              [&]() -> folly::coro::Task<BackingStore::GetBlobResult> {
+                co_return co_await queuedBackingStore->co_getBlobEnqueue(
+                    *blobOid,
+                    ObjectFetchContext::getNullContext(),
+                    SaplingImportRequest::FetchType::Fetch);
+              }))
+          .start();
+  auto cleanup = folly::makeGuard([&] {
+    faultInjector.removeFault(kBlobFetchFaultPoints[1], key);
+    faultInjector.unblockWithError(
+        kBlobFetchFaultPoints[1],
+        key,
+        folly::make_exception_wrapper<std::runtime_error>("test cleanup"));
+    EXPECT_TRUE(std::move(coroFuture).wait(kTestTimeout))
+        << "co_getBlobEnqueue did not finish after cleanup";
+  });
+
+  ASSERT_TRUE(
+      faultInjector.waitUntilBlocked(kBlobFetchFaultPoints[1], kTestTimeout));
+  EXPECT_EQ(
+      1,
+      faultInjector.unblockWithError(
+          kBlobFetchFaultPoints[1],
+          key,
+          std::runtime_error("coroutine blob checkpoint reached")));
+  expectRuntimeError(
+      std::move(coroFuture), "coroutine blob checkpoint reached");
+  cleanup.dismiss();
 }
 
 // Duplicate requests with same nodeID in one request batch will crash Eden with
@@ -790,10 +883,8 @@ TEST_F(
         "SaplingBackingStore::co_getTreeEnqueue",
         ".*",
         folly::make_exception_wrapper<std::runtime_error>("test cleanup"));
-    try {
-      std::move(future).get(kTestTimeout);
-    } catch (...) {
-    }
+    EXPECT_TRUE(std::move(future).wait(kTestTimeout))
+        << "co_getTreeEnqueue did not finish after cleanup";
   };
 
   ASSERT_TRUE(faultInjector.waitUntilBlocked(
@@ -825,8 +916,6 @@ struct SaplingBackingStoreErrorLoggingTest : SaplingBackingStoreTestBase {
   std::shared_ptr<SaplingBackingStore> queuedBackingStore =
       std::make_shared<SaplingBackingStore>(
           repo.path(),
-          repo.path(),
-          clientPath,
           kPathMapDefaultCaseSensitive,
           stats.copy(),
           &executor,
@@ -848,6 +937,101 @@ TEST_F(SaplingBackingStoreErrorLoggingTest, manifestResolutionFailureIsLogged) {
   const auto& strings = xplatLogger.events()[0].event.getStringMap();
   EXPECT_EQ(strings.at("component"), "backing_store");
   EXPECT_EQ(strings.at("error_type"), "manifest_resolution_failure");
+}
+
+TEST_F(
+    SaplingBackingStoreNoFaultInjectorTest,
+    dropAllPendingRequestsWithAuxRequestsQueued) {
+  queuedBackingStore->queue_.stop();
+  for (auto& thread : queuedBackingStore->threads_) {
+    thread.join();
+  }
+  queuedBackingStore->threads_.clear();
+  auto context = ObjectFetchContext::getNullContext();
+  SlOid blobOid{
+      Hash20{folly::StringPiece{"1111111111111111111111111111111111111111"}},
+      RelativePathPiece{"lean/check/blobOid"}};
+  SlOid treeOid{
+      Hash20{folly::StringPiece{"2222222222222222222222222222222222222222"}},
+      RelativePathPiece{"lean/check/treeOid"}};
+  SlOid blobAuxOid{
+      Hash20{folly::StringPiece{"3333333333333333333333333333333333333333"}},
+      RelativePathPiece{"lean/check/blobAuxOid"}};
+  SlOid treeAuxOid{
+      Hash20{folly::StringPiece{"4444444444444444444444444444444444444444"}},
+      RelativePathPiece{"lean/check/treeAuxOid"}};
+
+  auto blobFuture = queuedBackingStore->getBlobEnqueue(
+      blobOid, context, SaplingImportRequest::FetchType::Fetch);
+  auto blobDuplicateFuture = queuedBackingStore->getBlobEnqueue(
+      blobOid, context, SaplingImportRequest::FetchType::Fetch);
+  auto treeFuture = queuedBackingStore->queue_.enqueueTree(
+      SaplingImportRequest::makeTreeImportRequest(treeOid, context));
+  auto treeAuxFuture =
+      queuedBackingStore->getTreeAuxDataEnqueue(treeAuxOid, context);
+  auto blobAuxFuture = queuedBackingStore->queue_.enqueueBlobAux(
+      SaplingImportRequest::makeBlobAuxImportRequest(blobAuxOid, context));
+
+  EXPECT_EQ(4, queuedBackingStore->dropAllPendingRequestsFromQueue());
+
+  EXPECT_EQ(
+      "Request forcibly dropped",
+      completionError(std::move(blobFuture), kTestTimeout));
+  EXPECT_EQ(
+      "Request forcibly dropped",
+      completionError(std::move(blobDuplicateFuture), kTestTimeout));
+  EXPECT_EQ(
+      "Request forcibly dropped",
+      completionError(std::move(treeFuture), kTestTimeout));
+  EXPECT_EQ(
+      "Request forcibly dropped",
+      completionError(std::move(treeAuxFuture), kTestTimeout));
+  EXPECT_EQ(
+      "Request forcibly dropped",
+      completionError(std::move(blobAuxFuture), kTestTimeout));
+}
+
+TEST_F(
+    SaplingBackingStoreNoFaultInjectorTest,
+    dropAllPendingRequestsThenRefetchAuxData) {
+  queuedBackingStore->queue_.stop();
+  for (auto& thread : queuedBackingStore->threads_) {
+    thread.join();
+  }
+  queuedBackingStore->threads_.clear();
+  auto context = ObjectFetchContext::getNullContext();
+  SlOid blobOid{
+      Hash20{folly::StringPiece{"5555555555555555555555555555555555555555"}},
+      RelativePathPiece{"lean/check/blobOid"}};
+  SlOid treeAuxOid{
+      Hash20{folly::StringPiece{"6666666666666666666666666666666666666666"}},
+      RelativePathPiece{"lean/check/treeAuxOid"}};
+
+  auto firstBlobFuture = queuedBackingStore->getBlobEnqueue(
+      blobOid, context, SaplingImportRequest::FetchType::Fetch);
+  EXPECT_EQ(1, queuedBackingStore->dropAllPendingRequestsFromQueue());
+  EXPECT_EQ(
+      "Request forcibly dropped",
+      completionError(std::move(firstBlobFuture), kTestTimeout));
+  auto secondBlobFuture = queuedBackingStore->getBlobEnqueue(
+      blobOid, context, SaplingImportRequest::FetchType::Fetch);
+  EXPECT_EQ(1, queuedBackingStore->dropAllPendingRequestsFromQueue());
+  EXPECT_EQ(
+      "Request forcibly dropped",
+      completionError(std::move(secondBlobFuture), kTestTimeout));
+
+  auto firstTreeAuxFuture =
+      queuedBackingStore->getTreeAuxDataEnqueue(treeAuxOid, context);
+  EXPECT_EQ(1, queuedBackingStore->dropAllPendingRequestsFromQueue());
+  EXPECT_EQ(
+      "Request forcibly dropped",
+      completionError(std::move(firstTreeAuxFuture), kTestTimeout));
+  auto secondTreeAuxFuture =
+      queuedBackingStore->getTreeAuxDataEnqueue(treeAuxOid, context);
+  EXPECT_EQ(1, queuedBackingStore->dropAllPendingRequestsFromQueue());
+  EXPECT_EQ(
+      "Request forcibly dropped",
+      completionError(std::move(secondTreeAuxFuture), kTestTimeout));
 }
 
 } // namespace facebook::eden

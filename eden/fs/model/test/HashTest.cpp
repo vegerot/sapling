@@ -356,6 +356,18 @@ TEST(Hash32, ensureStringConstructorRejectsArgumentBadCharacters) {
       std::invalid_argument);
 }
 
+TEST(Hash20, stringConstructorWithHighBytes) {
+  std::string highBytes(40, '\x84');
+  EXPECT_THROW(Hash20(folly::StringPiece{highBytes}), std::invalid_argument);
+  std::string oneHighByte = "0123456789abcdef0123456789abcdef0123456\xff";
+  EXPECT_THROW(Hash20(folly::StringPiece{oneHighByte}), std::invalid_argument);
+}
+
+TEST(Hash32, stringConstructorWithHighBytes) {
+  std::string highBytes(64, '\x84');
+  EXPECT_THROW(Hash32(folly::StringPiece{highBytes}), std::invalid_argument);
+}
+
 TEST(Hash20, sha1IOBuf) {
   // Test computing the SHA1 of data spread across an IOBuf chain
   auto buf1 = IOBuf::create(50);

@@ -259,9 +259,6 @@ class localpeer(repository.peer):
     def pushkey(self, namespace, key, old, new):
         return self._repo.pushkey(namespace, key, old, new)
 
-    def stream_out(self, shallow=False):
-        raise errormod.Abort(_("cannot perform stream clone against local peer"))
-
     def unbundle(self, cg, heads, url):
         """apply a bundle on a repo
 
@@ -485,11 +482,10 @@ class localrepository:
 
         cachepath = self.localvfs.join("cache")
         self.sharedpath = self.path
-        self.sharedroot = self.root
-        try:
-            sharedpath = self.localvfs.readutf8("sharedpath").rstrip("\n")
-            if "relshared" in self.requirements:
-                sharedpath = self.localvfs.join(sharedpath)
+        self.sharedroot = os.path.realpath(self._rsrepo.shared_root)
+        self.sharedvfs = self.localvfs
+        sharedpath = self._rsrepo.shared_dot_path
+        if sharedpath != self.path:
             sharedvfs = vfsmod.vfs(sharedpath, realpath=True)
             cachepath = sharedvfs.join("cache")
             s = sharedvfs.base
@@ -499,7 +495,6 @@ class localrepository:
                     % (identity.default().dotdir(), s)
                 )
             self.sharedpath = s
-            self.sharedroot = sharedvfs.dirname(s)
             self.sharedvfs = sharedvfs
             # Read the requirements of the shared repo to make sure we
             # support them.
@@ -509,10 +504,6 @@ class localrepository:
                 if inst.errno != errno.ENOENT:
                     raise
             self.sharedvfs.audit = self._getvfsward(self.sharedvfs.audit)
-        except IOError as inst:
-            if inst.errno != errno.ENOENT:
-                raise
-            self.sharedvfs = self.localvfs
 
         self.store = store.store(
             self.requirements,
@@ -1333,6 +1324,7 @@ class localrepository:
         return bindings.copytrace.dagcopytrace(
             self.changelog.inner,
             self.manifestlog.datastore,
+            self._rsrepo,
             self.fileslog.filestore,
             self.changelog.dag,
             self.ui._rcfg,
@@ -1623,8 +1615,16 @@ class localrepository:
 
         This can be used for `log` operations.
         """
+        use_tree_manifest = self.ui.configbool(
+            "experimental", "pathhistory-treemanifest"
+        )
         hist = bindings.pathhistory.pathhistory(
-            nodes, paths, self.changelog.inner, self.manifestlog.datastore
+            nodes,
+            paths,
+            self.changelog.inner,
+            self.manifestlog.datastore,
+            self._rsrepo,
+            use_tree_manifest,
         )
         return hist
 
@@ -1634,8 +1634,16 @@ class localrepository:
         path can be either a file or a directory.
         nodes decides the search range (ex. "::." or "_firstancestors(.)")
         """
+        use_tree_manifest = self.ui.configbool(
+            "experimental", "pathhistory-treemanifest"
+        )
         return bindings.pathhistory.lastcreation(
-            nodes, path, self.changelog.inner, self.manifestlog.datastore
+            nodes,
+            path,
+            self.changelog.inner,
+            self.manifestlog.datastore,
+            self._rsrepo,
+            use_tree_manifest,
         )
 
     def publishing(self):
@@ -1840,6 +1848,13 @@ class localrepository:
             heads = cl._visibleheads.heads
             draftheads = list(repo.dageval(lambda: heads - public()))
             cl._visibleheads.heads = draftheads
+
+            # Write a dirty dirstate as part of the transaction, before the
+            # metalog is written and exported (ex. to git refs), so working
+            # copy clients such as EdenFS or the git index see the parent
+            # change first.
+            if not tr.lockfree and not repo.dirstate.pendingparentchange():
+                repo.dirstate.write(tr)
 
             # Flush changelog before flushing metalog.
             _flushchangelog(repo)
@@ -2295,7 +2310,11 @@ class localrepository:
         # The 'revs' might have been changed (ex. changelog migrated to a
         # different form).
         self._headcache.clear()
-        self._phasecache.invalidate()
+        # Do not construct the phasecache here: its construction reads heads,
+        # hence bookmarks, and bmstore.__init__ is a caller of this method.
+        phasecache, cached = isfilecached(self, "_phasecache")
+        if cached:
+            phasecache.invalidate()
         self.invalidatedagcopytrace()
 
     def invalidatedagcopytrace(self):

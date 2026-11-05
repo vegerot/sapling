@@ -577,6 +577,7 @@ def ancestorspec(repo, subset, x, n, order):
     if n < 0:
         # children lookup
         return _childrenspec(repo, subset, x, -n, order)
+    n = min(n, smartset.maxrev + 1)
     ps = set()
     cl = repo.changelog
     s = getset(repo, fullreposet(repo), x)
@@ -2288,6 +2289,21 @@ def _predecessors(repo, subset, targetset, startdepth, stopdepth):
         return baseset(repo=repo)
     s = getset(repo, fullreposet(repo), targetset)
     d = _mapbynodefunc(repo, s, f)
+    return subset & d
+
+
+@predicate("mutationhistory(set)", safe=True)
+def mutationhistory(repo, subset, x):
+    """The mutation history of changesets in set: the changesets themselves,
+    the visible changesets connected to them by mutations (amend, rebase,
+    fold, split and other rewrites) in either direction, and every changeset
+    those were created from. A hidden changeset that only leads to hidden
+    changesets is included only with ``--hidden``.
+    """
+    s = getset(repo, fullreposet(repo), x)
+    if not mutation.enabled(repo):
+        return subset & s
+    d = _mapbynodefunc(repo, s, lambda nodes: mutation.historynodes(repo, list(nodes)))
     return subset & d
 
 

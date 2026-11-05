@@ -44,14 +44,8 @@ from eden.fs.service.eden.thrift_types import (
 )
 from eden.test_support.testcase import EdenTestCaseBase
 
-from . import edenclient, gitrepo, hgrepo, mount_namespace, repobase, skip
-from .find_executables import FindExe
+from . import edenclient, hgrepo, mount_namespace, repobase, skip
 
-
-if not FindExe.is_buck_build() or os.environ.get("EDENFS_SUFFIX", "") != "":
-    _build_flavor = "open_source"
-else:
-    _build_flavor = "facebook"
 
 mount_namespace.maybe_reexec_in_private_mount_namespace()
 
@@ -77,8 +71,6 @@ class EdenTestCase(EdenTestCaseBase):
     # Override enable_fault_injection to True in subclasses to enable Eden's fault
     # injection framework when starting edenfs
     enable_fault_injection: bool = False
-
-    enable_logview: bool = True
 
     def report_time(self, event: str) -> None:
         """
@@ -186,11 +178,7 @@ class EdenTestCase(EdenTestCaseBase):
         # to point to our test home directory for the duration of the test.
         self.setenv("HOME", str(self.eden.home_dir))
 
-        extra_config = dict(self.edenfs_extra_config() or {})
-        fuse_config = list(extra_config.get("fuse", []))
-        extra_config["fuse"] = fuse_config
-        fuse_config.extend(edenclient.fuse_transport_config(self.use_io_uring()))
-        self.write_configs(extra_config, self.eden.system_rc_path)
+        self.write_edenfs_system_config()
 
         # Default to using the Rust version of commands when running
         # integration tests. An empty edenfsctl_rollout file means that all
@@ -210,19 +198,24 @@ class EdenTestCase(EdenTestCaseBase):
         if self.enable_fault_injection:
             extra_args.append("--enable_fault_injection")
 
-        if _build_flavor == "facebook" and not self.enable_logview:
-            # add option to disable logview
-            # we set `EDENFS_SUFFIX` when running our tests with OSS build
-            extra_args.append("--eden_logview=false")
-
-        storage_engine = self.select_storage_engine()
         return edenclient.EdenFS(
             base_dir=pathlib.Path(self.tmp_dir),
             logging_settings=logging_settings,
             extra_args=extra_args,
-            storage_engine=storage_engine,
             expected_fuse_transport="io_uring" if self.use_io_uring() else "devfuse",
         )
+
+    def write_edenfs_system_config(self) -> None:
+        """
+        Write edenfs_extra_config() to the system edenfs.rc that the daemon
+        reads at startup. A test that changes edenfs_extra_config() between
+        two daemons calls this before starting the second one.
+        """
+        extra_config = dict(self.edenfs_extra_config() or {})
+        fuse_config = list(extra_config.get("fuse", []))
+        extra_config["fuse"] = fuse_config
+        fuse_config.extend(edenclient.fuse_transport_config(self.use_io_uring()))
+        self.write_configs(extra_config, self.eden.system_rc_path)
 
     def write_configs(
         self, config_dict: Dict[str, List[str]], config_file_path
@@ -319,7 +312,6 @@ class EdenTestCase(EdenTestCaseBase):
         configs = {
             "experimental": [
                 "enable-nfs-server = true",
-                "propagate-checkout-errors = true",
                 "overlay-direct-file-create = true",
                 "overlay-cache-wal-files = true",
                 'overlay-wal-min-compaction-threshold = "50"',
@@ -331,7 +323,6 @@ class EdenTestCase(EdenTestCaseBase):
             # framework runs tests on each CPU core.
             "hg": ['num-retry-threads = "2"'],
             "overlay": [
-                "direct-file-writes = true",
                 'file-prealloc-pool-size = "64"',
                 'dir-prealloc-pool-size = "64"',
             ],
@@ -367,6 +358,10 @@ class EdenTestCase(EdenTestCaseBase):
                 configs["redirections"] = ['darwin-redirection-type = "symlink"']
         elif sys.platform == "win32":
             configs["notifications"] = ['enable-eden-menu = "false"']
+            # On Windows, each EventBase uses loopback TCP ports.
+            # Thread pools get one thread for each core. Tests also run on each core.
+            # Without a limit, the tests can use all ephemeral ports.
+            configs["daemon"] = ['environment = ["FOLLY_AVAILABLE_CONCURRENCY_MAX=4"]']
         return configs
 
     def create_hg_repo(
@@ -406,14 +401,6 @@ class EdenTestCase(EdenTestCaseBase):
             filtered=filtered,
         )
         repo.init(hgrc=hgrc, init_configs=init_configs)
-
-        return repo
-
-    def create_git_repo(self, name: str) -> gitrepo.GitRepository:
-        repo_path = os.path.join(self.repos_dir, name)
-        os.makedirs(repo_path, exist_ok=True)
-        repo = gitrepo.GitRepository(repo_path, temp_mgr=self.temp_mgr)
-        repo.init()
 
         return repo
 
@@ -489,13 +476,6 @@ class EdenTestCase(EdenTestCaseBase):
     def rmdir(self, path: str) -> None:
         """Unlink the directory at the specified path relative to the clone."""
         os.rmdir(self.get_path(path))
-
-    def select_storage_engine(self) -> str:
-        """
-        Prefer to use memory in the integration tests, but allow
-        the tests that restart to override this and pick something else.
-        """
-        return "memory"
 
     def set_rust_rollout_config(self, config: Dict[str, bool]) -> None:
         """Set the Rust rollout config for this test."""
@@ -658,11 +638,6 @@ class EdenRepoTest(EdenTestCase):
     # pyre-fixme[13]: Attribute `inode_catalog_type` is never initialized.
     inode_catalog_type: str
 
-    enable_logview: bool = False
-
-    # Run Git versions of tests, if on a compatible platform.
-    git_test_supported: bool = True
-
     # Override is_case_sensitive to True in subclasses to force a case-sensitive
     # clone regardless of the OS, or to False to force a case-insensitive clone.
     # Leave this as None to get the current OS's default case-sensitivity
@@ -683,7 +658,7 @@ class EdenRepoTest(EdenTestCase):
         super().setup_eden_test()
 
         self.repo_name = "main"
-        self.inode_catalog_type = "sqlite" if sys.platform == "win32" else "legacy"
+        self.inode_catalog_type = "inmemory" if sys.platform == "win32" else "legacy"
         self.repo = self.create_repo(self.repo_name)
         self.populate_repo()
         self.report_time("repository setup done")
@@ -927,8 +902,8 @@ def _replicate_eden_nfs_repo_test_with_wal_variant(
     base_variants = list(
         _replicate_eden_nfs_repo_test(test_class, run_io_uring=run_io_uring)
     )
-    # WAL is only implemented for the Legacy/LegacyDev FsInodeCatalog
-    # (Linux/macOS). Windows uses the Sqlite catalog, so the WAL variants
+    # WAL is only implemented for the Legacy FsInodeCatalog
+    # (Linux/macOS). Windows uses the InMemory catalog, so the WAL variants
     # would exercise the same code path as the base variants.
     if sys.platform == "win32":
         return base_variants
@@ -969,8 +944,6 @@ def _replicate_eden_repo_test(  # noqa: C901
 
     scm_variants: MixinList = [("Hg", [HgRepoTestMixin])]
     # Gate some tests on whether EdenFS was built to support them.
-    if eden.config.HAVE_GIT and test_class.git_test_supported:
-        scm_variants.append(("Git", [GitRepoTestMixin]))
     if eden.config.HAVE_FILTEREDHG:
         scm_variants.append(("FilteredHg", [FilteredHgTestMixin]))
 
@@ -1089,19 +1062,6 @@ class FilteredHgTestMixin(HgRepoTestMixin):
         return super().create_repo(name, filtered=filtered)
 
 
-class GitRepoTestMixin:
-    repo_type: str = "git"
-
-    def create_repo(self, name: str) -> repobase.Repository:
-        # pyre-fixme[16]: `GitRepoTestMixin` has no attribute `create_git_repo`.
-        return self.create_git_repo(name)
-
-    def create_eden_repo(self) -> repobase.Repository:
-        # pyre-fixme[16]: `GitRepoTestMixin` has no attribute `mount`.
-        # pyre-fixme[16]: `GitRepoTestMixin` has no attribute `temp_mgr`.
-        return gitrepo.GitRepository(self.mount, temp_mgr=self.temp_mgr)
-
-
 class NFSTestMixin:
     def use_nfs(self) -> bool:
         return True
@@ -1129,7 +1089,6 @@ class CoroutinesTestMixin:
     def get_coroutines_configs(self) -> List[str]:
         return [
             "enable-phase7 = true",
-            "enable-phase8 = true",
             "enable-phase9 = true",
             "enable-phase10 = true",
         ]

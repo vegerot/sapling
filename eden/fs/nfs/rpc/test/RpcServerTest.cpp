@@ -43,6 +43,22 @@ class TestFastPathProcessor : public RpcServerProcessor {
   }
 };
 
+class TestEchoProcessor : public RpcServerProcessor {
+ public:
+  ImmediateFuture<folly::Unit> dispatchRpc(
+      folly::io::Cursor /*deser*/,
+      folly::io::QueueAppender ser,
+      uint32_t xid,
+      uint32_t /*progNumber*/,
+      uint32_t /*progVersion*/,
+      uint32_t procNumber,
+      const std::optional<authsys_parms>& /*authSysCreds*/) override {
+    serializeReply(ser, accept_stat::SUCCESS, xid);
+    XdrTrait<uint32_t>::serialize(ser, procNumber);
+    return folly::unit;
+  }
+};
+
 std::unique_ptr<folly::IOBuf>
 buildRpcRequestWithCred(uint32_t xid, uint32_t proc, opaque_auth cred) {
   folly::IOBufQueue queue{folly::IOBufQueue::cacheChainLength()};
@@ -91,6 +107,36 @@ opaque_auth makeAuthSysCred(const authsys_parms& creds) {
   auto bytes = buf->coalesce();
   return opaque_auth{
       auth_flavor::AUTH_SYS, OpaqueBytes{bytes.begin(), bytes.end()}};
+}
+
+std::unique_ptr<folly::IOBuf> splitIntoTwoFragments(
+    std::unique_ptr<folly::IOBuf> request) {
+  auto bytes = request->coalesce();
+  auto payload = bytes.subpiece(sizeof(uint32_t));
+  auto firstLength = payload.size() / 2;
+  auto secondLength = payload.size() - firstLength;
+
+  folly::IOBufQueue queue{folly::IOBufQueue::cacheChainLength()};
+  folly::io::QueueAppender appender(&queue, 256);
+  appender.writeBE<uint32_t>(static_cast<uint32_t>(firstLength));
+  appender.push(payload.data(), firstLength);
+  appender.writeBE<uint32_t>(0x80000000u | static_cast<uint32_t>(secondLength));
+  appender.push(payload.data() + firstLength, secondLength);
+  return queue.move();
+}
+
+/**
+ * Put an empty, non-final fragment in front of a single-fragment request.
+ */
+std::unique_ptr<folly::IOBuf> prependEmptyFragment(
+    std::unique_ptr<folly::IOBuf> request) {
+  auto bytes = request->coalesce();
+
+  folly::IOBufQueue queue{folly::IOBufQueue::cacheChainLength()};
+  folly::io::QueueAppender appender(&queue, 256);
+  appender.writeBE<uint32_t>(0);
+  appender.push(bytes.data(), bytes.size());
+  return queue.move();
 }
 
 std::unique_ptr<folly::IOBuf> buildNullRpcRequest(uint32_t xid) {
@@ -240,6 +286,23 @@ struct RpcServerTest : ::testing::Test {
       std::unique_ptr<folly::IOBuf> request,
       const char* failMsg = "Expected an RPC reply") {
     sendRequest(clientFd, std::move(request));
+    EXPECT_TRUE(pollForReply(clientFd, 1000)) << failMsg;
+    return readReply(clientFd);
+  }
+
+  /**
+   * Like sendAndReceive, for a request that the server dispatches on the
+   * manual executor rather than answering inline on the EventBase.
+   */
+  std::vector<uint8_t> sendAndReceiveOnExecutor(
+      int clientFd,
+      std::unique_ptr<folly::IOBuf> request,
+      const char* failMsg = "Expected an RPC reply") {
+    sendRequest(clientFd, std::move(request));
+    for (int i = 0; i < 20; ++i) {
+      manualExecutor_->run();
+      evb.loopOnce(EVLOOP_NONBLOCK);
+    }
     EXPECT_TRUE(pollForReply(clientFd, 1000)) << failMsg;
     return readReply(clientFd);
   }
@@ -483,6 +546,50 @@ TEST_F(RpcServerTest, normal_proc_not_fast_pathed) {
 
   EXPECT_TRUE(pollForReply(clientFd, 1000))
       << "Reply should arrive after cranking the thread pool";
+
+  cleanup(clientFd, server);
+}
+
+TEST_F(RpcServerTest, request_split_into_two_fragments) {
+  auto server =
+      createTestServerWithManualExecutor(std::make_shared<TestEchoProcessor>());
+  auto clientFd = connectClient(*server);
+
+  auto reply = sendAndReceiveOnExecutor(
+      clientFd, splitIntoTwoFragments(buildRpcRequest(77, /*proc=*/1)));
+  EXPECT_EQ(readBigEndianU32(reply, 4), 77u); // xid
+  EXPECT_EQ(readBigEndianU32(reply, 8), 1u); // msg_type::REPLY
+  EXPECT_EQ(readBigEndianU32(reply, 24), 0u); // accept_stat::SUCCESS
+  EXPECT_EQ(readBigEndianU32(reply, 28), 1u); // echoed procedure number
+
+  cleanup(clientFd, server);
+}
+
+TEST_F(RpcServerTest, request_with_an_empty_first_fragment) {
+  auto server =
+      createTestServerWithManualExecutor(std::make_shared<TestEchoProcessor>());
+  auto clientFd = connectClient(*server);
+
+  auto reply = sendAndReceiveOnExecutor(
+      clientFd, prependEmptyFragment(buildRpcRequest(79, /*proc=*/2)));
+  EXPECT_EQ(readBigEndianU32(reply, 4), 79u); // xid
+  EXPECT_EQ(readBigEndianU32(reply, 8), 1u); // msg_type::REPLY
+  EXPECT_EQ(readBigEndianU32(reply, 24), 0u); // accept_stat::SUCCESS
+  EXPECT_EQ(readBigEndianU32(reply, 28), 2u); // echoed procedure number
+
+  cleanup(clientFd, server);
+}
+
+TEST_F(RpcServerTest, null_request_split_into_two_fragments_with_fast_path) {
+  auto server = createTestServerWithManualExecutor(
+      std::make_shared<TestFastPathProcessor>());
+  auto clientFd = connectClient(*server);
+
+  auto reply =
+      sendAndReceive(clientFd, splitIntoTwoFragments(buildNullRpcRequest(78)));
+  EXPECT_EQ(readBigEndianU32(reply, 4), 78u); // xid
+  EXPECT_EQ(readBigEndianU32(reply, 8), 1u); // msg_type::REPLY
+  EXPECT_EQ(readBigEndianU32(reply, 24), 0u); // accept_stat::SUCCESS
 
   cleanup(clientFd, server);
 }

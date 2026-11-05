@@ -9,10 +9,11 @@ oncall("scm_client_infra")
 
 artifacts = get_integration_test_env_and_deps()
 
-python_integration_test(
+python_unittest(
     name = "testcase",
     srcs = ["testcase_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/pypi/parameterized:parameterized",
@@ -37,30 +38,33 @@ python_unittest(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "cancellation",
     srcs = ["cancellation_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "casing",
     srcs = ["casing_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "changes",
     srcs = ["changes_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -68,20 +72,22 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "chown",
     srcs = ["chown_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "clone",
     srcs = ["clone_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -89,31 +95,33 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "config",
     srcs = ["config_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "corrupt_overlay",
     srcs = ["corrupt_overlay_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
-        "//eden/fs/service:thrift-python-types",
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "wal",
     srcs = ["wal_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -121,50 +129,70 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
+    name = "overlay_corruption",
+    srcs = ["overlay_corruption_test.py"],
+    # Other platforms use NFS or a different overlay.
+    compatible_with = ["ovr_config//os:linux"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    supports_static_listing = False,
+    deps = [
+        "//eden/fs/cli:lib",
+        "//eden/fs/service:thrift-python-types",
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_unittest(
     name = "debug_getpath",
     srcs = ["debug_getpath_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "debug_subscribe",
     srcs = ["debug_subscribe_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "debug",
     srcs = ["debug_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "doteden",
     srcs = ["doteden_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "edenclient_test",
     srcs = ["edenclient_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/service:thrift-python-types",
@@ -172,18 +200,19 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "fifo",
     srcs = ["fifo_test.py"],
     compatible_with = ["ovr_config//os:linux"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "fsck",
     srcs = ["fsck_test.py"],
     compatible_with = [
@@ -191,6 +220,7 @@ python_integration_test(
         "ovr_config//os:windows",
     ],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
@@ -198,20 +228,22 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "glob",
     srcs = ["glob_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "health",
     srcs = ["health_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -219,30 +251,33 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "help",
     srcs = ["help_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "cli_smoke",
     srcs = ["eden_cli_smoke_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "info",
     srcs = ["info_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -250,20 +285,22 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "invalidate",
     srcs = ["invalidate_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "privhelper",
     srcs = ["privhelper_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -271,20 +308,22 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "flush_cache",
     srcs = ["flush_cache_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "pressure_gc",
     srcs = ["pressure_gc_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/pypi/parameterized:parameterized",
@@ -293,7 +332,7 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "legacyephemeral_cleanup",
     srcs = ["legacyephemeral_cleanup_test.py"],
     compatible_with = [
@@ -301,6 +340,7 @@ python_integration_test(
         "ovr_config//os:macos",
     ],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -308,10 +348,11 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "list",
     srcs = ["list_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/pypi/parameterized:parameterized",
@@ -319,7 +360,7 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "lock",
     srcs = ["lock_test.py"],
     compatible_with = [
@@ -333,7 +374,7 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "eden_lock",
     srcs = ["eden_lock_test.py"],
     compatible_with = [
@@ -347,20 +388,22 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "long_path",
     srcs = ["long_path_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "materialized_query",
     srcs = ["materialized_query_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -369,17 +412,18 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "mmap_test",
     srcs = ["mmap_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "mount",
     srcs = ["mount_test.py"],
     env = selects.apply(
@@ -389,6 +433,7 @@ python_integration_test(
             EDEN_TEST_TSAN = "1" if sanitizer and "thread" in sanitizer else "0",
         ),
     ),
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -399,90 +444,112 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
+    name = "mount_health_check",
+    srcs = ["mount_health_check_test.py"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    supports_static_listing = False,
+    deps = [
+        "//eden/fs/cli:lib",
+        "//eden/fs/service:thrift-python-types",
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_unittest(
     name = "notify",
     srcs = ["notify_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "oexcl",
     srcs = ["oexcl_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "patch",
     srcs = ["patch_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "persistence",
     srcs = ["persistence_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "prjfs_stress",
     srcs = ["prjfs_stress.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "prjfs_match_fs",
     srcs = ["prjfs_match_fs.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "rage",
     srcs = ["rage_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "rc",
     srcs = ["rc_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "readdir",
     srcs = ["readdir_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/service:thrift-python-clients",
@@ -491,10 +558,11 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "redirect",
     srcs = ["redirect_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -502,30 +570,35 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "remount",
     srcs = ["remount_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
+        "//eden/fs/cli:lib",
         "//eden/integration/lib:lib",
+        "//thrift/lib/python:types",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "rename",
     srcs = ["rename_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "restart",
     srcs = ["restart_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -534,40 +607,44 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "sed",
     srcs = ["sed_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "setattr",
     srcs = ["setattr_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "service_log",
     srcs = ["service_log_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "stale",
     srcs = ["stale_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/py/eden:config",
@@ -575,10 +652,11 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "stale_inode",
     srcs = ["stale_inode_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/hg/lib:testutil",
@@ -586,10 +664,11 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "start",
     srcs = ["start_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/pypi/psutil:psutil",
@@ -599,42 +678,51 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "stats",
     srcs = ["stats_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "telemetry",
     srcs = ["telemetry_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "stop",
     srcs = ["stop_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
         "//eden/fs/cli:proc_utils",
+        "//eden/fs/py/eden/thrift:client",
+        "//eden/fs/service:thrift-python-clients",
+        "//eden/fs/service:thrift-python-types",
         "//eden/integration/lib:lib",
+        "//thrift/lib/python:types",
+        "//thrift/lib/python/client:base",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "takeover",
     srcs = ["takeover_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/pypi/pexpect:pexpect",
@@ -644,10 +732,11 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "thrift",
     srcs = ["thrift_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -656,37 +745,54 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "unicode",
     srcs = ["unicode_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "unixsocket",
     srcs = ["unixsocket_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "unlink",
     srcs = ["unlink_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
+    name = "unmount_recovery",
+    srcs = ["unmount_recovery_test.py"],
+    env = artifacts["env"],
+    network_access = network_access_utils.all(),
+    supports_static_listing = False,
+    deps = [
+        "fbsource//third-party/pypi/parameterized:parameterized",
+        "//eden/fs/cli:lib",
+        "//eden/fs/service:thrift-python-types",
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_unittest(
     name = "userinfo",
     srcs = ["userinfo_test.py"],
     env = artifacts["env"],
@@ -696,7 +802,7 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "windows_fsck",
     srcs = ["windows_fsck_test.py"],
     compatible_with = [
@@ -704,26 +810,28 @@ python_integration_test(
         "ovr_config//os:windows",
     ],
     env = artifacts["env"],
+    network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "xattr",
     srcs = ["xattr_test.py"],
     compatible_with = [
         "ovr_config//os:linux",
     ],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "projfs_buffer",
     srcs = ["projfs_buffer.py"],
     compatible_with = [
@@ -731,13 +839,14 @@ python_integration_test(
         "ovr_config//os:windows",
     ],
     env = artifacts["env"],
+    network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "projfs_enumeration",
     srcs = ["projfs_enumeration.py"],
     compatible_with = [
@@ -745,6 +854,7 @@ python_integration_test(
         "ovr_config//os:windows",
     ],
     env = artifacts["env"],
+    network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
@@ -774,30 +884,33 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "use_case",
     srcs = ["use_case_test.py"],
     env = full_artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "du",
     srcs = ["du_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "remove_test",
     srcs = ["remove_test.py"],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/pypi/parameterized:parameterized",
@@ -805,7 +918,7 @@ python_integration_test(
     ],
 )
 
-python_integration_test(
+python_unittest(
     name = "readdir_cookies_break_across_checkout",
     srcs = ["readdir_cookies_break_across_checkout_test.py"],
     # The cookie collision is a POSIX readdir/NFS behavior; Windows PrjFS
@@ -815,8 +928,23 @@ python_integration_test(
         "ovr_config//os:macos",
     ],
     env = artifacts["env"],
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "//eden/integration/lib:lib",
+    ],
+)
+
+http_artifacts = get_test_env_and_deps()
+
+python_unittest(
+    name = "http",
+    srcs = ["http_test.py"],
+    env = http_artifacts["env"],
+    network_access = network_access_utils.all(),
+    supports_static_listing = False,
+    deps = [
+        "//eden/integration/lib:lib",
+        "//thrift/lib/python:types",
     ],
 )

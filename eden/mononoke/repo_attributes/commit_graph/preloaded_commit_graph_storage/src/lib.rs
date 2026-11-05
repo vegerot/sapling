@@ -26,7 +26,7 @@ use commit_graph_types::edges::ParentsAndSubtreeSources;
 use commit_graph_types::storage::CommitGraphStorage;
 use commit_graph_types::storage::FetchedChangesetEdges;
 use commit_graph_types::storage::Prefetch;
-use commit_graph_types::storage::PrefetchTarget;
+use commit_graph_types::storage::PrefetchScope;
 use context::CoreContext;
 use fbthrift::compact_protocol;
 use mononoke_macros::mononoke;
@@ -127,17 +127,13 @@ impl PreloadedEdges {
         ))
     }
 
-    pub fn get(
-        &self,
-        cs_id: &ChangesetId,
-        should_apply_fallback: bool,
-    ) -> Result<Option<ChangesetEdges>> {
+    pub fn get(&self, cs_id: &ChangesetId) -> Result<Option<ChangesetEdges>> {
         let compact_edges = match self.cs_id_to_edges.get(cs_id) {
             Some(edges) => edges,
             None => return Ok(None),
         };
 
-        let mut edges = ChangesetEdgesMut {
+        let edges = ChangesetEdgesMut {
             node: ChangesetNode::new(
                 *cs_id,
                 Generation::new(compact_edges.generation as u64),
@@ -186,10 +182,6 @@ impl PreloadedEdges {
                 .transpose()?,
         }
         .freeze();
-
-        if should_apply_fallback {
-            edges.apply_subtree_source_fallback();
-        }
 
         Ok(Some(edges))
     }
@@ -360,15 +352,6 @@ impl PreloadedCommitGraphStorage {
             persistent_storage,
         }))
     }
-
-    /// Check if fallback should be applied for this repository
-    fn should_apply_fallback(&self) -> bool {
-        !justknobs::eval(
-            "scm/mononoke:commit_graph_disable_subtree_source_fallback",
-            None,
-            Some(self.repo_name()),
-        )
-    }
 }
 
 #[async_trait]
@@ -386,11 +369,7 @@ impl CommitGraphStorage for PreloadedCommitGraphStorage {
     }
 
     async fn fetch_edges(&self, ctx: &CoreContext, cs_id: ChangesetId) -> Result<ChangesetEdges> {
-        match self
-            .preloaded_edges
-            .load()
-            .get(&cs_id, self.should_apply_fallback())?
-        {
+        match self.preloaded_edges.load().get(&cs_id)? {
             Some(edges) => Ok(edges),
             None => self.persistent_storage.fetch_edges(ctx, cs_id).await,
         }
@@ -401,11 +380,7 @@ impl CommitGraphStorage for PreloadedCommitGraphStorage {
         ctx: &CoreContext,
         cs_id: ChangesetId,
     ) -> Result<Option<ChangesetEdges>> {
-        match self
-            .preloaded_edges
-            .load()
-            .get(&cs_id, self.should_apply_fallback())?
-        {
+        match self.preloaded_edges.load().get(&cs_id)? {
             Some(edges) => Ok(Some(edges)),
             None => self.persistent_storage.maybe_fetch_edges(ctx, cs_id).await,
         }
@@ -434,12 +409,11 @@ impl CommitGraphStorage for PreloadedCommitGraphStorage {
         prefetch: Prefetch,
     ) -> Result<HashMap<ChangesetId, FetchedChangesetEdges>> {
         let preloaded_edges = self.preloaded_edges.load();
-        let should_apply_fallback = self.should_apply_fallback();
         let mut fetched_edges: HashMap<_, _> = cs_ids
             .iter()
             .filter_map(|cs_id| {
                 preloaded_edges
-                    .get(cs_id, should_apply_fallback)
+                    .get(cs_id)
                     .map(|edges| edges.map(|edges| (*cs_id, edges.into())))
                     .transpose()
             })
@@ -466,10 +440,22 @@ impl CommitGraphStorage for PreloadedCommitGraphStorage {
         &self,
         ctx: &CoreContext,
         cs_ids: &[ChangesetId],
-        target: PrefetchTarget,
+        scope: PrefetchScope,
     ) -> Result<()> {
+        // Reads of preloaded changesets never reach the persistent storage,
+        // so prefetching below them there would only fill caches that are
+        // never consulted.
+        let preloaded_edges = self.preloaded_edges.load();
+        let cs_ids: Vec<_> = cs_ids
+            .iter()
+            .filter(|cs_id| !preloaded_edges.cs_id_to_edges.contains_key(cs_id))
+            .copied()
+            .collect();
+        if cs_ids.is_empty() {
+            return Ok(());
+        }
         self.persistent_storage
-            .prefetch_many_edges(ctx, cs_ids, target)
+            .prefetch_many_edges(ctx, &cs_ids, scope)
             .await
     }
 

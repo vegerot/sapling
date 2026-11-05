@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <folly/Executor.h>
 #include <folly/Synchronized.h>
 #include <folly/coro/safe/NowTask.h>
 #include <atomic>
@@ -15,7 +16,7 @@
 #include <unordered_map>
 
 #include <folly/logging/xlog.h>
-#include <gtest/gtest_prod.h>
+#include <folly/portability/GTestProd.h>
 
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/RefPtr.h"
@@ -30,6 +31,7 @@
 #include "eden/fs/store/BackingStore.h"
 #include "eden/fs/store/IObjectStore.h"
 #include "eden/fs/store/ObjectFetchContext.h"
+#include "eden/fs/store/WalkDetector.h"
 #include "eden/fs/utils/ShardedLruCache.h"
 
 namespace facebook::eden {
@@ -114,6 +116,11 @@ class ObjectStore : public IObjectStore,
                     public ObjectIdCodec,
                     public std::enable_shared_from_this<ObjectStore> {
  public:
+  /**
+   * `walkDetector` is the mount's walk detector, which gets told about the
+   * blobs and trees fetched from the backing store, or nullptr when the
+   * backing store does not detect walks.
+   */
   static std::shared_ptr<ObjectStore> create(
       std::shared_ptr<BackingStore> backingStore,
       std::shared_ptr<TreeCache> treeCache,
@@ -121,7 +128,9 @@ class ObjectStore : public IObjectStore,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
       std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
       std::shared_ptr<ReloadableConfig> edenConfig,
-      CaseSensitivity caseSensitive);
+      CaseSensitivity caseSensitive,
+      folly::Executor::KeepAlive<> executor,
+      std::shared_ptr<WalkDetector> walkDetector = nullptr);
   ~ObjectStore() override;
 
   /**
@@ -441,10 +450,6 @@ class ObjectStore : public IObjectStore,
    */
   bool areObjectsKnownIdentical(const ObjectId& one, const ObjectId& two) const;
 
-  void workingCopyParentHint(const RootId& parent) {
-    backingStore_->workingCopyParentHint(parent);
-  }
-
   folly::Synchronized<std::unordered_map<ProcessId, std::atomic<uint64_t>>>&
   getPidFetches() {
     return pidFetchCounts_->map_;
@@ -455,12 +460,14 @@ class ObjectStore : public IObjectStore,
   }
 
  private:
-  FRIEND_TEST(ObjectStoreTest, caching_policies_anything);
-  FRIEND_TEST(ObjectStoreTest, caching_policies_no_caching);
-  FRIEND_TEST(ObjectStoreTest, caching_policies_blob);
-  FRIEND_TEST(ObjectStoreTest, caching_policies_trees);
-  FRIEND_TEST(ObjectStoreTest, caching_policies_blob_aux_data);
-  FRIEND_TEST(ObjectStoreTest, caching_policies_trees_and_blob_aux_data);
+  FOLLY_GTEST_FRIEND_TEST(ObjectStoreTest, caching_policies_anything);
+  FOLLY_GTEST_FRIEND_TEST(ObjectStoreTest, caching_policies_no_caching);
+  FOLLY_GTEST_FRIEND_TEST(ObjectStoreTest, caching_policies_blob);
+  FOLLY_GTEST_FRIEND_TEST(ObjectStoreTest, caching_policies_trees);
+  FOLLY_GTEST_FRIEND_TEST(ObjectStoreTest, caching_policies_blob_aux_data);
+  FOLLY_GTEST_FRIEND_TEST(
+      ObjectStoreTest,
+      caching_policies_trees_and_blob_aux_data);
   // Forbidden constructor. Use create().
   ObjectStore(
       std::shared_ptr<BackingStore> backingStore,
@@ -469,8 +476,42 @@ class ObjectStore : public IObjectStore,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
       std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
       std::shared_ptr<ReloadableConfig> edenConfig,
-      CaseSensitivity caseSensitive);
+      CaseSensitivity caseSensitive,
+      folly::Executor::KeepAlive<> executor,
+      std::shared_ptr<WalkDetector> walkDetector);
+
+  /**
+   * Report a blob or tree that came back from the backing store to the walk
+   * detector, for the fetch causes that count as walking.
+   */
+  void witnessBlobFetch(
+      const ObjectId& id,
+      const BackingStore::GetBlobResult& result,
+      const ObjectFetchContext& context) const;
+  void witnessTreeFetch(
+      const ObjectId& id,
+      const Tree& tree,
+      ObjectFetchContext::Origin origin,
+      const ObjectFetchContext& context) const;
+
   // Forbidden copy constructor and assignment operator
+
+  /**
+   * Starts a fetch coroutine on the calling thread and wraps its result.
+   *
+   * A fetch answered from an in-memory cache or the local store completes
+   * before this returns, so the ImmediateFuture is ready and the FUSE and
+   * NFS dispatchers reply without an executor hop. Only a fetch that has to
+   * wait on the backing store's import queue resumes on executor_.
+   *
+   * folly calls this start "unsafe" because the coroutine reports executor_
+   * as its executor while its synchronous prefix runs on the caller's
+   * thread. The fetch paths do not depend on which thread that prefix runs
+   * on; the SemiFuture-returning backing store methods already run the same
+   * local lookups on the caller's thread.
+   */
+  template <typename T>
+  ImmediateFuture<T> startInline(folly::coro::Task<T> task) const;
   ObjectStore(ObjectStore const&) = delete;
   ObjectStore& operator=(ObjectStore const&) = delete;
 
@@ -541,6 +582,10 @@ class ObjectStore : public IObjectStore,
    * Multiple ObjectStores may share the same BackingStore.
    */
   std::shared_ptr<BackingStore> backingStore_;
+  /** Resumes fetches that had to wait on the backing store. */
+  folly::Executor::KeepAlive<> executor_;
+  /** The mount's walk detector; nullptr when the store detects no walks. */
+  std::shared_ptr<WalkDetector> walkDetector_;
 
   EdenStatsPtr const stats_;
 

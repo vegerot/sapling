@@ -14,6 +14,7 @@ use std::sync::Arc;
 #[cfg(fbcode_build)]
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -42,6 +43,8 @@ use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMappingRef;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
+use bonsai_p4_mapping::BonsaiP4Mapping;
+use bonsai_p4_mapping::BonsaiP4MappingRef;
 use bonsai_svnrev_mapping::BonsaiSvnrevMapping;
 use bonsai_svnrev_mapping::BonsaiSvnrevMappingRef;
 use bonsai_tag_mapping::BonsaiTagMapping;
@@ -65,6 +68,7 @@ use bytes::Bytes;
 use changeset_info::ChangesetInfo;
 use commit_rate_limit_config::CommitRateLimit;
 use context::CoreContext;
+use context::PerfCounterType;
 use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncData;
@@ -121,6 +125,7 @@ use metaconfig_types::RepoConfigRef;
 use mononoke_repos::MononokeRepos;
 use mononoke_types::ContentId;
 use mononoke_types::ContentManifestId;
+use mononoke_types::P4ChangelistId;
 use mononoke_types::RepositoryId;
 use mononoke_types::Svnrev;
 use mononoke_types::Timestamp;
@@ -247,6 +252,9 @@ pub struct Repo {
 
     #[facet]
     pub bonsai_svnrev_mapping: dyn BonsaiSvnrevMapping,
+
+    #[facet]
+    pub bonsai_p4_mapping: dyn BonsaiP4Mapping,
 
     #[facet]
     pub bonsai_hg_mapping: dyn BonsaiHgMapping,
@@ -561,6 +569,13 @@ fn report_bookmark_missing_from_cache(repo: &impl RepoIdentityRef, bookmark: &Bo
     });
 }
 
+#[cfg_attr(
+    not(fbcode_build),
+    expect(
+        unused_variables,
+        reason = "Only internal builds report to the API stats instrument"
+    )
+)]
 fn report_bookmark_missing_from_repo(repo: &impl RepoIdentityRef, bookmark: &BookmarkKey) {
     error!(
         "Monitored bookmark does not exist in the repo: {}",
@@ -885,6 +900,29 @@ impl<R: RepoConfigRef> RepoContext<R> {
     }
 }
 
+impl<R: RepoConfigRef + RepoIdentityRef> RepoContext<R> {
+    /// Reject commit-cloud writes on repos that accept no drafts at all.
+    /// `readonly` alone is not enough: the configerator family is readonly
+    /// yet takes drafts. `infinitepush.allow_writes` is the discriminator.
+    pub fn ensure_commit_cloud_writable(&self) -> Result<(), MononokeError> {
+        if !justknobs::eval(
+            "scm/mononoke:reject_commit_cloud_writes_on_readonly_repos",
+            None,
+            Some(self.name()),
+        ) {
+            return Ok(());
+        }
+        if self.config().readonly.is_read_only() && !self.config().infinitepush.allow_writes {
+            Err(MononokeError::InvalidRequest(format!(
+                "Commit-cloud writes are disabled on readonly repo {} (see scm/mononoke:reject_commit_cloud_writes_on_readonly_repos)",
+                self.config().repoid,
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl<R: MutableRenamesArc> RepoContext<R> {
     pub fn mutable_renames(&self) -> ArcMutableRenames {
         self.repo.mutable_renames_arc()
@@ -923,11 +961,12 @@ impl<R: RepoDerivedDataRef> RepoContext<R> {
     /// also reads persistent commits, so this does not mean a changeset
     /// read through it is ephemeral.
     pub fn in_bubble(&self) -> bool {
-        self.repo()
-            .repo_derived_data()
-            .manager()
-            .bubble_id()
-            .is_some()
+        self.bubble_id().is_some()
+    }
+
+    /// The bubble this context is bound to, which can also read persistent commits.
+    pub fn bubble_id(&self) -> Option<BubbleId> {
+        self.repo().repo_derived_data().manager().bubble_id()
     }
 }
 
@@ -956,7 +995,7 @@ impl<R: RepoDerivedDataRef + RepoIdentityRef> RepoContext<R> {
     /// or a commit uploaded then checked out by raw hash). Without it, serving the
     /// augmented manifest in place of the original would fail closed for those
     /// commits.
-    fn derive_hg_augmented_manifest_at_creation_enabled(&self) -> bool {
+    pub fn derive_hg_augmented_manifest_at_creation_enabled(&self) -> bool {
         self.repo()
             .repo_derived_data()
             .config()
@@ -1224,6 +1263,24 @@ impl<R: BonsaiSvnrevMappingRef> RepoContext<R> {
     }
 }
 
+impl<R: BonsaiP4MappingRef> RepoContext<R> {
+    /// Similar to many_changeset_hg_ids, but returning Perforce changelist ids.
+    pub async fn many_changeset_p4_changelist_ids(
+        &self,
+        changesets: Vec<ChangesetId>,
+    ) -> Result<Vec<(ChangesetId, P4ChangelistId)>, MononokeError> {
+        let mapping = self
+            .repo()
+            .bonsai_p4_mapping()
+            .get(&self.ctx, changesets.into())
+            .await?
+            .into_iter()
+            .map(|entry| (entry.bcs_id, entry.p4_changelist_id))
+            .collect();
+        Ok(mapping)
+    }
+}
+
 impl<R: RepoConfigRef> RepoContext<R> {
     /// Start a write to the repo.
     pub fn start_write(&self) -> Result<(), MononokeError> {
@@ -1356,6 +1413,7 @@ where
         + BonsaiGitMappingRef
         + BonsaiGlobalrevMappingRef
         + BonsaiSvnrevMappingRef
+        + BonsaiP4MappingRef
         + Clone
         + Send
         + Sync
@@ -1438,6 +1496,12 @@ where
                 self.repo()
                     .bonsai_svnrev_mapping()
                     .get_bonsai_from_svnrev(&self.ctx, rev)
+                    .await?
+            }
+            ChangesetSpecifier::P4Changelist(cl) => {
+                self.repo()
+                    .bonsai_p4_mapping()
+                    .get_bonsai_from_p4_changelist_id(&self.ctx, cl)
                     .await?
             }
             ChangesetSpecifier::GitSha1(git_sha1) => {
@@ -1816,6 +1880,8 @@ impl<R: PhasesRef + CommitGraphRef + Clone> RepoContext<R> {
             return Ok(Default::default());
         }
 
+        let walk_start = Instant::now();
+
         // initialize visited
         let mut visited: HashSet<_> = changesets.iter().cloned().collect();
 
@@ -1868,6 +1934,10 @@ impl<R: PhasesRef + CommitGraphRef + Clone> RepoContext<R> {
             public.extend(new_public);
             draft.extend(new_draft);
         }
+
+        self.ctx
+            .perf_counters()
+            .add_duration_us(PerfCounterType::PhasesSectionUs, walk_start.elapsed());
 
         Ok(Stack {
             draft,
@@ -2311,6 +2381,10 @@ mod tests {
     use fixtures::Linear;
     use fixtures::MergeEven;
     use fixtures::TestRepoFixture;
+    use futures::FutureExt;
+    use justknobs::test_helpers::JustKnobsInMemory;
+    use justknobs::test_helpers::KnobVal;
+    use justknobs::test_helpers::with_just_knobs_async;
     use mononoke_macros::mononoke;
 
     use super::*;
@@ -2357,6 +2431,62 @@ mod tests {
         let maybe_child = try_find_child(&ctx, &repo, ancestor, descendant, 100).await?;
         let child = maybe_child.ok_or_else(|| anyhow!("didn't find child"))?;
         assert_eq!(child, descendant);
+        Ok(())
+    }
+
+    async fn assert_commit_cloud_writable(fb: FacebookInit, knob_on: bool) -> Result<(), Error> {
+        let mut factory = test_repo_factory::TestRepoFactory::new(fb)?;
+        factory.with_config_override(|config| {
+            config.readonly = metaconfig_types::RepoReadOnly::ReadOnly("test".to_string());
+            config.infinitepush.allow_writes = false;
+        });
+        let repo: Repo = factory.build().await?;
+        let repo_ctx = RepoContext::new_test(CoreContext::test_mock(fb), Arc::new(repo)).await?;
+        match (repo_ctx.ensure_commit_cloud_writable(), knob_on) {
+            (Err(MononokeError::InvalidRequest(msg)), true)
+                if msg.contains("Commit-cloud writes are disabled")
+                    && msg
+                        .contains("scm/mononoke:reject_commit_cloud_writes_on_readonly_repos") => {}
+            (Ok(()), false) => {}
+            (other, _) => panic!(
+                "knob_on={knob_on}: readonly repo must be rejected iff gate on, got: {other:?}"
+            ),
+        }
+
+        // Readonly but draft-accepting (the configerator shape): always allowed.
+        let mut factory = test_repo_factory::TestRepoFactory::new(fb)?;
+        factory.with_config_override(|config| {
+            config.readonly = metaconfig_types::RepoReadOnly::ReadOnly("test".to_string());
+            config.infinitepush.allow_writes = true;
+        });
+        let repo: Repo = factory.build().await?;
+        let repo_ctx = RepoContext::new_test(CoreContext::test_mock(fb), Arc::new(repo)).await?;
+        assert!(
+            repo_ctx.ensure_commit_cloud_writable().is_ok(),
+            "knob_on={knob_on}: readonly repo with infinitepush writes must allow commit-cloud writes"
+        );
+
+        let repo: Repo = test_repo_factory::build_empty(fb).await?;
+        let repo_ctx = RepoContext::new_test(CoreContext::test_mock(fb), Arc::new(repo)).await?;
+        assert!(
+            repo_ctx.ensure_commit_cloud_writable().is_ok(),
+            "knob_on={knob_on}: writable repo must always allow commit-cloud writes"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_commit_cloud_rejects_readonly_repo(fb: FacebookInit) -> Result<(), Error> {
+        for knob_on in [true, false] {
+            with_just_knobs_async(
+                JustKnobsInMemory::new(HashMap::from([(
+                    "scm/mononoke:reject_commit_cloud_writes_on_readonly_repos".to_string(),
+                    KnobVal::Bool(knob_on),
+                )])),
+                assert_commit_cloud_writable(fb, knob_on).boxed(),
+            )
+            .await?;
+        }
         Ok(())
     }
 }

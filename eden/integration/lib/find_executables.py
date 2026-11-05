@@ -15,7 +15,6 @@ import logging
 import os
 import shutil
 import sys
-from pathlib import Path
 from typing import Any, Callable, Dict, Generic, List, Optional, Tuple, Type, TypeVar
 
 import eden.config
@@ -97,7 +96,7 @@ class FindExeClass:
             "edenfsctl (Python)",
             env="EDENFSCTL_REAL_PATH",
             buck_path="eden/fs/cli/edenfsctl.par",
-            cmake_path="eden/fs/cli/edenfsctl.real",
+            cmake_path="eden/fs/cli/edenfsctl.real/__main__.py",
             system_candidates=["/usr/local/bin/edenfsctl.real"],
         )
 
@@ -188,13 +187,6 @@ class FindExeClass:
             env="EDENFS_DROP_PRIVS",
             buck_path="eden/fs/fuse/privhelper/test/drop_privs",
         )
-
-    @cached_property
-    def GIT(self) -> str:
-        git = shutil.which("git.real") or shutil.which("git")
-        if git is None:
-            raise Exception("unable to find git binary")
-        return git
 
     @cached_property
     def HG(self) -> str:
@@ -359,16 +351,6 @@ class FindExeClass:
         src_dir = os.environ.get("CMAKE_SOURCE_DIR", "")
         if src_dir:
             return src_dir
-
-        # The CMAKE_SOURCE_DIR environment variable should always be set if running the
-        # tests through ctest.  However, if the test executable is invoked directly
-        # CMAKE_SOURCE_DIR may not be set.  If this build was driven by getdeps using an
-        # internal shipit-based build, the sources may exist at ../../shipit/eden.
-        # Try looking at that location just to make it easier for developers to run the
-        # test binary manually.
-        eden_dir = Path.cwd().parent.parent / "shipit" / "eden"
-        if eden_dir.exists():
-            return str(eden_dir)
 
         raise Exception(
             "unable to find source directory: "

@@ -45,6 +45,8 @@ struct TakeoverStats;
 struct CheckoutStats;
 struct TreeInodeStats;
 struct CgroupFileCacheStats;
+struct CheckoutRecoveryStats;
+struct MountHealthCheckStats;
 struct FakeStats;
 
 class EdenStats : public RefCounted {
@@ -105,6 +107,8 @@ class EdenStats : public RefCounted {
   ThreadLocal<CheckoutStats> checkoutStats_;
   ThreadLocal<TreeInodeStats> treeInodeStats_;
   ThreadLocal<CgroupFileCacheStats> cgroupFileCacheStats_;
+  ThreadLocal<CheckoutRecoveryStats> checkoutRecoveryStats_;
+  ThreadLocal<MountHealthCheckStats> mountHealthCheckStats_;
   ThreadLocal<FakeStats> fakeStats_;
 };
 
@@ -208,6 +212,18 @@ template <>
 inline CgroupFileCacheStats&
 EdenStats::getStatsForCurrentThread<CgroupFileCacheStats>() {
   return *cgroupFileCacheStats_.get();
+}
+
+template <>
+inline CheckoutRecoveryStats&
+EdenStats::getStatsForCurrentThread<CheckoutRecoveryStats>() {
+  return *checkoutRecoveryStats_.get();
+}
+
+template <>
+inline MountHealthCheckStats&
+EdenStats::getStatsForCurrentThread<MountHealthCheckStats>() {
+  return *mountHealthCheckStats_.get();
 }
 
 template <>
@@ -707,6 +723,10 @@ struct OverlayStats : StatsGroup<OverlayStats> {
   // already opened the file.
   Counter createdFdCached{"overlay.created_fd_cached"};
   Counter createdFdAlreadyOpen{"overlay.created_fd_already_open"};
+  // SHA-1 requests for materialized files that had to read and hash the
+  // file, rather than being served from the inode's cache or settled by a
+  // size mismatch.
+  Counter fileHashComputed{"overlay.file_hash_computed"};
 
   Counter loadOverlayDirSuccessful{"overlay.load_overlay_dir_successful"};
   Counter loadOverlayDirFailure{"overlay.load_overlay_dir_failure"};
@@ -745,6 +765,9 @@ struct OverlayStats : StatsGroup<OverlayStats> {
   Counter walEntriesReplayed{"overlay.wal_entries_replayed"};
   Counter walParseFailure{"overlay.wal_parse_failure"};
   Counter walCompaction{"overlay.wal_compaction"};
+  Counter onlineFsckDirectoryRecovery{"overlay.online_fsck_directory_recovery"};
+  Counter onlineFsckInodeRecovery{"overlay.online_fsck_inode_recovery"};
+  Counter onlineFsckStartupSkip{"overlay.online_fsck_startup_skip"};
   // Wall time spent inside the synchronous saveOverlayDir triggered by
   // maybeCompactWal. Bounded by kCompactionCap, but worth a histogram
   // because compaction runs on the FUSE/NFS dispatch thread under the
@@ -769,6 +792,7 @@ struct InodeMapStats : StatsGroup<InodeMapStats> {
   Counter lookupTreeInodeMiss{"inode_map.lookup_tree_inode_miss"};
   Counter lookupBlobInodeMiss{"inode_map.lookup_blob_inode_miss"};
   Counter lookupInodeError{"inode_map.lookup_inode_error"};
+  Counter forgetUnknownInode{"inode_map.forget_unknown_inode"};
 };
 
 struct InodeMetadataTableStats : StatsGroup<InodeMetadataTableStats> {
@@ -827,6 +851,52 @@ struct TreeInodeStats : StatsGroup<TreeInodeStats> {
 struct CgroupFileCacheStats : StatsGroup<CgroupFileCacheStats> {
   Counter reclaimedBytes{"local.memory.cgroup_file_cache.reclaimed_bytes"};
   Counter reclaimFailures{"local.memory.cgroup_file_cache.reclaim_failures"};
+};
+
+/**
+ * Remounts of checkouts the daemon stopped serving without being asked to.
+ */
+struct CheckoutRecoveryStats : StatsGroup<CheckoutRecoveryStats> {
+  Counter attempt{"checkout_recovery.attempt"};
+  Counter success{"checkout_recovery.success"};
+  Counter failure{"checkout_recovery.failure"};
+  Counter gaveUp{"checkout_recovery.gave_up"};
+  Counter notServed{"checkout_recovery.not_served"};
+  Counter flapLimited{"checkout_recovery.flap_limited"};
+  // Queued recoveries dropped because EdenFS left RUNNING before they mounted.
+  Counter cancelled{"checkout_recovery.cancelled"};
+  // Channel stops that did not trigger a recovery, by reason.
+  Counter channelStopSkippedTakeover{
+      "checkout_recovery.channel_stop_skipped.takeover"};
+  Counter channelStopSkippedUnmountRequested{
+      "checkout_recovery.channel_stop_skipped.unmount_requested"};
+  Counter channelStopSkippedDaemonNotRunning{
+      "checkout_recovery.channel_stop_skipped.daemon_not_running"};
+  Counter channelStopSkippedExpectedStop{
+      "checkout_recovery.channel_stop_skipped.expected_stop"};
+  // Not served any more, intentionally unmounted, or not recoverable.
+  Counter channelStopSkippedNotNeeded{
+      "checkout_recovery.channel_stop_skipped.not_needed"};
+  // In flight, gave up, or flapping.
+  Counter channelStopSkippedThrottled{
+      "checkout_recovery.channel_stop_skipped.throttled"};
+};
+
+/**
+ * Probes of the checkouts the daemon is serving
+ * (`mount:mount-health-check-interval`).
+ */
+struct MountHealthCheckStats : StatsGroup<MountHealthCheckStats> {
+  Counter probes{"mount_health_check.probes"};
+  Counter healthy{"mount_health_check.healthy"};
+  Counter issue{"mount_health_check.issue"};
+  Counter timedOut{"mount_health_check.timed_out"};
+  Counter notStarted{"mount_health_check.not_started"};
+  Counter hung{"mount_health_check.hung"};
+  Counter slow{"mount_health_check.slow"};
+  Counter hangEnded{"mount_health_check.hang_ended"};
+  // Probes that confirmed the mount with statx instead of the mount table.
+  Counter statxMountCheck{"mount_health_check.statx_mount_check"};
 };
 
 /*

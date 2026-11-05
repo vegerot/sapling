@@ -14,6 +14,16 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:conv",
+        "fbsource//xplat/folly:scope_guard",
+        "fbsource//xplat/folly/chrono:conv",
+        "fbsource//xplat/folly/container:array",
+        "fbsource//xplat/folly/coro:gtest_helpers",
+        "fbsource//xplat/folly/coro:task",
+        "fbsource//xplat/folly/coro:timeout",
+        "fbsource//xplat/folly/executors:manual_executor",
+        "fbsource//xplat/folly/portability:unistd",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/common/utils:fault_injector",
         "//eden/common/utils:file_utils",
         "//eden/common/utils:utils",
@@ -24,22 +34,13 @@ cpp_unittest(
         "//eden/fs/prjfs:prjfs",
         "//eden/fs/service:pretty_printers",
         "//eden/fs/service:thrift-cpp2-types",
+        "//eden/fs/store:context",
         "//eden/fs/store:store",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:inode_unloader",
         "//eden/fs/testharness:test_checks",
         "//eden/fs/testharness:test_mount",
         "//eden/fs/utils:eden_error",
-        "//folly:conv",
-        "//folly:scope_guard",
-        "//folly/chrono:conv",
-        "//folly/container:array",
-        "//folly/coro:gtest_helpers",
-        "//folly/coro:task",
-        "//folly/coro:timeout",
-        "//folly/executors:manual_executor",
-        "//folly/portability:unistd",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -50,6 +51,10 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:cancellation_token",
+        "fbsource//xplat/folly/executors:manual_executor",
+        "fbsource//xplat/folly/futures:core",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/common/utils:fault_injector",
         "//eden/common/utils:path",
         "//eden/common/utils:ref_ptr",
@@ -60,10 +65,6 @@ cpp_unittest(
         "//eden/fs/telemetry/test:capturing_xplat_logger",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_mount",
-        "//folly:cancellation_token",
-        "//folly/executors:manual_executor",
-        "//folly/futures:core",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -74,13 +75,13 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:scope_guard",
+        "fbsource//xplat/folly/logging/test:test_handler",
         "//eden/common/utils:fault_injector",
         "//eden/fs/inodes:inodes",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_mount",
         "//eden/fs/utils:eden_error",
-        "//folly:scope_guard",
-        "//folly/logging/test:test_handler",
     ],
 )
 
@@ -91,6 +92,7 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/executors:manual_executor",
         "//eden/fs/inodes:inodes",
         "//eden/fs/model:testutil",
         "//eden/fs/service:pretty_printers",
@@ -98,7 +100,6 @@ cpp_unittest(
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_mount",
         "//fb303:service_data",
-        "//folly/executors:manual_executor",
     ],
 )
 
@@ -110,6 +111,10 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:exception_wrapper",
+        "fbsource//xplat/folly/coro:task",
+        "fbsource//xplat/folly/logging:logging",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/fs/config:config",
         "//eden/fs/inodes:inodes",
         "//eden/fs/model/git:gitignore",
@@ -119,10 +124,6 @@ cpp_unittest(
         "//eden/fs/testharness:test_checks",
         "//eden/fs/testharness:test_mount",
         "//eden/fs/testharness:test_util",
-        "//folly:exception_wrapper",
-        "//folly/coro:task",
-        "//folly/logging:logging",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -134,6 +135,9 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/fmt:fmt",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/test:test_utils",
+        "fbsource//xplat/folly/testing:test_util",
+        "//eden/common/utils:fault_injector",
         "//eden/fs/fuse:fuse",
         "//eden/fs/inodes:inodes",
         "//eden/fs/model:model",
@@ -142,8 +146,7 @@ cpp_unittest(
         "//eden/fs/testharness:fake_fuse",
         "//eden/fs/testharness:stored_object",
         "//eden/fs/testharness:test_mount",
-        "//folly/test:test_utils",
-        "//folly/testing:test_util",
+        "//eden/fs/utils:linux_kernel_version",
     ],
 )
 
@@ -157,6 +160,8 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:cancellation_token",
+        "fbsource//xplat/folly/futures:core",
         "//eden/fs/fuse:fuse",
         "//eden/fs/inodes:inodes",
         "//eden/fs/store:store",
@@ -164,8 +169,6 @@ cpp_unittest(
         "//eden/fs/testharness:fake_fuse",
         "//eden/fs/testharness:stored_object",
         "//eden/fs/testharness:test_mount",
-        "//folly:cancellation_token",
-        "//folly/futures:core",
     ],
 )
 
@@ -176,6 +179,11 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:cancellation_token",
+        "fbsource//xplat/folly/container:f14_hash",
+        "fbsource//xplat/folly/executors:manual_executor",
+        "fbsource//xplat/folly/io:iobuf",
+        "fbsource//xplat/folly/io/async:async_base",
         "//eden/common/utils:fault_injector",
         "//eden/common/utils:path",
         "//eden/fs/inodes:inodes",
@@ -187,11 +195,6 @@ cpp_unittest(
         "//eden/fs/testharness:test_mount",
         "//fb303:service_data",
         "//fb303:thread_cached_service_data",
-        "//folly:cancellation_token",
-        "//folly/container:f14_hash",
-        "//folly/executors:manual_executor",
-        "//folly/io:iobuf",
-        "//folly/io/async:async_base",
     ],
 )
 
@@ -207,6 +210,14 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:file",
+        "fbsource//xplat/folly:range",
+        "fbsource//xplat/folly:scope_guard",
+        "fbsource//xplat/folly/chrono:conv",
+        "fbsource//xplat/folly/executors:manual_executor",
+        "fbsource//xplat/folly/futures:core",
+        "fbsource//xplat/folly/futures:future_splitter",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/common/utils:fault_injector",
         "//eden/fs/config:config",
         "//eden/fs/fuse:fuse",
@@ -220,14 +231,6 @@ cpp_unittest(
         "//eden/fs/testharness:test_checks",
         "//eden/fs/testharness:test_mount",
         "//eden/fs/testharness:test_util",
-        "//folly:file",
-        "//folly:range",
-        "//folly:scope_guard",
-        "//folly/chrono:conv",
-        "//folly/executors:manual_executor",
-        "//folly/futures:core",
-        "//folly/futures:future_splitter",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -239,16 +242,19 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/fmt:fmt",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:range",
+        "fbsource//xplat/folly/coro:gtest_helpers",
+        "fbsource//xplat/folly/test:test_utils",
+        "//eden/common/utils:fault_injector",
         "//eden/common/utils:utils",
         "//eden/fs/inodes:inodes",
+        "//eden/fs/journal:journal",
         "//eden/fs/store:store",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_checks",
         "//eden/fs/testharness:test_mount",
         "//eden/fs/testharness:test_util",
-        "//folly:range",
-        "//folly/coro:gtest_helpers",
-        "//folly/test:test_utils",
+        "//fb303:service_data",
     ],
 )
 
@@ -263,15 +269,15 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/executors:manual_executor",
+        "fbsource//xplat/folly/io/async:async_base",
+        "fbsource//xplat/folly/io/async:scoped_event_base_thread",
+        "fbsource//xplat/folly/logging:logging",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/common/utils:utils",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:fake_fuse",
         "//eden/fs/testharness:test_mount",
-        "//folly/executors:manual_executor",
-        "//folly/io/async:async_base",
-        "//folly/io/async:scoped_event_base_thread",
-        "//folly/logging:logging",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -283,22 +289,22 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:conv",
+        "fbsource//xplat/folly:range",
+        "fbsource//xplat/folly:try",
+        "fbsource//xplat/folly/coro:blocking_wait",
+        "fbsource//xplat/folly/coro:collect",
+        "fbsource//xplat/folly/coro:gtest_helpers",
+        "fbsource//xplat/folly/coro:invoke",
+        "fbsource//xplat/folly/coro:task",
+        "fbsource//xplat/folly/test:test_utils",
+        "fbsource//xplat/folly/testing:test_util",
         "//eden/fs/inodes:inodes",
         "//eden/fs/model:testutil",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_checks",
         "//eden/fs/testharness:test_mount",
         "//eden/fs/utils:glob",
-        "//folly:conv",
-        "//folly:range",
-        "//folly:try",
-        "//folly/coro:blocking_wait",
-        "//folly/coro:collect",
-        "//folly/coro:gtest_helpers",
-        "//folly/coro:invoke",
-        "//folly/coro:task",
-        "//folly/test:test_utils",
-        "//folly/testing:test_util",
     ],
 )
 
@@ -323,13 +329,13 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/coro:gtest_helpers",
+        "fbsource//xplat/folly/test:test_utils",
+        "fbsource//xplat/folly/testing:test_util",
         "//eden/fs/inodes:inodes",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_checks",
         "//eden/fs/testharness:test_mount",
-        "//folly/coro:gtest_helpers",
-        "//folly/test:test_utils",
-        "//folly/testing:test_util",
     ],
 )
 
@@ -340,7 +346,12 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:portability",
+        "fbsource//xplat/folly:string",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/common/utils:bug",
+        "//eden/common/utils:fault_injector",
+        "//eden/common/utils:ref_ptr",
         "//eden/fs/config:config",
         "//eden/fs/inodes:inodes",
         "//eden/fs/store:context",
@@ -349,8 +360,6 @@ cpp_unittest(
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_mount",
         "//eden/fs/testharness:test_util",
-        "//folly:string",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -361,10 +370,10 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/fs/inodes:inodes",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_mount",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -375,11 +384,11 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/chrono:conv",
+        "fbsource//xplat/folly/test:test_utils",
+        "fbsource//xplat/folly/testing:test_util",
         "//eden/fs/inodes:inodes",
         "//eden/fs/telemetry:stats",
-        "//folly/chrono:conv",
-        "//folly/test:test_utils",
-        "//folly/testing:test_util",
     ],
 )
 
@@ -401,9 +410,9 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:portability",
+        "fbsource//xplat/folly:utility",
         "//eden/fs/inodes:inode_metadata",
-        "//folly:portability",
-        "//folly:utility",
     ],
 )
 
@@ -455,9 +464,22 @@ cpp_unittest(
     network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
-        "fbsource//third-party/boost:boost_filesystem",
         "fbsource//third-party/fmt:fmt",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:exception",
+        "fbsource//xplat/folly:expected",
+        "fbsource//xplat/folly:file_util",
+        "fbsource//xplat/folly:range",
+        "fbsource//xplat/folly:scope_guard",
+        "fbsource//xplat/folly/executors:cpu_thread_pool_executor",
+        "fbsource//xplat/folly/io:fs_util",
+        "fbsource//xplat/folly/io:iobuf",
+        "fbsource//xplat/folly/logging/test:test_handler",
+        "fbsource//xplat/folly/synchronization:baton",
+        "fbsource//xplat/folly/synchronization:lifo_sem",
+        "fbsource//xplat/folly/synchronization/test:barrier",
+        "fbsource//xplat/folly/test:test_utils",
+        "fbsource//xplat/folly/testing:test_util",
         ":overlay_test_util",
         "//eden/common/testharness:temp_file",
         "//eden/common/utils:bug",
@@ -474,18 +496,7 @@ cpp_unittest(
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_checks",
         "//eden/fs/testharness:test_mount",
-        "//folly:exception",
-        "//folly:expected",
-        "//folly:file_util",
-        "//folly:range",
-        "//folly:scope_guard",
-        "//folly/executors:cpu_thread_pool_executor",
-        "//folly/logging/test:test_handler",
-        "//folly/synchronization:baton",
-        "//folly/synchronization:lifo_sem",
-        "//folly/synchronization/test:barrier",
-        "//folly/test:test_utils",
-        "//folly/testing:test_util",
+        "//thrift/lib/cpp2/protocol:protocol",
     ],
 )
 
@@ -495,8 +506,12 @@ cpp_unittest(
     network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
-        "fbsource//third-party/fmt:fmt",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:exception",
+        "fbsource//xplat/folly:expected",
+        "fbsource//xplat/folly:file_util",
+        "fbsource//xplat/folly:range",
+        "fbsource//xplat/folly/testing:test_util",
         ":overlay_test_util",
         "//eden/common/testharness:temp_file",
         "//eden/fs/inodes:inodes",
@@ -504,11 +519,6 @@ cpp_unittest(
         "//eden/fs/telemetry:stats",
         "//eden/fs/telemetry:structured_logger",
         "//eden/fs/testharness:test_util",
-        "//folly:exception",
-        "//folly:expected",
-        "//folly:file_util",
-        "//folly:range",
-        "//folly/testing:test_util",
     ],
 )
 
@@ -519,12 +529,12 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/fs/inodes:inodes",
         "//eden/fs/journal:journal",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_checks",
         "//eden/fs/testharness:test_mount",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -535,14 +545,14 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:string",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/common/utils:bug",
         "//eden/common/utils:fault_injector",
         "//eden/fs/inodes:inodes",
         "//eden/fs/store:context",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_mount",
-        "//folly:string",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -553,13 +563,13 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:string",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/common/utils:bug",
         "//eden/fs/inodes:inodes",
         "//eden/fs/store:context",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_mount",
-        "//folly:string",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -573,13 +583,13 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/executors:inline_executor",
+        "fbsource//xplat/folly/portability:windows",
         "//eden/common/utils:path",
         "//eden/fs/inodes:inodes",
         "//eden/fs/store:context",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_mount",
-        "//folly/executors:inline_executor",
-        "//folly/portability:windows",
     ],
 )
 
@@ -605,6 +615,11 @@ cpp_unittest(
         "fbsource//third-party/fmt:fmt",
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:exception",
+        "fbsource//xplat/folly:random",
+        "fbsource//xplat/folly/coro:gtest_helpers",
+        "fbsource//xplat/folly/executors:manual_executor",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/common/utils:case_sensitivity",
         "//eden/common/utils:fault_injector",
         "//eden/fs/fuse:fuse",
@@ -618,11 +633,6 @@ cpp_unittest(
         "//eden/fs/testharness:test_mount",
         "//eden/fs/testharness:test_util",
         "//fb303:service_data",
-        "//folly:exception",
-        "//folly:random",
-        "//folly/coro:gtest_helpers",
-        "//folly/executors:manual_executor",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -634,6 +644,12 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:exception",
+        "fbsource//xplat/folly:random",
+        "fbsource//xplat/folly/coro:gtest_helpers",
+        "fbsource//xplat/folly/coro:invoke",
+        "fbsource//xplat/folly/executors:manual_executor",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/common/utils:case_sensitivity",
         "//eden/common/utils:fault_injector",
         "//eden/common/utils:utils",
@@ -649,12 +665,6 @@ cpp_unittest(
         "//eden/fs/testharness:inode_unloader",
         "//eden/fs/testharness:test_checks",
         "//eden/fs/testharness:test_mount",
-        "//folly:exception",
-        "//folly:random",
-        "//folly/coro:gtest_helpers",
-        "//folly/coro:invoke",
-        "//folly/executors:manual_executor",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -665,13 +675,13 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/common/utils:fault_injector",
         "//eden/fs/inodes:inodes",
         "//eden/fs/store:context",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:inode_unloader",
         "//eden/fs/testharness:test_mount",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -683,18 +693,18 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:exception_wrapper",
+        "fbsource//xplat/folly/coro:blocking_wait",
+        "fbsource//xplat/folly/coro:gtest_helpers",
+        "fbsource//xplat/folly/executors:manual_executor",
+        "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/folly/test:test_utils",
         "//eden/common/utils:path",
         "//eden/fs/inodes:inodes",
         "//eden/fs/model:model",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:fake_inode_access_logger",
         "//eden/fs/testharness:test_mount",
-        "//folly:exception_wrapper",
-        "//folly/coro:blocking_wait",
-        "//folly/coro:gtest_helpers",
-        "//folly/executors:manual_executor",
-        "//folly/portability:gtest",
-        "//folly/test:test_utils",
     ],
 )
 
@@ -703,6 +713,8 @@ cpp_unittest(
     srcs = ["InodeAccessLoggerXplatTest.cpp"],
     network_access = network_access_utils.none(),
     deps = [
+        "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/folly/synchronization:saturating_semaphore",
         "//eden/common/telemetry:log_info",
         "//eden/fs/config:config",
         "//eden/fs/inodes:inodes",
@@ -712,8 +724,6 @@ cpp_unittest(
         "//eden/fs/telemetry/facebook:xplat_logger",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_mount",
-        "//folly/portability:gtest",
-        "//folly/synchronization:saturating_semaphore",
     ],
 )
 
@@ -725,13 +735,13 @@ cpp_binary(
         "ovr_config//os:macos",
     ],
     deps = [
+        "fbsource//xplat/folly/init:init",
         ":overlay_test_util",
         "//eden/common/utils:case_sensitivity",
         "//eden/fs/config:config",
         "//eden/fs/inodes:inodes",
         "//eden/fs/telemetry:stats",
         "//eden/fs/telemetry:structured_logger",
-        "//folly/init:init",
     ],
     external_deps = [
         "gflags",
@@ -742,9 +752,9 @@ cpp_benchmark(
     name = "inode_pressure_policy_benchmark",
     srcs = ["InodePressurePolicyBenchmark.cpp"],
     deps = [
+        "fbsource//xplat/folly:benchmark",
+        "fbsource//xplat/folly/init:init",
         "//eden/fs/inodes:inodes",
-        "//folly:benchmark",
-        "//folly/init:init",
     ],
 )
 
@@ -753,6 +763,8 @@ cpp_benchmark(
     srcs = ["CheckoutBenchmark.cpp"],
     deps = [
         "fbsource//third-party/fmt:fmt",
+        "fbsource//xplat/folly:benchmark",
+        "fbsource//xplat/folly/init:init",
         "//eden/common/utils:path",
         "//eden/fs/inodes:inodes",
         "//eden/fs/model:model",
@@ -761,8 +773,6 @@ cpp_benchmark(
         "//eden/fs/store:store",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_mount",
-        "//folly:benchmark",
-        "//folly/init:init",
     ],
 )
 
@@ -770,14 +780,14 @@ cpp_benchmark(
     name = "overlay_benchmark",
     srcs = ["OverlayBenchmark.cpp"],
     deps = [
+        "fbsource//xplat/folly:benchmark_util",
+        "fbsource//xplat/folly:stop_watch",
+        "fbsource//xplat/folly/init:init",
         ":overlay_test_util",
         "//eden/fs/config:config",
         "//eden/fs/inodes:inodes",
         "//eden/fs/telemetry:stats",
         "//eden/fs/telemetry:structured_logger",
-        "//folly:benchmark_util",
-        "//folly:stop_watch",
-        "//folly/init:init",
     ],
     external_deps = [
         "gflags",
@@ -788,14 +798,14 @@ cpp_benchmark(
     name = "overlay_dir_serializer_benchmark",
     srcs = ["OverlayDirSerializerBenchmark.cpp"],
     deps = [
+        "fbsource//xplat/folly:stop_watch",
+        "fbsource//xplat/folly/init:init",
         ":overlay_test_util",
         "//eden/fs/config:config",
         "//eden/fs/inodes:inode_catalog",
         "//eden/fs/inodes:inodes",
         "//eden/fs/telemetry:stats",
         "//eden/fs/telemetry:structured_logger",
-        "//folly:stop_watch",
-        "//folly/init:init",
         "//thrift/lib/cpp2/protocol:protocol",
     ],
     external_deps = [
@@ -810,6 +820,8 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly:scope_guard",
+        "fbsource//xplat/folly/coro:gtest_helpers",
         "//eden/common/utils:case_sensitivity",
         "//eden/fs/config:config",
         "//eden/fs/fuse:fuse",
@@ -822,8 +834,6 @@ cpp_unittest(
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:fake_fuse",
         "//eden/fs/testharness:test_mount",
-        "//folly:scope_guard",
-        "//folly/coro:gtest_helpers",
     ],
 )
 
@@ -834,6 +844,7 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "fbsource//xplat/folly/coro:gtest_helpers",
         "//eden/common/utils:utils",
         "//eden/fs/config:config",
         "//eden/fs/inodes:inodes",
@@ -842,7 +853,6 @@ cpp_unittest(
         "//eden/fs/store:store",
         "//eden/fs/testharness:fake_backing_store_and_tree_builder",
         "//eden/fs/testharness:test_mount",
-        "//folly/coro:gtest_helpers",
     ],
 )
 
@@ -851,14 +861,14 @@ cpp_benchmark(
     srcs = ["RenameMutexBenchmark.cpp"],
     deps = [
         "fbsource//third-party/benchmark:benchmark",
-        "//folly:shared_mutex",
-        "//folly:synchronized",
-        "//folly/coro:baton",
-        "//folly/coro:blocking_wait",
-        "//folly/coro:invoke",
-        "//folly/coro:mutex",
-        "//folly/coro:shared_mutex",
-        "//folly/coro:task",
-        "//folly/executors:cpu_thread_pool_executor",
+        "fbsource//xplat/folly:shared_mutex",
+        "fbsource//xplat/folly:synchronized",
+        "fbsource//xplat/folly/coro:baton",
+        "fbsource//xplat/folly/coro:blocking_wait",
+        "fbsource//xplat/folly/coro:invoke",
+        "fbsource//xplat/folly/coro:mutex",
+        "fbsource//xplat/folly/coro:shared_mutex",
+        "fbsource//xplat/folly/coro:task",
+        "fbsource//xplat/folly/executors:cpu_thread_pool_executor",
     ],
 )

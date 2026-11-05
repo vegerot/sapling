@@ -16,6 +16,8 @@
 #include "eden/fs/nfs/NfsDirList.h"
 #include "eden/fs/store/ObjectFetchContext.h"
 
+#include <optional>
+
 #include <sys/stat.h>
 
 #ifdef __APPLE__
@@ -95,16 +97,21 @@ class NfsDispatcher {
       const ObjectFetchContextPtr& context) = 0;
 
   /**
-   * Update the last fs request time of the inode. Parents won't be updated.
+   * Record a reference to the inode for inode garbage collection. Parents
+   * won't be updated.
    */
-  virtual ImmediateFuture<folly::Unit> updateLastFsRequestTime(
-      InodeNumber ino) = 0;
+  virtual ImmediateFuture<folly::Unit> markGcRef(
+      InodeNumber ino,
+      const ObjectFetchContextPtr& context) = 0;
 
   /**
-   * Find the given file in the passed in directory. It's InodeNumber and
-   * attributes are returned.
+   * Find the given name in the passed in directory. Its InodeNumber and
+   * attributes are returned, or nullopt when the directory has no such entry.
+   * Clients look a name up before every create and mkdir, so a missing name
+   * is the common outcome and is a value rather than an ENOENT error.
    */
-  virtual ImmediateFuture<std::tuple<InodeNumber, struct stat>> lookup(
+  virtual ImmediateFuture<std::optional<std::tuple<InodeNumber, struct stat>>>
+  lookup(
       InodeNumber dir,
       PathComponent name,
       const ObjectFetchContextPtr& context) = 0;

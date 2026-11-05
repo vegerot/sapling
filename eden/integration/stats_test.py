@@ -57,6 +57,73 @@ class GenericStatsTest(testcase.EdenRepoTest):
                 )
             )
 
+    def test_debug_counters_delta_across_a_restart(self) -> None:
+        # Make the cumulative counters non-zero, then snapshot them.
+        path = Path(self.mount) / "file"
+        for _ in range(5):
+            path.read_bytes()
+        self.poll_until_counter_condition(
+            lambda counters: self.assertGreater(
+                counters[self.protocol_type() + ".lookup_us.count"], 0
+            )
+        )
+        snapshot = os.path.join(self.tmp_dir, "counters_snapshot.json")
+        # `eden debug counters` is a Rust command; force the Rust dispatch so
+        # the test does not depend on the rollout state of this host.
+        rust_env = {"EDENFSCTL_ONLY_RUST": "1"}
+        self.eden.run_cmd(
+            "debug",
+            "counters",
+            "start-recording",
+            "--snapshot-path",
+            snapshot,
+            env=rust_env,
+        )
+
+        # A full restart starts the daemon's counters again from zero.
+        self.eden.restart()
+
+        # The later snapshot is smaller than the earlier one; the delta
+        # saturates at zero instead of wrapping around or panicking.
+        output = self.eden.run_cmd(
+            "debug",
+            "counters",
+            "finalize",
+            "--snapshot-path",
+            snapshot,
+            env=rust_env,
+        )
+        self.assertNotIn("1844674407", output, msg=f"output: {output}")
+        self.assertNotIn("lookup", output, msg=f"output: {output}")
+
+    def test_debug_counters_report_statfs(self) -> None:
+        if self.protocol_type() != "fuse":
+            self.skipTest("only FUSE exports a statfs counter")
+        import json
+
+        # Issue statfs calls on the mount and wait for the daemon to count them.
+        for _ in range(5):
+            os.statvfs(self.mount)
+        self.poll_until_counter_condition(
+            lambda counters: self.assertGreater(
+                counters["fuse.statfs_successful.sum"], 0
+            )
+        )
+
+        # `eden debug counters` is a Rust command; force the Rust dispatch so
+        # the test does not depend on the rollout state of this host.
+        output = self.eden.run_cmd(
+            "debug",
+            "counters",
+            "from-start",
+            "--full",
+            env={"EDENFSCTL_ONLY_RUST": "1"},
+        )
+        fs_stats = json.loads(output)["fs_stats"]
+        # The statfs counter is requested from the daemon and reported.
+        self.assertGreater(fs_stats["syscall_statfs"], 0, msg=f"output: {output}")
+        self.assertGreater(fs_stats["syscall_lookup"], 0, msg=f"output: {output}")
+
     def test_writing_untracked_file_bumps_write_counter(self) -> None:
         counters_before = self.get_counters()
         path = Path(self.mount) / "new_file"

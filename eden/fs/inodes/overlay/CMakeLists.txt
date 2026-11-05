@@ -3,43 +3,20 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-add_fbthrift_library(
-  eden_overlay_thrift
-  overlay.thrift
-  LANGUAGES cpp py
-  PY_NAMESPACE facebook.eden.overlay
+add_library(eden_overlay_thrift_cpp)
+thrift_generate(
+  eden_overlay_thrift_cpp overlay.thrift
+  LANGUAGE cpp2
+  INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR} ${THRIFT_INCLUDE_DIR}
 )
+target_include_directories(eden_overlay_thrift_cpp PUBLIC ${PROJECT_BINARY_DIR})
 
-add_library(
-  eden_overlay_checker
-  STATIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/OverlayChecker.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/OverlayChecker.h
-)
-
-if (NOT WIN32)
-  target_link_libraries(
-    eden_overlay_checker
-    PRIVATE
-      eden_fscatalog
+if (EDEN_HAVE_THRIFT_PYTHON)
+  add_fbthrift_python_library(
+    eden_overlay_thrift_python
+    overlay.thrift
+    NAMESPACE facebook.eden
   )
 endif()
 
-if (WIN32)
-  add_library(
-    eden_windows_fsck STATIC
-    WindowsFsck.cpp
-  )
-  target_link_libraries(
-    eden_windows_fsck
-    PRIVATE
-      eden_config
-      eden_inodes_inodenumber
-      eden_model
-      eden_overlay_thrift_cpp
-      eden_prjfs
-      eden_utils
-      Folly::folly
-      edencommon::edencommon_utils
-  )
-endif()
+include(generated_targets.cmake)

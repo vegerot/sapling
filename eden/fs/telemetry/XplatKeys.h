@@ -174,15 +174,8 @@ inline constexpr std::string_view kRemountError = "remount_error";
 inline constexpr std::string_view kMountPath = "mount_path";
 inline constexpr std::string_view kPathType = "path_type";
 
-// --- SqliteIntegrityCheck and FinishedCheckout ---
+// --- FinishedCheckout ---
 inline constexpr std::string_view kNumErrors = "num_errors";
-
-// --- NfsCrawlDetected ---
-inline constexpr std::string_view kReadCount = "read_count";
-inline constexpr std::string_view kReadThreshold = "read_threshold";
-inline constexpr std::string_view kReaddirCount = "readdir_count";
-inline constexpr std::string_view kReaddirThreshold = "readdir_threshold";
-inline constexpr std::string_view kProcessHierarchy = "process_hierarchy";
 
 // --- BigWalk ---
 inline constexpr std::string_view kWalkRoot = "walk_root";

@@ -579,6 +579,47 @@ TEST_P(FsInodeCatalogWalTest, loadWalDelta_collapsesAddThenRemove) {
   EXPECT_EQ(WalOpType::REMOVE, delta.at("x").type);
 }
 
+TEST_P(
+    FsInodeCatalogWalTest,
+    loadWalDelta_laterAddOfTheSameInodeRemovesTheEarlierName) {
+  // A file created under a temporary name and renamed over its final name,
+  // with the rename's REMOVE not written yet.
+  const InodeNumber parent{340};
+  auto entry = makeEntry(0100644, 7);
+  store_->appendWalEntry(
+      parent, WalOpType::ADD, PathComponentPiece{"tmp"}, &entry);
+  store_->appendWalEntry(
+      parent, WalOpType::ADD, PathComponentPiece{"final"}, &entry);
+
+  auto delta = store_->loadWalDelta(parent).delta;
+  ASSERT_EQ(2u, delta.size());
+  EXPECT_EQ(WalOpType::REMOVE, delta.at("tmp").type);
+  EXPECT_EQ(WalOpType::ADD, delta.at("final").type);
+  EXPECT_EQ(7, *delta.at("final").entry.inodeNumber());
+}
+
+TEST_P(
+    FsInodeCatalogWalTest,
+    loadWalDelta_aNameReusedForAnotherInodeKeepsItsLaterAdd) {
+  const InodeNumber parent{341};
+  auto first = makeEntry(0100644, 7);
+  auto second = makeEntry(0100644, 8);
+  store_->appendWalEntry(
+      parent, WalOpType::ADD, PathComponentPiece{"a"}, &first);
+  store_->appendWalEntry(
+      parent, WalOpType::ADD, PathComponentPiece{"a"}, &second);
+  // Inode 7 moves to b; a keeps inode 8.
+  store_->appendWalEntry(
+      parent, WalOpType::ADD, PathComponentPiece{"b"}, &first);
+
+  auto delta = store_->loadWalDelta(parent).delta;
+  ASSERT_EQ(2u, delta.size());
+  EXPECT_EQ(WalOpType::ADD, delta.at("a").type);
+  EXPECT_EQ(8, *delta.at("a").entry.inodeNumber());
+  EXPECT_EQ(WalOpType::ADD, delta.at("b").type);
+  EXPECT_EQ(7, *delta.at("b").entry.inodeNumber());
+}
+
 TEST_P(FsInodeCatalogWalTest, loadWalDelta_collapsesAddThenMaterialize) {
   const InodeNumber parent{302};
   auto entry = makeEntryWithHash(0100644, 1, std::string(20, '\xab'));
@@ -1056,7 +1097,8 @@ TEST_P(FsInodeCatalogWalTest, version2WalUsesVarintFields) {
     // Every integer is a varint: entryLen, nameLen, mode, inodeNumber,
     // hashLen. Walk the record with an independent decoder.
     size_t offset = FsFileContentStore::kWalVersion2HeaderLength;
-    EXPECT_EQ(bytes.size() - offset - 2, readVarint(bytes, offset));
+    const auto entryLen = readVarint(bytes, offset);
+    EXPECT_EQ(bytes.size() - offset, entryLen);
     EXPECT_EQ(WalOpType::ADD, static_cast<WalOpType>(bytes[offset++]));
     // 128 needs two bytes: 0x80 0x01.
     EXPECT_EQ(0x80, static_cast<uint8_t>(bytes[offset]));
@@ -1169,6 +1211,38 @@ TEST_P(FsInodeCatalogWalTest, appendWalEntry_rejectsFieldsTooLargeForVersion1) {
   EXPECT_EQ(v1Frame, readWal(legacy));
 }
 
+TEST_P(FsInodeCatalogWalTest, loadWalDelta_detectsTornLengthPrefix) {
+  for (size_t tailSize = 1; tailSize < sizeof(uint32_t); ++tailSize) {
+    const InodeNumber parent{340 + tailSize};
+    store_->appendWalEntry(
+        parent, WalOpType::REMOVE, PathComponentPiece{"keep"}, nullptr);
+    auto bytes = readWal(parent);
+    bytes.append(tailSize, '\xab');
+    ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, bytes));
+
+    auto result = store_->loadWalDelta(parent);
+    EXPECT_EQ(1u, result.parseErrors);
+    EXPECT_EQ(1u, result.rawEntriesParsed);
+    EXPECT_EQ(WalOpType::REMOVE, result.delta.at("keep").type);
+  }
+}
+
+TEST_P(FsInodeCatalogWalTest, loadWalDelta_rejectsRemovePayload) {
+  const InodeNumber parent{344};
+  store_->appendWalEntry(
+      parent, WalOpType::REMOVE, PathComponentPiece{"bad"}, nullptr);
+  auto bytes = readWal(parent);
+  auto entryLen = readU32(bytes, 0) + 1;
+  std::memcpy(bytes.data(), &entryLen, sizeof(entryLen));
+  bytes.push_back('\xab');
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, bytes));
+
+  auto result = store_->loadWalDelta(parent);
+  EXPECT_EQ(1u, result.parseErrors);
+  EXPECT_EQ(0u, result.rawEntriesParsed);
+  EXPECT_TRUE(result.delta.empty());
+}
+
 TEST_P(FsInodeCatalogWalTest, loadWalDelta_unknownOpIsSkipped) {
   // Forward-compat: an unknown opcode WITH a valid entryLen frame is
   // skipped (advanced by entryLen), not fatal. A subsequent valid REMOVE
@@ -1213,6 +1287,34 @@ TEST_P(FsInodeCatalogWalTest, loadWalDelta_skipsEmptyName) {
   EXPECT_EQ(2, *result.delta.at("ok").entry.inodeNumber());
   EXPECT_EQ(1u, result.parseErrors);
   EXPECT_EQ(1u, result.rawEntriesParsed);
+}
+
+TEST_P(
+    FsInodeCatalogWalTest,
+    loadWalDelta_skipsInvalidRemoveAndMaterializeNames) {
+  const InodeNumber parent{312};
+  const folly::StringPiece name{"bad/name"};
+  const auto nameLen = static_cast<uint16_t>(name.size());
+  const uint32_t entryLen = kOpByteSize + kNameLenSize + nameLen;
+  for (const auto op : {WalOpType::REMOVE, WalOpType::MATERIALIZE}) {
+    SCOPED_TRACE(static_cast<int>(op));
+    // Keep the frame intact so only its name is invalid. The following ADD
+    // must still be decoded instead of aborting the directory's WAL load.
+    std::string bytes;
+    bytes.append(reinterpret_cast<const char*>(&entryLen), sizeof(entryLen));
+    bytes.push_back(static_cast<char>(op));
+    bytes.append(reinterpret_cast<const char*>(&nameLen), sizeof(nameLen));
+    bytes.append(name.data(), name.size());
+    bytes += makeOldFormatAddWalFrame("ok", 0100644, 2);
+    ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, bytes));
+
+    auto result = store_->loadWalDelta(parent);
+    ASSERT_EQ(1u, result.delta.size());
+    EXPECT_EQ(WalOpType::ADD, result.delta.at("ok").type);
+    EXPECT_EQ(2, *result.delta.at("ok").entry.inodeNumber());
+    EXPECT_EQ(1u, result.parseErrors);
+    EXPECT_EQ(1u, result.rawEntriesParsed);
+  }
 }
 
 TEST_P(FsInodeCatalogWalTest, loadWalDelta_skipsInvalidUtf8Name) {

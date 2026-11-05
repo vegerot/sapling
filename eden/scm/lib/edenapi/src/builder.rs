@@ -22,6 +22,7 @@ use http_client::Encoding;
 use http_client::HttpVersion;
 use http_client::MinTransferSpeed;
 use parking_lot::RwLock;
+use repourl::RepoUrl;
 use url::Url;
 
 use crate::SaplingRemoteApi;
@@ -56,6 +57,7 @@ pub struct Builder<'a> {
     config: &'a dyn configmodel::Config,
     repo_name: Option<String>,
     server_url: Option<Url>,
+    path_server_url: Option<Url>,
 }
 
 impl<'a> Builder<'a> {
@@ -65,8 +67,22 @@ impl<'a> Builder<'a> {
             config,
             repo_name: None,
             server_url: None,
+            path_server_url: None,
         };
         Ok(builder)
+    }
+
+    /// Use the repo's remote path for the server URL when neither `server_url` nor
+    /// `edenapi.url` sets it.
+    ///
+    /// A `mononoke://host[:port]/<repo>` path names `https://host[:port]/slapi/`, unless
+    /// `experimental.slapi-url-from-path` is false. Other paths name no server. The repo
+    /// name comes from `remotefilelog.reponame`, which Sapling sets from `paths.default`.
+    pub fn repo_url(mut self, url: &RepoUrl) -> Result<Self, ConfigError> {
+        self.path_server_url = url
+            .slapi_server_url()
+            .map_err(|e| ConfigError::Invalid("paths.default".into(), e))?;
+        Ok(self)
     }
 
     /// Configure repo name for client. This is only used by the Http Client.
@@ -81,6 +97,46 @@ impl<'a> Builder<'a> {
         self
     }
 
+    /// Whether an HTTP client built now would have both a server URL and a repo name.
+    pub fn has_server_url_and_repo_name(&self) -> Result<bool, ConfigError> {
+        Ok(self.resolved_server_url()?.is_some()
+            && (self.repo_name.is_some()
+                || self
+                    .config
+                    .get_nonempty("remotefilelog", "reponame")
+                    .is_some()))
+    }
+
+    /// The server URL the client uses: `server_url`, else `edenapi.url`, else the remote
+    /// path's (see `repo_url`).
+    fn resolved_server_url(&self) -> Result<Option<Url>, ConfigError> {
+        if let Some(url) = &self.server_url {
+            return Ok(Some(url.clone()));
+        }
+        if let Some(url) = self.config.get_nonempty("edenapi", "url") {
+            let url = url
+                .parse::<Url>()
+                .map_err(|e| ConfigError::Invalid("edenapi.url".into(), e.into()))?;
+            return Ok(Some(url));
+        }
+        if get_config::<bool>(self.config, "experimental", "slapi-url-from-path")?.unwrap_or(true) {
+            return Ok(self.path_server_url.clone());
+        }
+        Ok(None)
+    }
+
+    /// `edenapi.url`, when it names a different host or port than `path_url`.
+    fn config_url_differing_from(&self, path_url: &Url) -> Option<Url> {
+        let config_url = Url::parse(&self.config.get_nonempty("edenapi", "url")?).ok()?;
+        let server = |url: &Url| {
+            (
+                url.host_str().map(str::to_owned),
+                url.port_or_known_default(),
+            )
+        };
+        (server(&config_url) != server(path_url)).then_some(config_url)
+    }
+
     /// Build the client.
     pub fn build(self) -> Result<Arc<dyn SaplingRemoteApi>, SaplingRemoteApiError> {
         {
@@ -92,10 +148,16 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        let mut builder = if let Some(server_url) = self.server_url {
-            HttpClientBuilder::from_config_with_url(self.config, server_url)?
-        } else {
-            HttpClientBuilder::from_config(self.config)?
+        if let Some(path_url) = &self.path_server_url
+            && let Some(config_url) = self.config_url_differing_from(path_url)
+        {
+            tracing::debug!(%path_url, edenapi_url = %config_url, "SLAPI server from the remote path differs from edenapi.url");
+            hg_metrics::max_counter("slapi.url_host_mismatch", 1);
+        }
+
+        let mut builder = match self.resolved_server_url()? {
+            Some(server_url) => HttpClientBuilder::from_config_with_url(self.config, server_url)?,
+            None => HttpClientBuilder::from_config(self.config)?,
         };
 
         if let Some(repo_name) = &self.repo_name {
@@ -154,6 +216,7 @@ pub struct HttpClientBuilder {
     min_transfer_speed: Option<MinTransferSpeed>,
     handler_min_transfer_speeds: HashMap<String, MinTransferSpeed>,
     max_retry_per_request: usize,
+    stream_retries: Option<bool>,
     http_config: http_client::Config,
 }
 
@@ -333,6 +396,8 @@ impl HttpClientBuilder {
         let max_retry_per_request =
             get_config::<usize>(config, "edenapi", "max-retry-per-request")?.unwrap_or(3);
 
+        let stream_retries = get_config(config, "experimental", "slapi-stream-retries")?;
+
         let max_concurrent_streams =
             get_config::<usize>(config, "edenapi", "max-concurrent-streams")?;
 
@@ -368,6 +433,7 @@ impl HttpClientBuilder {
             min_transfer_speed,
             handler_min_transfer_speeds,
             max_retry_per_request,
+            stream_retries,
             http_config,
         };
 
@@ -469,6 +535,13 @@ impl HttpClientBuilder {
         self
     }
 
+    /// Enable streamed retries for history, queries, uploads, and streaming clone.
+    /// Defaults to true; also set by `experimental.slapi-stream-retries`.
+    pub fn stream_retries(mut self, enabled: bool) -> Self {
+        self.stream_retries = Some(enabled);
+        self
+    }
+
     /// Timeout for HTTP requests sent by the client.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
@@ -556,6 +629,7 @@ pub(crate) struct Config {
     pub(crate) min_transfer_speed: Option<MinTransferSpeed>,
     pub(crate) handler_min_transfer_speeds: HashMap<String, MinTransferSpeed>,
     pub(crate) max_retry_per_request: usize,
+    pub(crate) stream_retries: bool,
     pub(crate) http_config: http_client::Config,
 }
 
@@ -589,6 +663,7 @@ impl TryFrom<HttpClientBuilder> for Config {
             min_transfer_speed,
             handler_min_transfer_speeds,
             max_retry_per_request,
+            stream_retries,
             http_config,
         } = builder;
 
@@ -636,6 +711,7 @@ impl TryFrom<HttpClientBuilder> for Config {
             min_transfer_speed,
             handler_min_transfer_speeds,
             max_retry_per_request,
+            stream_retries: stream_retries.unwrap_or(true),
             http_config,
         })
     }
@@ -662,6 +738,33 @@ mod tests {
         base.into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn test_stream_retries_config() {
+        for (value, enabled) in [(None, true), (Some("true"), true), (Some("false"), false)] {
+            let entries = value
+                .map(|value| vec![("experimental.slapi-stream-retries", value)])
+                .unwrap_or_default();
+            let config: Config = HttpClientBuilder::from_config(&make_config(entries))
+                .unwrap()
+                .try_into()
+                .unwrap();
+            assert_eq!(config.stream_retries, enabled);
+        }
+        let config: Config = HttpClientBuilder::new()
+            .repo_name("test")
+            .server_url("https://example.com/".parse().unwrap())
+            .try_into()
+            .unwrap();
+        assert!(config.stream_retries);
+        assert!(
+            HttpClientBuilder::from_config(&make_config(vec![(
+                "experimental.slapi-stream-retries",
+                "invalid"
+            )]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -765,6 +868,218 @@ mod tests {
 
         let builder = HttpClientBuilder::from_config(&config).unwrap();
         assert!(!builder.headers.contains_key(DIRECT_HOST_HEADER));
+    }
+
+    fn config_from(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn resolved_server_url(config: &BTreeMap<String, String>, url: &str) -> Option<String> {
+        let repo_url = RepoUrl::from_str(config, url).unwrap();
+        Builder::from_config(config)
+            .unwrap()
+            .repo_url(&repo_url)
+            .unwrap()
+            .resolved_server_url()
+            .unwrap()
+            .map(String::from)
+    }
+
+    #[test]
+    fn test_resolved_server_url_from_mononoke_path() {
+        let config = config_from(&[("schemes.mono", "mononoke://localhost:8443/{1}")]);
+        assert_eq!(
+            resolved_server_url(&config, "mono:repo").as_deref(),
+            Some("https://localhost:8443/slapi/"),
+            "an unconfigured mononoke path names the server"
+        );
+        assert_eq!(
+            resolved_server_url(&config, "mononoke://[::1]/path/to/repo").as_deref(),
+            Some("https://[::1]/slapi/"),
+            "the server URL does not include the repo name"
+        );
+    }
+
+    #[test]
+    fn test_resolved_server_url_prefers_config() {
+        let config = config_from(&[("edenapi.url", "https://configured.example.com/edenapi/")]);
+        assert_eq!(
+            resolved_server_url(&config, "mononoke://example.com/repo").as_deref(),
+            Some("https://configured.example.com/edenapi/"),
+            "an explicit edenapi.url wins over the path"
+        );
+
+        let repo_url = RepoUrl::from_str(&config, "mononoke://example.com/repo").unwrap();
+        let explicit = Url::parse("https://explicit.example.com/edenapi/").unwrap();
+        let builder = Builder::from_config(&config)
+            .unwrap()
+            .repo_url(&repo_url)
+            .unwrap()
+            .server_url(Some(explicit.clone()));
+        assert_eq!(
+            builder.resolved_server_url().unwrap(),
+            Some(explicit),
+            "an explicit server URL wins over edenapi.url"
+        );
+
+        let config = config_from(&[("edenapi.url", "")]);
+        assert_eq!(
+            resolved_server_url(&config, "mononoke://example.com/repo").as_deref(),
+            Some("https://example.com/slapi/"),
+            "an empty edenapi.url counts as unset"
+        );
+    }
+
+    #[test]
+    fn test_resolved_server_url_ignores_other_paths() {
+        let config = config_from(&[]);
+        for url in [
+            "https://example.com/edenapi/",
+            "ssh://user@host/repo",
+            "eager:///path/to/repo",
+        ] {
+            assert_eq!(
+                resolved_server_url(&config, url),
+                None,
+                "{url} names no server"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolved_server_url_kill_switch() {
+        let config = config_from(&[("experimental.slapi-url-from-path", "false")]);
+        assert_eq!(
+            resolved_server_url(&config, "mononoke://example.com/repo"),
+            None,
+            "experimental.slapi-url-from-path=false ignores the path"
+        );
+    }
+
+    #[test]
+    fn test_has_server_url_and_repo_name() {
+        let has_both = |entries: &[(&str, &str)], url: Option<&str>| {
+            let config = config_from(entries);
+            let builder = Builder::from_config(&config).unwrap();
+            let builder = match url {
+                Some(url) => builder
+                    .repo_url(&RepoUrl::from_str(&config, url).unwrap())
+                    .unwrap(),
+                None => builder,
+            };
+            builder.has_server_url_and_repo_name().unwrap()
+        };
+
+        assert!(has_both(
+            &[("remotefilelog.reponame", "repo")],
+            Some("mononoke://example.com/repo")
+        ));
+        assert!(has_both(
+            &[
+                ("edenapi.url", "https://example.com/edenapi/"),
+                ("remotefilelog.reponame", "repo"),
+            ],
+            None
+        ));
+        assert!(
+            !has_both(&[], Some("mononoke://example.com/repo")),
+            "the repo name comes from config, not the path"
+        );
+        assert!(
+            !has_both(&[("remotefilelog.reponame", "repo")], None),
+            "nothing names a server URL"
+        );
+        assert!(!has_both(
+            &[
+                ("experimental.slapi-url-from-path", "false"),
+                ("remotefilelog.reponame", "repo"),
+            ],
+            Some("mononoke://example.com/repo")
+        ));
+    }
+
+    #[test]
+    fn test_config_url_differing_from_path() {
+        let off_path = |config_url: Option<&str>, path: &str| {
+            let config = match config_url {
+                Some(url) => config_from(&[("edenapi.url", url)]),
+                None => config_from(&[]),
+            };
+            let repo_url = RepoUrl::from_str(&config, path).unwrap();
+            let builder = Builder::from_config(&config)
+                .unwrap()
+                .repo_url(&repo_url)
+                .unwrap();
+            let path_url = builder.path_server_url.as_ref()?;
+            builder
+                .config_url_differing_from(path_url)
+                .map(String::from)
+        };
+
+        assert_eq!(
+            off_path(
+                Some("https://other.example.com/edenapi/"),
+                "mononoke://example.com/repo"
+            ),
+            Some("https://other.example.com/edenapi/".to_string()),
+            "different hosts"
+        );
+        assert_eq!(
+            off_path(
+                Some("https://example.com:8443/edenapi/"),
+                "mononoke://example.com/repo"
+            ),
+            Some("https://example.com:8443/edenapi/".to_string()),
+            "different ports"
+        );
+        assert_eq!(
+            off_path(
+                Some("https://example.com/edenapi/"),
+                "mononoke://example.com:443/repo"
+            ),
+            None,
+            "same host, and 443 is the default HTTPS port"
+        );
+        assert_eq!(
+            off_path(
+                Some("https://EXAMPLE.com/edenapi/"),
+                "mononoke://example.com/repo"
+            ),
+            None,
+            "host names compare case-insensitively"
+        );
+        assert_eq!(
+            off_path(None, "mononoke://example.com/repo"),
+            None,
+            "no edenapi.url"
+        );
+        assert_eq!(
+            off_path(
+                Some("https://other.example.com/edenapi/"),
+                "ssh://user@example.com/repo"
+            ),
+            None,
+            "non-mononoke paths name no SLAPI server"
+        );
+    }
+
+    #[test]
+    fn test_build_uses_path_server_url() {
+        let config = config_from(&[("remotefilelog.reponame", "repo")]);
+        let repo_url = RepoUrl::from_str(&config, "mononoke://example.com:8443/repo").unwrap();
+        let client = Builder::from_config(&config)
+            .unwrap()
+            .repo_url(&repo_url)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.url().as_deref(),
+            Some("https://example.com:8443/slapi/")
+        );
     }
 
     #[test]

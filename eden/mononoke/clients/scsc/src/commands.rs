@@ -27,6 +27,7 @@ base_app::subcommands! {
     mod info;
     mod is_ancestor;
     mod land_stack if "SCSC_WRITES_ENABLED";
+    mod last_changed;
     mod list_bookmarks;
     mod log;
     mod lookup;
@@ -36,16 +37,15 @@ base_app::subcommands! {
     mod prepare_commits if "SCSC_WRITES_ENABLED";
     mod rebase_stack if "SCSC_WRITES_ENABLED";
     mod pushrebase_history;
-    mod restricted_paths if "SCSC_ADMIN_ENABLED";
+    mod restricted_paths;
     mod git_mutation_history;
     mod hg_mutation_history;
     mod repo_exists;
     mod repo_info;
     mod repos;
+    mod resolve_p4_revision;
     mod run_hooks;
-    // scmqueryclient-rust-test-support transitively depends on Linux-only
-    // srclients, so this integration-test subcommand cannot build for mac/windows.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", fbcode_build))]
     mod scmqueryclient_test if "SCSC_SCMQUERY_TEST_ENABLED";
     mod sparse_profile_delta;
     mod sparse_profile_size;

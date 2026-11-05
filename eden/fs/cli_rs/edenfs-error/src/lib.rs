@@ -28,7 +28,6 @@ use thrift_clients::errors::GetScmStatusV2Error;
 use thrift_clients::errors::GlobFilesError;
 use thrift_clients::errors::ListMountsError;
 use thrift_clients::errors::PeekCurrentJournalPositionError;
-use thrift_clients::errors::PrefetchFilesError;
 use thrift_clients::errors::PrefetchFilesV2Error;
 use thrift_clients::errors::ReaddirError;
 use thrift_clients::errors::RemoveBindMountError;
@@ -151,9 +150,6 @@ pub enum EdenFsError {
     #[error("EdenFS did not respond within set timeout: {0}")]
     RequestTimeout(Elapsed),
 
-    #[error("The running version of the EdenFS daemon doesn't know that method.")]
-    UnknownMethod(String),
-
     #[error("The Eden Thrift server responded with an EdenError. {0:?}")]
     ThriftRequestError(ThriftRequestError),
 
@@ -247,7 +243,6 @@ impl_has_error_handling_strategy!(GetSHA1Error);
 impl_has_error_handling_strategy!(GlobFilesError);
 impl_has_error_handling_strategy!(ListMountsError);
 impl_has_error_handling_strategy!(PeekCurrentJournalPositionError);
-impl_has_error_handling_strategy!(PrefetchFilesError);
 impl_has_error_handling_strategy!(PrefetchFilesV2Error);
 impl_has_error_handling_strategy!(ReaddirError);
 impl_has_error_handling_strategy!(RemoveBindMountError);

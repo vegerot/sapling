@@ -14,6 +14,7 @@ use remote_loader::should_fetch_configs;
 use strum::EnumString;
 use strum::IntoStaticStr;
 
+use crate::facebook;
 use crate::use_case::helpers;
 use crate::use_case::remote_config_snapshot::REMOTE_CONFIG_SNAPSHOT;
 use crate::use_case::thrift_types::scm_usecases_types::ScmUseCase;
@@ -44,6 +45,7 @@ pub enum UseCaseId {
     Hack,
     IslServerNode,
     MeerkatCli,
+    NestCli,
     NodeClient,
     ReloadCoordinator,
     ScmEdenContainer,
@@ -118,9 +120,9 @@ impl UseCase {
     }
 
     fn get_use_case(&self) -> Option<ScmUseCase> {
-        let is_pub = cpe::x2p::supports_vpnless();
+        let is_pub = facebook::supports_vpnless();
         let config_url = helpers::config_url(is_pub);
-        let proxy_url = cpe::x2p::proxy_url_http1();
+        let proxy_url = facebook::proxy_url_http1();
         let proxy_sock_path: Option<&str> = if proxy_url.is_empty() {
             None
         } else {
@@ -155,12 +157,12 @@ impl UseCase {
                     }
                 },
                 None => {
-                    // This shouldn't happen usually, this means that there was no local config, but also
-                    // that the local config existed when trying to read the timestamp.
-                    // Might happen if somebody deleted the local config between the two checks.
-                    // Return None to read the default values
+                    // No readable local config, but no refresh either: the cache
+                    // file is fresh but unparsable, it appeared between the two
+                    // reads, or the refresh thread could not be started. Return
+                    // None to read the default values.
                     tracing::error!(
-                        "Didn't find a local config, but also should_fetch_config returned False. Using default values."
+                        "Didn't find a local config and no remote config is being fetched. Using default values."
                     );
                     None
                 }
@@ -168,7 +170,9 @@ impl UseCase {
         }
     }
 
-    // Creates and detaches a thread that will update the config if it is stale
+    // Creates and detaches a thread that will update the config if it is stale.
+    // Returns None when the config is fresh, and also when the thread could not
+    // be started: the callers then use the local config or the defaults.
     fn maybe_update_config<C>(
         &self,
         is_pub: bool,
@@ -191,8 +195,13 @@ impl UseCase {
         let config_up_to_date_index = config_up_to_date_index.to_owned();
         let config_index = config_index.to_owned();
 
-        if should_fetch_configs(limit, &cache_path) {
-            return Some(std::thread::spawn(move || {
+        if !should_fetch_configs(limit, &cache_path) {
+            return None;
+        }
+
+        let spawned = std::thread::Builder::new()
+            .name("scm-use-cases-refresh".to_owned())
+            .spawn(move || {
                 get_remote_configs::<C>(
                     is_pub,
                     // Use-case fetching doesn't run on cloud environments, so we'll never add a
@@ -207,9 +216,14 @@ impl UseCase {
                     &config_up_to_date_index,
                     &config_index,
                 )
-            }));
+            });
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                tracing::warn!(?error, "could not start the use-case config refresh thread");
+                None
+            }
         }
-        None
     }
 }
 
@@ -226,5 +240,11 @@ mod tests {
             UseCaseId::EdenSearch
         );
         assert_eq!(<&'static str>::from(UseCaseId::EdenSearch), "edensearch");
+    }
+
+    #[test]
+    fn nest_cli_round_trips_through_its_string() {
+        assert_eq!(UseCaseId::from_str("nest-cli").unwrap(), UseCaseId::NestCli);
+        assert_eq!(<&'static str>::from(UseCaseId::NestCli), "nest-cli");
     }
 }

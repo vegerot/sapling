@@ -8,6 +8,10 @@
 
 import json
 import os
+import pathlib
+import sys
+
+from eden.fs.service.eden.thrift_types import EdenError, MountArgument, MountState
 
 from .lib import edenclient, testcase
 
@@ -27,10 +31,6 @@ class RemountTest(testcase.EdenRepoTest):
         expected_entries = {".eden", "adir", "hello", "slink"}
         self.assert_checkout_root_entries(expected_entries, path=mount_path)
 
-    def select_storage_engine(self) -> str:
-        """we need to persist data across restarts"""
-        return "sqlite"
-
     def test_remount_basic(self) -> None:
         # Mount multiple clients
         self._clone_checkouts(5)
@@ -44,40 +44,6 @@ class RemountTest(testcase.EdenRepoTest):
 
         # Verify that default repo created by EdenRepoTestBase is remounted
         self._assert_mounted(self.mount)
-
-    def test_git_and_hg(self) -> None:
-        # Create git and hg repositories for mounting
-        repo_names = {"git": "git_repo", "hg": "hg_repo"}
-        git_repo = self.create_git_repo(repo_names["git"])
-        hg_repo = self.create_hg_repo(repo_names["hg"])
-        repos = {"git_repo": git_repo, "hg_repo": hg_repo}
-
-        git_repo.write_file("hello", "hola\n")
-        git_repo.commit("Initial commit.")
-
-        hg_repo.write_file("hello", "hola\n")
-        hg_repo.commit("Initial commit.")
-
-        # Mount git and hg clients
-        for name, repo in repos.items():
-            for i in range(3):
-                self.eden.clone(repo.path, os.path.join(self.mounts_dir, f"{name}-{i}"))
-
-        self.eden.shutdown()
-        self.eden.start()
-
-        # Verify that clients are remounted on startup
-        for name, repo in repos.items():
-            scm_type = repo.get_type()
-            for i in range(3):
-                mount_path = os.path.join(self.mounts_dir, f"{name}-{i}")
-                self.assert_checkout_root_entries(
-                    {".eden", "hello"}, mount_path, scm_type=scm_type
-                )
-
-                hello = os.path.join(mount_path, "hello")
-                with open(hello, "r") as f:
-                    self.assertEqual("hola\n", f.read())
 
     def test_partial_unmount(self) -> None:
         self._clone_checkouts(5)
@@ -209,3 +175,85 @@ class RemountTest(testcase.EdenRepoTest):
         if not main_mounted:
             entries = sorted(os.listdir(self.mount))
             self.assertEqual(NOT_MOUNTED_DIR_LIST, entries)
+
+
+@testcase.eden_repo_test
+class CorruptCheckoutConfigTest(testcase.EdenRepoTest):
+    """Mounting a checkout whose on-disk state is corrupt must fail with a
+    clean EdenError and leave the daemon fully usable."""
+
+    def populate_repo(self) -> None:
+        self.repo.write_file("hello", "hola\n")
+        self.repo.commit("Initial commit.")
+
+    def _prepare_unmounted_checkout(self) -> tuple[str, pathlib.Path]:
+        mount2 = os.path.join(self.mounts_dir, "mount2")
+        self.eden.clone(self.repo.path, mount2)
+        self.eden.unmount(pathlib.Path(mount2))
+        return mount2, self.eden.client_dir_for_mount(pathlib.Path(mount2))
+
+    async def _mount(self, client, mount2: str, client_dir: pathlib.Path) -> None:
+        await client.mount(
+            MountArgument(
+                mountPoint=os.fsencode(mount2),
+                edenClientPath=os.fsencode(client_dir),
+                readOnly=False,
+            )
+        )
+
+    async def _assert_daemon_healthy(self, client, pid: int) -> None:
+        self.assertEqual(pid, (await client.getDaemonInfo()).pid)
+        self.assertEqual("hola\n", self.read_file("hello"))
+
+    async def test_mount_config_toml_without_repository_section(self) -> None:
+        if sys.platform != "linux":
+            self.skipTest("Linux daemon reliability regression")
+        self.addCleanup(self.eden.shutdown, retry=True)
+        mount2, client_dir = self._prepare_unmounted_checkout()
+        config_toml = client_dir / "config.toml"
+        config_toml.write_text('[redirection-targets]\nfoo = "bar"\n')
+
+        async with self.eden.get_async_thrift_client(timeout=30) as client:
+            pid = (await client.getDaemonInfo()).pid
+            with self.assertRaises(EdenError) as ctx:
+                await self._mount(client, mount2, client_dir)
+            self.assertIn("missing [repository] table", str(ctx.exception))
+            await self._assert_daemon_healthy(client, pid)
+
+    async def test_mount_config_toml_without_repository_section_control(
+        self,
+    ) -> None:
+        if sys.platform != "linux":
+            self.skipTest("Linux daemon reliability regression")
+        self.addCleanup(self.eden.shutdown, retry=True)
+        mount2, client_dir = self._prepare_unmounted_checkout()
+        config_toml = client_dir / "config.toml"
+        config_toml.write_text(config_toml.read_text() + "\n[redirection-targets]\n")
+
+        async with self.eden.get_async_thrift_client(timeout=30) as client:
+            pid = (await client.getDaemonInfo()).pid
+            await self._mount(client, mount2, client_dir)
+            await self._assert_daemon_healthy(client, pid)
+
+    def test_start_with_config_toml_without_repository_section(self) -> None:
+        if sys.platform != "linux":
+            self.skipTest("Linux daemon reliability regression")
+        mount2 = os.path.join(self.mounts_dir, "mount2")
+        self.eden.clone(self.repo.path, mount2)
+        config_toml = (
+            self.eden.client_dir_for_mount(pathlib.Path(mount2)) / "config.toml"
+        )
+        self.eden.shutdown()
+        config_toml.write_text('[redirection-targets]\nfoo = "bar"\n')
+
+        # The daemon must come up and serve the healthy checkout; only the
+        # corrupt one may fail to remount.
+        self.eden.start()
+        self.assertEqual("hola\n", self.read_file("hello"))
+        with self.eden.get_thrift_client() as client:
+            self.assertEqual(
+                MountState.RUNNING,
+                self.eden.get_mount_state(pathlib.Path(self.mount), client),
+            )
+            self.assertIsNone(self.eden.get_mount_state(pathlib.Path(mount2), client))
+            self.assertEqual(1, client.getCounter("startup_mount_failures"))

@@ -8,6 +8,7 @@ edition = "2024"
 homepage = "https://sapling-scm.com/"
 repository = "https://github.com/facebook/sapling"
 license = "MIT"
+exclude = ["BUCK"]
 
 [lib]
 name = "edenapi_types"
@@ -24,9 +25,9 @@ manifest-augmented-tree = { version = "0.1.0", path = "../../manifest-augmented-
 paste = "1.0.14"
 quickcheck = "1.1"
 quickcheck_arbitrary_derive = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-sapling-dag-types = { version = "0.1.0", path = "../../dag/dag-types", features = ["for-tests"] }
+sapling-dag-types = { version = "0.2.0", path = "../../dag/dag-types", features = ["for-tests"] }
 sapling-format-util = { version = "0.1.0", path = "../../util/format-util" }
-sapling-minibytes = { version = "0.1.0", path = "../../minibytes" }
+sapling-minibytes = { version = "0.2.0", path = "../../minibytes" }
 sapling-revisionstore_types = { version = "0.1.0", path = "../../revisionstore/types" }
 sapling-type_macros = { version = "0.1.0", path = "proc_macros" }
 sapling-types = { version = "0.1.0", path = "../../types" }
@@ -36,7 +37,7 @@ thiserror = "2.0.21"
 
 [dev-dependencies]
 quickcheck_macros = "1.2.0"
-serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 
 [features]
 default = ["for-tests"]

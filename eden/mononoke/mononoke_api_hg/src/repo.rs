@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
+use acl_manifest::RootAclManifestId;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::format_err;
@@ -22,10 +24,12 @@ use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarkKey;
 use bookmarks::Freshness;
 use bytes::Bytes;
-use cacheblob::MemWritesBlobstore;
+use cacheblob::MemWritesKeyedBlobstore;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
+use context::PerfCounterType;
 use dag_types::Location;
+use derived_data_manager::BonsaiDerivable;
 use edenapi_types::AnyId;
 use edenapi_types::UploadToken;
 use ephemeral_blobstore::Bubble;
@@ -38,23 +42,28 @@ use filestore::StoreRequest;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use futures::future;
 use futures::stream;
 use futures_util::try_join;
 use mercurial_derivation::DeriveHgChangeset;
+use mercurial_derivation::RootHgAugmentedManifestId;
 use mercurial_derivation::upload_augmented_manifest::UploadTreeAugmented;
 use mercurial_derivation::upload_augmented_manifest::build_augmented_manifests_for_uploaded_trees;
 use mercurial_derivation::upload_augmented_manifest::store_uploaded_tree_envelopes;
 use mercurial_mutation::HgMutationEntry;
 use mercurial_mutation::HgMutationStoreRef;
+use mercurial_types::HgAugmentedManifestId;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgFileEnvelopeMut;
 use mercurial_types::HgFileNodeId;
 use mercurial_types::HgManifestEnvelope;
 use mercurial_types::HgManifestId;
 use mercurial_types::HgNodeHash;
+use mercurial_types::blobs::HgBlobChangeset;
 use mercurial_types::blobs::RevlogChangeset;
 use mercurial_types::blobs::UploadHgNodeHash;
 use mercurial_types::blobs::UploadHgTreeEntry;
+use mercurial_types::blobs::hg_manifests_read_from_augmented;
 use mercurial_types::blobs::store_manifest_envelope;
 use metaconfig_types::RepoConfig;
 use mononoke_api::MononokeRepo;
@@ -64,12 +73,14 @@ use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::ContentMetadataV2;
+use mononoke_types::DateTime;
 use mononoke_types::RepoPath;
 use mononoke_types::hash::GitSha1;
 use phases::PhasesRef;
 use repo_blobstore::RepoBlobstore;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_client::find_new_draft_commits_and_derive_filenodes_for_public_roots;
+use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
 use repo_update_logger::CommitInfo;
 use repo_update_logger::log_new_commits;
@@ -85,9 +96,38 @@ use super::HgTreeContext;
 const STORE_AUGMENTED_MANIFESTS_AT_TREE_UPLOAD: &str =
     "scm/mononoke:store_augmented_manifests_at_tree_upload";
 
+/// Counts how many uploaded commits already have a stored root augmented
+/// manifest, without acting on it.
+const CHECK_UPLOADED_ROOT_HG_AUGMENTED_MANIFEST: &str =
+    "scm/mononoke:check_uploaded_root_hg_augmented_manifest";
+
+/// Maps uploaded commits whose root augmented manifest is stored to that root
+/// instead of deriving them. Implies the check above.
+const MAP_UPLOADED_ROOT_HG_AUGMENTED_MANIFEST: &str =
+    "scm/mononoke:map_uploaded_root_hg_augmented_manifest";
+
+/// Makes tree lookup require the augmented manifest as well as the hg
+/// manifest.
+const REQUIRE_AUGMENTED_MANIFEST_FOR_TREE_LOOKUP: &str =
+    "scm/mononoke:require_augmented_manifest_for_tree_lookup";
+
 #[derive(Clone)]
 pub struct HgRepoContext<R> {
     repo_ctx: RepoContext<R>,
+}
+
+/// A commit that replaces other commits, as recorded when they are amended,
+/// rebased or folded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitMutation {
+    /// The new commit.
+    pub successor: ChangesetId,
+    /// The commits it replaces.
+    pub predecessors: Vec<ChangesetId>,
+    /// The operation, such as "amend", "rebase" or "fold".
+    pub op: String,
+    /// The user who performed the operation.
+    pub user: String,
 }
 
 /// Where `get_graph_mapping` takes the draft flag of each commit from.
@@ -328,10 +368,59 @@ impl<R: MononokeRepo> HgRepoContext<R> {
             .await
     }
 
-    /// Look up in blobstore by `HgManifestId`
+    /// Whether the tree is stored: its augmented manifest once client
+    /// operations read augmented manifests, its Hg manifest otherwise.
     pub async fn tree_exists(&self, manifest_id: HgManifestId) -> Result<bool, MononokeError> {
-        self.is_key_present_in_blobstore(&manifest_id.blobstore_key(), None)
-            .await
+        let key = if self.reads_augmented_manifests() {
+            HgAugmentedManifestId::new(manifest_id.into_nodehash()).blobstore_key()
+        } else {
+            manifest_id.blobstore_key()
+        };
+        self.is_key_present_in_blobstore(&key, None).await
+    }
+
+    /// Whether lookup should tell the client that a tree is already uploaded.
+    ///
+    /// Lookup normally trusts the hg manifest alone, so a tree whose augmented
+    /// manifest is missing is never resent and never gets one. With
+    /// `scm/mononoke:require_augmented_manifest_for_tree_lookup` on, the tree
+    /// counts only when both manifests are stored, so the client resends it
+    /// and tree upload stores the missing envelope. Once client operations
+    /// read augmented manifests, the augmented manifest alone decides.
+    pub async fn is_tree_uploaded(&self, manifest_id: HgManifestId) -> Result<bool, MononokeError> {
+        if self.reads_augmented_manifests() || !self.requires_augmented_manifest_for_tree_lookup() {
+            return self.tree_exists(manifest_id).await;
+        }
+        let augmented_key = HgAugmentedManifestId::new(manifest_id.into_nodehash()).blobstore_key();
+        let hg_key = manifest_id.blobstore_key();
+        let (augmented_exists, hg_exists) = try_join!(
+            self.is_key_present_in_blobstore(&augmented_key, None),
+            self.is_key_present_in_blobstore(&hg_key, None),
+        )?;
+        // Only trees resent because of the augmented manifest, not new ones.
+        if hg_exists && !augmented_exists {
+            self.ctx()
+                .perf_counters()
+                .increment_counter(PerfCounterType::TreeLookupAugmentedMissing);
+        }
+        Ok(augmented_exists && hg_exists)
+    }
+
+    fn reads_augmented_manifests(&self) -> bool {
+        hg_manifests_read_from_augmented(self.repo().repo_identity().name())
+    }
+
+    fn requires_augmented_manifest_for_tree_lookup(&self) -> bool {
+        // A repo without augmented manifests would never see a tree as uploaded.
+        justknobs::eval(
+            REQUIRE_AUGMENTED_MANIFEST_FOR_TREE_LOOKUP,
+            None,
+            Some(self.repo().repo_identity().name()),
+        ) && self
+            .repo()
+            .repo_derived_data()
+            .config()
+            .is_enabled(RootHgAugmentedManifestId::VARIANT)
     }
 
     /// Look up a file in the repo by `HgFileNodeId`.
@@ -394,6 +483,23 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         contents: Bytes,
         computed_node_id: Option<HgNodeHash>,
     ) -> Result<HgManifestEnvelope, MononokeError> {
+        let envelope = self
+            .verify_tree(upload_node_id, p1, p2, contents, computed_node_id)
+            .await?;
+        self.store_verified_tree(envelope.clone()).await?;
+        Ok(envelope)
+    }
+
+    /// Check an uploaded tree against its node id and return the envelope
+    /// `store_verified_tree` would store, writing nothing.
+    pub async fn verify_tree(
+        &self,
+        upload_node_id: HgNodeHash,
+        p1: Option<HgNodeHash>,
+        p2: Option<HgNodeHash>,
+        contents: Bytes,
+        computed_node_id: Option<HgNodeHash>,
+    ) -> Result<HgManifestEnvelope, MononokeError> {
         if computed_node_id.is_some() {
             self.repo_ctx
                 .authorization_context()
@@ -409,11 +515,28 @@ impl<R: MononokeRepo> HgRepoContext<R> {
             computed_node_id,
         };
         let (envelope, _path) = entry.into_verified_envelope()?;
-        store_manifest_envelope(self.ctx(), self.repo().repo_blobstore(), envelope.clone())
+        Ok(envelope)
+    }
+
+    /// Store a tree envelope that `verify_tree` returned.
+    pub async fn store_verified_tree(
+        &self,
+        envelope: HgManifestEnvelope,
+    ) -> Result<(), MononokeError> {
+        store_manifest_envelope(self.ctx(), self.repo().repo_blobstore(), envelope)
             .await
             .map_err(MononokeError::from)?;
+        Ok(())
+    }
 
-        Ok(envelope)
+    /// Whether `build_and_store_augmented_manifests_for_uploaded_trees` writes
+    /// the envelopes it builds, rather than discarding them.
+    pub fn stores_augmented_manifests_at_tree_upload(&self) -> bool {
+        justknobs::eval(
+            STORE_AUGMENTED_MANIFESTS_AT_TREE_UPLOAD,
+            None,
+            Some(self.repo().repo_identity().name()),
+        )
     }
 
     /// Build the augmented manifest envelopes for a batch of already-stored
@@ -423,10 +546,11 @@ impl<R: MononokeRepo> HgRepoContext<R> {
     /// A tree whose child is neither in the batch nor already derived is an
     /// error: the batch builds completely or not at all.
     ///
-    /// Until `scm/mononoke:store_augmented_manifests_at_tree_upload` is on for
-    /// the repo, no envelope is written, and the build's own writes (large
-    /// directory shards, ACL nodes) land in a `MemWritesBlobstore` overlay that
-    /// dies with this call.
+    /// Everything the build writes (large directory shards, ACL nodes) and the
+    /// envelopes themselves go to an in-memory overlay above the repo
+    /// blobstore. Until `scm/mononoke:store_augmented_manifests_at_tree_upload`
+    /// is on for the repo the overlay dies with this call; once it is on it is
+    /// written out in one concurrent pass.
     ///
     /// Once it is on the writes are permanent: the key is the hg manifest id
     /// alone and the put is if-absent, so a wrong envelope cannot be corrected
@@ -436,20 +560,13 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         &self,
         trees: Vec<HgManifestEnvelope>,
     ) -> Result<Vec<UploadTreeAugmented>, Error> {
-        let store = justknobs::eval(
-            STORE_AUGMENTED_MANIFESTS_AT_TREE_UPLOAD,
-            None,
-            Some(self.repo().repo_identity().name()),
-        );
-        let repo_blobstore = if store {
-            self.repo().repo_blobstore().clone()
-        } else {
-            RepoBlobstore::new_with_wrapped_inner_blobstore(
-                self.repo().repo_blobstore().clone(),
-                |inner| Arc::new(MemWritesBlobstore::new(inner)),
-            )
-        };
-        let blobstore: Arc<dyn KeyedBlobstore> = Arc::new(repo_blobstore);
+        let store = self.stores_augmented_manifests_at_tree_upload();
+        // Above the repo blobstore, so a buffered write is a plain insert: the
+        // if-absent check happens once, in the real store, when it is persisted.
+        let overlay = Arc::new(MemWritesKeyedBlobstore::new(
+            self.repo().repo_blobstore().clone(),
+        ));
+        let blobstore: Arc<dyn KeyedBlobstore> = overlay.clone();
         let restricted_paths = self.repo().restricted_paths_arc();
         let built = build_augmented_manifests_for_uploaded_trees(
             self.ctx(),
@@ -460,6 +577,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         .await?;
         if store {
             store_uploaded_tree_envelopes(self.ctx(), &blobstore, &built).await?;
+            overlay.persist(self.ctx()).await?;
         }
         Ok(built)
     }
@@ -469,7 +587,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         &self,
         changesets: Vec<(HgChangesetId, RevlogChangeset, Option<BonsaiChangeset>)>,
         mutations: Vec<HgMutationEntry>,
-    ) -> Result<Vec<Result<(HgChangesetId, BonsaiChangeset), MononokeError>>, MononokeError> {
+    ) -> Result<Vec<Result<(HgBlobChangeset, BonsaiChangeset), MononokeError>>, MononokeError> {
         let mut uploaded_changesets: HashMap<HgChangesetId, ChangesetHandle> = HashMap::new();
         let filelogs = HashMap::new();
         let manifests = HashMap::new();
@@ -496,10 +614,10 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         let mut commits_to_log = Vec::new();
         for (hg_cs_id, handle) in uploaded_changesets {
             let result = match handle.get_completed_changeset().await {
-                Ok((bonsai, _)) => {
+                Ok((bonsai, hg_cs)) => {
                     hg_changesets.insert(hg_cs_id);
                     commits_to_log.push(CommitInfo::new(&bonsai, None));
-                    Ok((hg_cs_id, bonsai))
+                    Ok((hg_cs, bonsai))
                 }
                 Err(e) => Err(MononokeError::from(Error::from(e))),
             };
@@ -523,25 +641,62 @@ impl<R: MononokeRepo> HgRepoContext<R> {
     /// chokepoint. Gated by the per-repo creation-time JustKnob; concurrency is
     /// bounded because the batch is client-controlled (S493741).
     ///
-    /// MUST run only AFTER the bonsai<->hg mapping is committed: deriving
-    /// `RootHgAugmentedManifestId` pulls in `MappedHgChangesetId`, which with no
-    /// stored mapping re-derives and stores Mononoke's own hg id, clobbering a
-    /// caller-supplied divergent id (e.g. null/empty-tree mirror commits from
-    /// `UploadIdenticalChangesets`).
+    /// MUST run only AFTER the bonsai<->hg mapping is committed: with no stored
+    /// mapping, `RootHgAugmentedManifestId` derives from Bonsai and produces
+    /// Mononoke's own hg tree, not a caller-supplied divergent one (e.g.
+    /// null/empty-tree mirror commits from `UploadIdenticalChangesets`).
     pub async fn ensure_uploaded_augmented_manifests_derived(
         &self,
-        results: &[Result<(HgChangesetId, BonsaiChangeset), MononokeError>],
+        results: &[Result<(HgBlobChangeset, BonsaiChangeset), MononokeError>],
     ) {
+        let uploaded = results.iter().filter_map(|result| result.as_ref().ok());
+        let repo_name = self.repo().repo_identity().name();
+        // Mapping cannot bring augmented manifests to a repo that has them off.
+        let map_roots = justknobs::eval(
+            MAP_UPLOADED_ROOT_HG_AUGMENTED_MANIFEST,
+            None,
+            Some(repo_name),
+        ) && self
+            .repo()
+            .repo_derived_data()
+            .config()
+            .is_enabled(RootHgAugmentedManifestId::VARIANT);
+        // Bubbles are skipped: nothing is derived there.
+        let check_roots = (map_roots
+            || justknobs::eval(
+                CHECK_UPLOADED_ROOT_HG_AUGMENTED_MANIFEST,
+                None,
+                Some(repo_name),
+            ))
+            && self
+                .repo()
+                .repo_derived_data()
+                .manager()
+                .bubble_id()
+                .is_none();
+        // A commit mapped to its stored root is not derived.
+        let stored: Vec<&BonsaiChangeset> = if check_roots {
+            let checks: Vec<_> = uploaded
+                .map(|(hg_cs, bcs)| async move {
+                    let mapped = self.check_uploaded_root(hg_cs, bcs, map_roots).await;
+                    (!mapped).then_some(bcs)
+                })
+                .collect();
+            stream::iter(checks)
+                .buffer_unordered(100)
+                .filter_map(future::ready)
+                .collect()
+                .await
+        } else {
+            uploaded.map(|(_, bcs)| bcs).collect()
+        };
+
         // Derive only the heads of the uploaded batch: deriving a head derives
         // all its ancestors, so this covers every uploaded commit without the
         // redundant per-commit fan-out. A commit is a head iff no other uploaded
         // commit lists it as a parent. Computed by set difference, not by order:
         // `results` is NOT topologically sorted (store_hg_changesets builds it
         // from a HashMap) and one request may carry multiple independent stacks.
-        let stored: Vec<&BonsaiChangeset> = results
-            .iter()
-            .filter_map(|result| result.as_ref().ok().map(|(_, bcs)| bcs))
-            .collect();
         let parents_of_batch: HashSet<ChangesetId> =
             stored.iter().flat_map(|bcs| bcs.parents()).collect();
         let heads: Vec<ChangesetId> = stored
@@ -558,6 +713,68 @@ impl<R: MononokeRepo> HgRepoContext<R> {
             .await;
     }
 
+    /// Counts what the uploaded commit's root tree has in the augmented
+    /// manifest store and, with `map_roots`, maps the commit to a stored root.
+    /// Returns whether it was mapped.
+    async fn check_uploaded_root(
+        &self,
+        hg_cs: &HgBlobChangeset,
+        bcs: &BonsaiChangeset,
+        map_roots: bool,
+    ) -> bool {
+        let root = HgAugmentedManifestId::new(hg_cs.manifestid().into_nodehash());
+        let lookup = async {
+            let counter = match root.load(self.ctx(), self.repo().repo_blobstore()).await {
+                Err(LoadableError::Missing(_)) => PerfCounterType::UploadedRootAugmentedMissing,
+                Err(err) => return Err(Error::from(err)),
+                // Stored, but derivation would emit this root under another id.
+                Ok(envelope)
+                    if envelope.augmented_manifest.hg_node_id
+                        != envelope.augmented_manifest.computed_node_id =>
+                {
+                    PerfCounterType::UploadedRootAugmentedUnmappable
+                }
+                Ok(envelope) if map_roots => {
+                    let derivation_ctx = self
+                        .repo()
+                        .repo_derived_data()
+                        .manager()
+                        .derivation_context(None);
+                    // The augmented manifest depends on the ACL manifest, so
+                    // that is mapped first.
+                    RootAclManifestId::from_augmented_root_pointer(
+                        envelope.augmented_manifest.acl_manifest_directory_id,
+                    )
+                    .store_mapping(self.ctx(), &derivation_ctx, bcs.get_changeset_id())
+                    .await?;
+                    RootHgAugmentedManifestId::new(root)
+                        .store_prebuilt_mapping(
+                            self.ctx(),
+                            &derivation_ctx,
+                            hg_cs.get_changeset_id(),
+                            bcs.get_changeset_id(),
+                        )
+                        .await?;
+                    PerfCounterType::UploadedRootAugmentedMapped
+                }
+                Ok(_) => PerfCounterType::UploadedRootAugmentedStored,
+            };
+            Ok(counter)
+        };
+        let counter = lookup.await.unwrap_or_else(|err| {
+            self.ctx().scuba().clone().log_with_msg(
+                "Checking or mapping uploaded root augmented manifest failed",
+                Some(format!(
+                    "hg_cs_id: {}, err: {err:?}",
+                    hg_cs.get_changeset_id()
+                )),
+            );
+            PerfCounterType::UploadedRootAugmentedFailed
+        });
+        self.ctx().perf_counters().increment_counter(counter);
+        matches!(counter, PerfCounterType::UploadedRootAugmentedMapped)
+    }
+
     pub async fn fetch_mutations(
         &self,
         hg_changesets: HashSet<HgChangesetId>,
@@ -567,6 +784,56 @@ impl<R: MononokeRepo> HgRepoContext<R> {
             .hg_mutation_store()
             .all_predecessors(self.ctx(), hg_changesets)
             .await?)
+    }
+
+    /// Record mutations in the mutation store, timestamped with the current
+    /// time. The Mercurial changesets of the successors and predecessors are
+    /// derived if necessary.
+    pub async fn record_hg_mutations(
+        &self,
+        mutations: Vec<CommitMutation>,
+    ) -> Result<(), MononokeError> {
+        let cs_ids: HashSet<ChangesetId> = mutations
+            .iter()
+            .flat_map(|mutation| {
+                std::iter::once(mutation.successor).chain(mutation.predecessors.iter().copied())
+            })
+            .collect();
+        let hg_ids: HashMap<ChangesetId, HgChangesetId> = stream::iter(cs_ids)
+            .map(|cs_id| async move {
+                let hg_id = self.repo().derive_hg_changeset(self.ctx(), cs_id).await?;
+                Ok::<_, MononokeError>((cs_id, hg_id))
+            })
+            .buffer_unordered(10)
+            .try_collect()
+            .await?;
+
+        let timestamp = DateTime::now().timestamp_secs();
+        let entries: Vec<HgMutationEntry> = mutations
+            .into_iter()
+            .map(|mutation| {
+                HgMutationEntry::new(
+                    hg_ids[&mutation.successor],
+                    mutation
+                        .predecessors
+                        .iter()
+                        .map(|cs_id| hg_ids[cs_id])
+                        .collect(),
+                    Vec::new(),
+                    mutation.op,
+                    mutation.user,
+                    timestamp,
+                    0,
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let successors = entries.iter().map(|entry| *entry.successor()).collect();
+        self.repo()
+            .hg_mutation_store()
+            .add_entries(self.ctx(), successors, entries)
+            .await?;
+        Ok(())
     }
 
     // TODO(mbthomas): get_hg_from_bonsai -> derive_hg_changeset
@@ -886,7 +1153,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         // the commits being returned instead.
         let walk_drafts = !justknobs::eval(
             "scm/mononoke:commit_graph_pull_optimizations",
-            None,
+            ctx.client_request_info().map(|c| c.correlator.as_str()),
             Some(self.repo_ctx().name()),
         );
         let walked_draft_commits = async {
@@ -916,14 +1183,20 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         let classification = async {
             match walked_draft_commits {
                 Some(draft_commits) => anyhow::Ok(DraftClassification::Walked(draft_commits)),
-                None => Ok(DraftClassification::Phases(
-                    stream::iter(missing_commits.clone())
+                None => {
+                    let classify_start = Instant::now();
+                    let public = stream::iter(missing_commits.clone())
                         .chunks(100)
                         .map(|chunk| phases.get_cached_public(&ctx, chunk))
                         .buffered(25)
                         .try_concat()
-                        .await?,
-                )),
+                        .await?;
+                    ctx.perf_counters().add_duration_us(
+                        PerfCounterType::PhasesSectionUs,
+                        classify_start.elapsed(),
+                    );
+                    Ok(DraftClassification::Phases(public))
+                }
             }
         };
 
@@ -996,15 +1269,23 @@ impl<R: MononokeRepo> HgRepoContext<R> {
 mod tests {
     use std::sync::Arc;
 
+    use blobstore::BlobstoreGetData;
+    use blobstore::BlobstoreIsPresent;
     use fbinit::FacebookInit;
     use futures::FutureExt;
     use justknobs::test_helpers::JustKnobsInMemory;
     use justknobs::test_helpers::KnobVal;
     use justknobs::test_helpers::with_just_knobs_async;
     use maplit::hashmap;
+    use memblob::Memblob;
+    use mercurial_types::HgParents;
+    use mercurial_types::calculate_hg_node_id;
     use mononoke_api::repo::Repo;
     use mononoke_api::repo::RepoContext;
     use mononoke_macros::mononoke;
+    use samplingblob::SamplingBlobstore;
+    use samplingblob::SamplingHandler;
+    use test_repo_factory::TestRepoFactory;
     use tests_utils::CreateCommitContext;
 
     use super::*;
@@ -1019,6 +1300,84 @@ mod tests {
 
         let hg = repo_ctx.hg();
         assert_eq!(hg.repo_ctx().name(), "repo");
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_record_hg_mutations(fb: FacebookInit) -> Result<(), MononokeError> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
+
+        // B1 amends B, and C1 and D1 rebase C and D onto B1.
+        let a = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("a", "a")
+            .commit()
+            .await?;
+        let b = CreateCommitContext::new(&ctx, &repo, vec![a])
+            .add_file("b", "b")
+            .commit()
+            .await?;
+        let c = CreateCommitContext::new(&ctx, &repo, vec![b])
+            .add_file("c", "c")
+            .commit()
+            .await?;
+        let b1 = CreateCommitContext::new(&ctx, &repo, vec![a])
+            .add_file("b", "b1")
+            .commit()
+            .await?;
+        let c1 = CreateCommitContext::new(&ctx, &repo, vec![b1])
+            .add_file("c", "c")
+            .commit()
+            .await?;
+
+        let repo_ctx = RepoContext::new_test(ctx, Arc::new(repo)).await?;
+        let hg = repo_ctx.hg();
+        hg.record_hg_mutations(vec![
+            CommitMutation {
+                successor: b1,
+                predecessors: vec![b],
+                op: "amend".to_string(),
+                user: "alice".to_string(),
+            },
+            CommitMutation {
+                successor: c1,
+                predecessors: vec![c],
+                op: "rebase".to_string(),
+                user: "bob".to_string(),
+            },
+        ])
+        .await?;
+
+        let hg_b = hg.get_hg_from_bonsai(b).await?;
+        let hg_c = hg.get_hg_from_bonsai(c).await?;
+        let hg_b1 = hg.get_hg_from_bonsai(b1).await?;
+        let hg_c1 = hg.get_hg_from_bonsai(c1).await?;
+        let summary = |entries: Vec<HgMutationEntry>| {
+            entries
+                .iter()
+                .map(|entry| {
+                    (
+                        *entry.successor(),
+                        entry.predecessors().copied().collect::<Vec<_>>(),
+                        entry.op().to_string(),
+                        entry.user().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            summary(hg.fetch_mutations(HashSet::from([hg_b1])).await?),
+            vec![(hg_b1, vec![hg_b], "amend".to_string(), "alice".to_string())],
+        );
+        assert_eq!(
+            summary(hg.fetch_mutations(HashSet::from([hg_c1])).await?),
+            vec![(hg_c1, vec![hg_c], "rebase".to_string(), "bob".to_string())],
+        );
+        assert!(
+            hg.fetch_mutations(HashSet::from([hg_b])).await?.is_empty(),
+            "the replaced commit has no mutation history of its own",
+        );
 
         Ok(())
     }
@@ -1085,5 +1444,199 @@ mod tests {
             .await?;
         }
         Ok(())
+    }
+
+    async fn verify_directory(
+        hg: &HgRepoContext<Repo>,
+        contents: String,
+    ) -> Result<HgManifestEnvelope, MononokeError> {
+        let contents = Bytes::from(contents);
+        let node_id = calculate_hg_node_id(&contents, &HgParents::new(None, None));
+        hg.verify_tree(node_id, None, None, contents, None).await
+    }
+
+    async fn assert_augmented_manifests_build_without_hg_manifests(
+        fb: FacebookInit,
+    ) -> anyhow::Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: Repo = test_repo_factory::build_empty(fb).await?;
+        let hg = RepoContext::new_test(ctx, Arc::new(repo)).await?.hg();
+
+        // Root first, so the build has to order the batch itself.
+        let leaf = verify_directory(&hg, String::new()).await?;
+        let middle = verify_directory(&hg, format!("d\0{}t\n", leaf.node_id())).await?;
+        let root = verify_directory(&hg, format!("m\0{}t\n", middle.node_id())).await?;
+        let trees = vec![root, middle, leaf];
+        hg.build_and_store_augmented_manifests_for_uploaded_trees(trees.clone())
+            .await?;
+
+        for tree in &trees {
+            let node_id = tree.node_id();
+            let augmented_key = HgAugmentedManifestId::new(node_id).blobstore_key();
+            assert!(
+                hg.is_key_present_in_blobstore(&augmented_key, None).await?,
+                "the augmented manifest of {node_id} should be stored"
+            );
+            assert!(
+                !hg.tree_exists(HgManifestId::new(node_id)).await?,
+                "the hg manifest of {node_id} should not be stored yet"
+            );
+        }
+        Ok(())
+    }
+
+    async fn assert_tree_uploaded(fb: FacebookInit, required: bool) -> anyhow::Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: Repo = test_repo_factory::build_empty(fb).await?;
+        let hg = RepoContext::new_test(ctx, Arc::new(repo)).await?.hg();
+
+        // `leaf` gets both manifests, `middle` only its augmented manifest and
+        // `root` only its hg manifest.
+        let leaf = verify_directory(&hg, String::new()).await?;
+        let middle = verify_directory(&hg, format!("d\0{}t\n", leaf.node_id())).await?;
+        let root = verify_directory(&hg, format!("m\0{}t\n", middle.node_id())).await?;
+        hg.build_and_store_augmented_manifests_for_uploaded_trees(vec![
+            leaf.clone(),
+            middle.clone(),
+        ])
+        .await?;
+        hg.store_verified_tree(leaf.clone()).await?;
+        hg.store_verified_tree(root.clone()).await?;
+
+        let uploaded = |tree: &HgManifestEnvelope| {
+            let manifest_id = HgManifestId::new(tree.node_id());
+            let hg = hg.clone();
+            async move { hg.is_tree_uploaded(manifest_id).await }
+        };
+        assert!(
+            uploaded(&leaf).await?,
+            "a tree with both manifests is uploaded"
+        );
+        assert!(
+            !uploaded(&middle).await?,
+            "a tree without its hg manifest is never uploaded"
+        );
+        assert_eq!(
+            uploaded(&root).await?,
+            !required,
+            "a tree without its augmented manifest is uploaded only while lookup does not require it"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_tree_uploaded(fb: FacebookInit) -> anyhow::Result<()> {
+        for required in [true, false] {
+            with_just_knobs_async(
+                JustKnobsInMemory::new(hashmap! {
+                    STORE_AUGMENTED_MANIFESTS_AT_TREE_UPLOAD.to_string() => KnobVal::Bool(true),
+                    REQUIRE_AUGMENTED_MANIFEST_FOR_TREE_LOOKUP.to_string() => KnobVal::Bool(required),
+                }),
+                assert_tree_uploaded(fb, required).boxed(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Fails every read of an Hg manifest blob, standing in for a store where
+    /// they have been deleted.
+    #[derive(Debug)]
+    struct DenyHgManifestReads;
+
+    impl DenyHgManifestReads {
+        fn check(key: &str) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !key.contains("hgmanifest."),
+                "unexpected read of Hg manifest {key}"
+            );
+            Ok(())
+        }
+    }
+
+    impl SamplingHandler for DenyHgManifestReads {
+        fn sample_get(
+            &self,
+            _ctx: &CoreContext,
+            key: &str,
+            _value: Option<&BlobstoreGetData>,
+        ) -> anyhow::Result<()> {
+            Self::check(key)
+        }
+
+        fn sample_is_present(
+            &self,
+            _ctx: &CoreContext,
+            key: &str,
+            _value: &BlobstoreIsPresent,
+        ) -> anyhow::Result<()> {
+            Self::check(key)
+        }
+    }
+
+    async fn assert_tree_uploaded_read_from_augmented(fb: FacebookInit) -> anyhow::Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: Repo = TestRepoFactory::new(fb)?
+            .with_blobstore(Arc::new(SamplingBlobstore::new(
+                Memblob::default(),
+                Arc::new(DenyHgManifestReads),
+            )))
+            .build()
+            .await?;
+        let hg = RepoContext::new_test(ctx, Arc::new(repo)).await?.hg();
+
+        // `augmented` gets only its augmented manifest, `hg_only` only its hg
+        // manifest, and `missing` neither.
+        let augmented = verify_directory(&hg, String::new()).await?;
+        let hg_only = verify_directory(&hg, format!("a\0{}t\n", augmented.node_id())).await?;
+        let missing = verify_directory(&hg, format!("b\0{}t\n", augmented.node_id())).await?;
+        hg.build_and_store_augmented_manifests_for_uploaded_trees(vec![augmented.clone()])
+            .await?;
+        hg.store_verified_tree(hg_only.clone()).await?;
+
+        let uploaded = |tree: &HgManifestEnvelope| {
+            let manifest_id = HgManifestId::new(tree.node_id());
+            let hg = hg.clone();
+            async move { hg.is_tree_uploaded(manifest_id).await }
+        };
+        assert!(
+            uploaded(&augmented).await?,
+            "a tree with only its augmented manifest is uploaded"
+        );
+        assert!(
+            !uploaded(&hg_only).await?,
+            "a tree without its augmented manifest is not uploaded"
+        );
+        assert!(!uploaded(&missing).await?, "a missing tree is not uploaded");
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_tree_uploaded_read_from_augmented(fb: FacebookInit) -> anyhow::Result<()> {
+        for required in [true, false] {
+            with_just_knobs_async(
+                JustKnobsInMemory::new(hashmap! {
+                    STORE_AUGMENTED_MANIFESTS_AT_TREE_UPLOAD.to_string() => KnobVal::Bool(true),
+                    REQUIRE_AUGMENTED_MANIFEST_FOR_TREE_LOOKUP.to_string() => KnobVal::Bool(required),
+                    "scm/mononoke:hgmanifest_read_from_augmented".to_string() => KnobVal::Bool(true),
+                }),
+                assert_tree_uploaded_read_from_augmented(fb).boxed(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_augmented_manifests_build_without_hg_manifests(
+        fb: FacebookInit,
+    ) -> anyhow::Result<()> {
+        with_just_knobs_async(
+            JustKnobsInMemory::new(hashmap! {
+                STORE_AUGMENTED_MANIFESTS_AT_TREE_UPLOAD.to_string() => KnobVal::Bool(true),
+            }),
+            assert_augmented_manifests_build_without_hg_manifests(fb).boxed(),
+        )
+        .await
     }
 }

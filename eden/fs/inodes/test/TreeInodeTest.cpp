@@ -146,6 +146,40 @@ TEST_P(TreeInodeTestBase, renameOrdersUnrelatedDestinationChildLock) {
   }
 }
 
+TEST(TreeInode, loadTimeEntryCountsAreSnapshotAtLoad) {
+  FakeTreeBuilder builder;
+  builder.setFile("dir/a.txt", "a");
+  builder.setFile("dir/b.txt", "b");
+  builder.setFile("dir/sub/c.txt", "c");
+  TestMount mount{builder};
+
+  auto dir = mount.getTreeInode("dir");
+  EXPECT_EQ(2u, dir->loadTimeEntryCounts().files);
+  EXPECT_EQ(1u, dir->loadTimeEntryCounts().dirs);
+
+  mount.addFile("dir/d.txt", "d");
+  EXPECT_EQ(2u, dir->loadTimeEntryCounts().files);
+  EXPECT_EQ(1u, dir->loadTimeEntryCounts().dirs);
+}
+
+TEST(TreeInode, loadReportsEntryCountsToWalkDetector) {
+  FakeTreeBuilder builder;
+  for (int i = 0; i < 5; ++i) {
+    builder.setFile(fmt::format("dir/f{}.txt", i), "x");
+  }
+  builder.setFile("dir/sub/a.txt", "a");
+  TestMount mount{builder};
+
+  mount.getTreeInode("dir");
+  auto reported = mount.getWalkDetector().directorySizes();
+  auto dir = std::find_if(reported.begin(), reported.end(), [](auto& entry) {
+    return entry.first == RelativePath{"dir"};
+  });
+  ASSERT_NE(dir, reported.end());
+  EXPECT_EQ(5u, dir->second.files);
+  EXPECT_EQ(1u, dir->second.dirs);
+}
+
 TEST(TreeInode, findEntryDifferencesWithSameEntriesReturnsNone) {
   DirContents dir(CaseSensitivity::Sensitive);
   dir.emplace("one"_pc, makeDirEntry());
@@ -590,6 +624,51 @@ TEST_P(TreeInodeTestBase, readdirIndexIsRebuiltAfterRenameOverAnEntry) {
   EXPECT_EQ(2, getReaddirIndexCounters(mount).cached - before.cached);
 }
 
+TEST_P(TreeInodeTestBase, readdirIndexIsRebuiltAfterConflictRepair) {
+  FakeTreeBuilder builder;
+  const auto names = manyNames();
+  for (const auto& name : names) {
+    builder.setFile("dir/" + name, "");
+  }
+  builder.setFile("original", "original");
+  TestMount mount{
+      builder,
+      true,
+      true,
+      kPathMapDefaultCaseSensitive,
+      nullptr,
+      [](EdenConfig& config) {
+        config.overlayOnlineFsck.setValue(true, ConfigSourceType::CommandLine);
+      }};
+  maybeEnableCoroutines(mount);
+  auto original = mount.getFileInode("original");
+  auto dir = mount.getTreeInode("dir");
+  const auto& repaired = names.back();
+  {
+    auto contents = dir->getContentsUnchecked().wlock();
+    auto& entry = contents->entries.find(PathComponentPiece{repaired})->second;
+    entry = DirEntry{
+        entry.getInitialMode(),
+        original->getNodeId(),
+        entry.getObjectId(),
+        entry.aclRootState()};
+  }
+  const auto before = getReaddirIndexCounters(mount);
+  auto firstPage =
+      dir->fuseReaddir(
+             FuseDirList{4096}, 0, ObjectFetchContext::getNullContext())
+          .extract();
+  ASSERT_FALSE(firstPage.empty());
+  EXPECT_EQ(1, getReaddirIndexCounters(mount).cached - before.cached);
+
+  auto child = mount.getFileInode("dir/" + repaired);
+  EXPECT_NE(original->getNodeId(), child->getNodeId());
+  std::map<std::string, unsigned> seen;
+  listToEnd(dir, firstPage.back().offset, seen);
+  EXPECT_EQ(1u, seen[repaired]);
+  EXPECT_EQ(2, getReaddirIndexCounters(mount).cached - before.cached);
+}
+
 TEST_P(TreeInodeTestBase, readdirIndexIsDroppedByInodeGc) {
   FakeTreeBuilder builder;
   const auto names = manyNames();
@@ -973,6 +1052,9 @@ TEST_P(TreeInodeTestBase, removeRecursivelyNotReady) {
   EXPECT_FALSE(fut.isReady());
 
   builder.setAllReady();
+  // The tree fetch resumes on the server executor once the backing store
+  // answers.
+  mount.drainServerExecutor();
   std::move(fut).get(0ms);
 
   EXPECT_THROW_ERRNO(mount.getTreeInode("somedir"_relpath), ENOENT);
@@ -1218,188 +1300,6 @@ TEST_P(TreeInodeTestBase, getOrFindChildrenRemovedChild) {
   for (auto& [_name, child] : result) {
     ASSERT_TRUE(child.hasValue());
   }
-}
-
-TEST_P(
-    TreeInodeTestBase,
-    if_readdir_prefetching_is_disabled_aux_data_is_not_fetched) {
-  FakeTreeBuilder builder;
-  builder.setFile("foo/bar.txt", "bar");
-  builder.setFile("foo/baz.txt", "baz");
-  TestMount mount{builder};
-  maybeEnableCoroutines(mount);
-  mount.updateEdenConfig({
-      {"mount:readdir-prefetch", "none"},
-  });
-
-  auto foo = mount.getTreeInode("foo"_relpath);
-  auto result =
-      foo->fuseReaddir(
-             FuseDirList{4096}, 0, ObjectFetchContext::getNullContext())
-          .extract();
-
-  ASSERT_EQ(4, result.size());
-  EXPECT_EQ(".", result[0].name);
-  EXPECT_EQ("..", result[1].name);
-  EXPECT_EQ("bar.txt", result[2].name);
-  EXPECT_EQ("baz.txt", result[3].name);
-
-  auto bar = mount.getFileInode("foo/bar.txt"_relpath);
-  bar->stat(ObjectFetchContext::getNullContext()).get();
-  EXPECT_EQ(1, mount.getBackingStore()->getAuxDataLookups().size());
-
-  // Pump the prefetch operation here.
-  mount.drainServerExecutor();
-
-  EXPECT_EQ(1, mount.getBackingStore()->getAuxDataLookups().size());
-}
-
-TEST_P(TreeInodeTestBase, readdir_does_not_prefetch) {
-  FakeTreeBuilder builder;
-  builder.setFile("foo/bar.txt", "bar");
-  builder.setFile("foo/baz.txt", "baz");
-  TestMount mount{builder};
-  maybeEnableCoroutines(mount);
-  mount.updateEdenConfig({
-      {"mount:readdir-prefetch", "both"},
-  });
-
-  auto foo = mount.getTreeInode("foo"_relpath);
-  auto result =
-      foo->fuseReaddir(
-             FuseDirList{4096}, 0, ObjectFetchContext::getNullContext())
-          .extract();
-
-  ASSERT_EQ(4, result.size());
-  EXPECT_EQ(".", result[0].name);
-  EXPECT_EQ("..", result[1].name);
-  EXPECT_EQ("bar.txt", result[2].name);
-  EXPECT_EQ("baz.txt", result[3].name);
-
-  mount.drainServerExecutor();
-
-  auto auxData = mount.getBackingStore()->getAuxDataLookups();
-  EXPECT_EQ(0, auxData.size());
-}
-
-TEST_P(TreeInodeTestBase, stat_on_child_does_not_prefetch_parent) {
-  FakeTreeBuilder builder;
-  auto barObjectId = ObjectId::sha1("bar");
-  builder.setFile(
-      "foo/bar.txt"_relpath,
-      "bar",
-      /*executable=*/false,
-      /*objectId=*/barObjectId);
-  builder.setFile("foo/baz.txt", "baz");
-  TestMount mount{builder};
-  maybeEnableCoroutines(mount);
-  mount.updateEdenConfig({
-      {"mount:readdir-prefetch", "both"},
-  });
-
-  auto bar = mount.getFileInode("foo/bar.txt"_relpath);
-
-  auto executor = mount.getServerExecutor().get();
-
-  // Inject a fault in the getBlobAuxData method because we want to trigger the
-  // prefetch logic without actually fetching the aux data for `bar`.
-  mount.getServerState()->getFaultInjector().injectBlock(
-      "getBlobAuxData", ".*");
-
-  auto statFuture =
-      bar->stat(ObjectFetchContext::getNullContext()).semi().via(executor);
-
-  mount.drainServerExecutor();
-
-  EXPECT_FALSE(statFuture.isReady());
-
-  auto auxData = mount.getBackingStore()->getAuxDataLookups();
-  EXPECT_EQ(1, auxData.size());
-  EXPECT_EQ(auxData.front().getBytes(), barObjectId.getBytes());
-
-  // Unblock stat
-  mount.getServerState()->getFaultInjector().unblock("getBlobAuxData", ".*");
-
-  auto waitedStatFuture = std::move(statFuture).waitVia(executor);
-  EXPECT_TRUE(waitedStatFuture.isReady());
-}
-
-TEST_P(
-    TreeInodeTestBase,
-    readdir_followed_by_stat_on_child_prefetches_parents_children) {
-  FakeTreeBuilder builder;
-  builder.setFile("foo/bar.txt", "bar");
-  builder.setFile("foo/baz.txt", "baz");
-  TestMount mount{builder};
-  maybeEnableCoroutines(mount);
-  mount.updateEdenConfig({
-      {"mount:readdir-prefetch", "both"},
-  });
-
-  auto foo = mount.getTreeInode("foo"_relpath);
-  auto result =
-      foo->fuseReaddir(
-             FuseDirList{4096}, 0, ObjectFetchContext::getNullContext())
-          .extract();
-
-  ASSERT_EQ(4, result.size());
-  EXPECT_EQ(".", result[0].name);
-  EXPECT_EQ("..", result[1].name);
-  EXPECT_EQ("bar.txt", result[2].name);
-  EXPECT_EQ("baz.txt", result[3].name);
-
-  auto bar = mount.getFileInode("foo/bar.txt"_relpath);
-  bar->stat(ObjectFetchContext::getNullContext()).get();
-  EXPECT_EQ(1, mount.getBackingStore()->getAuxDataLookups().size());
-
-  // Pump the prefetch operation here.
-  mount.drainServerExecutor();
-
-  EXPECT_EQ(2, mount.getBackingStore()->getAuxDataLookups().size());
-}
-
-TEST_P(TreeInodeTestBase, stat_on_directories_only_prefetches_subdirectories) {
-  FakeTreeBuilder builder;
-  builder.setFile("foo/bar/internal.txt", "internal");
-  builder.setFile("foo/baz.txt", "baz");
-  builder.setFile("foo/qux/another.txt", "another");
-  builder.setFile("foo/dingo.txt", "dingo");
-  TestMount mount{builder};
-  maybeEnableCoroutines(mount);
-  mount.updateEdenConfig({
-      {"mount:readdir-prefetch", "both"},
-  });
-
-  auto foo = mount.getTreeInode("foo"_relpath);
-  auto result =
-      foo->fuseReaddir(
-             FuseDirList{4096}, 0, ObjectFetchContext::getNullContext())
-          .extract();
-
-  // stat() a directory. This looks like a `find .` operation where the
-  // traversal itself will lookup() any child directories, but will not stat()
-  // blobs. Therefore, it's best to only prefetch tree aux data.
-  auto bar = mount.getTreeInode("foo/bar"_relpath);
-  bar->stat(ObjectFetchContext::getNullContext()).get();
-  EXPECT_EQ(0, mount.getBackingStore()->getAuxDataLookups().size());
-
-  // Pump the prefetch operation here.
-  mount.drainServerExecutor();
-
-  // Trees don't have blob aux data.
-  EXPECT_EQ(0, mount.getBackingStore()->getAuxDataLookups().size());
-
-  // Now stat() a file. We already prefetched directories, so if a file is
-  // stat()'d, that's a clue that the rest of the files should be prefetched.
-
-  auto baz = mount.getFileInode("foo/baz.txt"_relpath);
-  baz->stat(ObjectFetchContext::getNullContext()).get();
-  EXPECT_EQ(1, mount.getBackingStore()->getAuxDataLookups().size());
-
-  // Pump the prefetch operation here.
-  mount.drainServerExecutor();
-
-  EXPECT_EQ(2, mount.getBackingStore()->getAuxDataLookups().size());
 }
 
 TEST_P(TreeInodeTestBase, buildDirFromTree) {

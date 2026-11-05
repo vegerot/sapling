@@ -5,12 +5,13 @@
  * GNU General Public License version 2.
  */
 
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use edenfs_utils::is_active_eden_mount;
+use edenfs_remove::LocalCheckoutState;
 use fail::fail_point;
 use tracing::debug;
 use tracing::warn;
@@ -18,21 +19,7 @@ use tracing::warn;
 use super::types::PathType;
 use super::types::RemoveContext;
 use super::utils;
-
-const AUX_PROCESSES_STOP_TIMEOUT: u64 = 60;
-
-/// Get the timeout for stopping aux processes.
-///
-/// Priority: CLI arg > EDENFS_AUX_PROCESSES_TIMEOUT_SECS env var > default (60s).
-pub fn get_aux_processes_stop_timeout(cli_timeout: Option<u64>) -> u64 {
-    if let Some(t) = cli_timeout {
-        return t;
-    }
-    std::env::var("EDENFS_AUX_PROCESSES_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(AUX_PROCESSES_STOP_TIMEOUT)
-}
+use crate::get_edenfs_instance;
 
 // Validate and canonicalize the given path into absolute path with the type of PathBuf.
 // Then determine a type for this path.
@@ -44,11 +31,25 @@ pub async fn classify_path(path: &str) -> Result<(PathBuf, PathType)> {
     let path_buf = PathBuf::from(path);
 
     match path_buf.canonicalize() {
+        // A registered checkout whose folder is gone can still be removed.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let Ok(path) = edenfs_remove::canonicalize_checkout_path(&path_buf).await else {
+                return Err(e.into());
+            };
+            match edenfs_remove::classify_checkout(get_edenfs_instance(), &path).await {
+                Ok(LocalCheckoutState::Inactive) => Ok((path, PathType::InactiveEdenMount)),
+                Err(error) => Err(error),
+                _ => Err(e.into()),
+            }
+        }
         Err(e) => Err(e.into()),
         Ok(canonicalized_path) => {
             let path = canonicalized_path.as_path();
             if path.is_file() {
-                return Ok((canonicalized_path, PathType::RegularFile));
+                return Ok((
+                    path_to_remove_for_file(&path_buf, canonicalized_path)?,
+                    PathType::RegularFile,
+                ));
             }
 
             if !path.is_dir() {
@@ -62,32 +63,32 @@ pub async fn classify_path(path: &str) -> Result<(PathBuf, PathType)> {
 
             debug!("{} is determined as a directory", path.display());
 
-            if is_active_eden_mount(path) {
-                debug!(
-                    "path {} is determined to be an active EdenFS mount",
-                    path.display()
-                );
-
-                return Ok((canonicalized_path, PathType::ActiveEdenMount));
-            }
-
-            debug!("{} is not an active EdenFS mount", path.display());
-
-            if utils::is_inactive_eden_mount(&canonicalized_path).await? {
-                debug!(
-                    "path {} is determined to be an inactive EdenFS mount",
-                    path.display()
-                );
-
-                return Ok((canonicalized_path, PathType::InactiveEdenMount));
-            }
-
-            // It's a directory that is not listed inside config.json
-            // We don't know how to handle it properly, so move to "Unknown" state
-            // and try to handle from there with "the best efforts".
-            Ok((canonicalized_path, PathType::Unknown))
+            let path_type =
+                match edenfs_remove::classify_checkout(get_edenfs_instance(), path).await? {
+                    LocalCheckoutState::Active => PathType::ActiveEdenMount,
+                    LocalCheckoutState::Inactive => PathType::InactiveEdenMount,
+                    // A directory that is not listed inside config.json. We don't know how
+                    // to handle it properly, so try to handle it from here with best efforts.
+                    LocalCheckoutState::Unknown => PathType::Unknown,
+                };
+            debug!("path {} is determined to be {}", path.display(), path_type);
+            Ok((canonicalized_path, path_type))
         }
     }
+}
+
+fn path_to_remove_for_file(given_path: &Path, canonicalized_path: PathBuf) -> Result<PathBuf> {
+    if !given_path.symlink_metadata()?.file_type().is_symlink() {
+        return Ok(canonicalized_path);
+    }
+    let link_name = given_path
+        .file_name()
+        .ok_or_else(|| anyhow!("{} has no file name", given_path.display()))?;
+    let link_parent = match given_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    Ok(link_parent.canonicalize()?.join(link_name))
 }
 
 pub async fn clean_up(context: &RemoveContext) -> Result<()> {
@@ -188,15 +189,28 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn test_classify_nonexistent_path() {
-        let tmp_dir = prepare_directory();
-        let path = format!("{}/test/no_file", tmp_dir.path().to_str().unwrap());
-        let path_buf = PathBuf::from(path);
-        let result = classify_path(path_buf.to_str().unwrap()).await;
-        assert!(
-            result.is_err(),
-            "nonexistent path should not be canonicalized"
+    async fn test_classify_path_symlink_to_regular_file() {
+        let temp_dir = prepare_directory();
+        let target = temp_dir.path().join("target.txt");
+        fs::write(&target, "anything").unwrap();
+        let link = temp_dir.path().join("link-to-target");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let (p, t) = classify_path(link.to_str().unwrap()).await.unwrap();
+        assert!(matches!(t, PathType::RegularFile));
+        assert_eq!(
+            p,
+            temp_dir
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("link-to-target")
         );
+
+        fs::remove_file(&p).unwrap();
+        assert!(target.exists());
+        assert!(link.symlink_metadata().is_err());
     }
 }

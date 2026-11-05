@@ -6,14 +6,13 @@
  */
 
 #[cfg(fbcode_build)]
+use std::collections::HashMap;
+
+#[cfg(fbcode_build)]
 use anyhow::anyhow;
 #[cfg(fbcode_build)]
 use backend_if::RimBackend;
 use context::CoreContext;
-#[cfg(fbcode_build)]
-use edenapi_types::file::FILE_COUNT_HEADER;
-#[cfg(fbcode_build)]
-use edenapi_types::tree::TREE_COUNT_HEADER;
 use gotham::helpers::http::Body;
 use gotham::state::FromState;
 use gotham::state::State;
@@ -23,23 +22,26 @@ use gotham_ext::middleware::MetadataState;
 use gotham_ext::middleware::Middleware;
 use gotham_ext::middleware::request_context::RequestContext;
 use gotham_ext::response::build_error_response_in_place;
-#[cfg(fbcode_build)]
-use http::HeaderMap;
-#[cfg(fbcode_build)]
-use http::Method;
 use http::Response;
 use http::StatusCode;
 use http::Uri;
-#[cfg(fbcode_build)]
-use permission_checker::TenantInfo;
 
 use crate::handlers::JsonErrorFormatter;
+use crate::middleware::ods::record_processed_work;
 #[cfg(fbcode_build)]
 use crate::utils::rim_rate_limiter::RimDecision;
 #[cfg(fbcode_build)]
+use crate::utils::rim_rate_limiter::RimRateLimiter;
+#[cfg(fbcode_build)]
+use crate::utils::rim_rate_limiter::STORAGE_READS_RESOURCE;
+#[cfg(fbcode_build)]
 use crate::utils::rim_rate_limiter::check_rate_limit;
 #[cfg(fbcode_build)]
-use crate::utils::rim_rate_limiter::report_load;
+use crate::utils::rim_rate_limiter::record_usage;
+#[cfg(fbcode_build)]
+use crate::utils::rim_rate_limiter::report_request;
+#[cfg(fbcode_build)]
+use crate::utils::rim_rate_limiter::request_attribution;
 
 #[cfg(fbcode_build)]
 const RIM_ENFORCE_JK: &str = "scm/mononoke:slapi_rim_enforce";
@@ -68,27 +70,28 @@ fn error_response(state: &mut State, error: HttpError) -> Response<Body> {
 async fn apply_rim_decision(
     state: &mut State,
     ctx: &CoreContext,
-    tenant: &TenantInfo,
+    tenancy_path: &[String],
     rim_backend: RimBackend,
-    requirement: (&str, f64),
+    requirements: &HashMap<String, f64>,
+    selection_key: Option<&str>,
 ) -> Option<Response<Body>> {
-    match check_rate_limit(ctx, tenant, rim_backend, requirement).await {
-        RimDecision::Allow => {
-            report_load(ctx, tenant, rim_backend, requirement).await;
-            None
-        }
-        RimDecision::Reject if justknobs::eval(RIM_ENFORCE_JK, None, None) => {
-            Some(rim_rejection_response(state))
-        }
+    let decision =
+        check_rate_limit(ctx, tenancy_path, rim_backend, requirements, selection_key).await;
+    let rejected = decision == RimDecision::Reject && justknobs::eval(RIM_ENFORCE_JK, None, None);
+    if decision != RimDecision::FailOpen {
+        report_request(ctx, tenancy_path, rim_backend, requirements, rejected);
+    }
+    match decision {
+        RimDecision::Allow => None,
+        RimDecision::Reject if rejected => Some(rim_rejection_response(state)),
         RimDecision::Reject => {
             let mut scuba = ctx.scuba().clone();
-            scuba.add("rim_tenancy_path", tenant.to_string());
-            scuba.add("rim_resource", requirement.0);
+            scuba.add("rim_tenancy_path", tenancy_path.join("/"));
+            scuba.add("rim_backend", rim_backend.0);
             scuba.log_with_msg(
                 "RIM would have rejected request but enforcement is disabled",
                 format!("JustKnob {RIM_ENFORCE_JK} is disabled"),
             );
-            report_load(ctx, tenant, rim_backend, requirement).await;
             None
         }
         RimDecision::FailOpen => None,
@@ -111,13 +114,13 @@ fn load_shedding_response(state: &mut State, ctx: &CoreContext) -> Option<Respon
 #[derive(Clone)]
 pub struct ThrottleMiddleware {
     #[cfg(fbcode_build)]
-    rim_backend: Option<RimBackend>,
+    rim: Option<RimRateLimiter>,
 }
 impl ThrottleMiddleware {
-    pub fn new(#[cfg(fbcode_build)] rim_backend: Option<RimBackend>) -> Self {
+    pub(crate) fn new(#[cfg(fbcode_build)] rim: Option<RimRateLimiter>) -> Self {
         Self {
             #[cfg(fbcode_build)]
-            rim_backend,
+            rim,
         }
     }
 }
@@ -139,45 +142,39 @@ impl Middleware for ThrottleMiddleware {
         }
 
         #[cfg(fbcode_build)]
-        if let Some(rim_backend) = self.rim_backend {
-            let tenant = state
-                .try_borrow::<MetadataState>()
-                .map(|metadata| metadata.metadata().tenant_info());
-            if let Some(tenant) = tenant {
-                // Older clients keep QPS-only accounting. Fetch counts are advisory.
-                let fetches = (Method::borrow_from(state) == Method::POST)
-                    .then(|| {
-                        // The API prefix is stripped; the encoded repo is one path segment.
-                        let (_, endpoint) = Uri::borrow_from(state)
-                            .path()
-                            .strip_prefix('/')?
-                            .split_once('/')?;
-                        let (header, resource) = match endpoint {
-                            "files2" => (FILE_COUNT_HEADER, "file_fetches"),
-                            "trees" => (TREE_COUNT_HEADER, "tree_fetches"),
-                            _ => return None,
-                        };
-                        let count = HeaderMap::borrow_from(state)
-                            .get(header)?
-                            .to_str()
-                            .ok()?
-                            .parse::<u32>()
-                            .ok()?;
-                        Some((resource, f64::from(count)))
-                    })
-                    .flatten();
-                let requirements = [Some(("qps", 1.0)), fetches];
-                // Check independently so an unconfigured fetch resource cannot bypass QPS.
-                for requirement in requirements.into_iter().flatten() {
-                    if let Some(response) =
-                        apply_rim_decision(state, &ctx, &tenant, rim_backend, requirement).await
-                    {
-                        return Some(response);
-                    }
-                }
+        if let Some(rim) = &self.rim
+            && let Some(metadata) = state.try_borrow::<MetadataState>()
+        {
+            let config = rim.config.get();
+            let (path, selection_key) = request_attribution(metadata.metadata(), &config);
+            // With demand_equals_usage=false, acquire selects resources; completion reports usage.
+            let requirements = [
+                (rim.cpu_resource.clone(), 0.0),
+                (STORAGE_READS_RESOURCE.to_owned(), 0.0),
+            ]
+            .into();
+            if let Some(response) = apply_rim_decision(
+                state,
+                &ctx,
+                &path,
+                rim.backend,
+                &requirements,
+                selection_key.as_deref(),
+            )
+            .await
+            {
+                return Some(response);
             }
+            record_usage(
+                state,
+                ctx.clone(),
+                rim.backend,
+                path,
+                rim.cpu_resource.clone(),
+            );
         }
 
+        record_processed_work(state, ctx);
         None
     }
 }

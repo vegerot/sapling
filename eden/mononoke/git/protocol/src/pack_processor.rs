@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write;
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -51,12 +52,53 @@ use scuba_ext::FutureStatsScubaExt;
 use sha1::Digest;
 use sha1::Sha1;
 use tempfile::Builder;
+use weight_observer::WeightGuard;
 use weight_observer::WeightObserver;
 
 use crate::PACKFILE_SUFFIX;
 
 const MAX_ALLOWED_DEPTH: u8 = 30;
+const MAX_CACHED_PACK_ENTRIES_BYTES: usize = 8 * 1024 * 1024;
 type ObjectMap = HashMap<ObjectId, ObjectContent>;
+
+struct DecodeWeight {
+    observer: Option<Arc<dyn WeightObserver>>,
+    weight: AtomicUsize,
+}
+
+impl DecodeWeight {
+    fn new(observer: Option<Arc<dyn WeightObserver>>) -> Self {
+        Self {
+            observer,
+            weight: AtomicUsize::new(0),
+        }
+    }
+
+    fn add(&self, weight: usize) {
+        if let Some(observer) = &self.observer {
+            self.weight.fetch_add(weight, Ordering::Relaxed);
+            observer.on_weight_added(weight);
+        }
+    }
+
+    fn into_guard(mut self) -> WeightGuard {
+        WeightGuard {
+            observer: self.observer.take(),
+            weight: self.weight.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for DecodeWeight {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.observer {
+            let weight = self.weight.load(Ordering::Relaxed);
+            if weight > 0 {
+                observer.on_weight_removed(weight);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 enum PackEntry {
@@ -125,6 +167,7 @@ fn into_data_entry(pack_entry: InputEntry) -> data::Entry {
         header: pack_entry.header,
         decompressed_size: pack_entry.decompressed_size,
         data_offset: pack_entry.pack_offset + pack_entry.header_size as u64,
+        encoded_header_size: pack_entry.header_size,
     }
 }
 
@@ -155,24 +198,46 @@ fn resolve_delta(
     })
 }
 
-async fn fetch_prereq_objects(
+fn new_entry_cache(entry_count: usize) -> Option<Vec<InputEntry>> {
+    let max_entries = MAX_CACHED_PACK_ENTRIES_BYTES
+        .saturating_sub(size_of::<Option<Vec<InputEntry>>>())
+        / size_of::<InputEntry>();
+    if entry_count > max_entries {
+        return None;
+    }
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(entry_count.min(max_entries))
+        .ok()?;
+    (entries.capacity() <= max_entries).then_some(entries)
+}
+
+async fn load_entries_and_prereq_objects(
     pack_file: &data::File,
     ctx: &CoreContext,
     blobstore: Arc<RepoBlobstore>,
     concurrency: usize,
-) -> Result<ObjectMap> {
-    // Iterate over all packfile entries and fetch all the required base items
+) -> Result<(Option<Vec<InputEntry>>, ObjectMap)> {
     let mut base_items = HashSet::new();
     let pack_stream = pack_file
         .streaming_iter()
         .context("Failure in iterating packfile")?;
+    let mut pending_entries = new_entry_cache(pack_stream.size_hint().0);
     for entry in pack_stream {
-        let entry = entry.context("Invalid packfile entry")?;
+        let mut entry = entry.context("Invalid packfile entry")?;
         if let RefDelta { base_id } = entry.header {
             base_items.insert(base_id);
         }
+        entry.compressed = None;
+        if let Some(entries) = &mut pending_entries {
+            if entries.len() < entries.capacity() {
+                entries.push(entry);
+            } else {
+                pending_entries = None;
+            }
+        }
     }
-    stream::iter(base_items)
+    let prereq_objects = stream::iter(base_items)
         .map(async |object_id| {
             let git_identifier = GitIdentifier::Basic(GitSha1::from_object_id(object_id.as_ref())?);
             anyhow::Ok(
@@ -194,26 +259,28 @@ async fn fetch_prereq_objects(
         .buffer_unordered(concurrency)
         .try_filter_map(|maybe_object| future::ready(Ok(maybe_object)))
         .try_collect::<HashMap<_, _>>()
-        .await
+        .await?;
+    Ok((pending_entries, prereq_objects))
 }
 
 /// Method responsible for parsing the packfile provided as part of push, verifying its correctness
 /// and returning an object map containing all the objects present in packfile mapped to their IDs
-/// Returns the parsed object map and the total tracked weight (bytes) that
-/// has been reported via `weight_observer.on_weight_added`. The caller is
-/// responsible for calling `on_weight_removed` with this value when the
-/// objects are no longer held in memory.
+/// Returns the parsed objects and their memory-accounting guard. Keep the guard
+/// alive for as long as the objects are held in memory.
 pub async fn parse_pack(
     pack_bytes: &[u8],
     ctx: &CoreContext,
     blobstore: Arc<RepoBlobstore>,
     concurrency: usize,
     weight_observer: Option<Arc<dyn WeightObserver>>,
-) -> Result<(FxHashMap<ObjectId, ObjectContent>, usize)> {
+) -> Result<(FxHashMap<ObjectId, ObjectContent>, WeightGuard)> {
     // If the packfile is empty, return an empty object map. This can happen when the push only has ref create/update
     // pointing to existing commit or just ref deletes
     if pack_bytes.is_empty() {
-        return Ok((FxHashMap::default(), 0));
+        return Ok((
+            FxHashMap::default(),
+            DecodeWeight::new(weight_observer).into_guard(),
+        ));
     }
     let mut raw_file = Builder::new()
         .suffix(PACKFILE_SUFFIX)
@@ -236,8 +303,7 @@ pub async fn parse_pack(
 fn process_pack_entries(
     pack_file: &data::File,
     entries: PackEntries,
-    weight_observer: &Option<Arc<dyn WeightObserver>>,
-    cumulative_weight: &AtomicUsize,
+    weight: &DecodeWeight,
 ) -> Result<PackEntries> {
     let (pending_entries, prereq_objects) = entries.into_pending_and_processed();
     let output_entries = pending_entries
@@ -248,7 +314,7 @@ fn process_pack_entries(
             let outcome = pack_file.decode_entry(
                 into_data_entry(entry.clone()),
                 &mut output,
-                &mut gix_features::zlib::Inflate::default(),
+                &mut Default::default(),
                 &|oid, out| resolve_delta(oid, out, &prereq_objects),
                 &mut Never,
             );
@@ -257,10 +323,7 @@ fn process_pack_entries(
                     let object_size = outcome.object_size as usize;
                     // Track weight as objects are decoded — uses the object_size
                     // already computed by decode_entry, zero extra cost.
-                    if let Some(observer) = weight_observer {
-                        observer.on_weight_added(object_size);
-                        cumulative_weight.fetch_add(object_size, Ordering::Relaxed);
-                    }
+                    weight.add(object_size);
                     let object_bytes =
                         Bytes::from(git_object_bytes(output, outcome.kind, object_size));
                     let mut hasher = Sha1::new();
@@ -296,7 +359,7 @@ async fn parse_stored_pack(
     blobstore: Arc<RepoBlobstore>,
     concurrency: usize,
     weight_observer: Option<Arc<dyn WeightObserver>>,
-) -> Result<(FxHashMap<ObjectId, ObjectContent>, usize)> {
+) -> Result<(FxHashMap<ObjectId, ObjectContent>, WeightGuard)> {
     let pack_file = Arc::new(File::at(pack_path, Kind::Sha1).with_context(|| {
         format!(
             "Error while opening packfile for push at {}",
@@ -320,20 +383,22 @@ async fn parse_stored_pack(
         "Push".to_string(),
     )?;
 
-    // Load all the prerequisite objects
-    let prereq_objects = fetch_prereq_objects(&pack_file, ctx, blobstore.clone(), concurrency)
-        .try_timed()
-        .await?
-        .log_future_stats(
-            ctx.scuba().clone(),
-            "Fetched Prerequisite Objects",
-            "Push".to_string(),
-        );
-    // Fetch all the entries that need to be processed
-    let pending_entries = pack_file
-        .streaming_iter()
-        .context("Failure in iterating packfile")?
-        .collect::<Result<Vec<_>, InputError>>()?;
+    let (cached_entries, prereq_objects) =
+        load_entries_and_prereq_objects(&pack_file, ctx, blobstore.clone(), concurrency)
+            .try_timed()
+            .await?
+            .log_future_stats(
+                ctx.scuba().clone(),
+                "Fetched Prerequisite Objects",
+                "Push".to_string(),
+            );
+    let pending_entries = match cached_entries {
+        Some(entries) => entries,
+        None => pack_file
+            .streaming_iter()
+            .context("Failure in iterating packfile")?
+            .collect::<Result<Vec<_>, InputError>>()?,
+    };
 
     // Process all the entries. Weight is tracked inline inside
     // process_pack_entries using outcome.object_size from decode_entry —
@@ -343,41 +408,18 @@ async fn parse_stored_pack(
         move || {
             let mut pack_entries =
                 PackEntries::from_pending_and_processed(pending_entries, prereq_objects);
-            let cumulative_weight = AtomicUsize::new(0);
-
-            // Helper to remove all tracked weight from the observer on error.
-            let cleanup_weight =
-                |cumulative: &AtomicUsize, observer: &Option<Arc<dyn WeightObserver>>| {
-                    let w = cumulative.load(Ordering::Relaxed);
-                    if let Some(observer) = observer {
-                        observer.on_weight_removed(w);
-                    }
-                };
-
+            let weight = DecodeWeight::new(weight_observer);
             let mut counter = 0;
             while !pack_entries.is_processed() {
                 if counter > MAX_ALLOWED_DEPTH {
-                    cleanup_weight(&cumulative_weight, &weight_observer);
                     anyhow::bail!(
                         "Maximum allowed depth reached while processing packfile entries"
                     );
                 }
                 counter += 1;
-                match process_pack_entries(
-                    &pack_file,
-                    pack_entries,
-                    &weight_observer,
-                    &cumulative_weight,
-                ) {
-                    Ok(entries) => pack_entries = entries,
-                    Err(e) => {
-                        cleanup_weight(&cumulative_weight, &weight_observer);
-                        return Err(e);
-                    }
-                }
+                pack_entries = process_pack_entries(&pack_file, pack_entries, &weight)?;
             }
-            let tracked_weight = cumulative_weight.load(Ordering::Relaxed);
-            Ok((pack_entries.into_processed()?, tracked_weight))
+            Ok((pack_entries.into_processed()?, weight.into_guard()))
         }
     })
     .try_timed()
@@ -388,3 +430,6 @@ async fn parse_stored_pack(
         "Push".to_string(),
     )
 }
+
+#[cfg(test)]
+mod tests;

@@ -45,7 +45,6 @@ constexpr folly::StringPiece kRepoCaseSensitiveKey{"case-sensitive"};
 constexpr folly::StringPiece kMountProtocol{"protocol"};
 constexpr folly::StringPiece kInodeCatalogType{"inode-catalog-type"};
 constexpr folly::StringPiece kRequireUtf8Path{"require-utf8-path"};
-constexpr folly::StringPiece kEnableSqliteOverlay{"enable-sqlite-overlay"};
 constexpr folly::StringPiece kUseWriteBackCache{"use-write-back-cache"};
 constexpr folly::StringPiece kReCas{"recas"};
 constexpr folly::StringPiece kReUseCase{"use-case"};
@@ -60,6 +59,21 @@ const RelativePathPiece kIntentionallyUnmountedFile{"intentionally-unmounted"};
 
 // File holding mapping of client directories.
 const RelativePathPiece kClientDirectoryMap{"config.json"};
+
+std::string getRequiredRepositoryString(
+    const cpptoml::table& repository,
+    folly::StringPiece key,
+    AbsolutePathPiece configPath) {
+  auto value = repository.get_as<std::string>(key.str());
+  if (!value) {
+    throwf<std::runtime_error>(
+        "{}: [{}] has no string key {}",
+        configPath,
+        kRepoSection.str(),
+        key.str());
+  }
+  return *value;
+}
 
 // Constants for use with the SNAPSHOT file
 //
@@ -332,6 +346,12 @@ void CheckoutConfig::clearIntentionallyUnmountedFlag() const {
   std::remove(intentionallyUnmountedFile.c_str());
 }
 
+void CheckoutConfig::setIntentionallyUnmountedFlag() const {
+  writeFileAtomic(
+      clientDirectory_ + kIntentionallyUnmountedFile, folly::ByteRange{})
+      .value();
+}
+
 bool CheckoutConfig::isIntentionallyUnmounted() const {
   auto intentionallyUnmountedFile =
       clientDirectory_ + kIntentionallyUnmountedFile;
@@ -381,8 +401,14 @@ std::unique_ptr<CheckoutConfig> CheckoutConfig::loadFromClientDirectory(
 
   // Load repository information
   auto repository = configRoot->get_table(kRepoSection.str());
-  config->repoType_ = *repository->get_as<std::string>(kRepoTypeKey.str());
-  config->repoSource_ = *repository->get_as<std::string>(kRepoSourceKey.str());
+  if (!repository) {
+    throwf<std::runtime_error>(
+        "{}: missing [{}] table", configPath, kRepoSection.str());
+  }
+  config->repoType_ =
+      getRequiredRepositoryString(*repository, kRepoTypeKey, configPath);
+  config->repoSource_ =
+      getRequiredRepositoryString(*repository, kRepoSourceKey, configPath);
 
   FieldConverter<MountProtocol> mountProtocolConverter;
   MountProtocol mountProtocol = kMountProtocolDefault;
@@ -411,20 +437,19 @@ std::unique_ptr<CheckoutConfig> CheckoutConfig::loadFromClientDirectory(
         inodeCatalogTypeConverter.fromString(*inodeCatalogTypeStr, {});
     if (result.hasValue()) {
       inodeCatalogType = result.value();
+    } else if (!folly::kIsWindows) {
+      // On Linux and macOS the overlay holds the only copy of materialized
+      // data, and opening it with a different catalog type would discard it.
+      // Windows overlays are rebuilt from the on-disk PrjFS state, so falling
+      // back to the default catalog is safe there.
+      throwf<std::runtime_error>(
+          "unsupported inode-catalog-type '{}' in {}: this overlay format is "
+          "no longer supported, reclone the checkout",
+          *inodeCatalogTypeStr,
+          configPath);
     }
   }
   config->inodeCatalogType_ = inodeCatalogType;
-
-  // TODO(xavierd): Remove the Windows check once D44683911 has been rolled out
-  // for several months at which point all the CheckoutConfig will have been
-  // rewritten to contain `enable-sqlite-overlay = true`
-  if (!folly::kIsWindows) {
-    auto enableSqliteOverlay =
-        repository->get_as<bool>(kEnableSqliteOverlay.str());
-    // SqliteOverlay is default on Windows
-    config->enableSqliteOverlay_ =
-        enableSqliteOverlay.value_or(folly::kIsWindows);
-  }
 
   auto useWriteBackCache = repository->get_as<bool>(kUseWriteBackCache.str());
   config->useWriteBackCache_ = useWriteBackCache.value_or(false);

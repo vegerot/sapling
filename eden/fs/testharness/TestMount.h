@@ -42,6 +42,7 @@ class TreeCache;
 class CheckoutConfig;
 class ErrorLogger;
 class FakeBackingStore;
+class FakeWalkDetector;
 class FakeFuse;
 class FakePrivHelper;
 class FakeTreeBuilder;
@@ -175,13 +176,20 @@ class TestMount {
       const RootId& initialCommitId,
       FakeTreeBuilder& rootBuilder,
       bool startReady = true,
-      InodeCatalogType inodeCatalogType = kDefaultInodeCatalogType,
-      InodeCatalogOptions inodeCatalogOptions = kDefaultInodeCatalogOptions);
+      InodeCatalogType inodeCatalogType = kInodeCatalogTypeDefault);
   void initialize(FakeTreeBuilder& rootBuilder, bool startReady = true);
-  void initialize(
-      FakeTreeBuilder& rootBuilder,
-      InodeCatalogType inodeCatalogType,
-      InodeCatalogOptions inodeCatalogOptions);
+
+  /**
+   * Classify the mount as served over the given protocol: forwarded to
+   * EdenMount::initialize() as the takeover mount protocol, which overrides
+   * the checkout config (and, unlike the config path, does not depend on
+   * platform defaults like experimental:enable-nfs-server). Must be called
+   * before the mount is initialized, i.e. on a default-constructed
+   * TestMount.
+   */
+  void setMountProtocol(MountProtocol protocol) {
+    mountProtocol_ = protocol;
+  }
 
   /**
    * Like initialize, except EdenMount::initialize is not called.
@@ -192,8 +200,7 @@ class TestMount {
       const RootId& initialCommitId,
       FakeTreeBuilder& rootBuilder,
       bool startReady,
-      InodeCatalogType inodeCatalogType = kDefaultInodeCatalogType,
-      InodeCatalogOptions inodeCatalogOptions = kDefaultInodeCatalogOptions);
+      InodeCatalogType inodeCatalogType = kInodeCatalogTypeDefault);
   void createMountWithoutInitializing(
       FakeTreeBuilder& rootBuilder,
       bool startReady = true);
@@ -225,6 +232,11 @@ class TestMount {
    * must be parseable by the ConfigSetting.
    */
   void updateEdenConfig(const std::map<std::string, std::string>& values);
+
+  /**
+   * The mount's walk detector, which records what it is told for tests.
+   */
+  FakeWalkDetector& getWalkDetector() const;
 
   /**
    * Callers can use this to populate the BackingStore before calling build().
@@ -269,8 +281,8 @@ class TestMount {
    * When simulateUncleanShutdown is true, the overlay's saved next inode
    * number is deleted after the old mount is destroyed, so the new mount
    * takes the same fsck recovery path as a mount whose daemon crashed. The
-   * Sqlite catalog used on Windows keeps no such file and reconciles the
-   * overlay with the disk on every start, so the option does nothing there.
+   * InMemory catalog used on Windows keeps no such file and rebuilds the
+   * overlay from the disk on every start, so the option does nothing there.
    */
   void remount(bool simulateUncleanShutdown = false);
 
@@ -402,8 +414,7 @@ class TestMount {
 
  private:
   void createMount(
-      InodeCatalogType InodeCatalogType = kDefaultInodeCatalogType,
-      InodeCatalogOptions inodeCatalogOptions = kDefaultInodeCatalogOptions);
+      InodeCatalogType inodeCatalogType = kInodeCatalogTypeDefault);
   void initTestDirectory(CaseSensitivity caseSensitivity);
   void setInitialCommit(const RootId& commitId);
   void setInitialCommit(const RootId& commitId, ObjectId rootTreeId);
@@ -427,6 +438,7 @@ class TestMount {
   std::unique_ptr<folly::test::TemporaryDirectory> testDir_;
 
   std::shared_ptr<EdenMount> edenMount_;
+  std::optional<MountProtocol> mountProtocol_;
   TreeInodePtr rootInode_;
 
 #ifndef _WIN32
@@ -469,7 +481,6 @@ class TestMount {
 inline void enableCoroutinesConfig(TestMount& mount) {
   mount.updateEdenConfig({
       {"coroutines:enable-phase7", "true"},
-      {"coroutines:enable-phase8", "true"},
       {"coroutines:enable-phase9", "true"},
       {"coroutines:enable-phase10", "true"},
   });

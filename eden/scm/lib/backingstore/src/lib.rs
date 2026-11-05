@@ -18,12 +18,21 @@
 
 mod auxdata;
 mod backingstore;
+#[cfg(fbcode_build)]
+mod facebook;
 mod ffi;
 mod ffi_errors;
 mod init;
+#[cfg(not(fbcode_build))]
+mod oss;
 mod prefetch;
 mod request;
+mod walk;
+
+#[cfg(not(fbcode_build))]
+use oss as facebook;
 
 pub use crate::backingstore::BackingStore;
 pub use crate::backingstore::HgCacheStats;
 pub use crate::init::backingstore_global_init;
+pub use crate::walk::WalkDetector;

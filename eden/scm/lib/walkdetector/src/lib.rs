@@ -9,10 +9,6 @@
 mod tests;
 mod walk_node;
 
-use std::borrow::Cow;
-use std::io::BufRead;
-use std::io::BufWriter;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +17,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -31,8 +28,6 @@ use coarsetime::Instant;
 #[cfg(test)]
 use mock_instant::Instant;
 use parking_lot::RwLock;
-use serde::Deserialize;
-use serde::Serialize;
 use tracing::Level;
 use types::RepoPath;
 use types::RepoPathBuf;
@@ -48,8 +43,6 @@ use walk_node::WalkNode;
 pub struct Detector {
     config: Config,
     root: Option<PathBuf>,
-    persistence_path: Option<PathBuf>,
-    last_persisted_metadata_fingerprint: Arc<AtomicU64>,
     inner: Arc<RwLock<Inner>>,
 }
 
@@ -69,48 +62,8 @@ impl Default for Inner {
     }
 }
 
-const METADATA_FINGERPRINT_UNKNOWN: u64 = 0;
-const METADATA_FINGERPRINT_PERSISTING: u64 = 1;
-
-/// How long bookkeeping operations (GC, metadata persistence) can take before
-/// we warn that they were slow.
+/// How long GC can take before we warn that it was slow.
 const SLOW_OPERATION_THRESHOLD: Duration = Duration::from_millis(100);
-
-fn metadata_fingerprint(entries: &[(RepoPathBuf, usize, usize)]) -> u64 {
-    let (xor, sum) = entries
-        .iter()
-        .fold((0u64, 0u64), |(xor, sum), (dir, files, dirs)| {
-            let hash = metadata_entry_hash(dir.as_str(), *files, *dirs);
-            (xor ^ hash, sum.wrapping_add(hash))
-        });
-
-    let mut fingerprint = 0xcbf29ce484222325;
-    fnv1a_update(&mut fingerprint, &(entries.len() as u64).to_le_bytes());
-    fnv1a_update(&mut fingerprint, &xor.to_le_bytes());
-    fnv1a_update(&mut fingerprint, &sum.to_le_bytes());
-
-    match fingerprint {
-        METADATA_FINGERPRINT_UNKNOWN | METADATA_FINGERPRINT_PERSISTING => fingerprint + 2,
-        _ => fingerprint,
-    }
-}
-
-fn metadata_entry_hash(path: &str, files: usize, dirs: usize) -> u64 {
-    let mut hash = 0xcbf29ce484222325;
-    fnv1a_update(&mut hash, path.as_bytes());
-    fnv1a_update(&mut hash, b"\0");
-    fnv1a_update(&mut hash, &files.to_le_bytes());
-    fnv1a_update(&mut hash, b"\0");
-    fnv1a_update(&mut hash, &dirs.to_le_bytes());
-    hash
-}
-
-fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
-    for byte in bytes {
-        *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(0x100000001b3);
-    }
-}
 
 impl Detector {
     pub fn new() -> Self {
@@ -125,19 +78,20 @@ impl Detector {
         self.config.walk_threshold = threshold;
     }
 
-    pub fn set_lax_depth(&mut self, depth: usize) {
-        self.config.lax_depth = depth;
-    }
-
-    pub fn set_strict_multiplier(&mut self, multiplier: usize) {
-        self.config.strict_multiplier = multiplier;
-    }
-
     pub fn set_walk_ratio(&mut self, threshold: f64) {
         if threshold <= 0.0 {
             return;
         }
         self.config.walk_ratio = threshold;
+    }
+
+    /// Set the fraction of the walk ratio that applies to in-order accesses. `1.0` turns the
+    /// sorted detection off; values outside (0, 1] are ignored.
+    pub fn set_walk_ratio_sorted_factor(&mut self, factor: f64) {
+        if factor <= 0.0 || factor > 1.0 {
+            return;
+        }
+        self.config.walk_ratio_sorted_factor = factor;
     }
 
     pub fn set_gc_interval(&mut self, interval: Duration) {
@@ -156,255 +110,15 @@ impl Detector {
         self.root = root;
     }
 
-    /// Set path for persisting large directory metadata across restarts.
-    pub fn set_persistence_path(&mut self, path: PathBuf) {
-        self.persistence_path = Some(path);
-        self.clear_last_persisted_metadata_fingerprint();
-    }
-
-    pub fn clear_persistence_path(&mut self) {
-        self.persistence_path = None;
-        self.clear_last_persisted_metadata_fingerprint();
-    }
-
-    /// Load previously persisted large directory metadata. Should be called after
-    /// config is set up (since config affects which metadata is considered "important").
-    pub fn load_persisted_metadata(&self) {
-        let path = match &self.persistence_path {
-            Some(p) => p,
-            None => return,
-        };
-
-        let start = std::time::Instant::now();
-        let file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                tracing::warn!(?e, ?path, "error opening persisted walk metadata");
-                return;
-            }
-        };
-
-        let mut entries = Vec::new();
-        for line in std::io::BufReader::new(file).lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::debug!(?e, "error reading line from walk metadata");
-                    continue;
-                }
-            };
-            match serde_json::from_str::<PersistedMetadata<'_>>(&line) {
-                Ok(entry) => {
-                    if entry.version != PERSISTED_METADATA_VERSION {
-                        tracing::debug!(
-                            version = entry.version,
-                            "skipping unsupported walk metadata version"
-                        );
-                        continue;
-                    }
-
-                    match RepoPathBuf::from_string(entry.dir.into_owned()) {
-                        Ok(repo_path) => {
-                            entries.push((repo_path, entry.files, entry.dirs));
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                ?e,
-                                "skipping persisted walk metadata with invalid path"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(?e, "skipping malformed walk metadata");
-                }
-            }
-        }
-
-        let mut inner = self.inner.write();
-        for (repo_path, files, dirs) in &entries {
-            inner.set_metadata(&self.config, repo_path.as_ref(), *files, *dirs);
-        }
-        drop(inner);
-        self.last_persisted_metadata_fingerprint
-            .store(metadata_fingerprint(&entries), Ordering::Release);
-
-        let elapsed = start.elapsed();
-        if elapsed > SLOW_OPERATION_THRESHOLD {
-            tracing::warn!(
-                ?elapsed,
-                count = entries.len(),
-                ?path,
-                "loading persisted walk metadata was slow"
-            );
-        } else {
-            tracing::debug!(
-                ?elapsed,
-                count = entries.len(),
-                ?path,
-                "loaded persisted walk metadata"
-            );
-        }
-    }
-
-    /// Persist current large directory metadata to disk.
-    fn persist_metadata(&self, entries: Vec<(RepoPathBuf, usize, usize)>) {
-        let path = match &self.persistence_path {
-            Some(p) => p,
-            None => return,
-        };
-
-        let start = std::time::Instant::now();
-        let fingerprint = metadata_fingerprint(&entries);
-
-        if !self.try_claim_metadata_persist(fingerprint) {
-            let elapsed = start.elapsed();
-            if elapsed > SLOW_OPERATION_THRESHOLD {
-                tracing::warn!(
-                    ?elapsed,
-                    count = entries.len(),
-                    ?path,
-                    "checking persisted walk metadata was slow"
-                );
-            } else {
-                tracing::debug!(
-                    ?elapsed,
-                    count = entries.len(),
-                    ?path,
-                    "persisted walk metadata is unchanged or already being persisted"
-                );
-            }
-            return;
-        }
-
-        if entries.is_empty() {
-            // Remove stale file if no important metadata exists.
-            let result = match std::fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => {
-                    tracing::warn!(?e, ?path, "error removing stale persisted walk metadata");
-                    Err(e)
-                }
-            };
-            let elapsed = start.elapsed();
-            if result.is_ok() {
-                self.set_last_persisted_metadata_fingerprint(fingerprint);
-                if elapsed > SLOW_OPERATION_THRESHOLD {
-                    tracing::warn!(?elapsed, ?path, "persisting empty walk metadata was slow");
-                }
-            } else {
-                self.mark_metadata_persist_failed();
-            }
-            return;
-        }
-
-        let result = atomicfile::atomic_write(path, 0o644, false, |file| {
-            let mut file = BufWriter::new(file);
-            for (dir, files, dirs) in &entries {
-                serde_json::to_writer(
-                    &mut file,
-                    &PersistedMetadata {
-                        version: PERSISTED_METADATA_VERSION,
-                        dir: Cow::Borrowed(dir.as_str()),
-                        files: *files,
-                        dirs: *dirs,
-                    },
-                )
-                .map_err(std::io::Error::other)?;
-                file.write_all(b"\n")?;
-            }
-            file.flush()
-        })
-        .map(|_| ());
-
-        let elapsed = start.elapsed();
-        match result {
-            Ok(()) => {
-                self.set_last_persisted_metadata_fingerprint(fingerprint);
-                if elapsed > SLOW_OPERATION_THRESHOLD {
-                    tracing::warn!(
-                        ?elapsed,
-                        count = entries.len(),
-                        ?path,
-                        "persisting walk metadata was slow"
-                    );
-                } else {
-                    tracing::debug!(
-                        ?elapsed,
-                        count = entries.len(),
-                        ?path,
-                        "persisted walk metadata"
-                    );
-                }
-            }
-            Err(e) => {
-                self.mark_metadata_persist_failed();
-                tracing::warn!(?e, ?path, "error persisting walk metadata");
-            }
-        }
-    }
-
-    fn try_claim_metadata_persist(&self, fingerprint: u64) -> bool {
-        loop {
-            let current = self
-                .last_persisted_metadata_fingerprint
-                .load(Ordering::Acquire);
-            if current == fingerprint || current == METADATA_FINGERPRINT_PERSISTING {
-                return false;
-            }
-            if self
-                .last_persisted_metadata_fingerprint
-                .compare_exchange(
-                    current,
-                    METADATA_FINGERPRINT_PERSISTING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return true;
-            }
-        }
-    }
-
-    fn set_last_persisted_metadata_fingerprint(&self, fingerprint: u64) {
-        self.last_persisted_metadata_fingerprint
-            .store(fingerprint, Ordering::Release);
-    }
-
-    fn mark_metadata_persist_failed(&self) {
-        let _ = self.last_persisted_metadata_fingerprint.compare_exchange(
-            METADATA_FINGERPRINT_PERSISTING,
-            METADATA_FINGERPRINT_UNKNOWN,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-    }
-
-    fn clear_last_persisted_metadata_fingerprint(&self) {
-        self.last_persisted_metadata_fingerprint
-            .store(METADATA_FINGERPRINT_UNKNOWN, Ordering::Release);
-    }
-
-    fn maybe_persist_metadata(&self, important_metadata: Option<Vec<(RepoPathBuf, usize, usize)>>) {
-        if let Some(entries) = important_metadata {
-            self.persist_metadata(entries);
-        }
-    }
-
-    /// Run GC if needed, then persist any metadata collected by GC after dropping the write lock.
+    /// Run GC if needed. Returns whether a walk was removed.
     fn maybe_gc(&self) -> bool {
-        let mut inner = self.inner.write();
-        let (walk_changed, important_metadata) =
-            match inner.maybe_gc(&self.config, self.persistence_path.is_some()) {
-                Some(result) => (result.deleted_walks > 0, result.important_metadata),
-                None => (false, None),
-            };
-        drop(inner);
-        self.maybe_persist_metadata(important_metadata);
-        walk_changed
+        if !self.inner.read().needs_gc(&self.config) {
+            return false;
+        }
+        self.inner
+            .write()
+            .maybe_gc(&self.config)
+            .is_some_and(|result| result.deleted_walks > 0)
     }
 
     /// Return list of (walk root dir, walk depth) representing active file content walks.
@@ -448,9 +162,21 @@ impl Detector {
     /// Observe a "heavy" or remote file (content) read of `path`.
     /// Returns whether an active walk changed (either created or removed).
     pub fn file_loaded(&self, path: impl AsRef<RepoPath>, pid: u32) -> bool {
+        self.file_loaded_with_dir_size(path, None, pid)
+    }
+
+    /// Like `file_loaded`, but `dir_size` optionally reports the `(num_files, num_dirs)` of the
+    /// directory containing `path`, which fills in that directory's metadata if the detector
+    /// hasn't seen the directory itself load.
+    pub fn file_loaded_with_dir_size(
+        &self,
+        path: impl AsRef<RepoPath>,
+        dir_size: Option<(usize, usize)>,
+        pid: u32,
+    ) -> bool {
         let path = path.as_ref();
 
-        tracing::trace!(%path, "file_loaded");
+        tracing::trace!(%path, ?dir_size, "file_loaded");
 
         // Try lightweight read-only path.
         if self.mark_read(path, WalkType::File, true, pid).is_some() {
@@ -466,8 +192,20 @@ impl Detector {
         let mut walk_changed = self.maybe_gc();
         let mut inner = self.inner.write();
 
-        let walk_threshold = walk_threshold(&self.config, dir_path.depth());
+        let walk_threshold = self.config.walk_threshold;
         let walk_ratio = self.config.walk_ratio;
+
+        // A hint of zero files for the directory of a file being loaded is stale.
+        if let Some((num_files, num_dirs)) = dir_size
+            && num_files > 0
+            && interesting_metadata(walk_threshold, walk_ratio, Some(num_files), Some(num_dirs))
+            && inner
+                .node
+                .get_node(dir_path)
+                .is_none_or(|node| node.total_files().is_none())
+        {
+            inner.set_metadata(&self.config, dir_path, num_files, num_dirs);
+        }
 
         let (owner, suffix) =
             inner
@@ -489,7 +227,14 @@ impl Detector {
             my_dir.seen_files.insert(base_name.to_owned());
 
             let seen_count = my_dir.seen_files.len();
-            if my_dir.is_walked(WalkType::File, seen_count, 0, walk_threshold, walk_ratio) {
+            if my_dir.is_walked(
+                WalkType::File,
+                seen_count,
+                0,
+                walk_threshold,
+                self.config.walk_ratio_for(my_dir.seen_files.is_sorted()),
+                0,
+            ) {
                 my_dir.seen_files.clear();
                 inner.insert_walk(
                     &self.config,
@@ -502,6 +247,14 @@ impl Detector {
         }
 
         walk_changed
+    }
+
+    /// Account a "heavy" or remote file read of `path` to the walk already covering it, if any,
+    /// taking only the read lock. Returns whether a walk covered it. Otherwise the caller should
+    /// report the read with `file_loaded`, which may create or extend walks under the write lock.
+    pub fn file_loaded_fast(&self, path: impl AsRef<RepoPath>, pid: u32) -> bool {
+        self.mark_read(path.as_ref(), WalkType::File, true, pid)
+            .is_some()
     }
 
     /// Observe a "soft" or cached file (content) access of `path`.
@@ -548,7 +301,7 @@ impl Detector {
         }
 
         if is_interesting_metadata {
-            // Fill in interesting metadata before GC so a GC triggered by this access can persist it.
+            // Fill in interesting metadata that informs detection of file content walks.
             self.inner
                 .write()
                 .set_metadata(&self.config, path, num_files, num_dirs);
@@ -562,8 +315,7 @@ impl Detector {
 
         let mut inner = self.inner.write();
 
-        let walk_threshold = walk_threshold(&self.config, dir_path.depth());
-        let walk_ratio = self.config.walk_ratio;
+        let walk_threshold = self.config.walk_threshold;
 
         let (owner, suffix) =
             inner
@@ -590,15 +342,13 @@ impl Detector {
                 seen_count,
                 0,
                 walk_threshold,
-                walk_ratio,
+                self.config.walk_ratio_for(my_dir.seen_dirs.is_sorted()),
+                0,
             ) {
+                let walk = Walk::for_type(WalkType::Directory, 0, seen_count as u64, pid);
+                walk.credit_breadth(my_dir.total_dirs().unwrap_or_default());
                 my_dir.seen_dirs.clear();
-                inner.insert_walk(
-                    &self.config,
-                    WalkType::Directory,
-                    Walk::for_type(WalkType::Directory, 0, seen_count as u64, pid),
-                    dir_path,
-                );
+                inner.insert_walk(&self.config, WalkType::Directory, walk, dir_path);
 
                 walk_changed = true;
             }
@@ -607,40 +357,59 @@ impl Detector {
         walk_changed
     }
 
-    /// Observe a "soft" or cached directory access of `path`. This will not be tracked as a new
-    /// walk, but will reset TTL of an existing walk. `num_files` and `num_dirs` report the number
-    /// of file and directory children of `path`, respectively. Pass zero if you don't know. Returns
-    /// whether path was covered by an active walk.
-    pub fn dir_read(
+    /// Account a "heavy" or remote directory load of `path` to the walk already covering it, if
+    /// any, taking only the read lock. Returns whether a walk covered it. Directory sizes worth
+    /// remembering are left to `dir_loaded`, which records them under the write lock.
+    pub fn dir_loaded_fast(
         &self,
         path: impl AsRef<RepoPath>,
         num_files: usize,
         num_dirs: usize,
         pid: u32,
     ) -> bool {
-        let path = path.as_ref();
-        tracing::trace!(%path, num_files, num_dirs, "dir_read");
-
-        // Remember interesting directory metadata, even though directory is being loaded from cache.
-        // It could still be involved in ongoing or future walk activity that involves remote fetches.
-        if important_metadata(
+        !interesting_metadata(
             self.config.walk_threshold,
             self.config.walk_ratio,
             Some(num_files),
             Some(num_dirs),
-        ) {
-            self.inner
-                .write()
-                .set_metadata(&self.config, path, num_files, num_dirs);
-        }
+        ) && self
+            .mark_read(path.as_ref(), WalkType::Directory, true, pid)
+            .is_some()
+    }
 
+    /// Observe a "soft" or cached directory access of `path`. This will not be tracked as a new
+    /// walk, but will reset TTL of an existing walk. Returns whether path was covered by an
+    /// active walk. Takes only the read lock; see `dir_metadata` for remembering its size.
+    pub fn dir_read(&self, path: impl AsRef<RepoPath>, pid: u32) -> bool {
+        let path = path.as_ref();
+        tracing::trace!(%path, "dir_read");
         self.mark_read(path, WalkType::Directory, false, pid)
             .is_some()
     }
 
-    /// Record that a certain number of files have been preloaded. This has no functional purpose -
-    /// it is purely to measure the efficiency of this library when paired with a prefetch
-    /// mechanism. Returns total number of files preloaded and read (i.e. cache hits) so far.
+    /// Whether a directory with `num_files` files and `num_dirs` directories is large enough that
+    /// its size should be remembered with `dir_metadata` even when it was read from cache: it could
+    /// still be involved in ongoing or future walk activity that involves remote fetches.
+    pub fn is_dir_metadata_important(&self, num_files: usize, num_dirs: usize) -> bool {
+        important_metadata(
+            self.config.walk_threshold,
+            self.config.walk_ratio,
+            Some(num_files),
+            Some(num_dirs),
+        )
+    }
+
+    /// Remember the size of directory `path`. Takes the write lock.
+    pub fn dir_metadata(&self, path: impl AsRef<RepoPath>, num_files: usize, num_dirs: usize) {
+        self.inner
+            .write()
+            .set_metadata(&self.config, path.as_ref(), num_files, num_dirs);
+    }
+
+    /// Record that `preload_count` files were prefetched for the walk rooted at `walk_root`.
+    /// Returns the total files preloaded and the total files the walker has read, cached or
+    /// remote, so prefetching can be paced against the walker's progress. A walker can read files
+    /// in a different order from the prefetch, so its remote reads count as progress too.
     pub fn files_preloaded(
         &self,
         walk_root: impl AsRef<RepoPath>,
@@ -649,7 +418,7 @@ impl Detector {
         let walk_root = walk_root.as_ref();
         tracing::trace!(%walk_root, preload_count, "files_preloaded");
 
-        let inner = self.inner.read();
+        let inner = self.inner.read_recursive();
 
         if let Some(node) = inner.node.get_node(walk_root) {
             if let Some(walk) = node.get_walk_for_type(WalkType::File) {
@@ -658,7 +427,8 @@ impl Detector {
                     .fetch_add(preload_count, Ordering::Relaxed);
                 return (
                     prev_preload + preload_count,
-                    walk.file_reads.load(Ordering::Relaxed),
+                    walk.file_reads.load(Ordering::Relaxed)
+                        + walk.file_loads.load(Ordering::Relaxed),
                 );
             }
         }
@@ -677,7 +447,9 @@ impl Detector {
     ) -> Option<&'a RepoPath> {
         let dir = path.parent()?;
 
-        let inner = self.inner.read();
+        // Readers must not queue behind a waiting writer: this runs on filesystem threads for
+        // every read, while walk bookkeeping on the write lock is best effort.
+        let inner = self.inner.read_recursive();
 
         // Bump last_access, but don't insert any new nodes/walks.
         if let Some((walk_node, suffix)) = inner.node.get_owning_node(wt, dir) {
@@ -772,9 +544,15 @@ impl Inner {
         // TODO: consider moving "should merge" logic into `WalkNode::insert_walk` to do
         // more work in a single traversal.
 
-        let walk_node = self
-            .node
-            .insert_walk(config, walk_type, dir, walk, dir.depth());
+        // A walk rooted inside an existing walk's coverage (merged or split off from it) was
+        // justified by that walk's breadth proofs, so it keeps the credit.
+        if let Some((owner, _)) = self.node.get_owning_node(walk_type, dir) {
+            if let Some(owner_walk) = owner.get_dominating_walk(walk_type) {
+                walk.credit_breadth(owner_walk.credited_breadth());
+            }
+        }
+
+        let walk_node = self.node.insert_walk(config, walk_type, dir, walk);
         walk_node.last_access.bump();
 
         // Check if we should immediately promote this walk to parent directory. This is
@@ -797,14 +575,18 @@ impl Inner {
         }
 
         // Check if we have a containing walk whose depth boundary should be increased.
-        if let Some((ancestor_dir, new_depth)) =
+        if let Some((ancestor_dir, new_depth, crossed)) =
             self.should_advance_ancestor_walk(config, walk_type, dir)
         {
-            self.insert_walk(config, walk_type, Walk::new(new_depth), ancestor_dir);
+            let walk = Walk::new(new_depth);
+            walk.credit_breadth(crossed);
+            self.insert_walk(config, walk_type, walk, ancestor_dir);
         }
     }
 
     /// If `dir` (and its siblings) imply a walk at `dir.parent()`, insert a walk at `dir.parent()`.
+    /// Siblings count once they have had a walk during the parent's current run of activity, so
+    /// they don't all need to be live at the same time.
     fn maybe_merge_into_parent<'a>(
         &mut self,
         config: &Config,
@@ -813,19 +595,31 @@ impl Inner {
     ) -> Option<()> {
         tracing::trace!(%dir, "maybe_merge_into_parent");
 
-        let parent_dir = dir.parent()?;
-        let parent_node = self.node.get_node(parent_dir)?;
+        let (parent_dir, name) = dir.split_last_component()?;
+        let parent_node = self.node.get_node_mut(parent_dir)?;
 
-        let walk_depth = should_merge_into_ancestor(
-            walk_threshold(config, parent_dir.depth()),
-            config.walk_ratio,
+        // A parent walk that already reaches one level down contains anything this could insert;
+        // activity under it counts towards advancing that walk instead.
+        if parent_node
+            .get_dominating_walk(walk_type)
+            .is_some_and(|w| w.depth >= 1)
+        {
+            return None;
+        }
+
+        let (kin_count, sorted) = parent_node.insert_walked_child(walk_type, name.to_owned());
+
+        let walk = should_merge_into_ancestor(
+            config.walk_threshold,
+            config.walk_ratio_for(sorted),
             walk_type,
             dir,
+            kin_count,
             parent_node,
             1,
         )?;
 
-        self.insert_walk(config, walk_type, Walk::new(walk_depth), parent_dir);
+        self.insert_walk(config, walk_type, walk, parent_dir);
 
         Some(())
     }
@@ -854,28 +648,31 @@ impl Inner {
 
         let grandparent_node = ancestor.get_node(suffix.parent()?)?;
 
-        let walk_depth = should_merge_into_ancestor(
-            walk_threshold(config, grandparent_dir.depth()),
+        let kin_count = live_kin_count(grandparent_node, walk_type, 2);
+
+        let walk = should_merge_into_ancestor(
+            config.walk_threshold,
             config.walk_ratio,
             walk_type,
             dir,
+            kin_count,
             grandparent_node,
             2,
         )?;
 
-        self.insert_walk(config, walk_type, Walk::new(walk_depth), grandparent_dir);
+        self.insert_walk(config, walk_type, walk, grandparent_dir);
 
         Some(())
     }
 
     /// If a walk at `dir` suggests we can advance the depth of a containing walk, return
-    /// (containing_dir, new_depth).
+    /// (containing_dir, new_depth, breadth credited to the new walk).
     fn should_advance_ancestor_walk<'a>(
         &mut self,
         config: &Config,
         walk_type: WalkType,
         dir: &'a RepoPath,
-    ) -> Option<(&'a RepoPath, usize)> {
+    ) -> Option<(&'a RepoPath, usize, usize)> {
         let parent_dir = dir.parent()?;
         let (ancestor, suffix) = self.node.get_owning_node_mut(walk_type, parent_dir)?;
         let ancestor_dir = parent_dir.strip_suffix(suffix, true)?;
@@ -890,8 +687,7 @@ impl Inner {
             suffix.split_first_component()?.0
         };
 
-        let ancestor_depth = ancestor_dir.depth();
-        let threshold = walk_threshold(config, ancestor_depth);
+        let threshold = config.walk_threshold;
 
         // Check if the containing walk's node has N children with descendants that
         // have pushed to the next depth. The idea is we want some confidence before
@@ -911,9 +707,9 @@ impl Inner {
             "should_advance_ancestor_walk",
         );
 
-        let ancestor_walk_depth = ancestor
-            .get_dominating_walk(walk_type)
-            .map_or(0, |w| w.depth);
+        let ancestor_walk = ancestor.get_dominating_walk(walk_type);
+        let ancestor_walk_depth = ancestor_walk.map_or(0, |w| w.depth);
+        let credit = ancestor_walk.map_or(0, |w| w.credited_breadth());
 
         // Check that both:
         //    - We are walked at depth=0 based on num_advanced_children. This ensures the walk is
@@ -926,18 +722,31 @@ impl Inner {
             0,
             threshold,
             config.walk_ratio,
+            credit,
         ) && ancestor.is_walked(
             WalkType::Directory,
             num_advanced_descendants,
             ancestor_walk_depth,
             threshold,
             config.walk_ratio,
+            credit,
         );
 
         if is_walked {
             let depth = ancestor_walk_depth + 1;
-            tracing::debug!(dir=%ancestor_dir, depth, "expanding walk boundary");
-            return Some((ancestor_dir, depth));
+            let crossed = credit
+                .max(
+                    ancestor
+                        .total_count(WalkType::Directory, 0)
+                        .unwrap_or_default(),
+                )
+                .max(
+                    ancestor
+                        .total_count(WalkType::Directory, ancestor_walk_depth)
+                        .unwrap_or_default(),
+                );
+            tracing::debug!(dir=%ancestor_dir, depth, crossed, "expanding walk boundary");
+            return Some((ancestor_dir, depth, crossed));
         } else if !suffix.is_empty() {
             // If suffix isn't empty (i.e. dir isn't a direct child of ancestor), check if
             // ancestor's direct child `name` should be split off into a separate walk. This helps
@@ -947,11 +756,12 @@ impl Inner {
             // "foo/bar" allows all the activity under "foo/bar" to be consolidated easily to a
             // single walk.
 
-            let threshold = walk_threshold(config, ancestor_depth + 1);
+            let threshold = config.walk_threshold;
             let split_off_child = match ancestor.get_node(head.as_ref()) {
                 // If we have directory size hints, use them.
                 Some(child) => {
-                    child.get_walk_for_type(walk_type).is_none()
+                    let child_depth = ancestor_walk_depth.saturating_sub(1);
+                    (child.get_walk_for_type(walk_type).is_none()
                         // Similar to above, check for evidence of advanced walk activity for
                         // direct children and at depth N+1.
                         && child.is_walked(
@@ -960,26 +770,38 @@ impl Inner {
                             0,
                             threshold,
                             config.walk_ratio,
+                            0,
                         )
                         && child.is_walked(
                             WalkType::Directory,
                             child_seen_count,
-                            ancestor_walk_depth.saturating_sub(1),
+                            child_depth,
                             threshold,
                             config.walk_ratio,
-                        )
+                            0,
+                        ))
+                    .then(|| {
+                        child
+                            .total_count(WalkType::Directory, 0)
+                            .unwrap_or_default()
+                            .max(
+                                child
+                                    .total_count(WalkType::Directory, child_depth)
+                                    .unwrap_or_default(),
+                            )
+                    })
                 }
                 // Otherwise use default threshold.
-                None => child_seen_count >= threshold,
+                None => (child_seen_count >= threshold).then_some(0),
             };
 
-            if split_off_child {
+            if let Some(crossed) = split_off_child {
                 // If parent=ancestor/foo/bar/parent and suffix=foo/bar/parent,
                 // we want "ancestor/foo", so strip suffix[1:] from parent.
                 let child_path =
                     parent_dir.strip_suffix(suffix.split_first_component()?.1, true)?;
                 tracing::debug!(%child_path, depth=ancestor_walk_depth, "splitting off walk for child");
-                return Some((child_path, ancestor_walk_depth));
+                return Some((child_path, ancestor_walk_depth, crossed));
             }
         }
 
@@ -992,14 +814,14 @@ impl Inner {
     }
 
     /// Returns GC stats, or None if GC did not run.
-    fn maybe_gc(&mut self, config: &Config, collect_metadata: bool) -> Option<GcResult> {
+    fn maybe_gc(&mut self, config: &Config) -> Option<GcResult> {
         if !self.needs_gc(config) {
             return None;
         }
 
         let start = std::time::Instant::now();
 
-        let result = self.node.gc(config, collect_metadata);
+        let result = self.node.gc(config);
 
         let elapsed = start.elapsed();
 
@@ -1035,51 +857,32 @@ impl Inner {
     }
 }
 
-const PERSISTED_METADATA_VERSION: u32 = 1;
-
-#[derive(Deserialize, Serialize)]
-struct PersistedMetadata<'a> {
-    #[serde(rename = "v")]
-    version: u32,
-    #[serde(rename = "d", borrow)]
-    dir: Cow<'a, str>,
-    #[serde(rename = "f")]
-    files: usize,
-    #[serde(rename = "s")]
-    dirs: usize,
-}
-
-fn walk_threshold(config: &Config, walk_root_depth: usize) -> usize {
-    // Add a threshold multiplier for walk roots that are shallower than `lax_depth`. This
-    // makes it harder for walks to percolate "too high".
-    if walk_root_depth < config.lax_depth {
-        (config.strict_multiplier * config.walk_threshold).max(config.walk_threshold)
-    } else {
-        config.walk_threshold
-    }
-}
-
-/// Check if existing walks at nodes `ancestor_distance` below `ancestor` should be "merged" into a
-/// new walk at `ancestor`. Returns depth of new walk to be inserted, if any.
-fn should_merge_into_ancestor(
-    walk_threshold: usize,
-    walk_ratio: f64,
-    walk_type: WalkType,
-    dir: &RepoPath,
-    ancestor: &WalkNode,
-    ancestor_distance: usize,
-) -> Option<usize> {
+/// Count nodes `distance` below `ancestor` that have a live walk of `walk_type`.
+fn live_kin_count(ancestor: &WalkNode, walk_type: WalkType, distance: usize) -> usize {
     let mut kin_count = 0;
     ancestor.iter(|node, depth| -> bool {
-        if depth == ancestor_distance {
+        if depth == distance {
             if node.get_walk_for_type(walk_type).is_some() {
                 kin_count += 1;
             }
         }
 
-        depth < ancestor_distance
+        depth < distance
     });
+    kin_count
+}
 
+/// Check if `kin_count` walks at nodes `ancestor_distance` below `ancestor` should be "merged"
+/// into a new walk at `ancestor`. Returns the new walk to be inserted, if any.
+fn should_merge_into_ancestor(
+    walk_threshold: usize,
+    walk_ratio: f64,
+    walk_type: WalkType,
+    dir: &RepoPath,
+    kin_count: usize,
+    ancestor: &WalkNode,
+    ancestor_distance: usize,
+) -> Option<Walk> {
     tracing::trace!(
         %dir,
         kin_count,
@@ -1096,6 +899,9 @@ fn should_merge_into_ancestor(
         ancestor_distance - 1,
         walk_threshold,
         walk_ratio,
+        ancestor
+            .get_dominating_walk(walk_type)
+            .map_or(0, |w| w.credited_breadth()),
     ) {
         tracing::debug!(
             %dir,
@@ -1106,7 +912,13 @@ fn should_merge_into_ancestor(
             total_dirs=ancestor.total_dirs(),
             "combining with collateral kin",
         );
-        Some(ancestor_distance)
+        let walk = Walk::new(ancestor_distance);
+        walk.credit_breadth(
+            ancestor
+                .total_count(WalkType::Directory, ancestor_distance - 1)
+                .unwrap_or_default(),
+        );
+        Some(walk)
     } else {
         None
     }
@@ -1115,35 +927,33 @@ fn should_merge_into_ancestor(
 // How many children must be accessed in a directory to consider the directory "walked".
 const DEFAULT_WALK_THRESHOLD: usize = 3;
 
-// Walk threshold multiplier for walks near the top of the repo.
-const DEFAULT_STRICT_MULTIPLIER: usize = 20;
-
-// Depth at which we no longer get the strict multiplier. 0 means we never get the multiplier.
-const DEFAULT_LAX_DEPTH: usize = 0;
-
 // If we know the total dir size, make sure walk threshold is at least 3% of dir size.
 // This avoids detecting walks for enormous directories too quickly.
 const DEFAULT_WALK_RATIO: f64 = 0.03;
+
+// The fraction of the walk ratio that applies while a directory's children have all been
+// accessed in sorted order. In-order access is how a lister visits a directory, so a quarter of
+// the usual share of a huge directory is enough evidence.
+const DEFAULT_WALK_RATIO_SORTED_FACTOR: f64 = 0.25;
 
 // How often we garbage collect stale nodes.
 // We do not rely on running a full GC to expire old walks, only to clean up memory.
 const DEFAULT_GC_INTERVAL: Duration = Duration::from_secs(10);
 
 // How stale a walk must be before we remove it.
-const DEFAULT_GC_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_GC_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct Config {
     // "How many children must be accessed before we consider parent walked?"
     // This is the main threshold to tune detector aggro.
     walk_threshold: usize,
-    // Walks with depth < lax_depth will use a stricter walk_threshold.
-    lax_depth: usize,
-    // Walk threshold multiplier for walks rooted shallower than lax_depth.
-    strict_multiplier: usize,
     // A minimum walk threshold as ratio of total directory size. This only applies when we know the
     // size of the directory. This slows down walk detection in humongous directories.
     walk_ratio: f64,
+    // Fraction of `walk_ratio` that applies while the accesses counted for a directory have all
+    // come in sorted order; 1.0 means in-order access gets no credit.
+    walk_ratio_sorted_factor: f64,
     // How often we run a full GC to clean up memory. We do not rely on a full GC to functionally
     // expire inactive walks.
     gc_interval: Duration,
@@ -1155,11 +965,22 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             walk_threshold: DEFAULT_WALK_THRESHOLD,
-            lax_depth: DEFAULT_LAX_DEPTH,
-            strict_multiplier: DEFAULT_STRICT_MULTIPLIER,
             walk_ratio: DEFAULT_WALK_RATIO,
+            walk_ratio_sorted_factor: DEFAULT_WALK_RATIO_SORTED_FACTOR,
             gc_interval: DEFAULT_GC_INTERVAL,
             gc_timeout: DEFAULT_GC_TIMEOUT,
+        }
+    }
+}
+
+impl Config {
+    /// The walk ratio to hold a directory to, given whether its counted accesses have all come in
+    /// sorted order.
+    fn walk_ratio_for(&self, sorted: bool) -> f64 {
+        if sorted {
+            self.walk_ratio * self.walk_ratio_sorted_factor
+        } else {
+            self.walk_ratio
         }
     }
 }
@@ -1179,6 +1000,10 @@ pub struct Walk {
     dir_loads: AtomicU64,
     // How many light/cached dir fetches we've observed under this walk.
     dir_reads: AtomicU64,
+
+    // Largest directory count this walk has satisfied `walk_ratio` against. Advancing across
+    // levels no wider than this only needs the base walk threshold.
+    credited_breadth: AtomicUsize,
 
     // Most commonly seen pid for this walk. Wrapped in an Arc so it can be shared with the
     // background thread that resolves pid_detail (see spawn_pid_detail_resolution).
@@ -1238,6 +1063,20 @@ impl Walk {
         };
         counter.fetch_add(initial_loads, Ordering::Relaxed);
         w
+    }
+
+    fn credited_breadth(&self) -> usize {
+        self.credited_breadth.load(Ordering::Relaxed)
+    }
+
+    fn credit_breadth(&self, breadth: usize) {
+        self.credited_breadth.fetch_max(breadth, Ordering::Relaxed);
+    }
+
+    /// Take over `other`'s credit. Only for a walk replacing `other` at the same root; a
+    /// descendant's crossing says nothing about the rest of this walk's subtree.
+    fn absorb_credit(&self, other: &Self) {
+        self.credit_breadth(other.credited_breadth());
     }
 
     fn absorb_counters(&self, other: &Self) {

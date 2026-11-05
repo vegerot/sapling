@@ -1,7 +1,7 @@
 load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_treehugger")
+oncall("scm_server_infra")
 
 rust_library(
     name = "repo_factory",
@@ -13,6 +13,9 @@ rust_library(
             "MononokeRepoFactoryStats_ods3_types": "//eden/mononoke/facebook/ods3_schemas:MononokeRepoFactoryStats_ods3-rust",
         }
     ),
+    test_deps = [
+        "//eden/mononoke/common/mononoke_macros:mononoke_macros",
+    ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:parking_lot",
@@ -33,11 +36,12 @@ rust_library(
         "//eden/mononoke/blobstore:readonlyblob",
         "//eden/mononoke/blobstore:redactedblobstore",
         "//eden/mononoke/blobstore:virtually_sharded_blobstore",
-        "//eden/mononoke/clients/facebook/bookmark_service_client:bookmark_service_client",
+        "//eden/mononoke/clients/bookmark_service_client:bookmark_service_client",
         "//eden/mononoke/clients/facebook/derived_data_service_client:derived_data_client_library",
         "//eden/mononoke/cmdlib:environment",
         "//eden/mononoke/common/acl_regions:acl_regions",
         "//eden/mononoke/common/futures_watchdog:futures_watchdog",
+        "//eden/mononoke/common/mononoke_configs:mononoke_configs",
         "//eden/mononoke/common/permission_checker:permission_checker",
         "//eden/mononoke/common/rust/caching_ext:caching_ext",
         "//eden/mononoke/common/rust/justknobs_ext:justknobs",
@@ -59,6 +63,7 @@ rust_library(
         "//eden/mononoke/repo_attributes/bonsai_git_mapping:bonsai_git_mapping",
         "//eden/mononoke/repo_attributes/bonsai_globalrev_mapping:bonsai_globalrev_mapping",
         "//eden/mononoke/repo_attributes/bonsai_hg_mapping:bonsai_hg_mapping",
+        "//eden/mononoke/repo_attributes/bonsai_p4_mapping:bonsai_p4_mapping",
         "//eden/mononoke/repo_attributes/bonsai_svnrev_mapping:bonsai_svnrev_mapping",
         "//eden/mononoke/repo_attributes/bonsai_tag_mapping:bonsai_tag_mapping",
         "//eden/mononoke/repo_attributes/bookmarks:bookmarks",
@@ -152,6 +157,7 @@ rust_library(
         "//eden/mononoke/repo_attributes/bonsai_git_mapping:bonsai_git_mapping",
         "//eden/mononoke/repo_attributes/bonsai_globalrev_mapping:bonsai_globalrev_mapping",
         "//eden/mononoke/repo_attributes/bonsai_hg_mapping:bonsai_hg_mapping",
+        "//eden/mononoke/repo_attributes/bonsai_p4_mapping:bonsai_p4_mapping",
         "//eden/mononoke/repo_attributes/bonsai_svnrev_mapping:bonsai_svnrev_mapping",
         "//eden/mononoke/repo_attributes/bonsai_tag_mapping:bonsai_tag_mapping",
         "//eden/mononoke/repo_attributes/bookmarks:bookmarks",
@@ -193,7 +199,15 @@ rust_library(
         "//eden/mononoke/repo_client:streaming_clone",
         "//eden/mononoke/servers/slapi/slapi_server/context:context",
         "//eden/mononoke/servers/slapi/wireproto_handler:wireproto_handler",
-    ],
+    ]
+    + (
+        []
+        if rust_oss.is_oss_build()
+        else [
+            "//eden/mononoke/common/mononoke_configs:mononoke_configs",
+            "//eden/mononoke/metaconfig:metaconfig_parser",
+        ]
+    ),
 )
 
 rust_library(

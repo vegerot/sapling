@@ -92,9 +92,10 @@
       "kernel": "*", (glob) (?)
       "likely_agentic": "false",
       "method": "batch",
+      "repo_config_version": "*", (glob)
       "repository": "lfs1",
       "request_id": "*", (glob)
-      "rim_tenancy_path_v2": "root/unknown/*/*/*", (glob)
+      "rim_workload_tenancy_path": "root/unknown/unknown/default",
       "sandcastle_alias": null,
       "sandcastle_nonce": null,
       "sandcastle_vcs": null,
@@ -164,9 +165,10 @@
       "kernel": "*", (glob) (?)
       "likely_agentic": "false",
       "method": "upload",
+      "repo_config_version": "*", (glob)
       "repository": "lfs1",
       "request_id": "*", (glob)
-      "rim_tenancy_path_v2": "root/unknown/*/*/*", (glob)
+      "rim_workload_tenancy_path": "root/unknown/unknown/default",
       "sandcastle_alias": null,
       "sandcastle_nonce": null,
       "sandcastle_vcs": null,
@@ -240,9 +242,10 @@
       "kernel": "*", (glob) (?)
       "likely_agentic": "false",
       "method": "batch",
+      "repo_config_version": "*", (glob)
       "repository": "lfs1",
       "request_id": "*", (glob)
-      "rim_tenancy_path_v2": "root/unknown/*/*/*", (glob)
+      "rim_workload_tenancy_path": "root/unknown/unknown/default",
       "sandcastle_alias": null,
       "sandcastle_nonce": null,
       "sandcastle_vcs": null,
@@ -318,10 +321,11 @@
       "kernel": "*", (glob) (?)
       "likely_agentic": "false",
       "method": "download",
+      "repo_config_version": "*", (glob)
       "repository": "lfs1",
       "request_id": "*", (glob)
       "response_content_encoding": "zstd",
-      "rim_tenancy_path_v2": "root/unknown/*/*/*", (glob)
+      "rim_workload_tenancy_path": "root/unknown/unknown/default",
       "sandcastle_alias": null,
       "sandcastle_nonce": null,
       "sandcastle_vcs": null,
@@ -384,7 +388,7 @@
       "kernel": "*", (glob) (?)
       "likely_agentic": "false",
       "request_id": "*", (glob)
-      "rim_tenancy_path_v2": "root/unknown/*/*/*", (glob)
+      "rim_workload_tenancy_path": "root/unknown/unknown/default",
       "sandcastle_alias": null,
       "sandcastle_nonce": null,
       "sandcastle_vcs": null,

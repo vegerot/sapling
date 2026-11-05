@@ -1,11 +1,16 @@
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 
-oncall("scm_server_treehugger")
+oncall("scm_server_infra")
 
 rust_binary(
     name = "check_git_wc",
     srcs = glob(["src/**/*.rs"]),
     autocargo = {
+        "cargo_target_config": {
+            # The library this binary uses is also called `check_git_wc`, and
+            # rustdoc cannot write both to the same directory.
+            "doc": False,
+        },
         "cargo_toml_config": {
             "package": {
                 "name": "check_git_wc_bin",

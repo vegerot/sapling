@@ -102,6 +102,22 @@ a succesful test
   ----------------------------------------------------------------------
   # Ran 1 tests, 0 skipped, 0 failed.
 
+Opt-in skip reporting counts executions when tests repeat
+========================================================
+
+  $ echo '#require missing' > test-skip.t
+  $ rt --runs-per-test 2 test-skip.t > skip.log 2>&1
+  $ tail -n 1 skip.log
+  # Ran 0 tests, 2 skipped, 0 failed.
+  $ HGTEST_REPORT_SKIPS=1 rt --runs-per-test 2 test-skip.t > skip.log 2>&1
+  [80]
+  $ tail -n 1 skip.log
+  # Ran 0 tests, 2 skipped, 0 failed.
+  $ HGTEST_REPORT_SKIPS=1 rt --runs-per-test 2 test-success.t test-skip.t > skip.log 2>&1
+  $ tail -n 1 skip.log
+  # Ran 2 tests, 2 skipped, 0 failed.
+  $ rm test-skip.t skip.log
+
 failing test
 ==================
 
@@ -743,10 +759,14 @@ Accept the fix
   ----------------------------------------------------------------------
   # Ran 2 tests, 0 skipped, 0 failed.
 
+Keep the placeholder split so the legacy shell does not expand it in the Python
+heredoc.
+
   >>> data = open("test-failure.t").read()
-  >>> data.count("saved backup bundle to $TESTTMP/foo.hg")
+  >>> bundle_message = "saved backup bundle to $" + "TESTTMP/"
+  >>> data.count(bundle_message + "foo.hg")
   5
-  >>> "saved backup bundle to $TESTTMP/*.hg (glob)" in data
+  >>> bundle_message + "*.hg (glob)" in data
   True
 
 Race condition - test file was modified when test is running

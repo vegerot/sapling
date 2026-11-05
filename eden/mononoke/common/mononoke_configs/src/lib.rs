@@ -9,11 +9,10 @@
 //! and registering for config-update notifications.
 //!
 //! Internal organization:
-//! - [`ConfigUpdateReceiver`][receiver::ConfigUpdateReceiver] trait is in
-//!   [`receiver`]
+//! - [`ConfigUpdateReceiver`] trait is in `receiver`
 //! - The unified watcher task (single tokio task that owns the config source —
-//!   tier manifest or legacy blob — plus the per-repo control channel and
-//!   per-repo wait fan-in) is in [`watcher`]
+//!   the tier manifest — plus the per-repo control channel and
+//!   per-repo wait fan-in) is in `watcher`
 //!
 //! `MononokeConfigs` itself owns the `ArcSwap` state and the task handles.
 
@@ -22,7 +21,6 @@ mod watcher;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -35,7 +33,6 @@ use cached_config::ConfigStore;
 use cloned::cloned;
 use metaconfig_parser::RepoConfigs;
 use metaconfig_parser::StorageConfigs;
-use metaconfig_parser::config::configerator_config_handle;
 use metaconfig_parser::configerator_manifest_handle;
 use metaconfig_parser::configerator_repo_spec_handle;
 use metaconfig_parser::parse_manifest_common_and_storage;
@@ -57,7 +54,10 @@ use crate::watcher::RepoHandleEvent;
 use crate::watcher::liveness_updater;
 use crate::watcher::unified_config_watcher;
 
-const CONFIGERATOR_TIER_PREFIX: &str = "configerator://scm/mononoke/repos/tiers/";
+/// The configerator path of a tier's manifest.
+pub fn tier_manifest_path(tier: &str) -> String {
+    format!("scm/mononoke/repos/tiers/{tier}_manifest")
+}
 
 /// Shorthand for a value swapped atomically via `arc_swap`. Used for the
 /// stateful slots inside `MononokeConfigs` that receivers read.
@@ -70,6 +70,8 @@ define_stats! {
     liveness_count: timeseries(Average, Sum, Count),
     spurious_reload_suppressed: timeseries(Average, Sum, Count),
     merge_skipped_no_handle: timeseries(Average, Sum, Count),
+    bulk_reload_spec_reused: timeseries(Sum),
+    bulk_reload_spec_parsed: timeseries(Sum),
     per_repo_refresh_count: timeseries(Average, Sum, Count),
     per_repo_refresh_failure_count: timeseries(Average, Sum, Count),
     ensure_repo_handle_success_count: timeseries(Average, Sum, Count),
@@ -114,92 +116,45 @@ pub struct MononokeConfigs {
 }
 
 impl MononokeConfigs {
-    /// Create a new instance of MononokeConfigs with configurations backed via ConfigStore.
-    /// If the config path points to a dynamic config source (e.g. configerator), this enables
-    /// auto-refresh of those configurations.
-    pub fn new(
-        config_path: impl AsRef<Path>,
-        config_store: &ConfigStore,
-        manifest_path: Option<&str>,
-        runtime_handle: Handle,
-    ) -> Result<Self> {
-        // Derive tier name from the configerator config path.
-        // Configerator paths follow the pattern:
-        //   configerator://scm/mononoke/repos/tiers/{tier_name}
-        let tier_name = config_path
-            .as_ref()
-            .to_str()
-            .and_then(|p| p.strip_prefix(CONFIGERATOR_TIER_PREFIX))
-            .filter(|t| !t.is_empty())
-            .map(|t| t.to_owned());
+    /// Create a new instance of MononokeConfigs for `tier`, read through
+    /// `config_store`: `scm/mononoke/repos/tiers/<tier>_manifest` plus the
+    /// per-repo `RepoSpec` each manifest entry names, all watched for changes.
+    pub fn new(tier: &str, config_store: &ConfigStore, runtime_handle: Handle) -> Result<Self> {
         let update_receivers = Arc::new(ArcSwap::from_pointee(vec![]));
-        let maybe_manifest_handle = manifest_path
-            .map(|path| configerator_manifest_handle(path, config_store))
-            .transpose()?;
 
-        // Validate: split-loading (manifest) requires a tier name for resolving
-        // tier_overrides in RepoSpec configs.
-        if maybe_manifest_handle.is_some() && tier_name.is_none() {
-            anyhow::bail!(
-                "tier_name is required when split-loading is enabled (manifest_path is set)"
-            );
-        }
-
-        // Manifest-backed processes never touch the legacy blob; blob-backed is unchanged.
-        let (maybe_config_handle, resolved_repo_configs, storage) = if let Some(manifest_handle) =
-            maybe_manifest_handle.as_ref()
-        {
-            // The manifest is the sole source of common/storage; fail closed at startup.
-            let manifest = manifest_handle.get();
-            let (common, storage) = parse_manifest_common_and_storage(&manifest).context(
-                "common/storage could not be parsed from the tier manifest; \
-                         refusing to start",
-            )?;
-            STATS::tier_blob_skipped.add_value(1);
-            // Repos load on demand.
-            (None, RepoConfigs::new(HashMap::new(), common), storage)
-        } else {
-            let blob_storage = metaconfig_parser::load_storage_configs(&config_path, config_store)?;
-            let blob_repo_configs =
-                metaconfig_parser::load_repo_configs(&config_path, config_store)?;
-            let maybe_config_handle =
-                configerator_config_handle(config_path.as_ref(), config_store)?;
-            (maybe_config_handle, blob_repo_configs, blob_storage)
-        };
+        let manifest_handle =
+            configerator_manifest_handle(&tier_manifest_path(tier), config_store)?;
+        // The manifest is the sole source of common/storage; fail closed at startup.
+        let manifest = manifest_handle.get();
+        let (common, storage) = parse_manifest_common_and_storage(&manifest).context(
+            "common/storage could not be parsed from the tier manifest; refusing to start",
+        )?;
+        STATS::tier_blob_skipped.add_value(1);
+        // Repos load on demand.
         let storage_configs = Arc::new(ArcSwap::from_pointee(storage));
-        let repo_configs = Arc::new(ArcSwap::from_pointee(resolved_repo_configs));
+        let repo_configs = Arc::new(ArcSwap::from_pointee(RepoConfigs::new(
+            HashMap::new(),
+            common,
+        )));
+        let tier_name = Some(tier.to_owned());
+        let maybe_manifest_handle = Some(manifest_handle.clone());
 
         let repo_handles = Arc::new(RwLock::new(HashMap::new()));
 
-        // Control channel for the per-repo arm of unified_config_watcher.
-        // Only created when split-loading is active (manifest is set), since
-        // that's the only case where per-repo handles exist. Single registration
-        // channel: avoids the duplicate-registration race a seed loop would have.
-        let (repo_handle_event_tx, repo_handle_event_rx) = if maybe_manifest_handle.is_some() {
-            let (tx, rx) = mpsc::unbounded_channel();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
+        // Control channel for the per-repo arm of unified_config_watcher: a
+        // single registration channel avoids the duplicate-registration race a
+        // seed loop would have.
+        let (repo_handle_event_tx, repo_handle_event_rx) = mpsc::unbounded_channel();
+        let repo_handle_event_tx = Some(repo_handle_event_tx);
+
+        let config_source = ConfigSource {
+            handle: manifest_handle,
+            tier: tier.to_owned(),
         };
 
-        // Manifest ⇒ manifest-sourced watcher; else follow the blob handle (static configs: none).
-        let maybe_config_source = match maybe_manifest_handle.clone() {
-            Some(handle) => Some(ConfigSource::Manifest {
-                handle,
-                tier: tier_name
-                    .clone()
-                    .expect("validated above: manifest_path requires tier_name"),
-            }),
-            None => maybe_config_handle.map(ConfigSource::Blob),
-        };
+        let maybe_liveness_updater = Some(runtime_handle.spawn(liveness_updater()));
 
-        let maybe_liveness_updater = if maybe_config_source.is_some() {
-            Some(runtime_handle.spawn(liveness_updater()))
-        } else {
-            None
-        };
-
-        let maybe_config_updater = if let Some(config_source) = maybe_config_source {
+        let maybe_config_updater = {
             cloned!(
                 repo_handles,
                 repo_configs,
@@ -214,10 +169,8 @@ impl MononokeConfigs {
                 repo_configs,
                 storage_configs,
                 update_receivers,
-                repo_handle_event_rx,
+                Some(repo_handle_event_rx),
             )))
-        } else {
-            None
         };
 
         Ok(Self {
@@ -232,6 +185,22 @@ impl MononokeConfigs {
             tier_name,
             repo_handle_event_tx,
         })
+    }
+
+    /// Creates an instance backed by fixed in-memory configurations.
+    pub fn new_static(repo_configs: RepoConfigs, storage_configs: StorageConfigs) -> Self {
+        Self {
+            repo_configs: Arc::new(ArcSwap::from_pointee(repo_configs)),
+            storage_configs: Arc::new(ArcSwap::from_pointee(storage_configs)),
+            update_receivers: Arc::new(ArcSwap::from_pointee(vec![])),
+            maybe_config_updater: None,
+            maybe_liveness_updater: None,
+            maybe_manifest_handle: None,
+            repo_handles: Arc::new(RwLock::new(HashMap::new())),
+            config_store: None,
+            tier_name: None,
+            repo_handle_event_tx: None,
+        }
     }
 
     /// The latest repo configs fetched from the underlying configuration store.
@@ -254,6 +223,16 @@ impl MononokeConfigs {
     /// Returns the current TierManifest, if split-loading is enabled.
     pub fn manifest(&self) -> Option<Arc<TierManifest>> {
         self.maybe_manifest_handle.as_ref().map(|h| h.get())
+    }
+
+    /// Configerator version of the tier manifest this task last loaded, when
+    /// configs come from configerator. Lets a caller tell "this task is at
+    /// or past my change" from "this task is stale".
+    pub fn manifest_version(&self) -> Option<String> {
+        self.maybe_manifest_handle
+            .as_ref()
+            .and_then(|h| h.get_with_version().1)
+            .map(|info| info.version)
     }
 
     /// The tier name (derived from the configerator config path), if split-

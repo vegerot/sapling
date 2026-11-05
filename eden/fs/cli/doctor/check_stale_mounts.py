@@ -203,8 +203,8 @@ class StaleMountsFound(FixableProblem):
 
     def check_fix(self) -> bool:
         mount_points = get_all_stale_eden_mount_points(self._mount_table)
-        # check that there are no stale or unknown mount points. We have a different check for hanging mounts
-        return mount_points[0] == [] and mount_points[2] == []
+        # Hanging and unknown-status mounts are not part of this problem.
+        return mount_points[0] == []
 
 
 def get_stale_eden_mount_points(
@@ -268,11 +268,7 @@ def get_all_eden_mount_points(mount_table: mtab.MountTable) -> Set[Tuple[bytes, 
     eden_mounts = set()
     for mount in all_system_mounts:
         if is_edenfs_mount(mount.device, mount.vfstype):
-            if (
-                mount.vfstype == b"fuse"
-                or mount.vfstype == b"macfuse_eden"
-                or mount.vfstype == b"fuse.edenfs"
-            ):
+            if mount.vfstype == b"fuse" or mount.vfstype == b"fuse.edenfs":
                 eden_mounts.add((mount.mount_point, b"fuse"))
             elif mount.vfstype == b"nfs" or mount.vfstype == b"edenfs:":
                 eden_mounts.add((mount.mount_point, b"nfs"))

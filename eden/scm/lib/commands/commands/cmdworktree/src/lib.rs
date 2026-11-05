@@ -6,11 +6,11 @@
  */
 
 mod add;
+mod checkout;
 mod label;
 mod list;
 mod remove;
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use clidispatch::ReqCtx;
@@ -19,9 +19,7 @@ use cmdutil::ConfigExt;
 use cmdutil::FormatterOpts;
 use cmdutil::Result;
 use cmdutil::define_flags;
-use fs_err as fs;
 use repo::repo::Repo;
-use workingcopy::workingcopy::WorkingCopy;
 use worktree::Worktrees;
 
 define_flags! {
@@ -33,13 +31,16 @@ define_flags! {
         /// create a snapshot of the current working copy, then restore it in the new worktree (for 'add')
         snapshot: bool,
 
-        /// revision to check out (for 'add')
+        /// revision to check out, must resolve to one commit (for 'add')
         #[short('r')]
         #[argtype("REV")]
         rev: String,
 
         /// remove all linked worktrees (for 'remove')
         all: bool,
+
+        /// remove worktrees even if they have modified or untracked files or shelved changes, without prompting (for 'remove')
+        force: bool,
 
         /// remove the label instead of setting it (for 'label')
         remove: bool,
@@ -51,33 +52,20 @@ define_flags! {
     }
 }
 
-pub fn run(ctx: ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8> {
+pub fn run(ctx: ReqCtx<WorktreeOpts>, repo: &Repo) -> Result<u8> {
     let subcmd = ctx.opts.args.first().map(|s| s.as_str()).unwrap_or("");
     if !ctx.opts.rev.is_empty() && subcmd != "add" {
         abort!("--rev can only be used with 'worktree add'");
     }
-    let runner: fn(&ReqCtx<WorktreeOpts>, &Repo, &WorkingCopy) -> Result<u8> = match subcmd {
-        "list" | "ls" => {
-            let worktrees = Worktrees::open(repo, repo.config().as_ref())?;
-            return list::run(&ctx, repo, &worktrees);
-        }
-        "add" => add::run,
-        "remove" | "rm" => remove::run,
-        "label" => label::run,
+    let worktrees = || Worktrees::open(repo, repo.config().as_ref());
+    match subcmd {
+        "list" | "ls" => list::run(&ctx, repo, &worktrees()?),
+        "label" => label::run(&ctx, repo, &worktrees()?),
+        "add" => add::run(&ctx, repo, &worktrees()?),
+        "remove" | "rm" => remove::run(&ctx, repo, &worktrees()?),
         "" => abort!("you need to specify a subcommand (run with --help to see a list)"),
         other => abort!("unknown worktree subcommand '{}'", other),
-    };
-
-    if !repo.requirements.contains("eden") {
-        abort!("worktree commands require an EdenFS-backed repository");
     }
-
-    runner(&ctx, repo, wc)
-}
-
-pub(crate) struct CurrentGroup {
-    pub(crate) shared_store_path: PathBuf,
-    pub(crate) group_id: String,
 }
 
 /// Read the configured slot-reservation TTL in seconds. Reservations older than
@@ -91,19 +79,6 @@ pub(crate) fn reservation_ttl_seconds(repo: &Repo) -> Result<i64> {
     Ok(ttl.as_secs() as i64)
 }
 
-pub(crate) fn require_group(repo: &Repo) -> Result<CurrentGroup> {
-    let shared_store_path = repo.store_path();
-    let registry = worktree::load_registry(shared_store_path)?;
-    let current = util::path::strip_unc_prefix(fs::canonicalize(repo.path())?);
-    match registry.find_group_for_path(&current) {
-        Some(group_id) => Ok(CurrentGroup {
-            shared_store_path: shared_store_path.to_path_buf(),
-            group_id,
-        }),
-        None => abort!("this worktree is not part of a group"),
-    }
-}
-
 pub fn aliases() -> &'static str {
     "worktree|wt"
 }
@@ -111,8 +86,8 @@ pub fn aliases() -> &'static str {
 pub fn doc() -> &'static str {
     r#"manage multiple linked worktrees sharing the same repository
 
-    worktree groups allow multiple EdenFS-backed working copies to share
-    the same backing store. One worktree is designated as the main worktree,
+    worktree groups allow multiple EdenFS-backed or native Git working copies
+    to share the same repository. One worktree is designated as the main worktree,
     and additional linked worktrees can be created, listed, labeled, and
     removed.
 
@@ -120,7 +95,7 @@ pub fn doc() -> &'static str {
 
       list [-Tjson]                                     List all worktrees in the group
       add [PATH] [-r REV] [--label TEXT] [--snapshot]   Create a new linked worktree
-      remove PATH [PATH...] [--all] [-y]                Remove linked worktree(s)
+      remove PATH [PATH...] [--all] [--force] [-y]      Remove linked worktree(s)
       label [PATH] TEXT [--remove]                      Set or remove a worktree label
 
     If PATH is omitted from `add`, `worktree.path-generator` is used to
@@ -129,14 +104,19 @@ pub fn doc() -> &'static str {
     Config options::
 
       worktree.max-count=N                     Hard limit on linked worktrees per repo group (0 = unlimited, the default)
+      worktree.max-count-message=TEXT          Message shown instead of the default when max-count is reached
       worktree.reservation-ttl=DURATION        How long an in-flight add holds a slot before it is treated as stale (default 1h)
       worktree.require-generated-path=true     Require path generator, disallow manual PATH
       worktree.path-generator=CMD              Shell command to generate PATH when omitted
       worktree.snapshot-direct-copy=true       Use direct copy for --snapshot
-      worktree.git-enabled=true                Enable worktree listing in native Git repositories
+      worktree.git-enabled=true                Enable worktree commands in native Git repositories
+      worktree.direct-eden-removal=false       Remove EdenFS checkouts via edenfsctl instead of in-process (default: true)
+      worktree.check-shelves-on-remove=false   Let remove delete a checkout with shelved changes without --force (default: true)
 
-    Git repositories currently support the `list` subcommand. Other subcommands
-    require an EdenFS-backed repository."#
+    In native Git repositories, `add` creates a detached checkout and `remove`
+    refuses locked worktrees, as Git does, even with `--force`. Worktrees
+    created directly with Git are also supported. The `--snapshot` option
+    requires EdenFS."#
 }
 
 pub fn synopsis() -> Option<&'static str> {

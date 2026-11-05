@@ -11,7 +11,7 @@ use chrono::FixedOffset;
 use chrono::TimeZone;
 use mononoke_types::DateTime;
 
-/// Return a `DateTime` corresponding to <year>-01-01 00:00:00 UTC.
+/// Return a `DateTime` corresponding to `<year>-01-01 00:00:00` UTC.
 pub fn day_1_utc(year: i32) -> DateTime {
     DateTime::new(
         FixedOffset::west_opt(0)
@@ -21,7 +21,7 @@ pub fn day_1_utc(year: i32) -> DateTime {
     )
 }
 
-/// Return a `DateTime` corresponding to <year>-01-01 00:00:00 UTC,
+/// Return a `DateTime` corresponding to `<year>-01-01 00:00:00` UTC,
 /// with the specified offset applied.
 pub fn day_1_tz(year: i32, offset: i32) -> DateTime {
     DateTime::new(
@@ -52,5 +52,5 @@ pub static YEAR_2000: LazyLock<DateTime> = LazyLock::new(|| day_1_utc(2000));
 pub static YEAR_2000_PST: LazyLock<DateTime> = LazyLock::new(|| day_1_tz(2000, PST_OFFSET));
 
 /// 2100-01-01 00:00:00 UTC.
-pub static YEAR_2100: LazyLock<DateTime> = LazyLock::new(|| day_1_utc(2000));
+pub static YEAR_2100: LazyLock<DateTime> = LazyLock::new(|| day_1_utc(2100));
 pub static YEAR_2100_PST: LazyLock<DateTime> = LazyLock::new(|| day_1_tz(2100, PST_OFFSET));

@@ -5,6 +5,10 @@
  * GNU General Public License version 2.
  */
 
+use std::any::Any;
+use std::io::Write;
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
 use std::path::Path;
 use std::process::Command;
 
@@ -40,6 +44,9 @@ struct CliUsageSample;
 
 /// Value used in Python to indicate a command failed to parse
 pub const PYTHON_EDENFSCTL_EX_USAGE: i32 = 64;
+
+/// The exit code of a Rust program whose main thread panicked.
+const PANIC_EXIT_CODE: i32 = 101;
 
 // Initialize OpenSSL before curl's `.init_array` constructor so OpenSSL does
 // not register an atexit cleanup that frees its state under HTTP threads still
@@ -129,6 +136,8 @@ fn fallback(reason: Option<&clap::Error>, telemetry_sample: &mut CliUsageSample)
     // import modules. So, let's strip the PYTHONHOME and PYTHONPATH variables.
     cmd.env_remove("PYTHONHOME");
     cmd.env_remove("PYTHONPATH");
+    #[cfg(fbcode_build)]
+    cmd.envs(art_cli_lite_rs::outgoing_env("edenfsctl.real"));
 
     // Python cannot tell a dev build from a release one, so hand it our
     // decision instead of letting it log where we would not.
@@ -204,11 +213,14 @@ fn wrapper_main(telemetry_sample: &mut CliUsageSample) -> Result<i32> {
             // and exit with the same exit code that Python exits with for parse failures.
             Err(e) if e.kind() == clap::error::ErrorKind::UnknownArgument => {
                 e.print().ok();
-                std::process::exit(PYTHON_EDENFSCTL_EX_USAGE)
+                exit_process(PYTHON_EDENFSCTL_EX_USAGE)
             }
             // Some other error occurred during parsing. Let's exit like normal
             // since we can't confirm it was due to an invalid command/arg.
-            Err(e) => e.exit(),
+            Err(e) => {
+                e.print().ok();
+                exit_process(e.exit_code())
+            }
         }
     } else if std::env::var("EDENFSCTL_SKIP_RUST").is_ok() {
         fallback(None, telemetry_sample)
@@ -269,7 +281,8 @@ fn wrapper_main(telemetry_sample: &mut CliUsageSample) -> Result<i32> {
                     || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
                 {
                     if should_use_rust_help(std::env::args(), &None, &None).unwrap_or(false) {
-                        e.exit()
+                        e.print().ok();
+                        exit_process(e.exit_code())
                     } else {
                         fallback(Some(&e), telemetry_sample)
                     }
@@ -337,8 +350,57 @@ where
     }
 }
 
+fn finish() {
+    #[cfg(fbcode_build)]
+    art_cli_lite_rs::finish_process();
+}
+
+/// Leaves the process without the exit-time teardown that `exit(3)` runs.
+///
+/// The atexit handlers of this binary destroy the C++ singletons (folly), whose
+/// shutdown timer aborts when the host cannot create a thread, and whose
+/// teardown races with the threads this CLI never joins: the use-case config
+/// refresh in `edenfs_client::use_case` and the fbagent connection. Telemetry
+/// and tracing are flushed before this point, so nothing is lost by skipping
+/// the handlers.
+fn exit_process(code: i32) -> ! {
+    finish();
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: both are plain C calls with no pointer arguments other than the
+    // NULL that tells `fflush` to flush every open stream; `_exit` does not
+    // return, so no Rust code observes the state left behind.
+    unsafe {
+        libc::fflush(std::ptr::null_mut());
+        libc::_exit(code)
+    }
+}
+
+#[cfg(fbcode_build)]
+fn trace() {
+    art_cli_lite_rs::trace_cli_for_process("cli.edenfsctl");
+    art_cli_lite_rs_thrift::install_thrift_interceptor();
+    http_client::Request::on_new_request(|request| {
+        for (name, value) in art_cli_lite_rs::outgoing_http(request.ctx().url().as_str()) {
+            request.set_header(name, value);
+        }
+    });
+}
+
 #[fbinit::main]
-fn main(_fb: FacebookInit) -> Result<()> {
+fn main(_fb: FacebookInit) {
+    // Everything that can panic runs under `catch_unwind`: an unwind out of
+    // `main` would drop the `fbinit::DestroyGuard` and run the C++ teardown
+    // that `exit_process` exists to skip. The panic hook has already printed
+    // the message by the time the unwind gets here.
+    let code = catch_unwind(run).unwrap_or(PANIC_EXIT_CODE);
+    exit_process(code)
+}
+
+/// The command, its error report and its usage sample. Returns the exit code.
+fn run() -> i32 {
+    #[cfg(fbcode_build)]
+    trace();
     // NOTE: if you are considering passing `FacebookInit` down, you may want to check
     // [`fbinit::expect_init`].
     #[cfg(fbcode_build)]
@@ -349,14 +411,23 @@ fn main(_fb: FacebookInit) -> Result<()> {
 
     let scenario = failpoint::setup_fail_points();
 
-    fail_point!("edenfsctl:main");
-
-    let code = match wrapper_main(&mut sample) {
-        Ok(code) => Ok(code),
-        Err(e) => {
+    let code = match catch_unwind(AssertUnwindSafe(|| {
+        fail_point!("edenfsctl:main");
+        wrapper_main(&mut sample)
+    })) {
+        Ok(Ok(code)) => code,
+        Ok(Err(e)) => {
             #[cfg(fbcode_build)]
             sample.set_exception(&e);
-            Err(e)
+            // The text Rust prints for an `Err` returned from `main`. A failed
+            // write (stderr closed) must not turn the exit code into a panic's.
+            let _ = writeln!(std::io::stderr(), "Error: {e:?}");
+            1
+        }
+        Err(panic) => {
+            #[cfg(fbcode_build)]
+            sample.set_exception(&anyhow!("panic: {}", panic_message(panic.as_ref())));
+            PANIC_EXIT_CODE
         }
     };
 
@@ -366,14 +437,24 @@ fn main(_fb: FacebookInit) -> Result<()> {
 
     #[cfg(fbcode_build)]
     {
-        sample.set_exit_code(*code.as_ref().unwrap_or(&1));
-        send_edenfs_cli_usage(sample.sample);
+        sample.set_exit_code(code);
+        // Best effort. On a host that is out of threads the send itself panics
+        // ("OS can't spawn worker thread"); the command keeps its exit code.
+        let _ = catch_unwind(AssertUnwindSafe(|| send_edenfs_cli_usage(sample.sample)));
     }
 
-    match code {
-        Ok(code) => std::process::exit(code),
-        Err(e) => Err(e),
-    }
+    code
+}
+
+/// The text a panic carried: what `panic!` was given, or the placeholder the
+/// standard panic hook prints for any other payload.
+#[cfg(fbcode_build)]
+fn panic_message(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("Box<dyn Any>")
 }
 
 #[cfg(test)]
@@ -449,6 +530,173 @@ mod tests {
                 &Some(dir.path()),
                 &Some(vec!["debug"])
             )?,);
+        }
+        Ok(())
+    }
+
+    #[cfg(fbcode_build)]
+    const AGENT_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIDSzCCAjOgAwIBAgIUBZH3MYYDAtH3rw4GEoicCwbFgyowDQYJKoZIhvcNAQEL\nBQAwGDEWMBQGA1UEAwwNY2xpX2xpdGVfdGVzdDAgFw0yNjA5MDEwNTI2MDNaGA8y\nMTI2MDgwODA1MjYwM1owGDEWMBQGA1UEAwwNY2xpX2xpdGVfdGVzdDCCASIwDQYJ\nKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKXL9A3z58/dnw9duMi1pjARHnDzMRRJ\n1dFIGDMqJVN8O0ngpQdl2DM4dN1i32JArfIquwULAC1izthntgFo0uXNSNpRaclj\n2oggdKXIwsWYKyK99q2dBi77kq5yVTLArBRVWrz1Q5/EMfyGDsxP/lsJ30Zy5tRo\nKXACiJ/Vgo8pScQ/8cBKvNtUkcNQCUwRqNMfj0gLNZHtu1H5O6h0ps3OTZVGrpyl\nzGO2QQAjt0dV1uxRcwtMhwfl11xjRo8vjFXCNmPtdsN00uUoyR0nfto1ZJ0zNCxB\nSnC0fnO0+wIIjL/U77IYEtVRb1s8pWfYuL87D77VLKAG00hN9kAQ74sCAwEAAaOB\nijCBhzBmBgNVHREEXzBdhkFtaWQ6Ly9QUk9EL1VTRVIvMTIzND9mbGF2b3I9eCZh\nZ2VudC5pZD1BR0VOVCUzYWNsYXVkZV9jb2RlJnRpZXI9eYYYbWlkOi8vUFJPRC9N\nQUNISU5FL2hvc3QwMB0GA1UdDgQWBBTWPEQZLYG+v7eXfhis6aMrM+bJHTANBgkq\nhkiG9w0BAQsFAAOCAQEApL49k77CDcILMCZd+aY2W70PG4OkbexS0ovBg5Zfok43\nGMWkG612VKBcJOpymvs2sscvdVZNpb/szTNMBtlKsVaS9vpr5fGzm+34OH+dUZ7o\nApz+0yPCYeHLvErrmXf9zWZJ8usFzipWgqFcFNpeyQ/7p02p89/fVnKrzWIYarZl\n/+6w9wq4XM0+SkapyRdW0Q+LqpvVIBQJUIOgY+pD1OMPJCIpuEwh5QJYc8C2Dae2\n8c+HXC0sz0TCyWiriU3ErKL9BQObu/wrDYbRt8YWOryHp0Zvx7M8p9JxuOFoEgJE\nox+ZgOXJBgPJwkSmw7K5ugovFBuStJFUB5jaM2FYrQ==\n-----END CERTIFICATE-----\n";
+
+    #[cfg(fbcode_build)]
+    fn http_headers_sent() -> Result<Vec<(String, String)>> {
+        use std::io::BufRead;
+        use std::io::BufReader;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}/", listener.local_addr()?);
+        let server = std::thread::spawn(move || -> Result<Vec<(String, String)>> {
+            let (stream, _) = listener.accept()?;
+            let mut reader = BufReader::new(stream.try_clone()?);
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line)?;
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(": ") {
+                    headers.push((name.to_lowercase(), value.to_owned()));
+                }
+            }
+            (&stream).write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
+            Ok(headers)
+        });
+        super::trace();
+        http_client::HttpClient::new().get(url.parse()?).send()?;
+        server.join().expect("server thread should not panic")
+    }
+
+    #[cfg(fbcode_build)]
+    fn agent_ids(cp2: &str, apc: &str) -> (Option<String>, Option<String>) {
+        use base64::Engine;
+
+        let decode = |value: &str| {
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(
+                    value
+                        .trim_end_matches('=')
+                        .replace('-', "+")
+                        .replace('_', "/"),
+                )
+                .expect("carrier should be base64")
+        };
+        let cp2: baggage::Baggage =
+            fbthrift::compact_protocol::deserialize(decode(cp2)).expect("cp2 should be a Baggage");
+        let apc: context_prop_const::ContextpropCore::ArtilleryPropagatedContext =
+            fbthrift::compact_protocol::deserialize(decode(apc))
+                .expect("the V1 carrier should be an ArtilleryPropagatedContext");
+        (cp2.agent_id, apc.agent_id)
+    }
+
+    #[cfg(fbcode_build)]
+    #[fbinit::test]
+    fn egress_carries_the_agents_trace_only_when_traced(_fb: fbinit::FacebookInit) -> Result<()> {
+        const MODE: &str = "EDENFSCTL_EGRESS_TEST_MODE";
+        if let Ok(mode) = std::env::var(MODE) {
+            let headers = http_headers_sent()?;
+            let header = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            };
+            let handle = edenfs_core::fsutil::handle_command(std::path::Path::new("mount"));
+            let env = |name: &str| {
+                handle
+                    .get_envs()
+                    .find(|(key, _)| *key == name)
+                    .and_then(|(_, value)| value)
+                    .map(|value| value.to_string_lossy().into_owned())
+            };
+            let expected = (
+                Some("AGENT:claude_code".to_owned()),
+                Some("AGENT:claude_code".to_owned()),
+            );
+            for (egress, cp2, apc) in [
+                (
+                    "http",
+                    header("cp2"),
+                    header("propagated-artillery-trace-ids"),
+                ),
+                (
+                    "handle.exe",
+                    env("CONTEXTPROP_BAGGAGE"),
+                    env("ARTILLERY_CONTEXT"),
+                ),
+            ] {
+                match (mode == "traced", cp2, apc) {
+                    (true, Some(cp2), Some(apc)) => {
+                        assert_eq!(agent_ids(&cp2, &apc), expected, "{egress} names the agent")
+                    }
+                    (false, None, None) => {}
+                    (traced, cp2, apc) => {
+                        panic!("{mode} {egress}: traced={traced} cp2={cp2:?} apc={apc:?}")
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let dir = TempDir::new()?;
+        let cert = dir.path().join("cert.pem");
+        std::fs::write(&cert, AGENT_CERT)?;
+        let control = |name: &str, overrides: &str| -> Result<std::path::PathBuf> {
+            let path = dir.path().join(format!("{name}.json"));
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"transports": ["none"], "observe_sample_rate": 0, "killed": false, "overrides": {{"edenfsctl": {{{overrides}}}}}}}"#
+                ),
+            )?;
+            Ok(path)
+        };
+        let cases = [
+            ("traced", Some(control("traced", r#""sample_rate": 1.0"#)?)),
+            ("human", None),
+            ("killed", Some(control("killed", r#""killed": true"#)?)),
+            (
+                "sampled_out",
+                Some(control("sampled_out", r#""sample_rate": 0.0"#)?),
+            ),
+        ];
+        for (mode, control) in cases {
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            child
+                .args([
+                    "--exact",
+                    "tests::egress_carries_the_agents_trace_only_when_traced",
+                ])
+                .env(MODE, mode)
+                .env("EDENFS_NO_TELEMETRY", "1");
+            for name in [
+                "TRACEPARENT",
+                "CONTEXTPROP_BAGGAGE",
+                "ARTILLERY_CONTEXT",
+                "CODING_AGENT_METADATA",
+                "META_3PAI_INVOCATION_ID",
+                "AGENT",
+                "CONFUCIUS_IN_NAMESPACE",
+                "CLAUDE_CODE_CURRENT_SESSION_ID",
+                "CC_TRACE_DIR",
+                "ARTILLERY_KILLSWITCH_PATH",
+                "THRIFT_TLS_CL_CERT_PATH",
+            ] {
+                child.env_remove(name);
+            }
+            if let Some(control) = control {
+                child
+                    .env("ARTILLERY_KILLSWITCH_PATH", control)
+                    .env("THRIFT_TLS_CL_CERT_PATH", &cert)
+                    .env("CODING_AGENT_METADATA", "id=claude_code")
+                    .env(
+                        "TRACEPARENT",
+                        "00-5ad4f2c7a3e14b8d1f2e3d4c5b6a7940-b7ad6b7169203331-01",
+                    );
+            }
+            let status = child.status()?;
+            assert!(status.success(), "{mode} run: {status:?}");
         }
         Ok(())
     }

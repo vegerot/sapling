@@ -7,7 +7,8 @@ cpp_library(
     srcs = ["Xdr.cpp"],
     headers = ["Xdr.h"],
     exported_deps = [
-        "//folly:preprocessor",
-        "//folly/io:iobuf",
+        "fbsource//third-party/fmt:fmt",
+        "fbsource//xplat/folly:preprocessor",
+        "fbsource//xplat/folly/io:iobuf",
     ],
 )

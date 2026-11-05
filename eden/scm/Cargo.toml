@@ -1,5 +1,5 @@
 [patch.crates-io]
-abomonation = { git = "https://github.com/markbt/abomonation", rev = "0f43346d2afa2aedc64d61f3f4273e8d1e454642" }
+darwin-libproc = { git = "https://github.com/fbsource/darwin-libproc", rev = "f73ddb1002d51ae74c1b41670fae56bd5896b7a3" }
 
 [workspace]
 members = [
@@ -80,6 +80,7 @@ members = [
   "lib/config/hgrc-parser",
   "lib/config/loader",
   "lib/config/model",
+  "lib/config/rcutil",
   "lib/config/remote-loader",
   "lib/config/set",
   "lib/config/static",
@@ -121,6 +122,7 @@ members = [
   "lib/formatter",
   "lib/fsinfo",
   "lib/fsyncglob",
+  "lib/fuzzutil",
   "lib/gitcompat",
   "lib/gitstore",
   "lib/grepocompat",
@@ -132,6 +134,8 @@ members = [
   "lib/http-client",
   "lib/identity",
   "lib/indexedlog",
+  "lib/indexedlog/benches",
+  "lib/indexedlog/config",
   "lib/io",
   "lib/io/term/logger",
   "lib/io/term/style",
@@ -209,6 +213,8 @@ members = [
   "lib/util/ascii-tree",
   "lib/util/atexit",
   "lib/util/btrfs",
+  "lib/util/bytescan",
+  "lib/util/bytescan/benches",
   "lib/util/factory",
   "lib/util/format-util",
   "lib/util/hgplain",
@@ -221,6 +227,7 @@ members = [
   "lib/util/rewrite-macros",
   "lib/util/rewrite-macros/tree-pattern-match",
   "lib/util/sigbus-memops",
+  "lib/util/small_set",
   "lib/util/sysutil",
   "lib/util/testutil",
   "lib/util/time-interval",
@@ -329,4 +336,5 @@ members = [
   "saplingnative/conch_parser",
   "saplingnative/pybindings",
 ]
+exclude = ["lib/dag/fuzz", "lib/indexedlog/fuzz"]
 resolver = "2"

@@ -3,28 +3,26 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-if (IS_FB_BUILD)
-  rust_static_library(
-    rust_backingstore
-    CRATE backingstore
-    USE_CXX_INCLUDE
-    FEATURES fb)
-else()
-  rust_static_library(rust_backingstore CRATE backingstore USE_CXX_INCLUDE)
-endif()
-
-install_rust_static_library(
-  rust_backingstore
-  EXPORT mercurial
-  INSTALL_DIR lib
-)
-
+# The crate builds into rust_edenfs_staticlib, in eden/fs's Cargo workspace,
+# which can resolve another version of cxx than eden/scm's.
 rust_cxx_bridge(
   backingstore
   "src/ffi.rs"
   LIBS
   fmt::fmt
   Folly::folly
+  CXX_VERSION_DIR
+  "${PROJECT_SOURCE_DIR}/eden/fs/rust/edenfs-staticlib"
+)
+
+# Open-source builds declare folly::IOBuf in a second bridge, see src/oss.rs.
+rust_cxx_bridge(
+  backingstore_iobuf
+  "src/oss.rs"
+  LIBS
+  Folly::folly
+  CXX_VERSION_DIR
+  "${PROJECT_SOURCE_DIR}/eden/fs/rust/edenfs-staticlib"
 )
 
 file(GLOB C_API_SRCS "src/*.cpp")
@@ -47,13 +45,24 @@ target_include_directories(
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
+include(generated_targets.cmake)
 target_link_libraries(
   backingstore
   PUBLIC
   edencommon::edencommon_os
-  rust_backingstore
+  ${SAPLING_NATIVE_BACKINGSTORE_DEPS}
+  rust_edenfs_staticlib
+  backingstore_iobuf
   fmt::fmt
   Folly::folly
+)
+
+rust_cxx_header(
+  rust_cxx
+  LIBS
+  rust_edenfs_staticlib
+  CXX_VERSION_DIR
+  "${PROJECT_SOURCE_DIR}/eden/fs/rust/edenfs-staticlib"
 )
 
 # curl used in the Rust crate has its own copy of curl compiled and it uses

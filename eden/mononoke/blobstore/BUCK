@@ -2,12 +2,19 @@ load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
 
-oncall("scm_server_treehugger")
+oncall("scm_server_infra")
 
 rust_library(
     name = "blobstore_factory",
     srcs = glob(["factory/src/**/*.rs"]),
     autocargo = {"cargo_toml_dir": "factory"},
+    test_deps = [
+        "fbsource//third-party/rust:tempfile",
+        "//common/rust/shed/fbinit:fbinit",
+        "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/common/mononoke_macros:mononoke_macros",
+        "//eden/mononoke/servers/slapi/slapi_server/context:context",
+    ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:clap",
@@ -187,6 +194,7 @@ rust_library(
     test_deps = [
         "fbsource//third-party/rust:assert_matches",
         "fbsource//third-party/rust:maplit",
+        "fbsource//third-party/rust:tempfile",
         ":memblob",
         "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/fbinit:fbinit",
@@ -597,15 +605,18 @@ rust_library(
         "fbsource//third-party/rust:chrono",
         "fbsource//third-party/rust:derivative",
         "fbsource//third-party/rust:futures",
+        "fbsource//third-party/rust:governor",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:smallvec",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
         "fbsource//third-party/rust:vec1",
         ":blobstore",
         ":prefixblob",
         "//common/rust/shed/facet:facet",
         "//common/rust/shed/futures_lazy_shared:futures_lazy_shared",
+        "//common/rust/shed/futures_retry:futures_retry",
         "//common/rust/shed/scuba_stub:scuba",
         "//common/rust/shed/sql:sql",
         "//eden/mononoke/common/rust/sql_ext:sql_ext",

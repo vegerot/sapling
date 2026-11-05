@@ -8,6 +8,7 @@ edition = "2024"
 homepage = "https://sapling-scm.com/"
 repository = "https://github.com/facebook/sapling"
 license = "MIT"
+exclude = ["BUCK"]
 
 [lib]
 name = "refencode"
@@ -17,4 +18,4 @@ sapling-types = { version = "0.1.0", path = "../types" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 
 [dev-dependencies]
-serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }

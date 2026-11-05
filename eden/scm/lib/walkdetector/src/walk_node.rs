@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::time::Duration;
 
 #[cfg(test)]
@@ -25,13 +25,56 @@ use crate::Walk;
 use crate::WalkType;
 use crate::important_metadata;
 use crate::interesting_metadata;
-use crate::walk_threshold;
 
 pub(crate) struct GcResult {
     pub(crate) deleted_nodes: usize,
     pub(crate) remaining_nodes: usize,
     pub(crate) deleted_walks: usize,
-    pub(crate) important_metadata: Option<Vec<(RepoPathBuf, usize, usize)>>,
+}
+
+/// Child names recorded for one kind of activity, and whether they have arrived in ascending
+/// order so far. Tools that list a directory (`ls`, `find`, serial `grep`) visit its entries in
+/// order while random access does not, so an in-order run is stronger evidence of a walk than
+/// the count alone and the detector holds it to a fraction of the walk ratio. The set stays
+/// small: it is cleared once the walk forms.
+#[derive(Default)]
+pub(crate) struct SeenNames {
+    names: BTreeSet<PathComponentBuf>,
+    // Set once a new name sorted before one already recorded; only `clear` resets it.
+    out_of_order: bool,
+}
+
+impl SeenNames {
+    /// Record `name`. A name recorded before carries no new order information.
+    pub(crate) fn insert(&mut self, name: PathComponentBuf) {
+        if self.names.contains(&name) {
+            return;
+        }
+        if self.names.last().is_some_and(|last| name < *last) {
+            self.out_of_order = true;
+        }
+        self.names.insert(name);
+    }
+
+    /// Start over from `names`, whose arrival order is unknown: later names count as in order
+    /// only if they sort after all of them.
+    pub(crate) fn reset_to(&mut self, names: impl IntoIterator<Item = PathComponentBuf>) {
+        self.clear();
+        self.names.extend(names);
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Whether every name recorded so far arrived in ascending order.
+    pub(crate) fn is_sorted(&self) -> bool {
+        !self.out_of_order
+    }
+
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// Tree structure to track active walks. This makes it efficient to find a file's
@@ -54,10 +97,15 @@ pub(crate) struct WalkNode {
     pub(crate) advanced_file_children: HashMap<PathComponentBuf, usize>,
     pub(crate) advanced_dir_children: HashMap<PathComponentBuf, usize>,
 
+    // Child directories that have had a walk rooted at them while we had no walk
+    // covering them (only used before transitioning to walk).
+    pub(crate) walked_file_children: SeenNames,
+    pub(crate) walked_dir_children: SeenNames,
+
     // File names seen so far (only used before transitioning to walk).
-    pub(crate) seen_files: HashSet<PathComponentBuf>,
+    pub(crate) seen_files: SeenNames,
     // Dir names seen so far (only used before transitioning to walk).
-    pub(crate) seen_dirs: HashSet<PathComponentBuf>,
+    pub(crate) seen_dirs: SeenNames,
 
     // Count of children directories.
     total_dirs: Option<usize>,
@@ -89,6 +137,8 @@ impl WalkNode {
             children: Default::default(),
             advanced_file_children: Default::default(),
             advanced_dir_children: Default::default(),
+            walked_file_children: Default::default(),
+            walked_dir_children: Default::default(),
             seen_files: Default::default(),
             seen_dirs: Default::default(),
             total_dirs: None,
@@ -108,6 +158,16 @@ impl WalkNode {
                 .children
                 .get(head)
                 .and_then(|child| child.get_node(tail)),
+            None => Some(self),
+        }
+    }
+
+    pub(crate) fn get_node_mut(&mut self, dir: &RepoPath) -> Option<&mut Self> {
+        match dir.split_first_component() {
+            Some((head, tail)) => self
+                .children
+                .get_mut(head)
+                .and_then(|child| child.get_node_mut(tail)),
             None => Some(self),
         }
     }
@@ -225,7 +285,6 @@ impl WalkNode {
         walk_type: WalkType,
         walk_root: &RepoPath,
         mut walk: Walk,
-        root_depth: usize,
     ) -> &mut Self {
         if self.get_walk_for_type(walk_type).is_some() {
             // Refresh our last_access_time as we see a descendant walk getting inserted. In general
@@ -252,19 +311,20 @@ impl WalkNode {
                     self.children
                         .get_mut(head)
                         .unwrap()
-                        .insert_walk(config, walk_type, tail, walk, root_depth)
+                        .insert_walk(config, walk_type, tail, walk)
                 } else {
                     self.children
                         .entry(head.to_owned())
                         .or_insert_with(|| Self::new(config.gc_timeout))
-                        .insert_walk(config, walk_type, tail, walk, root_depth)
+                        .insert_walk(config, walk_type, tail, walk)
                 }
             }
             None => {
-                let threshold = walk_threshold(config, root_depth);
+                let threshold = config.walk_threshold;
                 let walk_ratio = config.walk_ratio;
 
                 self.clear_advanced_children(walk_type);
+                self.walked_children_mut(walk_type).clear();
 
                 // This can have a side effect of adding to self.advanced_children.
                 self.remove_contained(walk_type, &walk, threshold, walk_ratio);
@@ -276,13 +336,18 @@ impl WalkNode {
                     walk.depth + 1,
                     threshold,
                     walk_ratio,
+                    walk.credited_breadth(),
                 ) {
+                    walk.credit_breadth(
+                        self.total_count(WalkType::Directory, walk.depth + 1)
+                            .unwrap_or_default(),
+                    );
                     walk.depth += 1;
                     tracing::debug!(
                         new_depth = walk.depth,
                         "advancing walk after removing descendants"
                     );
-                    self.insert_walk(config, walk_type, walk_root, walk, root_depth)
+                    self.insert_walk(config, walk_type, walk_root, walk)
                 } else {
                     self.set_walk_for_type(walk_type, Some(walk));
                     self
@@ -336,7 +401,7 @@ impl WalkNode {
             WalkType::Directory => self.file_walk.as_ref().or(self.dir_walk.as_ref()),
         };
 
-        walk.filter(|&walk| !self.expired())
+        walk.filter(|&_walk| !self.expired())
     }
 
     pub(crate) fn get_walk_for_type(&self, walk_type: WalkType) -> Option<&Walk> {
@@ -345,7 +410,7 @@ impl WalkNode {
             WalkType::Directory => self.dir_walk.as_ref(),
         };
 
-        walk.filter(|&walk| !self.expired())
+        walk.filter(|&_walk| !self.expired())
     }
 
     /// Set walk of `walk_type` to new_walk. Returns old walk, if any.
@@ -362,6 +427,7 @@ impl WalkNode {
                 ),
             ) if depth >= dir_depth => {
                 new_walk.absorb_counters(dir_walk);
+                new_walk.absorb_credit(dir_walk);
                 self.dir_walk = None;
             }
             _ => {}
@@ -374,6 +440,7 @@ impl WalkNode {
 
         if let (Some(old), Some(new)) = (&old_walk, &new_walk) {
             new.absorb_counters(old);
+            new.absorb_credit(old);
         }
 
         std::mem::replace(old_walk, new_walk)
@@ -412,6 +479,46 @@ impl WalkNode {
             WalkType::File => self.advanced_file_children.clear(),
             WalkType::Directory => self.advanced_dir_children.clear(),
         }
+    }
+
+    fn walked_children_mut(&mut self, walk_type: WalkType) -> &mut SeenNames {
+        match walk_type {
+            WalkType::File => &mut self.walked_file_children,
+            WalkType::Directory => &mut self.walked_dir_children,
+        }
+    }
+
+    /// Record that direct child `name` has a walk of `walk_type`, and count this as activity on
+    /// self. Once self has gone `gc_timeout` without activity, the record starts over from the
+    /// children whose walks are still live. Returns the number of recorded children and whether
+    /// they were recorded in sorted order.
+    pub(crate) fn insert_walked_child(
+        &mut self,
+        walk_type: WalkType,
+        name: PathComponentBuf,
+    ) -> (usize, bool) {
+        let expired = self.expired();
+        let children = &self.children;
+        let walked = match walk_type {
+            WalkType::File => &mut self.walked_file_children,
+            WalkType::Directory => &mut self.walked_dir_children,
+        };
+
+        if expired {
+            walked.reset_to(
+                children
+                    .iter()
+                    .filter(|(_, child)| child.get_walk_for_type(walk_type).is_some())
+                    .map(|(name, _)| name.clone()),
+            );
+        }
+
+        walked.insert(name);
+        let recorded = (walked.len(), walked.is_sorted());
+
+        self.last_access.bump();
+
+        recorded
     }
 
     /// Recursively remove all walks contained within a walk of depth `depth`.
@@ -617,7 +724,9 @@ impl WalkNode {
             .is_some_and(|w| w.depth >= (path.depth() + depth))
     }
 
-    /// Return whether this Dir should be considered "walked".
+    /// Return whether this Dir should be considered "walked". `credit` is the largest directory
+    /// count the relevant walk has already satisfied `walk_ratio` against; the ratio only raises
+    /// the threshold for counts beyond it.
     pub(crate) fn is_walked(
         &self,
         walk_type: WalkType,
@@ -625,18 +734,14 @@ impl WalkNode {
         depth: usize,
         mut walk_threshold: usize,
         walk_ratio: f64,
+        credit: usize,
     ) -> bool {
         if seen_count == 0 {
             return false;
         }
 
-        let total_count = match walk_type {
-            WalkType::File => self.total_files_at_depth(depth),
-            WalkType::Directory => self.total_dirs_at_depth(depth),
-        };
-
         // If we have the total size hint, adjust the threshold for extreme cases.
-        if let Some(total) = total_count {
+        if let Some(total) = self.total_count(walk_type, depth) {
             // If dir is too small we know we will never reach the threshold. Adjust threshold down
             // until it is smaller than dir size.
             while walk_threshold > total {
@@ -646,13 +751,21 @@ impl WalkNode {
             // Conversely, if directory is very large we don't want to detect a walk too
             // aggressively. Ensure the threshold is at least `walk_ratio` of the total directory
             // size. For example, a if `walk_ratio` is 0.1 and the directory size is 10_000, we will
-            // raise the `walk_threshold` to 1_000.
-            if total > 0 && (walk_threshold as f64) / (total as f64) < walk_ratio {
+            // raise the `walk_threshold` to 1_000. A walk that already crossed a level at least
+            // this wide has proven itself, so the ratio does not apply to it again.
+            if total > credit && (walk_threshold as f64) / (total as f64) < walk_ratio {
                 walk_threshold = ((total as f64) * walk_ratio) as usize;
             }
         }
 
         seen_count >= walk_threshold
+    }
+
+    pub(crate) fn total_count(&self, walk_type: WalkType, depth: usize) -> Option<usize> {
+        match walk_type {
+            WalkType::File => self.total_files_at_depth(depth),
+            WalkType::Directory => self.total_dirs_at_depth(depth),
+        }
     }
 
     pub(crate) fn iter(&self, mut cb: impl FnMut(&WalkNode, usize) -> bool) {
@@ -670,13 +783,12 @@ impl WalkNode {
     }
 
     /// Delete nodes not accessed within timeout.
-    pub(crate) fn gc(&mut self, config: &Config, collect_metadata: bool) -> GcResult {
+    pub(crate) fn gc(&mut self, config: &Config) -> GcResult {
         // Return (nodes_deleted, nodes_remaining, walks_deleted, walks_remaining, keep_me)
         fn inner(
             config: &Config,
             path: &mut RepoPathBuf,
             node: &mut WalkNode,
-            important_metadata_entries: &mut Option<Vec<(RepoPathBuf, usize, usize)>>,
         ) -> (usize, usize, usize, usize, bool) {
             let mut walks_removed = 0;
             let mut deleted = 0;
@@ -686,7 +798,7 @@ impl WalkNode {
             node.children.retain(|name, child| {
                 path.push(name);
 
-                let (d, r, w, wr, keep) = inner(config, path, child, important_metadata_entries);
+                let (d, r, w, wr, keep) = inner(config, path, child);
 
                 deleted += d;
                 retained += r;
@@ -731,15 +843,6 @@ impl WalkNode {
             }
 
             if keep_me {
-                if let Some(entries) = important_metadata_entries.as_mut() {
-                    if important_metadata {
-                        entries.push((
-                            path.clone(),
-                            node.total_files().unwrap_or_default(),
-                            node.total_dirs().unwrap_or_default(),
-                        ));
-                    }
-                }
                 retained += 1;
             } else {
                 deleted += 1;
@@ -748,13 +851,8 @@ impl WalkNode {
             (deleted, retained, walks_removed, walks_remaining, keep_me)
         }
 
-        let mut important_metadata = collect_metadata.then(Vec::new);
-        let (mut deleted, remaining, mut walks_deleted, walks_remaining, keep_me) = inner(
-            config,
-            &mut RepoPathBuf::new(),
-            self,
-            &mut important_metadata,
-        );
+        let (mut deleted, remaining, mut walks_deleted, walks_remaining, keep_me) =
+            inner(config, &mut RepoPathBuf::new(), self);
 
         self.descendant_might_have_walk = walks_remaining > 0;
 
@@ -780,7 +878,6 @@ impl WalkNode {
             deleted_nodes: deleted,
             remaining_nodes: remaining,
             deleted_walks: walks_deleted,
-            important_metadata,
         }
     }
 
@@ -797,7 +894,10 @@ impl WalkNode {
         self.last_access.reset();
         self.advanced_file_children.clear();
         self.advanced_dir_children.clear();
+        self.walked_file_children.clear();
+        self.walked_dir_children.clear();
         self.seen_files.clear();
+        self.seen_dirs.clear();
 
         // No harm in retaining self.total_dirs and self.total_files, or the important tallies in
         // total_dirs_at_depth and total_files_at_depth.

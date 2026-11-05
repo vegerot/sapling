@@ -9,6 +9,7 @@
 
 #include "eden/fs/inodes/FileInode.h"
 
+#include <fb303/ServiceData.h>
 #include <fmt/format.h>
 #include <folly/Range.h>
 #include <folly/coro/GtestHelpers.h>
@@ -17,9 +18,12 @@
 #include <chrono>
 #include <thread>
 
+#include "eden/common/utils/FaultInjector.h"
 #include "eden/common/utils/StatTimes.h"
 #include "eden/fs/inodes/OverlayFileAccess.h"
+#include "eden/fs/inodes/RequestContext.h"
 #include "eden/fs/inodes/TreeInode.h"
+#include "eden/fs/journal/Journal.h"
 #include "eden/fs/store/IObjectStore.h"
 #include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
@@ -42,7 +46,7 @@ struct fmt::formatter<timespec> {
   }
 
   template <typename FormatContext>
-  auto format(const timespec& ts, FormatContext& ctx) {
+  auto format(const timespec& ts, FormatContext& ctx) const {
     return fmt::format_to(ctx.out(), "{}.{:09d}", ts.tv_sec, ts.tv_nsec);
   }
 };
@@ -56,7 +60,7 @@ struct fmt::formatter<std::chrono::system_clock::time_point> {
   template <typename FormatContext>
   auto format(
       const std::chrono::system_clock::time_point& tp,
-      FormatContext& ctx) {
+      FormatContext& ctx) const {
     auto duration = tp.time_since_epoch();
     auto secs = std::chrono::duration_cast<std::chrono::seconds>(duration);
     auto nsecs =
@@ -218,6 +222,47 @@ TEST_P(FileInodeTest, getType) {
   auto regularFile = mount_.getFileInode("dir/a.txt");
   EXPECT_EQ(dtype_t::Dir, dir->getType());
   EXPECT_EQ(dtype_t::Regular, regularFile->getType());
+}
+
+TEST_P(FileInodeTest, overlayWriteFaultUsesInodeNumberBeforeChangingBytes) {
+  auto inode = mount_.getFileInode("dir/a.txt");
+  auto context = ObjectFetchContext::getNullContext();
+  const auto original = inode->readAll(context).get();
+  auto& injector = mount_.getServerState()->getFaultInjector();
+  injector.injectError("overlay-write", "0", std::runtime_error("wrong key"));
+  EXPECT_EQ(original.size(), inode->write(original, 0, context).get());
+  injector.removeFault("overlay-write", "0");
+  injector.injectError(
+      "overlay-write",
+      fmt::format("{}", inode->getNodeId()),
+      std::runtime_error("overlay write blocked"),
+      1);
+  EXPECT_THROW_RE(
+      inode->write("new", 0, context).get(),
+      std::runtime_error,
+      "overlay write blocked");
+  EXPECT_EQ(original, inode->readAll(context).get());
+  EXPECT_EQ(original.size(), inode->write(original, 0, context).get());
+}
+
+TEST_P(FileInodeTest, journalFaultUsesMountInjectorBeforeAdvancingSequence) {
+  auto inode = mount_.getFileInode("dir/a.txt");
+  auto context = ObjectFetchContext::getNullContext();
+  EXPECT_EQ(3, inode->write("old", 0, context).get());
+  auto& journal = mount_.getEdenMount()->getJournal();
+  const auto sequence = journal.peekLatest()->sequenceID;
+  mount_.getServerState()->getFaultInjector().injectError(
+      "journal-record",
+      "dir/a[.]txt",
+      std::runtime_error("journal record blocked"),
+      1);
+  EXPECT_THROW_RE(
+      inode->write("new", 0, context).get(),
+      std::runtime_error,
+      "journal record blocked");
+  EXPECT_EQ(sequence, journal.peekLatest()->sequenceID);
+  EXPECT_EQ(3, inode->write("new", 0, context).get());
+  EXPECT_EQ(sequence + 1, journal.peekLatest()->sequenceID);
 }
 
 TEST_P(FileInodeTest, getattrFromBlob) {
@@ -873,6 +918,103 @@ CO_TEST(FileInode, materializationPreservesCachedHashes) {
       mount.getEdenMount()->getOverlayFileAccess()->getBlake3(
           *inode, std::optional<std::string>{std::string(32, 'k')});
   EXPECT_EQ(*cachedAuxData.blake3, materializedBlake3);
+}
+
+TEST(FileInode, loadAttachesParentDirEntryCountsToFetchContext) {
+  FakeTreeBuilder builder;
+  builder.setFiles(
+      {{"dir/a.txt", "a"}, {"dir/b.txt", "b"}, {"dir/sub/c.txt", "c"}});
+  TestMount mount{builder};
+
+  ObjectFetchContextPtr context = makeRefPtr<FsObjectFetchContext>();
+  EXPECT_FALSE(context->getParentDirEntryCounts().has_value());
+
+  auto inode = mount.getFileInode("dir/a.txt");
+  EXPECT_EQ("a", inode->readAll(context).get(0ms));
+
+  auto counts = context->getParentDirEntryCounts();
+  ASSERT_TRUE(counts.has_value());
+  EXPECT_EQ(2, counts->files);
+  EXPECT_EQ(1, counts->dirs);
+}
+
+TEST(FileInode, loadSkipsParentDirEntryCountsWhenDisabled) {
+  FakeTreeBuilder builder;
+  builder.setFiles({{"dir/a.txt", "a"}, {"dir/b.txt", "b"}});
+  TestMount mount{builder};
+  mount.updateEdenConfig({{"experimental:walk-dir-size-hints", "false"}});
+
+  ObjectFetchContextPtr context = makeRefPtr<FsObjectFetchContext>();
+  auto inode = mount.getFileInode("dir/a.txt");
+  EXPECT_EQ("a", inode->readAll(context).get(0ms));
+
+  EXPECT_FALSE(context->getParentDirEntryCounts().has_value());
+}
+
+namespace {
+int64_t getFileHashesComputed(TestMount& mount) {
+  mount.getServerState()->getStats()->flush();
+  return facebook::fb303::ServiceData::get()
+      ->getCounterIfExists("overlay.file_hash_computed.sum")
+      .value_or(0);
+}
+} // namespace
+
+CO_TEST(FileInode, isSameAsSkipsHashWhenSizesDiffer) {
+  FakeTreeBuilder builder;
+  builder.setFiles({{"test.txt", "Hello World"}});
+  TestMount mount{builder};
+  auto fetchContext = ObjectFetchContext::getNullContext();
+
+  auto inode = mount.getFileInode("test.txt");
+  auto blobId = inode->getObjectId().value();
+  inode->write("Hello World, longer"_sp, 0, fetchContext).get(0ms);
+
+  auto before = getFileHashesComputed(mount);
+  EXPECT_FALSE(
+      co_await inode->co_isSameAs(
+          blobId, TreeEntryType::REGULAR_FILE, fetchContext));
+  EXPECT_EQ(before, getFileHashesComputed(mount));
+}
+
+CO_TEST(FileInode, isSameAsHashesWhenSizesMatch) {
+  FakeTreeBuilder builder;
+  builder.setFiles({{"test.txt", "Hello World"}});
+  TestMount mount{builder};
+  auto fetchContext = ObjectFetchContext::getNullContext();
+
+  auto inode = mount.getFileInode("test.txt");
+  auto blobId = inode->getObjectId().value();
+  inode->write("Hello Earth"_sp, 0, fetchContext).get(0ms);
+
+  auto before = getFileHashesComputed(mount);
+  EXPECT_FALSE(
+      co_await inode->co_isSameAs(
+          blobId, TreeEntryType::REGULAR_FILE, fetchContext));
+  EXPECT_EQ(before + 1, getFileHashesComputed(mount));
+
+  // The hash is cached on the inode until the next write.
+  EXPECT_FALSE(
+      co_await inode->co_isSameAs(
+          blobId, TreeEntryType::REGULAR_FILE, fetchContext));
+  EXPECT_EQ(before + 1, getFileHashesComputed(mount));
+
+  inode->write("Hello World"_sp, 0, fetchContext).get(0ms);
+  EXPECT_TRUE(
+      co_await inode->co_isSameAs(
+          blobId, TreeEntryType::REGULAR_FILE, fetchContext));
+}
+
+TEST(FileInode, loadReportsBlobReadToWalkDetector) {
+  FakeTreeBuilder builder;
+  builder.setFiles({{"dir/a.txt", "a"}});
+  TestMount mount{builder};
+
+  auto inode = mount.getFileInode("dir/a.txt");
+  EXPECT_EQ("a", inode->readAll(ObjectFetchContext::getNullContext()).get(0ms));
+
+  const std::vector<ObjectId> expected{*inode->getObjectId()};
+  EXPECT_EQ(expected, mount.getWalkDetector().fileReads());
 }
 
 // TODO: test multiple flags together

@@ -1027,25 +1027,25 @@ impl<Value: ShardedMapV2Value> ShardedMapV2Node<Value> {
 
                     // Check if there's a value at the current prefix in the map,
                     // and check that it's different from the values in all `other_maps`.
-                    let item = match (current_map.value.take(), current_map.prefix.is_empty()) {
-                        (Some(value), true) => {
-                            let previous_values = other_maps
-                                .iter_mut()
-                                .flat_map(|other_map| {
-                                    match (other_map.value.take(), other_map.prefix.is_empty()) {
-                                        (Some(value), true) => Some(*value),
-                                        _ => None,
-                                    }
-                                })
-                                .collect::<Vec<_>>();
+                    let item = if current_map.prefix.is_empty() && let Some(value) = current_map.value.take() {
+                        let previous_values = other_maps
+                            .iter_mut()
+                            .filter_map(|other_map| {
+                                if other_map.prefix.is_empty() && let Some(value) = other_map.value.take() {
+                                    Some(*value)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>();
 
-                            if !previous_values.iter().any(|other_value| other_value == value.as_ref()) {
-                                Some(DifferenceStreamItem { current_value: *value, previous_values })
-                            } else {
-                                None
-                            }
+                        if !previous_values.iter().any(|other_value| other_value == value.as_ref()) {
+                            Some(DifferenceStreamItem { current_value: *value, previous_values })
+                        } else {
+                            None
                         }
-                        _ => None,
+                    } else {
+                        None
                     };
 
                     // Find the children of the current map corresponding to all possible
@@ -2260,6 +2260,43 @@ mod test {
                 ("omiux".to_string(), 2, vec![9]),
                 ("omundo".to_string(), 3, vec![])
             ]
+        );
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_sharded_map_v2_difference_stream_longer_prefix(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let blobstore = KeyedMemblob::default();
+        let helper = MapHelper(ctx, blobstore);
+
+        // The map's only entry is absent from the other map, so it must be reported even
+        // though the node prefixes ("foo" and "bar") diverge.
+        let map = helper.from_entries(&[("foo", 1)]).await?;
+        let other = helper.from_entries(&[("bar", 1)]).await?;
+        assert_eq!(
+            helper
+                .difference_stream(map, vec![other])
+                .await?
+                .into_iter()
+                .sorted()
+                .collect::<Vec<_>>(),
+            vec![("foo".to_string(), 1, vec![])],
+        );
+
+        // "ab" has the same value in both maps, so only "a" differs, even though the other
+        // map's node for "ab" still carries the prefix "b" when "a" is visited.
+        let map = helper.from_entries(&[("a", 1), ("ab", 2)]).await?;
+        let other = helper.from_entries(&[("ab", 2)]).await?;
+        assert_eq!(
+            helper
+                .difference_stream(map, vec![other])
+                .await?
+                .into_iter()
+                .sorted()
+                .collect::<Vec<_>>(),
+            vec![("a".to_string(), 1, vec![])],
         );
 
         Ok(())

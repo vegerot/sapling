@@ -49,15 +49,16 @@ use bonsai_globalrev_mapping::SqlBonsaiGlobalrevMappingBuilder;
 use bonsai_hg_mapping::ArcBonsaiHgMapping;
 use bonsai_hg_mapping::CachingBonsaiHgMapping;
 use bonsai_hg_mapping::SqlBonsaiHgMappingBuilder;
+use bonsai_p4_mapping::ArcBonsaiP4Mapping;
+use bonsai_p4_mapping::CachingBonsaiP4Mapping;
+use bonsai_p4_mapping::SqlBonsaiP4MappingBuilder;
 use bonsai_svnrev_mapping::ArcBonsaiSvnrevMapping;
 use bonsai_svnrev_mapping::CachingBonsaiSvnrevMapping;
 use bonsai_svnrev_mapping::SqlBonsaiSvnrevMappingBuilder;
 use bonsai_tag_mapping::ArcBonsaiTagMapping;
 use bonsai_tag_mapping::CachedBonsaiTagMapping;
 use bonsai_tag_mapping::SqlBonsaiTagMappingBuilder;
-#[cfg(fbcode_build)]
 use bookmark_service_client::BookmarkServiceClient;
-#[cfg(fbcode_build)]
 use bookmark_service_client::RepoBookmarkServiceClient;
 use bookmarks::ArcBookmarkUpdateLog;
 use bookmarks::ArcBookmarks;
@@ -106,10 +107,10 @@ use derived_data_remote::DerivationClient;
 use derived_data_remote::RemoteDerivationOptions;
 use enabled_derived_data_types::ArcEnabledDerivedDataTypes;
 use enabled_derived_data_types::SqlEnabledDerivedDataTypesBuilder;
-#[cfg(fbcode_build)]
 use environment::BookmarkCacheAddress;
 use environment::BookmarkCacheDerivedData;
 use environment::BookmarkCacheKind;
+use environment::BookmarkCacheOptions;
 use environment::Caching;
 use environment::LocalCacheEncoding;
 use environment::MononokeEnvironment;
@@ -156,6 +157,7 @@ use metaconfig_types::RepoConfig;
 use metaconfig_types::RepoReadOnly;
 #[cfg(fbcode_build)]
 use metaconfig_types::ZelosConfig;
+use mononoke_configs::MononokeConfigs;
 use mutable_blobstore::ArcMutableRepoBlobstore;
 use mutable_blobstore::MutableRepoBlobstore;
 use mutable_counters::ArcMutableCounters;
@@ -346,6 +348,14 @@ pub trait RepoFactoryOverride<T> = Fn(T) -> T + Send + Sync + 'static;
 #[derive(Clone)]
 pub struct RepoFactory {
     pub env: Arc<MononokeEnvironment>,
+    #[cfg_attr(
+        not(fbcode_build),
+        expect(
+            dead_code,
+            reason = "Only the internal repo event publisher reads the configs"
+        )
+    )]
+    configs: Arc<MononokeConfigs>,
     sql_factories: RepoFactoryCache<MetadataDatabaseConfig, Arc<MetadataSqlFactory>>,
     blobstores: RepoFactoryCache<BlobConfig, Arc<dyn Blobstore>>,
     redacted_blobs: RepoFactoryCache<MetadataDatabaseConfig, Arc<RedactedBlobs>>,
@@ -361,7 +371,7 @@ pub struct RepoFactory {
 }
 
 impl RepoFactory {
-    pub fn new(env: Arc<MononokeEnvironment>) -> RepoFactory {
+    pub fn new(env: Arc<MononokeEnvironment>, configs: Arc<MononokeConfigs>) -> RepoFactory {
         RepoFactory {
             sql_factories: RepoFactoryCache::new(env.fb, "sql_factories"),
             blobstores: RepoFactoryCache::new(env.fb, "blobstore"),
@@ -374,6 +384,7 @@ impl RepoFactory {
             scrub_handler: default_scrub_handler(),
             blobstore_component_sampler: None,
             bonsai_hg_mapping_overwrite: false,
+            configs,
             env,
             derived_data_scuba_table_overwrite: None,
         }
@@ -757,6 +768,9 @@ pub enum RepoFactoryError {
     #[error("Error opening bonsai-globalrev mapping")]
     BonsaiGlobalrevMapping,
 
+    #[error("Error opening bonsai-p4 mapping")]
+    BonsaiP4Mapping,
+
     #[error("Error opening bonsai-svnrev mapping")]
     BonsaiSvnrevMapping,
 
@@ -1008,6 +1022,26 @@ impl RepoFactory {
             )))
         } else {
             Ok(Arc::new(bonsai_globalrev_mapping))
+        }
+    }
+
+    pub async fn bonsai_p4_mapping(
+        &self,
+        repo_config: &ArcRepoConfig,
+        repo_identity: &ArcRepoIdentity,
+    ) -> Result<ArcBonsaiP4Mapping> {
+        let bonsai_p4_mapping = self
+            .open_sql::<SqlBonsaiP4MappingBuilder>(repo_config)
+            .await
+            .context(RepoFactoryError::BonsaiP4Mapping)?
+            .build(repo_identity.id());
+        if let Some(cache_handler_factory) = self.cache_handler_factory("bonsai_p4_mapping")? {
+            Ok(Arc::new(CachingBonsaiP4Mapping::new(
+                Arc::new(bonsai_p4_mapping),
+                cache_handler_factory,
+            )))
+        } else {
+            Ok(Arc::new(bonsai_p4_mapping))
         }
     }
 
@@ -1528,7 +1562,7 @@ impl RepoFactory {
     ) -> Result<ArcRepoDerivationQueues> {
         #[cfg(not(fbcode_build))]
         {
-            let _ = repo_derived_data;
+            let _ = (repo_config, repo_derived_data);
             anyhow::bail!("RepoDerivationQueues is not supported in non-fbcode builds")
         }
         #[cfg(fbcode_build)]
@@ -1784,32 +1818,14 @@ impl RepoFactory {
     }
 
     /// Resolve the effective bookmark cache options for a repo.
-    /// For Git repos, always use local WBC instead of the process-level
-    /// default (Remote), while preserving the configured derived data
-    /// scope.
     fn effective_bookmark_cache_options(
         &self,
         repo_config: &ArcRepoConfig,
     ) -> Result<(BookmarkCacheKind, BookmarkCacheDerivedData)> {
-        if repo_config.default_commit_identity_scheme == CommitIdentityScheme::GIT
-            // A Local WBC with no warmers (NoDerivation, e.g. gitimport) can't
-            // warm anything; leave such callers on their configured cache kind.
-            && self.env.bookmark_cache_options.derived_data
-                != BookmarkCacheDerivedData::NoDerivation
-            // An explicitly disabled cache never queries the Bookmark Service,
-            // so it stays disabled; only a Remote default is upgraded to Local.
-            && self.env.bookmark_cache_options.cache_kind != BookmarkCacheKind::Disabled
-        {
-            Ok((
-                BookmarkCacheKind::Local,
-                self.env.bookmark_cache_options.derived_data.clone(),
-            ))
-        } else {
-            Ok((
-                self.env.bookmark_cache_options.cache_kind.clone(),
-                self.env.bookmark_cache_options.derived_data.clone(),
-            ))
-        }
+        Ok(effective_bookmark_cache_options(
+            repo_config,
+            &self.env.bookmark_cache_options,
+        ))
     }
 
     async fn build_bookmarks_cache_impl(
@@ -1841,6 +1857,18 @@ impl RepoFactory {
                     repo_identity.clone(),
                     repo_event_publisher.clone(),
                     warmer_requirement,
+                )
+                .with_event_router_coordinator_enabled(
+                    repo_config
+                        .metadata_cache_config
+                        .as_ref()
+                        .is_some_and(|config| config.wbc_process_bookmark_notifications),
+                )
+                .with_event_router_batching_enabled(
+                    repo_config
+                        .metadata_cache_config
+                        .as_ref()
+                        .is_some_and(|config| config.wbc_event_router_batching_enabled),
                 );
 
                 match effective_derived_data {
@@ -1866,7 +1894,6 @@ impl RepoFactory {
                 Ok(Arc::new(wbc_builder.build().watched().await?)
                     as Arc<dyn CombinedBookmarksCache + Send + Sync>)
             }
-            #[cfg(fbcode_build)]
             BookmarkCacheKind::Remote(address) => {
                 match effective_derived_data {
                     BookmarkCacheDerivedData::SpecificTypes(_) => {
@@ -1886,15 +1913,24 @@ impl RepoFactory {
                     BookmarkCacheAddress::HostPort(host_port) => {
                         BookmarkServiceClient::from_host_port(self.env.fb, host_port.to_string())?
                     }
+                    #[cfg(fbcode_build)]
                     BookmarkCacheAddress::SmcTier(tier_name) => {
                         BookmarkServiceClient::from_tier_name(self.env.fb, tier_name.to_string())?
                     }
+                    #[cfg(fbcode_build)]
                     BookmarkCacheAddress::ShardManagerTier(tier_name) => {
                         BookmarkServiceClient::from_sm_tier_name(
                             self.env.fb,
                             tier_name.to_string(),
                             repo_identity.name().to_string(),
                         )?
+                    }
+                    #[cfg(not(fbcode_build))]
+                    BookmarkCacheAddress::SmcTier(_)
+                    | BookmarkCacheAddress::ShardManagerTier(_) => {
+                        anyhow::bail!(
+                            "bookmark service tier addresses are unavailable in OSS mode; configure a loopback host:port address"
+                        )
                     }
                 };
                 let repo_client = RepoBookmarkServiceClient::new(
@@ -1904,12 +1940,6 @@ impl RepoFactory {
                 );
 
                 Ok(Arc::new(repo_client) as Arc<dyn CombinedBookmarksCache + Send + Sync>)
-            }
-            #[cfg(not(fbcode_build))]
-            BookmarkCacheKind::Remote(_addr) => {
-                return Err(anyhow::anyhow!(
-                    "Remote bookmark cache not supported in non-fbcode builds"
-                ));
             }
             BookmarkCacheKind::Disabled => Ok(Arc::new(NoopBookmarksCache::new(bookmarks.clone()))
                 as Arc<dyn CombinedBookmarksCache + Send + Sync>),
@@ -2169,6 +2199,7 @@ impl RepoFactory {
                 {
                     let event_publisher = ScribeRepoEventPublisher::new(
                         self.env.fb,
+                        self.configs.clone(),
                         repo_config.metadata_cache_config.as_ref(),
                     )?;
                     Ok(Arc::new(event_publisher) as ArcRepoEventPublisher)
@@ -2273,4 +2304,115 @@ fn get_derivation_client(
             None
         };
     Ok(derivation_service_client)
+}
+
+/// The bookmark cache options for a repo, given the process-level `configured`
+/// ones. Git and Perforce repos have no Bookmark Service shard, so for them a
+/// Remote cache is upgraded to a local WBC, keeping the configured derived data
+/// scope.
+fn effective_bookmark_cache_options(
+    repo_config: &RepoConfig,
+    configured: &BookmarkCacheOptions,
+) -> (BookmarkCacheKind, BookmarkCacheDerivedData) {
+    let no_bookmark_service_shard = matches!(
+        repo_config.default_commit_identity_scheme,
+        CommitIdentityScheme::GIT | CommitIdentityScheme::P4
+    ) || repo_config.p4_source.is_some();
+    let cache_kind = if no_bookmark_service_shard
+        // A Local WBC with no warmers (NoDerivation, e.g. gitimport) can't
+        // warm anything; leave such callers on their configured cache kind.
+        && configured.derived_data != BookmarkCacheDerivedData::NoDerivation
+        // An explicitly disabled cache never queries the Bookmark Service,
+        // so it stays disabled; only a Remote default is upgraded to Local.
+        && configured.cache_kind != BookmarkCacheKind::Disabled
+    {
+        BookmarkCacheKind::Local
+    } else {
+        configured.cache_kind.clone()
+    };
+    (cache_kind, configured.derived_data.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use metaconfig_types::P4SourceConfig;
+    use mononoke_macros::mononoke;
+
+    use super::*;
+
+    fn remote() -> BookmarkCacheOptions {
+        BookmarkCacheOptions {
+            cache_kind: BookmarkCacheKind::Remote(BookmarkCacheAddress::default()),
+            derived_data: BookmarkCacheDerivedData::AllKinds,
+        }
+    }
+
+    fn repo(scheme: CommitIdentityScheme, p4_source: Option<P4SourceConfig>) -> RepoConfig {
+        RepoConfig {
+            default_commit_identity_scheme: scheme,
+            p4_source,
+            ..Default::default()
+        }
+    }
+
+    fn p4_source() -> Option<P4SourceConfig> {
+        Some(P4SourceConfig {
+            server_alias: "test1".to_string(),
+            depot: "//test1/".to_string(),
+        })
+    }
+
+    #[mononoke::test]
+    fn test_repos_without_a_bookmark_service_shard_use_a_local_cache() {
+        for repo in [
+            repo(CommitIdentityScheme::GIT, None),
+            repo(CommitIdentityScheme::P4, None),
+            repo(CommitIdentityScheme::P4, p4_source()),
+            // A mirror whose config still says HG is a Perforce repo all the same.
+            repo(CommitIdentityScheme::HG, p4_source()),
+        ] {
+            assert_eq!(
+                effective_bookmark_cache_options(&repo, &remote()),
+                (BookmarkCacheKind::Local, BookmarkCacheDerivedData::AllKinds),
+                "{repo:?}"
+            );
+        }
+    }
+
+    #[mononoke::test]
+    fn test_hg_repos_keep_the_remote_cache() {
+        for scheme in [
+            CommitIdentityScheme::HG,
+            CommitIdentityScheme::BONSAI,
+            CommitIdentityScheme::UNKNOWN,
+        ] {
+            let (cache_kind, derived_data) =
+                effective_bookmark_cache_options(&repo(scheme.clone(), None), &remote());
+            assert!(
+                matches!(cache_kind, BookmarkCacheKind::Remote(_)),
+                "{scheme:?}"
+            );
+            assert_eq!(derived_data, BookmarkCacheDerivedData::AllKinds);
+        }
+    }
+
+    #[mononoke::test]
+    fn test_disabled_and_no_derivation_are_left_alone() {
+        let repo = repo(CommitIdentityScheme::P4, p4_source());
+        let disabled = BookmarkCacheOptions {
+            cache_kind: BookmarkCacheKind::Disabled,
+            ..remote()
+        };
+        assert_eq!(
+            effective_bookmark_cache_options(&repo, &disabled).0,
+            BookmarkCacheKind::Disabled
+        );
+        let no_derivation = BookmarkCacheOptions {
+            derived_data: BookmarkCacheDerivedData::NoDerivation,
+            ..remote()
+        };
+        let (cache_kind, derived_data) = effective_bookmark_cache_options(&repo, &no_derivation);
+        assert!(matches!(cache_kind, BookmarkCacheKind::Remote(_)));
+        assert_eq!(derived_data, BookmarkCacheDerivedData::NoDerivation);
+    }
 }

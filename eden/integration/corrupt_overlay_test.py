@@ -6,15 +6,65 @@
 
 # pyre-strict
 
+from __future__ import annotations
+
+import errno
 import logging
 import os
 import pathlib
 import stat
+import subprocess
+import sys
 from typing import List
 
 import eden.integration.lib.overlay as overlay_mod
-from eden.fs.service.eden.thrift_types import MountState
 from eden.integration.lib import testcase
+
+
+@testcase.eden_repo_test
+class OverlayWriteErrorTest(testcase.EdenRepoTest):
+    def populate_repo(self) -> None:
+        self.repo.write_file("dir/file", "original\n")
+        self.repo.write_file("hello", "healthy\n")
+        self.repo.commit("Initial commit.")
+
+    def test_truncate_survives_parent_overlay_write_error(self) -> None:
+        if sys.platform != "linux" or os.geteuid() == 0:
+            self.skipTest("Requires Linux permission checks for a non-root daemon")
+        self.addCleanup(self.eden.shutdown, retry=True)
+        parent_inode = os.stat(self.mount_path / "dir").st_ino
+        file_inode = os.stat(self.mount_path / "dir/file").st_ino
+        self.assertNotEqual(parent_inode % 256, file_inode % 256)
+        shard = (
+            self.eden.overlay_dir_for_mount(self.mount_path)
+            / f"{parent_inode % 256:02x}"
+        )
+        mode = stat.S_IMODE(shard.stat().st_mode)
+        pid = self.eden.get_pid_via_thrift()
+        os.chmod(shard, 0o500)
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys\n"
+                    "try:\n"
+                    "    with open(sys.argv[1], 'w'):\n"
+                    "        pass\n"
+                    "except OSError as error:\n"
+                    "    sys.exit(error.errno)\n",
+                    str(self.mount_path / "dir/file"),
+                ],
+                timeout=15,
+            )
+        finally:
+            os.chmod(shard, mode)
+        with self.eden.get_thrift_client(timeout=10) as client:
+            self.assertEqual(pid, client.getDaemonInfo().pid)
+        self.assertEqual(errno.EACCES, result.returncode)
+        self.assertEqual("healthy\n", self.read_file("hello"))
+        self.write_file("dir/file", "recovered\n")
+        self.assertEqual("recovered\n", self.read_file("dir/file"))
 
 
 @testcase.eden_nfs_repo_test_with_wal_variant
@@ -103,43 +153,3 @@ class CorruptOverlayTest(testcase.HgRepoTestMixin, testcase.EdenRepoTest):
 
         self.eden.start()
         self.assertEqual({str(self.mount): "NOT_RUNNING"}, self.eden.list_cmd_simple())
-
-
-@testcase.eden_repo_test
-class CorruptSqliteOverlayTest(testcase.EdenRepoTest):
-    def populate_repo(self) -> None:
-        self.repo.write_file("hello", "hola\n")
-        self.repo.write_file("dir/a", "a\n")
-        self.repo.write_file("dir/b", "b\n")
-
-        self.repo.commit("Initial commit.")
-
-    def test_integrity_corrupt_sqlite(self) -> None:
-        """Slightly corrupt the sqlite database so opening it doesn't catch the
-        corruption.
-        """
-        self.read_dir("dir")
-        self.eden.shutdown()
-
-        treestoredb = self.eden.overlay_dir_for_mount(self.mount_path) / "treestore.db"
-        size = os.stat(treestoredb).st_size
-        os.truncate(
-            self.eden.overlay_dir_for_mount(self.mount_path) / "treestore.db", size - 5
-        )
-
-        self.eden.start()
-        self.assertEqual(self.eden.get_mount_state(self.mount_path), MountState.RUNNING)
-
-    def test_full_corrupt_sqlite(self) -> None:
-        """Fully corrupt the database, opening it is sufficient to detect the corruption."""
-        self.read_dir("dir")
-        self.eden.shutdown()
-
-        treestoredb = self.eden.overlay_dir_for_mount(self.mount_path) / "treestore.db"
-        size = os.stat(treestoredb).st_size
-        os.truncate(
-            self.eden.overlay_dir_for_mount(self.mount_path) / "treestore.db", size // 2
-        )
-
-        self.eden.start()
-        self.assertEqual(self.eden.get_mount_state(self.mount_path), MountState.RUNNING)

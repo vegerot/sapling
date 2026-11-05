@@ -19,9 +19,8 @@ import type {Hash} from 'shared/types/common';
 import type {ExportStack, ImportedStack, ImportStack} from 'shared/types/stack';
 import type {TypeaheadKind} from './CommitInfoView/types';
 import type {InternalTypes} from './InternalTypes';
-import type {CodeReviewIssue} from './firstPassCodeReview/types';
 import type {Serializable} from './serialize';
-import type {Args, DiffCommit, PartiallySelectedDiffCommit} from './stackEdit/diffSplitTypes';
+import type {PartiallySelectedDiffCommit} from './stackEdit/diffSplitTypes';
 
 export type Result<T> = {value: T; error?: undefined} | {value?: undefined; error: Error};
 
@@ -312,6 +311,11 @@ export type WorktreeInfo = {
   sharedRoot: AbsolutePath;
   /** All worktrees in this group, including the current one. */
   worktrees: WorktreeEntry[];
+  /**
+   * Whether `sl worktree add` / `label` / `remove` work in this repo.
+   * Sapling only supports `sl worktree list` outside EdenFS (e.g. native Git repos).
+   */
+  supportsMutation: boolean;
 };
 
 export type WorktreeEntry = {
@@ -804,7 +808,11 @@ export type PlatformSpecificClientToServerMessages =
   | {type: 'platform/openFolder'; path: AbsolutePath}
   | {type: 'platform/changeTitle'; title: string}
   | {type: 'platform/confirm'; message: string; details?: string | undefined}
-  | {type: 'platform/subscribeToAvailableCwds'}
+  | {
+      type: 'platform/subscribeToAvailableCwds';
+      /** Other folders to offer, from hosts that know them, such as the VS Code Agents Window. */
+      cwds?: Array<AbsolutePath>;
+    }
   | {type: 'platform/subscribeToUnsavedFiles'}
   | {type: 'platform/saveAllUnsavedFiles'}
   | {type: 'platform/setPersistedState'; key: string; data?: string}
@@ -877,19 +885,12 @@ export type PlatformSpecificClientToServerMessages =
       userContext?: string;
     }
   | {
-      type: 'platform/runAICodeReviewPlatform';
-      cwd: string;
-    }
-  | {
       type: 'platform/runAICodeReviewChat';
       source: 'commitInfoView' | 'smartAction';
       reviewScope: CodeReviewScope;
       userContext?: string;
       agentBackend?: 'devmate' | 'claude';
       reviewAndFix?: boolean;
-    }
-  | {
-      type: 'platform/subscribeToAIReviewComments';
     };
 
 /**
@@ -918,16 +919,24 @@ export type PlatformSpecificServerToClientMessages =
       value: Json | undefined;
     }
   | {
-      type: 'platform/gotAIReviewComments';
-      comments: Result<CodeReviewIssue[]>;
-    }
-  | {
       type: 'platform/commitFieldAIStatus';
       target: Hash | 'head';
       field: InternalFieldName;
       status: 'loading' | 'idle' | 'error';
       error?: string;
     };
+
+/** A prompt for the embedding host's AI agent. See `Platform.promptAgent`. */
+export type AgentPrompt = {
+  /** Smart action id, e.g. 'review-code'. Used for telemetry. */
+  actionId: string;
+  /** Short human-readable label. */
+  displayPrompt: string;
+  /** The full prompt sent to the agent. */
+  modelPrompt: string;
+  /** Wait for the agent's final response, instead of only starting a chat. */
+  awaitResponse?: boolean;
+};
 
 export type CodeReviewProviderSpecificClientToServerMessages =
   never | InternalTypes['PhabricatorClientToServerMessages'];
@@ -1016,7 +1025,6 @@ export const settableConfigNames = [
   'isl.copy-commit-hash-format',
   'github.preferred_submit_command',
   'ui.allowemptycommit',
-  'ui.merge',
   'amend.autorestack',
   'isl.show-authored-diffs',
   'isl.show-ai-reviewing-badge',
@@ -1107,8 +1115,15 @@ export type ClientToServerMessage =
    * `partial` says `diffIds` names diffs of interest — the commit that just got selected, say —
    * rather than describing every diff on screen. Leave it off if `diffIds` is the whole smartlog;
    * a server that remembers what to refetch later reads the unqualified form as the smartlog.
+   * `force` bypasses fetch debouncing and cached signal counts when a user gesture requires fresh
+   * remote state.
    */
-  | {type: 'fetchDiffSummaries'; diffIds?: Array<DiffId>; partial?: boolean}
+  | {
+      type: 'fetchDiffSummaries';
+      diffIds?: Array<DiffId>;
+      partial?: boolean;
+      force?: boolean;
+    }
   | {type: 'fetchDiffComments'; diffId: DiffId}
   | {type: 'fetchLandInfo'; topOfStack: DiffId}
   | {type: 'fetchAndSetStables'; additionalStables: Array<string>}
@@ -1139,7 +1154,6 @@ export type ClientToServerMessage =
   | {type: 'bulkFetchFeatureFlags'; id: string; names: Array<string>}
   | {type: 'fetchInternalUserInfo'}
   | {type: 'fetchDevEnvType'; id: string}
-  | {type: 'splitCommitWithAI'; id: string; diffCommit: DiffCommit; args: Args}
   | {type: 'gotUiState'; state: string}
   | CodeReviewProviderSpecificClientToServerMessages
   | PlatformSpecificClientToServerMessages
@@ -1185,12 +1199,6 @@ export type ClientToServerMessage =
       type: 'fetchABPropDetails';
       id: string;
       name: string;
-    }
-  | {
-      type: 'runDevmateCommand';
-      args: Array<string>;
-      cwd: string;
-      requestId: string;
     }
   | {
       type: 'fetchSubscribedFullRepoBranches';
@@ -1311,7 +1319,14 @@ export type ServerToClientMessage =
   | {type: 'uploadFileResult'; id: string; result: Result<string>}
   | {type: 'gotRepoUrlAtHash'; url: Result<string>}
   | {type: 'comparison'; comparison: Comparison; data: ComparisonData; ignoreWhitespace?: boolean}
-  | {type: 'comparisonContextLines'; path: RepoRelativePath; lines: Result<Array<string>>}
+  | {
+      type: 'comparisonContextLines';
+      path: RepoRelativePath;
+      lines: Result<Array<string>>;
+      /** The `start` and `numLines` of the request this answers. */
+      start?: number;
+      numLines?: number;
+    }
   | {type: 'beganLoadingMoreCommits'}
   | {type: 'commitsShownRange'; rangeInDays: number | undefined}
   | {type: 'additionalCommitAvailability'; moreAvailable: boolean}
@@ -1328,11 +1343,6 @@ export type ServerToClientMessage =
   | {type: 'bulkFetchedFeatureFlags'; id: string; result: Record<string, boolean>}
   | {type: 'fetchedInternalUserInfo'; info: Serializable}
   | {type: 'fetchedDevEnvType'; envType: string; id: string}
-  | {
-      type: 'splitCommitWithAI';
-      id: string;
-      result: Result<ReadonlyArray<PartiallySelectedDiffCommit>>;
-    }
   | {type: 'getUiState'}
   | OperationProgressEvent
   | PlatformSpecificServerToClientMessages
@@ -1383,19 +1393,6 @@ export type ServerToClientMessage =
       type: 'fetchedTaskDetails';
       id: string;
       result: Result<InternalTypes['InternalTaskDetails']>;
-    }
-  | {
-      type: 'devmateCommandResult';
-      result: (
-        | {
-            type: 'value';
-            stdout: string;
-          }
-        | {
-            type: 'error';
-            stderr: string;
-          }
-      ) & {requestId: string};
     }
   | {
       type: 'fetchedSubscribedFullRepoBranches';

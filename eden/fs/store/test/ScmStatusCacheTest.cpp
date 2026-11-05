@@ -170,8 +170,8 @@ TEST_F(ScmStatusCacheTest, drop_cached_promise) {
   auto future_1 = std::move(std::get<StatusResultFuture>(getResult_1));
   EXPECT_FALSE(future_1.isReady());
 
-  cache->dropPromise(key, 1);
   auto promise = std::get<StatusResultPromise>(getResult_0);
+  cache->dropPromise(key, promise);
   promise->setValue(status);
 
   // check promise is still valid after being dropped
@@ -181,10 +181,33 @@ TEST_F(ScmStatusCacheTest, drop_cached_promise) {
   auto getResult_2 = cache->get(key, 1);
   EXPECT_FALSE(std::holds_alternative<StatusResultFuture>(getResult_2));
 
-  // dropping a promise with sequence smaller should be noop
-  cache->dropPromise(key, 0);
+  // dropping a promise that is no longer the stored one should be noop
+  cache->dropPromise(key, promise);
   auto getResult_3 = cache->get(key, 1);
   EXPECT_TRUE(std::holds_alternative<StatusResultFuture>(getResult_3));
+}
+
+TEST_F(ScmStatusCacheTest, drop_promise_after_joiner_at_later_sequence) {
+  auto cache = ScmStatusCache::create(
+      rawEdenConfig.get(), makeRefPtr<EdenStats>(), journal);
+  auto key = ScmStatusCache::makeKey(id1, false);
+
+  journal->recordChanged("file.txt"_relpath, dtype_t::Regular);
+  auto ownerSeq = journal->peekLatest()->sequenceID;
+  auto ownerResult = cache->get(key, ownerSeq);
+  ASSERT_TRUE(std::holds_alternative<StatusResultPromise>(ownerResult));
+
+  journal->recordChanged(".hg/blackbox.log"_relpath, dtype_t::Regular);
+  auto joinerSeq = journal->peekLatest()->sequenceID;
+  auto joinerResult = cache->get(key, joinerSeq);
+  ASSERT_TRUE(std::holds_alternative<StatusResultFuture>(joinerResult));
+
+  auto promise = std::get<StatusResultPromise>(ownerResult);
+  promise->setException(std::runtime_error("diff failed"));
+  cache->dropPromise(key, promise);
+
+  auto laterResult = cache->get(key, joinerSeq);
+  EXPECT_TRUE(std::holds_alternative<StatusResultPromise>(laterResult));
 }
 
 TEST_F(ScmStatusCacheTest, get_results_as_promise_or_future) {

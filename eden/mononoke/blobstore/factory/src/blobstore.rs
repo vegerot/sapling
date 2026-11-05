@@ -645,6 +645,7 @@ async fn make_multiplexed_wal<'a>(
         fb,
         inner_config,
         mysql_options,
+        readonly_storage,
         blobstore_options,
         config_store,
         scrub_handler,
@@ -702,15 +703,20 @@ async fn setup_inner_blobstores<'a>(
     fb: FacebookInit,
     inner_config: Vec<(BlobstoreId, MultiplexedStoreType, BlobConfig)>,
     mysql_options: &'a MysqlOptions,
+    readonly_storage: ReadOnlyStorage,
     blobstore_options: &'a BlobstoreOptions,
     config_store: &'a ConfigStore,
     scrub_handler: &'a Arc<dyn ScrubHandler>,
     component_sampler: Option<&'a Arc<dyn ComponentSamplingHandler>>,
 ) -> Result<(Vec<InnerBlobstore>, Vec<InnerBlobstore>), Error> {
+    // Without scrub options the components honour `readonly_storage`. Scrub mode keeps its
+    // own rule: `Repair` leaves the components writable so repairs can be written (the walker
+    // runs with read-only storage by default and relies on this), any other scrub action
+    // makes them read-only.
     let component_readonly = blobstore_options
         .scrub_options
         .as_ref()
-        .map_or(ReadOnlyStorage(false), |v| {
+        .map_or(readonly_storage, |v| {
             ReadOnlyStorage(v.scrub_action != ScrubAction::Repair)
         });
 
@@ -761,4 +767,93 @@ async fn setup_inner_blobstores<'a>(
         }
     }
     Ok((normal_components, write_only_components))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use blobstore::BlobstoreBytes;
+    use context::CoreContext;
+    use fbinit::FacebookInit;
+    use metaconfig_types::LocalDatabaseConfig;
+    use mononoke_macros::mononoke;
+
+    use super::*;
+
+    fn multiplex_config(dir: &Path) -> BlobConfig {
+        BlobConfig::MultiplexedWal {
+            multiplex_id: MultiplexId::new(1),
+            blobstores: vec![(
+                BlobstoreId::new(0),
+                MultiplexedStoreType::Normal,
+                BlobConfig::Files {
+                    path: dir.join("files"),
+                },
+            )],
+            write_quorum: 1,
+            queue_db: ShardedDatabaseConfig::Local(LocalDatabaseConfig {
+                path: dir.join("queue"),
+            }),
+            inner_blobstores_scuba_table: None,
+            multiplex_scuba_table: None,
+            scuba_sample_rate: NonZeroU64::new(1).unwrap(),
+        }
+    }
+
+    async fn make(
+        fb: FacebookInit,
+        dir: &Path,
+        readonly: bool,
+    ) -> Result<Arc<dyn Blobstore>, Error> {
+        let (_source, config_store) = sqlblob::get_test_config_store();
+        let options = BlobstoreOptions::new(
+            ChaosOptions::new(None, None),
+            DelayOptions::default(),
+            ThrottleOptions::default(),
+            #[cfg(fbcode_build)]
+            ManifoldOptions::default(),
+            PackOptions::default(),
+            CachelibBlobstoreOptions::default(),
+            Some(PutBehaviour::Overwrite),
+            MysqlOptions::default(),
+        );
+        make_blobstore(
+            fb,
+            multiplex_config(dir),
+            &MysqlOptions::default(),
+            ReadOnlyStorage(readonly),
+            &options,
+            &config_store,
+            &multiplexedblob::scrub::default_scrub_handler(),
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[mononoke::fbinit_test]
+    async fn readonly_storage_multiplex_unlink(fb: FacebookInit) -> Result<(), Error> {
+        let ctx = CoreContext::test_mock(fb);
+        let dir = tempfile::TempDir::new()?;
+
+        // Writable instance: store a blob.
+        let rw = make(fb, dir.path(), false).await?;
+        rw.put(&ctx, "key".to_string(), BlobstoreBytes::from_bytes("value"))
+            .await?;
+        assert!(rw.get(&ctx, "key").await?.is_some());
+
+        // Read-only instance over the same storage.
+        let ro = make(fb, dir.path(), true).await?;
+        // `put` is refused ...
+        assert!(
+            ro.put(&ctx, "key2".to_string(), BlobstoreBytes::from_bytes("v"))
+                .await
+                .is_err()
+        );
+        // ... and so is `unlink`: read-only storage blocks every write, so the blob survives.
+        assert!(ro.unlink(&ctx, "key").await.is_err());
+        assert!(rw.get(&ctx, "key").await?.is_some());
+        Ok(())
+    }
 }

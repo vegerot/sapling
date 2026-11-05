@@ -43,8 +43,8 @@ source code.
 
 ```
 [overlay]
-buffered = true
-inode-catalog-type = "lmdb"
+use-wal = true
+inode-reservation = true
 
 [experimental]
 enable-nfs-server = false
@@ -60,17 +60,17 @@ enable-nfs-server = true
 `~/.edenrc`
 
 ```
-[mount]
-readdir-prefetch = "trees"
+[fuse]
+request-timeout = "10m"
 ```
 
 In the given example, EdenFS would get the config values from the following
 locations
 
-- `overlay:buffered = true # /etc/eden/edenfs.rc`
-- `overlay:inode-catalog-type = "lmdb" # /etc/eden/edenfs.rc`
+- `overlay:use-wal = true # /etc/eden/edenfs.rc`
+- `overlay:inode-reservation = true # /etc/eden/edenfs.rc`
 - `experimental:enable-nfs-server = true # /etc/eden/edenfs_dynamic.rc, overrides /etc/eden/edenfs.rc`
-- `mount:readdir-prefetch = "trees" # ~/.edenrc, doesn't exist in any /etc/eden files`
+- `fuse:request-timeout = "10m" # ~/.edenrc, doesn't exist in any /etc/eden files`
 
 Running `edenfsctl fsconfig` will provide an annotated view of EdenFS' configs,
 similar to the example above.

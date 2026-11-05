@@ -104,6 +104,17 @@ fn get_default_stats_manager_factory() -> Box<dyn StatsManagerFactory + Send + S
 /// You probably don't have to use this function, it is made public so that it
 /// might be used by the macros in this crate. It creates a new SingletonCounter.
 pub fn create_singleton_counter(name: String) -> BoxSingletonCounter {
+    // Read-only, unlike `create_stats_manager`: installing the default factory
+    // here would make a later `register_stats_manager_factory` call panic.
+    if let Some(counter) = STATS_MANAGER_FACTORY
+        .read()
+        .expect("poisoned lock")
+        .as_ref()
+        .and_then(|factory| factory.create_singleton_counter(&name))
+    {
+        return counter;
+    }
+
     #[cfg(all(fbcode_build, not(stats_backend = "noop")))]
     {
         Box::new(::stats_facebook::singleton_counter::ServiceDataSingletonCounter::new(name))
@@ -112,6 +123,134 @@ pub fn create_singleton_counter(name: String) -> BoxSingletonCounter {
     #[cfg(any(not(fbcode_build), stats_backend = "noop"))]
     {
         let _ = name;
-        Box::new(crate::noop_stats::Noop)
+        #[cfg(stats_backend = "noop")]
+        {
+            BoxSingletonCounter::new(Box::new(crate::noop_stats::Noop))
+        }
+        #[cfg(not(stats_backend = "noop"))]
+        {
+            Box::new(crate::noop_stats::Noop)
+        }
+    }
+}
+
+#[cfg(all(test, stats_backend = "noop"))]
+mod glue_counter_tests {
+    use stats_traits::stat_types::CounterStatic;
+
+    use crate::define_stats;
+    use crate::define_stats_struct;
+
+    define_stats! {
+        prefix = "stats_glue_tests";
+        singleton: singleton_counter(),
+        counter: counter(),
+        histogram: quantile_stat(Sum; P 50;),
+        dynamic: dynamic_singleton_counter("dynamic.{}", (key: String)),
+    }
+
+    define_stats_struct! {
+        GlueStats("stats_glue_struct.{}", key: String),
+        singleton: singleton_counter(),
+        counter: counter(),
+        histogram: quantile_stat(Sum; P 50;),
+    }
+
+    #[test]
+    fn singleton_macros_accept_compatibility_arguments() {
+        STATS::counter.increment_value(1);
+        STATS::histogram.add_value(7);
+        STATS::singleton.set_value((), 40);
+        STATS::singleton.increment_value(String::from("compatibility"), 2);
+        assert_eq!(STATS::singleton.get_value(()), None);
+
+        let stats = GlueStats::new(String::from("key"));
+        stats.counter.increment_value(1);
+        stats.histogram.add_value(7);
+        stats.singleton.set_value(String::from("compatibility"), 40);
+        stats.singleton.increment_value((), 2);
+        assert_eq!(
+            stats.singleton.get_value(String::from("compatibility")),
+            None
+        );
+    }
+
+    #[test]
+    fn dynamic_macro_accepts_non_copy_arguments() {
+        use stats_traits::dynamic_stat_types::DynamicSingletonCounter;
+
+        STATS::dynamic.set_value(String::from("compatibility"), 40, (String::from("cat"),));
+        STATS::dynamic.increment_value((), 2, (String::from("cat"),));
+        assert_eq!(
+            STATS::dynamic.get_value(String::from("compatibility"), (String::from("cat"),)),
+            None
+        );
+        assert_eq!(STATS::dynamic.get_value((), (String::from("dog"),)), None);
+    }
+}
+
+#[cfg(all(test, not(stats_backend = "noop")))]
+mod tests {
+    use std::sync::Mutex;
+
+    use fbinit::FacebookInit;
+    use stats_traits::stat_types::SingletonCounter;
+
+    use super::*;
+
+    static ASKED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static WRITES: Mutex<Vec<(String, i64)>> = Mutex::new(Vec::new());
+
+    struct RecordingCounter(String);
+
+    impl SingletonCounter for RecordingCounter {
+        fn set_value(&self, _fb: FacebookInit, value: i64) {
+            WRITES.lock().unwrap().push((self.0.clone(), value));
+        }
+
+        fn increment_value(&self, _fb: FacebookInit, _value: i64) {}
+
+        fn get_value(&self, _fb: FacebookInit) -> Option<i64> {
+            None
+        }
+    }
+
+    /// Supplies singleton counters for `routed.*` names only.
+    struct RoutingFactory;
+
+    impl StatsManagerFactory for RoutingFactory {
+        fn create(&self) -> BoxStatsManager {
+            crate::noop_stats::NoopStatsFactory.create()
+        }
+
+        fn create_singleton_counter(&self, name: &str) -> Option<BoxSingletonCounter> {
+            ASKED.lock().unwrap().push(name.to_owned());
+            name.starts_with("routed.")
+                .then(|| Box::new(RecordingCounter(name.to_owned())) as BoxSingletonCounter)
+        }
+    }
+
+    // The only test in this crate that touches the process-global factory,
+    // which can be registered once per process.
+    #[fbinit::test]
+    fn singleton_counters_come_from_the_registered_factory_when_it_supplies_one(fb: FacebookInit) {
+        let _built_in = create_singleton_counter("before.registration".to_owned());
+        assert!(
+            STATS_MANAGER_FACTORY.read().unwrap().is_none(),
+            "a singleton lookup must not install the default factory"
+        );
+        register_stats_manager_factory(RoutingFactory);
+
+        create_singleton_counter("routed.counter".to_owned()).set_value(fb, 5);
+        let _built_in = create_singleton_counter("other.counter".to_owned());
+
+        assert_eq!(
+            *ASKED.lock().unwrap(),
+            vec!["routed.counter".to_owned(), "other.counter".to_owned()]
+        );
+        assert_eq!(
+            *WRITES.lock().unwrap(),
+            vec![("routed.counter".to_owned(), 5)]
+        );
     }
 }

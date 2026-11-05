@@ -1,7 +1,7 @@
 load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_treehugger")
+oncall("scm_server_infra")
 
 rust_library(
     name = "repo_metadata",
@@ -14,6 +14,7 @@ rust_library(
             "fbsource//third-party/rust:futures",
             "//eden/mononoke/blobstore:blobstore",
             "//eden/mononoke/common/dedupmap:dedupmap",
+            "//eden/mononoke/common/rust/justknobs_ext:justknobs",
             "//eden/mononoke/derived_data:blame",
             "//eden/mononoke/derived_data:changeset_info",
             "//eden/mononoke/derived_data:unodes",

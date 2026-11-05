@@ -11,14 +11,6 @@ sl_rust_library(
                 "dependencies": {"sapling-manifest": {"features": ["for-tests"]}},
                 "dev-dependencies": {"sapling-manifest-tree": {"features": ["for-tests"]}},
             },
-            "lib": {"name": "copytrace"},
-            "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
-                "license": "MIT",
-                "name": "sapling-copytrace",
-                "repository": "https://github.com/facebook/sapling",
-            },
         },
     },
     crate_root = "src/lib.rs",
@@ -30,7 +22,6 @@ sl_rust_library(
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-trait",
-        "fbsource//third-party/rust:bytecount",
         "fbsource//third-party/rust:lru-cache",
         "fbsource//third-party/rust:parking_lot",
         "fbsource//third-party/rust:serde",
@@ -46,6 +37,7 @@ sl_rust_library(
         "//eden/scm/lib/pathmatcher:pathmatcher",
         "//eden/scm/lib/storemodel:storemodel",
         "//eden/scm/lib/types:types",
+        "//eden/scm/lib/util/bytescan:bytescan",
         "//eden/scm/lib/xdiff:xdiff",
     ],
 )

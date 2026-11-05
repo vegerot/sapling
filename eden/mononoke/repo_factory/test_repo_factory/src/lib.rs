@@ -9,6 +9,8 @@
 #![deny(missing_docs)]
 
 use std::collections::BTreeSet;
+#[cfg(fbcode_build)]
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use acl_regions::ArcAclRegions;
@@ -21,6 +23,8 @@ use bonsai_globalrev_mapping::ArcBonsaiGlobalrevMapping;
 use bonsai_globalrev_mapping::SqlBonsaiGlobalrevMappingBuilder;
 use bonsai_hg_mapping::ArcBonsaiHgMapping;
 use bonsai_hg_mapping::SqlBonsaiHgMappingBuilder;
+use bonsai_p4_mapping::ArcBonsaiP4Mapping;
+use bonsai_p4_mapping::SqlBonsaiP4MappingBuilder;
 use bonsai_svnrev_mapping::ArcBonsaiSvnrevMapping;
 use bonsai_svnrev_mapping::SqlBonsaiSvnrevMappingBuilder;
 use bonsai_tag_mapping::ArcBonsaiTagMapping;
@@ -77,8 +81,14 @@ use megarepo_mapping::MegarepoMapping;
 use memblob::Memblob;
 use mercurial_mutation::ArcHgMutationStore;
 use mercurial_mutation::SqlHgMutationStoreBuilder;
+#[cfg(fbcode_build)]
+use metaconfig_parser::RepoConfigs;
+#[cfg(fbcode_build)]
+use metaconfig_parser::StorageConfigs;
 use metaconfig_types::ArcRepoConfig;
 use metaconfig_types::BlameVersion;
+#[cfg(fbcode_build)]
+use metaconfig_types::CommonConfig;
 use metaconfig_types::ComparableRegex;
 use metaconfig_types::DerivedDataConfig;
 use metaconfig_types::DerivedDataTypesConfig;
@@ -91,6 +101,8 @@ use metaconfig_types::InfinitepushParams;
 use metaconfig_types::RepoConfig;
 use metaconfig_types::SourceControlServiceParams;
 use metaconfig_types::UnodeVersion;
+#[cfg(fbcode_build)]
+use mononoke_configs::MononokeConfigs;
 use mononoke_types::DerivableType;
 use mononoke_types::RepositoryId;
 use mutable_blobstore::ArcMutableRepoBlobstore;
@@ -312,6 +324,7 @@ impl TestRepoFactory {
         metadata_con.execute_batch(SqlBookmarksBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiGitMappingBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiGlobalrevMappingBuilder::CREATION_QUERY)?;
+        metadata_con.execute_batch(SqlBonsaiP4MappingBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiSvnrevMappingBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiTagMappingBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiHgMappingBuilder::CREATION_QUERY)?;
@@ -557,6 +570,15 @@ impl TestRepoFactory {
         Ok(Arc::new(
             SqlBonsaiGlobalrevMappingBuilder::from_sql_connections(self.metadata_db.clone())
                 .build(RendezVousOptions::for_test(), repo_identity.id()),
+        ))
+    }
+
+    /// Construct Bonsai P4 Mapping using the in-memory metadata
+    /// database.
+    pub fn bonsai_p4_mapping(&self, repo_identity: &ArcRepoIdentity) -> Result<ArcBonsaiP4Mapping> {
+        Ok(Arc::new(
+            SqlBonsaiP4MappingBuilder::from_sql_connections(self.metadata_db.clone())
+                .build(repo_identity.id()),
         ))
     }
 
@@ -1014,8 +1036,20 @@ impl TestRepoFactory {
     ) -> Result<ArcRepoEventPublisher> {
         #[cfg(fbcode_build)]
         {
-            let event_publisher =
-                ScribeRepoEventPublisher::new(self.fb, repo_config.metadata_cache_config.as_ref())?;
+            let configs = Arc::new(MononokeConfigs::new_static(
+                RepoConfigs::new(
+                    HashMap::from([(self.name.clone(), repo_config.as_ref().clone())]),
+                    CommonConfig::default(),
+                ),
+                StorageConfigs {
+                    storage: HashMap::new(),
+                },
+            ));
+            let event_publisher = ScribeRepoEventPublisher::new(
+                self.fb,
+                configs,
+                repo_config.metadata_cache_config.as_ref(),
+            )?;
             Ok(Arc::new(event_publisher))
         }
         #[cfg(not(fbcode_build))]

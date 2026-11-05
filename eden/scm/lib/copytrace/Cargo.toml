@@ -8,6 +8,7 @@ edition = "2024"
 homepage = "https://sapling-scm.com/"
 repository = "https://github.com/facebook/sapling"
 license = "MIT"
+exclude = ["BUCK"]
 
 [lib]
 name = "copytrace"
@@ -15,12 +16,12 @@ name = "copytrace"
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
-bytecount = "0.6.9"
 lru-cache = "0.1.2"
-parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard", "serde"] }
 sapling-async-runtime = { version = "0.1.0", path = "../async-runtime" }
-sapling-configmodel = { version = "0.1.0", path = "../config/model" }
-sapling-dag = { version = "0.1.0", path = "../dag" }
+sapling-bytescan = { version = "0.1.0", path = "../util/bytescan" }
+sapling-configmodel = { version = "0.2.0", path = "../config/model" }
+sapling-dag = { version = "0.2.0", path = "../dag" }
 sapling-hg-metrics = { version = "0.1.0", path = "../hg-metrics" }
 sapling-manifest = { version = "0.1.0", path = "../manifest", features = ["for-tests"] }
 sapling-manifest-tree = { version = "0.1.0", path = "../manifest-tree" }
@@ -35,5 +36,5 @@ tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
 sapling-manifest-tree = { version = "0.1.0", path = "../manifest-tree", features = ["for-tests"] }
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tracing-test = { version = "0.2.6", features = ["no-env-filter"] }

@@ -8,6 +8,7 @@
 mod enqueue;
 mod inspect;
 mod nuke;
+mod repair;
 mod summary;
 mod unsafe_evict;
 
@@ -15,17 +16,22 @@ use anyhow::Result;
 use bonsai_git_mapping::BonsaiGitMapping;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
+use bonsai_p4_mapping::BonsaiP4Mapping;
 use bonsai_svnrev_mapping::BonsaiSvnrevMapping;
 use bookmarks::Bookmarks;
 use clap::Parser;
 use clap::Subcommand;
+use commit_graph::CommitGraph;
 use enqueue::EnqueueArgs;
+use ephemeral_blobstore::RepoEphemeralStore;
 use inspect::InspectArgs;
 use metaconfig_types::RepoConfig;
 use metaconfig_types::RepoConfigRef;
 use mononoke_app::MononokeApp;
 use mononoke_app::args::RepoArgs;
 use nuke::NukeArgs;
+use repair::RepairArgs;
+use repo_blobstore::RepoBlobstore;
 use repo_derivation_queues::RepoDerivationQueues;
 use repo_identity::RepoIdentity;
 use summary::SummaryArgs;
@@ -57,10 +63,21 @@ pub enum DerivationQueueSubcommand {
     Inspect(InspectArgs),
     /// Delete every item in the derivation queue for this (repo, config). WARNING: nukes the entire queue. Pause the derivation service first.
     UnsafeNuke(NukeArgs),
+    /// Derive and remove isolated stranded items (dry run unless --apply).
+    Repair(RepairArgs),
 }
 
 #[facet::container]
 pub struct Repo {
+    #[facet]
+    commit_graph: CommitGraph,
+
+    #[facet]
+    repo_blobstore: RepoBlobstore,
+
+    #[facet]
+    repo_ephemeral_store: RepoEphemeralStore,
+
     #[facet]
     repo_derivation_queues: RepoDerivationQueues,
 
@@ -81,6 +98,9 @@ pub struct Repo {
 
     #[facet]
     bonsai_svnrev_mapping: dyn BonsaiSvnrevMapping,
+
+    #[facet]
+    bonsai_p4_mapping: dyn BonsaiP4Mapping,
 
     #[facet]
     bookmarks: dyn Bookmarks,
@@ -110,6 +130,9 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
         }
         DerivationQueueSubcommand::UnsafeNuke(args) => {
             nuke::nuke(&ctx, &repo, config_name, args).await
+        }
+        DerivationQueueSubcommand::Repair(args) => {
+            repair::repair(&ctx, &repo, config_name, args).await
         }
     }
 }

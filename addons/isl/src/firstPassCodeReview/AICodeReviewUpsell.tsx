@@ -10,16 +10,15 @@ import {Button} from 'isl-components/Button';
 import {ButtonDropdown} from 'isl-components/ButtonDropdown';
 import {Icon} from 'isl-components/Icon';
 import {Tooltip} from 'isl-components/Tooltip';
-import {useAtom, useAtomValue, useSetAtom} from 'jotai';
+import {useAtomValue, useSetAtom} from 'jotai';
 import clientToServerAPI from '../ClientToServerAPI';
 import {latestHeadCommit} from '../serverAPIState';
 import type {CodeReviewScope} from '../types';
-import {codeReviewStatusAtom, lastSelectedReviewOptionIdAtom} from './firstPassCodeReviewAtoms';
+import {lastSelectedReviewOptionIdAtom} from './firstPassCodeReviewAtoms';
 
 import type {JSX} from 'react';
 import {useCallback, useEffect, useState} from 'react';
 import {tracker} from '../analytics';
-import {useFeatureFlagSync} from '../featureFlags';
 import {Internal} from '../Internal';
 import platform from '../platform';
 import './AICodeReviewUpsell.css';
@@ -31,24 +30,13 @@ export function AICodeReviewUpsell({
   isCommitMode: boolean;
   hasUncommittedChanges: boolean;
 }): JSX.Element | null {
-  const [status, setStatus] = useAtom(codeReviewStatusAtom);
   const headCommit = useAtomValue(latestHeadCommit);
   const [hidden, setHidden] = useState(false);
-  const aiFirstPassCodeReviewEnabled = useFeatureFlagSync(
-    Internal.featureFlags?.AIFirstPassCodeReview,
-  );
 
-  const allReviewOptions: Array<{label: string; id: string; featureFlag?: string}> =
-    Internal.aiCodeReview?.reviewOptions ?? [];
-  const flagResults = allReviewOptions.map(opt =>
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    useFeatureFlagSync(
-      opt.featureFlag
-        ? Internal.featureFlags?.[opt.featureFlag as keyof typeof Internal.featureFlags]
-        : undefined,
-    ),
-  );
-  const reviewOptions = allReviewOptions.filter((opt, i) => !opt.featureFlag || flagResults[i]);
+  const reviewOptions: Array<{
+    label: string;
+    id: string;
+  }> = Internal.aiCodeReview?.reviewOptions ?? [];
 
   const reviewScope: CodeReviewScope = isCommitMode
     ? 'uncommitted changes'
@@ -58,7 +46,6 @@ export function AICodeReviewUpsell({
 
   const startReview = useCallback(
     (agentBackend: string) => {
-      setStatus('running');
       setHidden(true);
       clientToServerAPI.postMessage({
         type: 'platform/runAICodeReviewChat',
@@ -70,7 +57,7 @@ export function AICodeReviewUpsell({
         extras: {agentBackend},
       });
     },
-    [setStatus, reviewScope],
+    [reviewScope],
   );
 
   const lastSelectedId = useAtomValue(lastSelectedReviewOptionIdAtom);
@@ -92,14 +79,9 @@ export function AICodeReviewUpsell({
 
   const bannerText = 'Get AI feedback before submitting';
 
-  const isReviewInProgress = aiFirstPassCodeReviewEnabled && status === 'running';
   const noUncommittedChanges = isCommitMode && !hasUncommittedChanges;
-  const shouldDisableButton = isReviewInProgress || noUncommittedChanges;
-  const disabledReason = isReviewInProgress
-    ? 'Review already in progress'
-    : noUncommittedChanges
-      ? 'No uncommitted changes'
-      : null;
+  const shouldDisableButton = noUncommittedChanges;
+  const disabledReason = noUncommittedChanges ? 'No uncommitted changes' : null;
 
   const reviewButton =
     reviewOptions.length === 1 ? (

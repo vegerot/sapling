@@ -14,7 +14,7 @@
 #include <folly/Synchronized.h>
 #include <folly/coro/Task.h>
 #include <folly/coro/safe/NowTask.h>
-#include <gtest/gtest_prod.h>
+#include <folly/portability/GTestProd.h>
 #include <sys/types.h>
 #include <atomic>
 #include <memory>
@@ -32,9 +32,6 @@
 #include "eden/fs/store/sl/SaplingImportRequestQueue.h"
 #include "eden/fs/telemetry/ActivityBuffer.h"
 #include "eden/scm/lib/backingstore/src/ffi.rs.h"
-#ifdef EDEN_HAVE_OBC
-#include "monitoring/obc/OBCPxx.h"
-#endif
 
 namespace sapling {
 using NodeId = facebook::eden::Hash20;
@@ -183,8 +180,6 @@ class SaplingBackingStore final
 
   SaplingBackingStore(
       AbsolutePathPiece repository,
-      AbsolutePathPiece mount,
-      AbsolutePathPiece clientDirectory,
       CaseSensitivity caseSensitive,
       EdenStatsPtr stats,
       UnboundedQueueExecutor* serverThreadPool,
@@ -203,8 +198,6 @@ class SaplingBackingStore final
    */
   SaplingBackingStore(
       AbsolutePathPiece repository,
-      AbsolutePathPiece mount,
-      AbsolutePathPiece clientDirectory,
       CaseSensitivity caseSensitive,
       EdenStatsPtr stats,
       folly::Executor* executor,
@@ -350,36 +343,47 @@ class SaplingBackingStore final
   folly::Expected<sapling::HgCacheStats, std::string> getCacheStats() const;
 
  private:
-  FRIEND_TEST(
+  FOLLY_GTEST_FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
       cachingPolicyConstruction);
-  FRIEND_TEST(SaplingBackingStoreNoFaultInjectorTest, getTree);
-  FRIEND_TEST(SaplingBackingStoreWithFaultInjectorTest, getTree);
-  FRIEND_TEST(SaplingBackingStoreNoFaultInjectorTest, getBlob);
-  FRIEND_TEST(SaplingBackingStoreWithFaultInjectorTest, getBlob);
-  FRIEND_TEST(
+  FOLLY_GTEST_FRIEND_TEST(SaplingBackingStoreNoFaultInjectorTest, getTree);
+  FOLLY_GTEST_FRIEND_TEST(SaplingBackingStoreWithFaultInjectorTest, getTree);
+  FOLLY_GTEST_FRIEND_TEST(SaplingBackingStoreNoFaultInjectorTest, getBlob);
+  FOLLY_GTEST_FRIEND_TEST(SaplingBackingStoreWithFaultInjectorTest, getBlob);
+  FOLLY_GTEST_FRIEND_TEST(
+      SaplingBackingStoreNoFaultInjectorTest,
+      dropAllPendingRequestsWithAuxRequestsQueued);
+  FOLLY_GTEST_FRIEND_TEST(
+      SaplingBackingStoreNoFaultInjectorTest,
+      dropAllPendingRequestsThenRefetchAuxData);
+  FOLLY_GTEST_FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
       sameRequestsDifferentFetchCause);
-  FRIEND_TEST(
+  FOLLY_GTEST_FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
       prefetchBlobsWithDuplicates);
-  FRIEND_TEST(
+  FOLLY_GTEST_FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
       prefetchBlobsWithDuplicatesResolvesAllCallbacks);
-  FRIEND_TEST(SaplingBackingStoreWithFaultInjectorTest, getTreeBatch);
-  FRIEND_TEST(
+  FOLLY_GTEST_FRIEND_TEST(
+      SaplingBackingStoreWithFaultInjectorTest,
+      getTreeBatch);
+  FOLLY_GTEST_FRIEND_TEST(
       SaplingBackingStoreWithFaultInjectorIgnoreConfigTest,
       getTreeBatch);
-  FRIEND_TEST(
+  FOLLY_GTEST_FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
       getTreeBatchConvertsPermissionDeniedToRestrictedTree);
-  FRIEND_TEST(
+  FOLLY_GTEST_FRIEND_TEST(
       SaplingBackingStoreWithFaultInjectorTest,
       getTreeEnqueueFutureChainCanBePausedAndResumed);
-  FRIEND_TEST(
+  FOLLY_GTEST_FRIEND_TEST(
       SaplingBackingStoreWithFaultInjectorTest,
       coGetTreeEnqueueCoroutineKeepsObjectAlive);
-  FRIEND_TEST(
+  FOLLY_GTEST_FRIEND_TEST(
+      SaplingBackingStoreWithFaultInjectorTest,
+      blobFetchCheckpointsAreReachable);
+  FOLLY_GTEST_FRIEND_TEST(
       SaplingBackingStoreWithFaultInjectorTest,
       coGetRootTreeFaultInjection);
   friend class EdenServiceHandler;
@@ -636,9 +640,13 @@ class SaplingBackingStore final
       ObjectIdRange ids,
       const ObjectFetchContextPtr& context) override;
 
-  void workingCopyParentHint(const RootId& parent) override {
-    sapling_backingstore_set_parent_hint(*store_.get(), parent.value());
-  }
+  /**
+   * A detector backed by the Rust walk detector for `mountPath`. It follows
+   * `backingstore.walk-mode` and the other walk settings as the store reloads
+   * them, so it exists even while the mode is off.
+   */
+  std::shared_ptr<WalkDetector> createWalkDetector(
+      AbsolutePathPiece mountPath) override;
 
   void processBlobImportRequests(
       std::vector<std::shared_ptr<SaplingImportRequest>>&& requests);
@@ -766,16 +774,6 @@ class SaplingBackingStore final
   folly::Synchronized<std::unordered_set<std::string>> fetchedFilePaths_;
 
   EdenStatsPtr stats_;
-
-#ifdef EDEN_HAVE_OBC
-  // This is used to avoid reading config in hot path of get request
-  bool isOBCEnabled_ = false;
-  // TODO: this is a prototype to test OBC API on eden
-  // we should move these to a separate class
-  monitoring::OBCP99P95P50 getBlobPerRepoLatencies_; // calculates p50, p95, p99
-  monitoring::OBCP99P95P50 getTreePerRepoLatencies_; // calculates p50, p95, p99
-  void initializeOBCCounters();
-#endif
 
   bool dogfoodingHost();
 

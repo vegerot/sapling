@@ -745,6 +745,58 @@ async fn test_enforcement_condition_set_request_flag_and_restriction_acl(
     Ok(())
 }
 
+// What it tests: `require_client_request_flag` satisfied by either
+// partial-responses request header.
+// Expected: unauthorized access is enforced when the client sent the opt-in
+// or the opt-out header, since either declares the client handles
+// enforcement; allowed when neither was sent.
+#[mononoke::fbinit_test]
+async fn test_enforcement_condition_set_partial_responses_headers(fb: FacebookInit) -> Result<()> {
+    let restricted_acl = MononokeIdentity::from_str("REPO_REGION:restricted_acl")?;
+    let restricted_paths = vec![(NonRootMPath::new("restricted/dir")?, restricted_acl.clone())];
+    let condition_set = || {
+        EnforcementConditionSetBuilder::new()
+            .with_require_client_request_flag(true)
+            .with_restriction_acls([restricted_acl.clone()])
+            .build()
+    };
+
+    let was_denied_without_flag = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(restricted_paths.clone())
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[condition_set()],
+        )
+        .await?;
+    let was_denied_with_opt_in = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(restricted_paths.clone())
+        .with_partial_responses_opt_in(true)
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[condition_set()],
+        )
+        .await?;
+    let was_denied_with_opt_out = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(restricted_paths)
+        .with_partial_responses_opt_out(true)
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[condition_set()],
+        )
+        .await?;
+
+    assert!(!was_denied_without_flag);
+    assert!(was_denied_with_opt_in);
+    assert!(was_denied_with_opt_out);
+    Ok(())
+}
+
 // What it tests: condition set whose `machine_tiers` list contains the caller's
 // MACHINE_TIER identity value.
 // Expected: filter matches, so unauthorized access is enforced.
@@ -1232,31 +1284,53 @@ async fn test_both_mode_acl_manifest_deny_overrides_config_allow(fb: FacebookIni
     Ok(())
 }
 
-// What it tests: Both mode should deny when config denies even if AclManifest
-// allows the same path.
-// Expected: Both mode denies because one authoritative source denies.
+/// What it tests: Combined metadata checking and Both-mode request enforcement
+/// evaluate conflicting ACLs for the same restriction root differently.
+/// Expected: metadata authorizes from the AclManifest ACL while enforcement
+/// denies on the config ACL, characterizing the inconsistency fixed later.
 #[mononoke::fbinit_test]
-async fn test_both_mode_config_deny_overrides_acl_manifest_allow(fb: FacebookInit) -> Result<()> {
+async fn test_both_mode_combined_check_and_enforcement_disagree_for_conflicting_acls(
+    fb: FacebookInit,
+) -> Result<()> {
     let denied_acl = MononokeIdentity::from_str("REPO_REGION:restricted_acl")?;
     let allowed_acl = MononokeIdentity::from_str("REPO_REGION:myusername_project")?;
     let restricted_root = NonRootMPath::new("restricted/dir")?;
+    let restricted_path = NonRootMPath::new("restricted/dir/file")?;
+    let enforcement_condition_sets = [EnforcementConditionSetBuilder::new()
+        .with_always_enabled(true)
+        .build()];
 
-    let result = RestrictedPathsTestDataBuilder::new()
+    let test_data = RestrictedPathsTestDataBuilder::new()
         .with_acl_manifest_mode(AclManifestMode::Both)
         .with_config_restricted_paths(vec![(restricted_root.clone(), denied_acl.clone())])
-        .with_acl_manifest_restricted_paths(vec![(restricted_root, allowed_acl)])
+        .with_acl_manifest_restricted_paths(vec![(restricted_root, allowed_acl.clone())])
         .with_file_path_changes(vec![("restricted/dir/file", None)])
         .build(fb)
-        .await?
-        .observe_path_enforcement_after_commit(
-            NonRootMPath::new("restricted/dir/file")?,
-            &[EnforcementConditionSetBuilder::new()
-                .with_restriction_acls([denied_acl])
-                .build()],
-        )
         .await?;
 
-    assert!(result);
+    let (combined_checks, was_denied) = test_data
+        .observe_path_check_and_enforcement_after_commit(
+            restricted_path,
+            &enforcement_condition_sets,
+        )
+        .await?;
+    assert_eq!(combined_checks.len(), 1, "{combined_checks:#?}");
+    assert_eq!(
+        combined_checks[0].restriction_info().repo_region_acl,
+        allowed_acl.to_string(),
+        "the combined check should use the AclManifest ACL"
+    );
+    // TODO(T291525172): Invert this assertion when Both-mode reconciliation is
+    // wired into combined metadata checking.
+    assert!(
+        combined_checks[0].has_authorization(),
+        "the current combined metadata check uses only the AclManifest ACL: {combined_checks:#?}"
+    );
+
+    assert!(
+        was_denied,
+        "Both-mode request enforcement should deny on the config ACL"
+    );
     Ok(())
 }
 

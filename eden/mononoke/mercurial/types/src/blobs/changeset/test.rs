@@ -23,7 +23,11 @@ use crate::HgBlob;
 use crate::HgBlobNode;
 use crate::HgManifestId;
 use crate::HgNodeHash;
+use crate::HgParents;
+use crate::NULL_HASH;
 use crate::NonRootMPath;
+use crate::blobs::ChangesetMetadata;
+use crate::blobs::HgChangesetContent;
 
 const CHANGESET: &[u8] = include_bytes!("cset.bin");
 const CHANGESET_NOEXTRA: &[u8] = include_bytes!("cset_noextra.bin");
@@ -158,4 +162,53 @@ fn extras_roundtrip() {
     QuickCheck::new()
         .tests(50) // more takes too much time
         .quickcheck(extras_roundtrip_prop as fn(BTreeMap<Vec<u8>, Vec<u8>>) -> TestResult);
+}
+
+fn changeset_with_files(files: Vec<NonRootMPath>) -> RevlogChangeset {
+    RevlogChangeset::new_from_parts(
+        HgParents::None,
+        HgManifestId::new(NULL_HASH),
+        Bytes::from_static(b"user"),
+        DateTime::from_timestamp(0, 0).unwrap(),
+        BTreeMap::new(),
+        files,
+        Bytes::from_static(b"msg"),
+    )
+}
+
+fn changeset_content_with_files(files: Vec<NonRootMPath>) -> HgChangesetContent {
+    HgChangesetContent::new_from_parts(
+        HgParents::None,
+        HgManifestId::new(NULL_HASH),
+        ChangesetMetadata {
+            user: "user".to_string(),
+            time: DateTime::from_timestamp(0, 0).unwrap(),
+            extra: BTreeMap::new(),
+            message: "msg".to_string(),
+        },
+        files,
+    )
+}
+
+#[mononoke::test]
+fn generate_writes_non_utf8_path_bytes_verbatim() {
+    let path = NonRootMPath::new(b"caf\xe9").unwrap();
+    let cs = changeset_with_files(vec![path.clone()]);
+
+    let mut text = Vec::new();
+    cs.generate(&mut text).expect("generate");
+
+    // Mercurial's changelog text: "\n".join([hex(manifest), user, date] + files + ["", desc]),
+    // with file names written as raw bytes.
+    let hg_text: &[u8] = b"0000000000000000000000000000000000000000\nuser\n0 0\ncaf\xe9\n\nmsg";
+    assert_eq!(text, hg_text);
+
+    let hg_id = HgBlobNode::new(Bytes::from_static(hg_text), None, None).nodeid();
+    assert_eq!(cs.get_node().unwrap().nodeid(), hg_id);
+
+    let parsed = RevlogChangeset::parse(HgBlob::new(Bytes::from(text)), None, None).expect("parse");
+    assert_eq!(parsed.files(), &[path.clone()][..]);
+
+    let content = changeset_content_with_files(vec![path]);
+    assert_eq!(content.compute_hash().unwrap().into_nodehash(), hg_id);
 }

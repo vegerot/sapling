@@ -16,6 +16,9 @@ use chrono::Duration as ChronoDuration;
 use context::CoreContext;
 use context::PerfCounterType;
 use derivative::Derivative;
+use futures::Stream;
+use futures::StreamExt;
+use futures::stream;
 use futures_lazy_shared::LazyShared;
 use metaconfig_types::BubbleDeletionMode;
 use mononoke_types::ChangesetId;
@@ -30,6 +33,8 @@ use crate::bubble::Bubble;
 use crate::bubble::BubbleId;
 use crate::bubble::ExpiryStatus;
 use crate::error::EphemeralBlobstoreError;
+use crate::unlink::UnlinkPolicy;
+use crate::unlink::Unlinker;
 
 /// Outcome of extending a bubble's TTL
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +43,12 @@ pub enum ExtendBubbleTtlOutcome {
     Extended(Timestamp),
     /// The bubble's TTL was not changed, current expiration timestamp
     NotChanged(Timestamp),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeleteBubbleOutcome {
+    pub keys_deleted: usize,
+    pub keys_already_deleted: usize,
 }
 
 /// Ephemeral Store.
@@ -469,8 +480,14 @@ impl RepoEphemeralStoreInner {
     }
 
     /// Method responsible for deleting the bubble and all the data contained within.
-    /// Returns the number of blobs deleted from the bubble.
-    async fn delete_bubble(&self, ctx: &CoreContext, bubble_id: BubbleId) -> Result<usize> {
+    /// Returns the number of blobs deleted from the bubble and the number of blobs
+    /// that were already deleted.
+    async fn delete_bubble(
+        &self,
+        ctx: &CoreContext,
+        bubble_id: BubbleId,
+        unlinker: &Unlinker,
+    ) -> Result<DeleteBubbleOutcome> {
         // Step 0: Validate if bubble deletion is enabled.
         if let BubbleDeletionMode::Disabled = self.bubble_deletion_mode {
             return Err(EphemeralBlobstoreError::DeleteBubbleDisabled.into());
@@ -487,11 +504,11 @@ impl RepoEphemeralStoreInner {
         .await?;
         // If only marking is required, exit now.
         if let BubbleDeletionMode::MarkOnly = self.bubble_deletion_mode {
-            return Ok(0); // Since 0 blob items were unlinked/removed.
+            return Ok(DeleteBubbleOutcome::default()); // Since 0 blob items were unlinked/removed.
         }
         // Step 2: Delete the blob content within the expired bubble.
         let bubble = self.open_bubble_raw(ctx, bubble_id, false).await?;
-        let count = bubble.delete_blobs_in_bubble(ctx).await?;
+        let outcome = bubble.delete_blobs_in_bubble(ctx, unlinker).await?;
 
         // Step 3: Delete the metadata associated with the bubble from
         // the backing SQL store.
@@ -531,7 +548,7 @@ impl RepoEphemeralStoreInner {
             &bubble_id,
         )
         .await?;
-        Ok(count)
+        Ok(outcome)
     }
 
     async fn open_bubble_raw(
@@ -759,11 +776,56 @@ impl RepoEphemeralStore {
     }
 
     /// Method responsible for deleting the bubble and all the data contained within.
-    /// Returns the number of blobs deleted from the bubble.
+    /// Returns the number of blobs deleted from the bubble and the number of blobs
+    /// that were already deleted.
     /// NOTE: Deletes the bubble regardless of its expiry status. Make sure the bubble
     /// is suitable for deletion.
-    pub async fn delete_bubble(&self, ctx: &CoreContext, bubble_id: BubbleId) -> Result<usize> {
-        self.inner()?.delete_bubble(ctx, bubble_id).await
+    pub async fn delete_bubble(
+        &self,
+        ctx: &CoreContext,
+        bubble_id: BubbleId,
+    ) -> Result<DeleteBubbleOutcome> {
+        let unlinker = Unlinker::new(UnlinkPolicy::default());
+        self.delete_bubble_with_unlinker(ctx, bubble_id, &unlinker)
+            .await
+    }
+
+    async fn delete_bubble_with_unlinker(
+        &self,
+        ctx: &CoreContext,
+        bubble_id: BubbleId,
+        unlinker: &Unlinker,
+    ) -> Result<DeleteBubbleOutcome> {
+        self.inner()?.delete_bubble(ctx, bubble_id, unlinker).await
+    }
+
+    /// Deletes the given bubbles, running up to `concurrency` deletions at a time,
+    /// and yields each bubble's outcome as soon as its deletion finishes.
+    /// NOTE: Deletes the bubbles regardless of their expiry status. Make sure the
+    /// bubbles are suitable for deletion.
+    pub fn delete_bubbles(
+        &self,
+        ctx: &CoreContext,
+        bubble_ids: Vec<BubbleId>,
+        concurrency: usize,
+        unlink_policy: UnlinkPolicy,
+    ) -> impl Stream<Item = (BubbleId, Result<DeleteBubbleOutcome>)> + Send + 'static {
+        let store = self.clone();
+        let ctx = ctx.clone();
+        let unlinker = Arc::new(Unlinker::new(unlink_policy));
+        stream::iter(bubble_ids)
+            .map(move |bubble_id| {
+                let store = store.clone();
+                let ctx = ctx.clone();
+                let unlinker = unlinker.clone();
+                async move {
+                    let outcome = store
+                        .delete_bubble_with_unlinker(&ctx, bubble_id, &unlinker)
+                        .await;
+                    (bubble_id, outcome)
+                }
+            })
+            .buffer_unordered(concurrency)
     }
 
     /// Gets the vector of bubbles that are past their expiry period
@@ -880,12 +942,26 @@ impl RepoEphemeralStore {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
+    use std::fmt;
+    use std::num::NonZeroU32;
+    use std::num::NonZeroUsize;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
     use anyhow::anyhow;
+    use async_trait::async_trait;
+    use blobstore::Blobstore;
     use blobstore::BlobstoreBytes;
     use blobstore::BlobstoreEnumerableWithUnlink;
+    use blobstore::BlobstoreEnumerationData;
+    use blobstore::BlobstoreGetData;
     use blobstore::BlobstoreIsPresent;
     use blobstore::BlobstoreKeyParam;
+    use blobstore::BlobstoreKeySource;
     use blobstore::KeyedBlobstore;
+    use blobstore::OverwriteStatus;
+    use blobstore::PutBehaviour;
     use context::CoreContext;
     use fbinit::FacebookInit;
     use maplit::hashset;
@@ -901,6 +977,7 @@ mod test {
 
     use super::*;
     use crate::builder::RepoEphemeralStoreBuilder;
+    use crate::unlink::UnlinkRetry;
 
     fn bootstrap(
         fb: FacebookInit,
@@ -1445,7 +1522,7 @@ mod test {
         // Delete the bubble
         let deleted = eph.delete_bubble(&ctx, bubble1.bubble_id()).await?;
         // Should be 0 since deletion mode is MarkOnly
-        assert_eq!(deleted, 0);
+        assert_eq!(deleted.keys_deleted, 0);
         // Even though the bubble hasn't been deleted from the backing physical store
         // it should appear as deleted to the user and hence not be accessible.
         let res = eph.open_bubble(&ctx, bubble1.bubble_id()).await;
@@ -1472,7 +1549,7 @@ mod test {
         // Delete the bubble
         let deleted = eph.delete_bubble(&ctx, bubble1.bubble_id()).await?;
         // Should be 0 since the bubble was empty
-        assert_eq!(deleted, 0);
+        assert_eq!(deleted.keys_deleted, 0);
         Ok(())
     }
 
@@ -1487,7 +1564,7 @@ mod test {
         // Delete the bubble
         let deleted = eph.delete_bubble(&ctx, bubble1.bubble_id()).await?;
         // Should be 0 since the bubble was empty
-        assert_eq!(deleted, 0);
+        assert_eq!(deleted.keys_deleted, 0);
         Ok(())
     }
 
@@ -1539,7 +1616,67 @@ mod test {
         // Delete the bubble
         let deleted = eph.delete_bubble(&ctx, bubble1.bubble_id()).await?;
         // Should be 4 based on the input data added
-        assert_eq!(deleted, 4);
+        assert_eq!(deleted.keys_deleted, 4);
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn delete_bubbles_test(fb: FacebookInit) -> Result<()> {
+        let initial = Duration::from_hours(30 * 24);
+        let grace = Duration::from_hours(6);
+        let (ctx, blobstore, repo_blobstore, eph) =
+            bootstrap(fb, initial, grace, BubbleDeletionMode::MarkAndDelete)?;
+        let empty_bubble = eph.create_bubble(&ctx, None, vec![]).await?;
+        let nonempty_bubble = eph.create_bubble(&ctx, None, vec![]).await?;
+        let nonempty_repo = nonempty_bubble.wrap_repo_blobstore(repo_blobstore);
+        for key in ["test_key_1", "test_key_2"] {
+            nonempty_repo
+                .put(
+                    &ctx,
+                    key.to_string(),
+                    BlobstoreBytes::from_bytes("test data"),
+                )
+                .await?;
+        }
+        let missing_bubble = BubbleId::new(std::num::NonZeroU64::new(99999).unwrap());
+
+        let mut results = eph
+            .delete_bubbles(
+                &ctx,
+                vec![
+                    empty_bubble.bubble_id(),
+                    nonempty_bubble.bubble_id(),
+                    missing_bubble,
+                ],
+                2,
+                UnlinkPolicy::default(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        results.sort_by_key(|(bubble_id, _)| *bubble_id);
+
+        let [(_, empty), (_, nonempty), (_, missing)] = results.as_slice() else {
+            panic!(
+                "Every requested bubble should be reported, got {} results",
+                results.len()
+            );
+        };
+        assert!(
+            matches!(empty, Ok(outcome) if outcome.keys_deleted == 0),
+            "The empty bubble should be deleted without deleting any keys"
+        );
+        assert!(
+            matches!(nonempty, Ok(outcome) if outcome.keys_deleted == 2),
+            "Both keys of the non-empty bubble should be deleted"
+        );
+        assert!(
+            missing.is_err(),
+            "Deleting an unknown bubble should fail without affecting the others"
+        );
+        let enumerated = blobstore
+            .enumerate(&ctx, &BlobstoreKeyParam::from(..))
+            .await?;
+        assert!(enumerated.keys.is_empty(), "No bubble data should remain");
         Ok(())
     }
 
@@ -2224,6 +2361,365 @@ mod test {
             }
         }
 
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    enum UnlinkFault {
+        KeyVanishesAfterListing,
+        UnlinkFails,
+        UnlinkFailsOnce,
+    }
+
+    #[derive(Debug)]
+    struct FaultyBlobstore {
+        inner: Arc<dyn BlobstoreEnumerableWithUnlink>,
+        fault: UnlinkFault,
+        unlink_attempts: Mutex<HashMap<String, usize>>,
+    }
+
+    impl FaultyBlobstore {
+        fn record_unlink_attempt(&self, key: &str) -> usize {
+            let mut unlink_attempts = self.unlink_attempts.lock().expect("lock poisoned");
+            let attempts = unlink_attempts.entry(key.to_string()).or_default();
+            *attempts += 1;
+            *attempts
+        }
+
+        fn max_unlink_attempts(&self) -> Option<usize> {
+            self.unlink_attempts
+                .lock()
+                .expect("lock poisoned")
+                .values()
+                .copied()
+                .max()
+        }
+    }
+
+    impl fmt::Display for FaultyBlobstore {
+        fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+            write!(fmt, "FaultyBlobstore<{}>", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl Blobstore for FaultyBlobstore {
+        async fn get<'a>(
+            &'a self,
+            ctx: &'a CoreContext,
+            key: &'a str,
+        ) -> Result<Option<BlobstoreGetData>> {
+            self.inner.get(ctx, key).await
+        }
+
+        async fn put_explicit<'a>(
+            &'a self,
+            ctx: &'a CoreContext,
+            key: String,
+            value: BlobstoreBytes,
+            put_behaviour: PutBehaviour,
+        ) -> Result<OverwriteStatus> {
+            self.inner
+                .put_explicit(ctx, key, value, put_behaviour)
+                .await
+        }
+
+        async fn put_with_status<'a>(
+            &'a self,
+            ctx: &'a CoreContext,
+            key: String,
+            value: BlobstoreBytes,
+        ) -> Result<OverwriteStatus> {
+            self.inner.put_with_status(ctx, key, value).await
+        }
+
+        async fn unlink<'a>(&'a self, ctx: &'a CoreContext, key: &'a str) -> Result<()> {
+            let attempt = self.record_unlink_attempt(key);
+            match self.fault {
+                UnlinkFault::KeyVanishesAfterListing => self.inner.unlink(ctx, key).await,
+                UnlinkFault::UnlinkFails => Err(anyhow!("Injected unlink failure for {key}")),
+                UnlinkFault::UnlinkFailsOnce if attempt == 1 => {
+                    Err(anyhow!("Injected first unlink failure for {key}"))
+                }
+                UnlinkFault::UnlinkFailsOnce => self.inner.unlink(ctx, key).await,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl BlobstoreKeySource for FaultyBlobstore {
+        async fn enumerate<'a>(
+            &'a self,
+            ctx: &'a CoreContext,
+            range: &'a BlobstoreKeyParam,
+        ) -> Result<BlobstoreEnumerationData> {
+            let enumeration = self.inner.enumerate(ctx, range).await?;
+            if let UnlinkFault::KeyVanishesAfterListing = self.fault
+                && let Some(key) = enumeration.keys.iter().next()
+            {
+                self.inner.unlink(ctx, key).await?;
+            }
+            Ok(enumeration)
+        }
+    }
+
+    async fn bubble_with_keys_in_faulty_store(
+        fb: FacebookInit,
+        fault: UnlinkFault,
+    ) -> Result<(
+        CoreContext,
+        Arc<dyn BlobstoreEnumerableWithUnlink>,
+        RepoEphemeralStore,
+        BubbleId,
+        Arc<FaultyBlobstore>,
+    )> {
+        let initial = Duration::from_hours(30 * 24);
+        let grace = Duration::from_hours(6);
+        let (ctx, blobstore, repo_blobstore, _) =
+            bootstrap(fb, initial, grace, BubbleDeletionMode::MarkAndDelete)?;
+        let faulty = Arc::new(FaultyBlobstore {
+            inner: blobstore.clone(),
+            fault,
+            unlink_attempts: Mutex::new(HashMap::new()),
+        });
+        let eph = RepoEphemeralStoreBuilder::with_sqlite_in_memory()?.build(
+            REPO_ZERO,
+            faulty.clone(),
+            initial,
+            grace,
+            BubbleDeletionMode::MarkAndDelete,
+        );
+        let bubble = eph.create_bubble(&ctx, None, vec![]).await?;
+        let bubble_repo = bubble.wrap_repo_blobstore(repo_blobstore);
+        for i in 1..=3 {
+            bubble_repo
+                .put(
+                    &ctx,
+                    format!("test_key_{i}"),
+                    BlobstoreBytes::from_bytes(format!("test data {i}")),
+                )
+                .await?;
+        }
+        Ok((ctx, blobstore, eph, bubble.bubble_id(), faulty))
+    }
+
+    #[mononoke::fbinit_test]
+    async fn delete_bubble_with_key_vanished_after_listing_test(fb: FacebookInit) -> Result<()> {
+        let (ctx, blobstore, eph, bubble_id, _) =
+            bubble_with_keys_in_faulty_store(fb, UnlinkFault::KeyVanishesAfterListing).await?;
+
+        let deleted = eph.delete_bubble(&ctx, bubble_id).await?;
+
+        assert_eq!(
+            deleted,
+            DeleteBubbleOutcome {
+                keys_deleted: 2,
+                keys_already_deleted: 1,
+            },
+            "The key that vanished after listing should be counted as already deleted"
+        );
+        let enumerated = blobstore
+            .enumerate(&ctx, &BlobstoreKeyParam::from(..))
+            .await?;
+        assert!(
+            enumerated.keys.is_empty(),
+            "No keys should remain after deleting the bubble"
+        );
+        let err = eph
+            .open_bubble(&ctx, bubble_id)
+            .await
+            .expect_err("Bubble should no longer exist after deletion");
+        assert!(
+            matches!(
+                err.downcast_ref::<EphemeralBlobstoreError>(),
+                Some(EphemeralBlobstoreError::NoSuchBubble(_))
+            ),
+            "Reopening a deleted bubble should fail with NoSuchBubble"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn delete_bubble_with_failing_unlink_test(fb: FacebookInit) -> Result<()> {
+        let (ctx, blobstore, eph, bubble_id, faulty) =
+            bubble_with_keys_in_faulty_store(fb, UnlinkFault::UnlinkFails).await?;
+
+        let result = eph.delete_bubble(&ctx, bubble_id).await;
+
+        assert!(
+            result.is_err(),
+            "Unlink failures for keys that are still present should fail the deletion"
+        );
+        assert_eq!(
+            faulty.max_unlink_attempts(),
+            Some(1),
+            "Without a retry policy every key should be unlinked at most once"
+        );
+        let enumerated = blobstore
+            .enumerate(&ctx, &BlobstoreKeyParam::from(..))
+            .await?;
+        assert_eq!(
+            enumerated.keys.len(),
+            3,
+            "All keys should remain when unlinking them fails"
+        );
+        Ok(())
+    }
+
+    fn retrying_unlink_policy(max_attempts: usize) -> UnlinkPolicy {
+        UnlinkPolicy {
+            max_unlinks_per_sec: None,
+            retry: Some(UnlinkRetry {
+                max_attempts: NonZeroUsize::new(max_attempts)
+                    .expect("max_attempts should be positive"),
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+            }),
+        }
+    }
+
+    #[mononoke::fbinit_test]
+    async fn delete_bubbles_retries_failed_unlinks_test(fb: FacebookInit) -> Result<()> {
+        let (ctx, blobstore, eph, bubble_id, faulty) =
+            bubble_with_keys_in_faulty_store(fb, UnlinkFault::UnlinkFailsOnce).await?;
+
+        let results = eph
+            .delete_bubbles(&ctx, vec![bubble_id], 1, retrying_unlink_policy(3))
+            .collect::<Vec<_>>()
+            .await;
+
+        let [(_, Ok(outcome))] = results.as_slice() else {
+            panic!(
+                "The bubble should be deleted once its failed unlinks are retried, got {results:?}"
+            );
+        };
+        assert_eq!(
+            *outcome,
+            DeleteBubbleOutcome {
+                keys_deleted: 3,
+                keys_already_deleted: 0,
+            },
+            "Every key should be unlinked by its retry"
+        );
+        assert_eq!(
+            faulty.max_unlink_attempts(),
+            Some(2),
+            "Each key should succeed on its second attempt"
+        );
+        let enumerated = blobstore
+            .enumerate(&ctx, &BlobstoreKeyParam::from(..))
+            .await?;
+        assert!(
+            enumerated.keys.is_empty(),
+            "No keys should remain after the retries succeed"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn delete_bubbles_without_retry_fails_on_transient_unlink_failure_test(
+        fb: FacebookInit,
+    ) -> Result<()> {
+        let (ctx, blobstore, eph, bubble_id, faulty) =
+            bubble_with_keys_in_faulty_store(fb, UnlinkFault::UnlinkFailsOnce).await?;
+
+        let results = eph
+            .delete_bubbles(&ctx, vec![bubble_id], 1, UnlinkPolicy::default())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(
+            matches!(results.as_slice(), [(_, Err(_))]),
+            "Without a retry policy a single unlink failure should fail the deletion, got {results:?}"
+        );
+        assert_eq!(
+            faulty.max_unlink_attempts(),
+            Some(1),
+            "Without a retry policy no key should be unlinked twice"
+        );
+        let enumerated = blobstore
+            .enumerate(&ctx, &BlobstoreKeyParam::from(..))
+            .await?;
+        assert!(
+            !enumerated.keys.is_empty(),
+            "Keys whose unlink failed should remain"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn delete_bubbles_gives_up_after_max_unlink_attempts_test(
+        fb: FacebookInit,
+    ) -> Result<()> {
+        let (ctx, blobstore, eph, bubble_id, faulty) =
+            bubble_with_keys_in_faulty_store(fb, UnlinkFault::UnlinkFails).await?;
+
+        let results = eph
+            .delete_bubbles(&ctx, vec![bubble_id], 1, retrying_unlink_policy(3))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(
+            matches!(results.as_slice(), [(_, Err(_))]),
+            "The deletion should fail once a key runs out of unlink attempts, got {results:?}"
+        );
+        assert_eq!(
+            faulty.max_unlink_attempts(),
+            Some(3),
+            "No key should be unlinked more than the 3 allowed attempts"
+        );
+        let enumerated = blobstore
+            .enumerate(&ctx, &BlobstoreKeyParam::from(..))
+            .await?;
+        assert_eq!(
+            enumerated.keys.len(),
+            3,
+            "All keys should remain when every unlink attempt fails"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn delete_bubbles_respects_unlink_rate_limit_test(fb: FacebookInit) -> Result<()> {
+        let initial = Duration::from_hours(30 * 24);
+        let grace = Duration::from_hours(6);
+        let (ctx, blobstore, repo_blobstore, eph) =
+            bootstrap(fb, initial, grace, BubbleDeletionMode::MarkAndDelete)?;
+        let bubble = eph.create_bubble(&ctx, None, vec![]).await?;
+        let bubble_repo = bubble.wrap_repo_blobstore(repo_blobstore);
+        for i in 1..=6 {
+            bubble_repo
+                .put(
+                    &ctx,
+                    format!("test_key_{i}"),
+                    BlobstoreBytes::from_bytes(format!("test data {i}")),
+                )
+                .await?;
+        }
+        let policy = UnlinkPolicy {
+            max_unlinks_per_sec: NonZeroU32::new(20),
+            retry: None,
+        };
+
+        let started = Instant::now();
+        let results = eph
+            .delete_bubbles(&ctx, vec![bubble.bubble_id()], 1, policy)
+            .collect::<Vec<_>>()
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(results.as_slice(), [(_, Ok(outcome))] if outcome.keys_deleted == 6),
+            "All 6 keys should be deleted under the rate limit, got {results:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "At 20 unlinks/s with a burst of 2, the 4 unlinks after the burst need at least 200ms, took {elapsed:?}"
+        );
+        let enumerated = blobstore
+            .enumerate(&ctx, &BlobstoreKeyParam::from(..))
+            .await?;
+        assert!(enumerated.keys.is_empty(), "No bubble data should remain");
         Ok(())
     }
 }

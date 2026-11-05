@@ -32,7 +32,7 @@ from eden.fs.service.eden.thrift_types import (
     SyncBehavior,
 )
 
-from .lib import testcase
+from .lib import hgrepo, testcase
 
 
 @testcase.eden_repo_test
@@ -166,8 +166,6 @@ class DebugBlobHgTest(testcase.HgRepoTestMixin, testcase.EdenRepoTest):
             self.assertEqual(4, len(response.blobs))
             for blob in response.blobs:
                 if blob.origin == DataFetchOrigin.MEMORY_CACHE:
-                    blob.blob.error
-                elif blob.origin == DataFetchOrigin.DISK_CACHE:
                     blob.blob.error
                 elif blob.origin == DataFetchOrigin.LOCAL_BACKING_STORE:
                     self.assertEqual(b"\xff\xfe\xfd\xfc", blob.blob.blob)
@@ -372,6 +370,31 @@ class DebugTreeHgTest(testcase.HgRepoTestMixin, testcase.EdenRepoTest):
             ),
             response,
         )
+
+    async def test_debug_tree_of_empty_tree(self) -> None:
+        # A commit without files has an empty root tree. `debugGetTree` returns
+        # an empty `treeEntries` list for it and `eden debug tree` prints an
+        # empty tree.
+        repo = self.repo
+        assert isinstance(repo, hgrepo.HgRepository)
+        repo.hg("rm", "testDir/testTree/binary")
+        empty_commit = repo.commit("Remove every file.")
+        manifest = repo.hg("log", "-r", empty_commit, "-T", "{manifest}").strip()
+
+        async with self.eden.get_async_thrift_client() as client:
+            response = await client.debugGetTree(
+                DebugGetScmTreeRequest(
+                    mountId=MountId(mountPoint=self.mount.encode()),
+                    id=manifest.encode(),
+                    origins=DataFetchOrigin.ANYWHERE,
+                )
+            )
+        tree = response.trees[0].scmTreeData
+        self.assertEqual(ScmTreeOrError.Type.treeEntries, tree.type)
+        self.assertEqual([], list(tree.treeEntries))
+
+        output = self.eden.run_cmd("debug", "tree", self.mount, manifest)
+        self.assertEqual("", output)
 
     async def test_debug_tree_locations(self) -> None:
         async with self.eden.get_async_thrift_client() as client:

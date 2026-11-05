@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Display;
 use std::future::Future;
+use std::iter;
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -21,6 +22,7 @@ use blobstore::Loadable;
 use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMappingRef;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
+use bonsai_p4_mapping::BonsaiP4MappingRef;
 use bonsai_svnrev_mapping::BonsaiSvnrevMappingRef;
 use bookmarks::BookmarkKey;
 use bytes::Bytes;
@@ -74,6 +76,7 @@ use mononoke_types::ContentManifestId;
 use mononoke_types::FileChange;
 pub use mononoke_types::Generation;
 use mononoke_types::NonRootMPath;
+use mononoke_types::P4ChangelistId;
 use mononoke_types::SkeletonManifestId;
 use mononoke_types::SubtreeChange;
 use mononoke_types::Svnrev;
@@ -89,6 +92,7 @@ use repo_derived_data::RepoDerivedDataArc;
 use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
 use repo_permission_checker::RepoPermissionCheckerRef;
+use restricted_paths::DenyingRestriction;
 use restricted_paths::RestrictedPathsArc;
 use restricted_paths::check_path_restriction_infos;
 use skeleton_manifest::RootSkeletonManifestId;
@@ -109,14 +113,15 @@ use crate::changeset_path_diff::ChangesetPathDiffContext;
 use crate::errors::MononokeError;
 use crate::repo::RepoContext;
 use crate::repo::RepoWithBubble;
+use crate::restricted_paths::OmissionCollector;
 use crate::restricted_paths::PathAccessInfo;
-use crate::restricted_paths::RestrictedChangeGroup;
-use crate::restricted_paths::RestrictedPathsChangesInfo;
+use crate::restricted_paths::RestrictedPathsPolicy;
 use crate::specifiers::ChangesetId;
 use crate::specifiers::GitSha1;
 use crate::specifiers::HgChangesetId;
 
 mod find_files;
+mod restricted_paths_changes;
 
 const ENABLE_BONSAI_ONLY_LFS_DIFFS: &str = "scm/mononoke:changeset_diff_enable_bonsai_only_lfs";
 
@@ -289,6 +294,64 @@ fn to_vec1<X>(maybe_vec: Option<Vec<X>>) -> Option<Vec1<X>> {
     maybe_vec.and_then(|v| Vec1::try_from_vec(v).ok())
 }
 
+/// How a requested path resolved under partial-response semantics.
+pub enum PathVisibility<R> {
+    /// Caller is entitled: content context for the visible side.
+    Present(ChangesetPathContentContext<R>),
+    /// Restricted-path denial, carrying the denying restriction.
+    Denied(DenyingRestriction),
+}
+
+/// Classify one side of a diff pair under partial-response semantics.
+///
+/// `Strict` propagates any error. `SkipAndCollect` converts only
+/// restricted-path denials into `None` (recording them against the denying
+/// restriction); repo-auth denials and all other errors still fail. Callers
+/// map `None` to omit-or-downgrade per the per-side absent rule.
+async fn policy_side<R, F>(
+    fut: F,
+    policy: &RestrictedPathsPolicy,
+) -> Result<Option<ChangesetPathContentContext<R>>, MononokeError>
+where
+    F: Future<Output = Result<ChangesetPathContentContext<R>, MononokeError>>,
+{
+    match fut.await {
+        Ok(ctx) => Ok(Some(ctx)),
+        Err(e) => match policy {
+            RestrictedPathsPolicy::SkipAndCollect(collector)
+                if let Some(denial) = e.restricted_paths_denial() =>
+            {
+                collector.record(denial.denying_restriction());
+                Ok(None)
+            }
+            _ => Err(e),
+        },
+    }
+}
+
+/// Map a fallible stream item into an optional, recording restricted-path
+/// denials against their denying restriction and dropping those items. All
+/// other errors still fail the stream.
+fn skip_restricted_denials<S, T>(
+    stream: S,
+    collector: Arc<OmissionCollector>,
+) -> impl Stream<Item = Result<T, MononokeError>>
+where
+    S: Stream<Item = Result<T, MononokeError>>,
+{
+    stream.filter_map(move |res| match res {
+        Err(e) => {
+            if let Some(denial) = e.restricted_paths_denial() {
+                collector.record(denial.denying_restriction());
+                futures::future::ready(None)
+            } else {
+                futures::future::ready(Some(Err(e)))
+            }
+        }
+        Ok(item) => futures::future::ready(Some(Ok(item))),
+    })
+}
+
 impl<R> ChangesetContext<R> {
     /// Construct a new `MononokeChangeset`.  The changeset must exist
     /// in the repo.
@@ -409,6 +472,19 @@ impl<R: BonsaiSvnrevMappingRef> ChangesetContext<R> {
             .repo()
             .bonsai_svnrev_mapping()
             .get_svnrev_from_bonsai(self.ctx(), self.id)
+            .await?;
+        Ok(mapping)
+    }
+}
+
+impl<R: BonsaiP4MappingRef> ChangesetContext<R> {
+    /// The Perforce changelist this changeset was imported from, for mirror repos.
+    pub async fn p4_changelist_id(&self) -> Result<Option<P4ChangelistId>, MononokeError> {
+        let mapping = self
+            .repo_ctx()
+            .repo()
+            .bonsai_p4_mapping()
+            .get_p4_changelist_id_from_bonsai(self.ctx(), self.id)
             .await?;
         Ok(mapping)
     }
@@ -1037,6 +1113,20 @@ where
         )
         .await
     }
+
+    /// How a requested path resolved under partial-response semantics.
+    pub async fn check_path_visibility(
+        &self,
+        path: &MPath,
+    ) -> Result<PathVisibility<R>, MononokeError> {
+        match self.path_with_content(path.clone()).await {
+            Ok(ctx) => Ok(PathVisibility::Present(ctx)),
+            Err(e) => match e.restricted_paths_denial() {
+                Some(denial) => Ok(PathVisibility::Denied(denial.denying_restriction().clone())),
+                None => Err(e),
+            },
+        }
+    }
 }
 
 impl<R: MononokeRepo> ChangesetContext<R> {
@@ -1086,14 +1176,19 @@ impl<R: MononokeRepo> ChangesetContext<R> {
     ///
     /// This performs an efficient manifest traversal, and as such returns
     /// contexts only for **paths which exist**.
+    ///
+    /// How restricted-path denials are handled is governed by `policy`:
+    /// `Strict` fails the stream on any denial, `SkipAndCollect` skips
+    /// denied paths, recording each against its denying restriction.
     pub async fn paths_with_history<T: Iterator<Item = MPath>>(
         &self,
         paths: T,
+        policy: &RestrictedPathsPolicy,
     ) -> Result<
         impl Stream<Item = Result<ChangesetPathHistoryContext<R>, MononokeError>> + use<R, T>,
         MononokeError,
     > {
-        Ok(self
+        let stream = self
             .root_unode_manifest_id()
             .await?
             .manifest_unode_id()
@@ -1112,23 +1207,34 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                         entry,
                     )
                 }
-            }))
+            });
+        match policy {
+            RestrictedPathsPolicy::Strict => Ok(stream.left_stream()),
+            RestrictedPathsPolicy::SkipAndCollect(collector) => {
+                Ok(skip_restricted_denials(stream, collector.clone()).right_stream())
+            }
+        }
     }
 
     /// Returns a stream of path content contexts for a set of paths.
     ///
     /// This performs an efficient manifest traversal, and as such returns
     /// contexts only for **paths which exist**.
+    ///
+    /// How restricted-path denials are handled is governed by `policy`:
+    /// `Strict` fails the stream on any denial, `SkipAndCollect` skips
+    /// denied paths, recording each against its denying restriction.
     pub async fn paths_with_content<T: Iterator<Item = MPath>>(
         &self,
         paths: T,
+        policy: &RestrictedPathsPolicy,
     ) -> Result<
         impl Stream<Item = Result<ChangesetPathContentContext<R>, MononokeError>> + use<R, T>,
         MononokeError,
     > {
         let root_id = self.root_content_manifest_id().await?;
 
-        Ok(root_id
+        let stream = root_id
             .find_entries(
                 self.ctx().clone(),
                 self.repo_ctx().repo().repo_blobstore().clone(),
@@ -1148,7 +1254,13 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                         .await
                     }
                 }
-            }))
+            });
+        match policy {
+            RestrictedPathsPolicy::Strict => Ok(stream.left_stream()),
+            RestrictedPathsPolicy::SkipAndCollect(collector) => {
+                Ok(skip_restricted_denials(stream, collector.clone()).right_stream())
+            }
+        }
     }
 
     /// Returns a stream of path contexts for a set of paths.
@@ -1238,14 +1350,25 @@ impl<R: MononokeRepo> ChangesetContext<R> {
     ///
     /// This performs an efficient manifest traversal, and as such returns
     /// contexts only for **deleted paths which have existed previously**.
+    ///
+    /// How restricted-path denials are handled is governed by `policy`:
+    /// `Strict` fails the stream on any denial, `SkipAndCollect` skips
+    /// denied paths, recording each against its denying restriction.
     pub async fn deleted_paths(
         &self,
         paths: impl Iterator<Item = MPath> + 'static,
+        policy: &RestrictedPathsPolicy,
     ) -> Result<
         impl Stream<Item = Result<ChangesetPathHistoryContext<R>, MononokeError>> + '_,
         MononokeError,
     > {
-        Ok(self.deleted_paths_impl(self.root_deleted_manifest_v2_id().await?, paths))
+        let stream = self.deleted_paths_impl(self.root_deleted_manifest_v2_id().await?, paths);
+        match policy {
+            RestrictedPathsPolicy::Strict => Ok(stream.left_stream()),
+            RestrictedPathsPolicy::SkipAndCollect(collector) => {
+                Ok(skip_restricted_denials(stream, collector.clone()).right_stream())
+            }
+        }
     }
 }
 
@@ -1268,6 +1391,7 @@ where
         + BonsaiGitMappingRef
         + BonsaiGlobalrevMappingRef
         + BonsaiSvnrevMappingRef
+        + BonsaiP4MappingRef
         + MutableRenamesArc
         + Clone
         + Send
@@ -1281,6 +1405,7 @@ where
         include_subtree_copies: bool,
         path_restrictions: Option<Vec<MPath>>,
         diff_items: BTreeSet<ChangesetDiffItem>,
+        policy: &RestrictedPathsPolicy,
     ) -> Result<Vec<ChangesetPathDiffContext<R>>, MononokeError> {
         self.diff(
             other,
@@ -1290,6 +1415,7 @@ where
             diff_items,
             ChangesetFileOrdering::Unordered,
             None,
+            policy,
         )
         .watched()
         .await
@@ -1330,6 +1456,7 @@ where
         after: Option<&MPath>,
         before_or_at: Option<&MPath>,
         max_entries: usize,
+        policy: &RestrictedPathsPolicy,
     ) -> Result<Vec<ChangesetPathDiffContext<R>>, MononokeError> {
         // Per-path `ChangesetPathContentContext::new` calls do an ACL check
         // and a restricted-paths check. Bound the parallel fan-out per the
@@ -1405,21 +1532,33 @@ where
 
         stream::iter(candidates)
             .map(|path| async move {
-                let (new_content, old_content) = try_join(
-                    ChangesetPathContentContext::new(self.clone(), path.clone()),
-                    ChangesetPathContentContext::new(other.clone(), path.clone()),
+                let (new_side, old_side) = try_join(
+                    policy_side(
+                        ChangesetPathContentContext::new(self.clone(), path.clone()),
+                        policy,
+                    ),
+                    policy_side(
+                        ChangesetPathContentContext::new(other.clone(), path.clone()),
+                        policy,
+                    ),
                 )
                 .await?;
-                ChangesetPathDiffContext::new_file(
-                    self.clone(),
-                    path,
-                    Some(new_content),
-                    Some(old_content),
-                    CopyInfo::None,
-                    None,
-                )
+                if new_side.is_none() && old_side.is_none() {
+                    Ok(None)
+                } else {
+                    ChangesetPathDiffContext::new_file(
+                        self.clone(),
+                        path,
+                        new_side,
+                        old_side,
+                        CopyInfo::None,
+                        None,
+                    )
+                    .map(Some)
+                }
             })
             .buffered(LFS_PATH_CONTEXT_CONCURRENCY)
+            .try_filter_map(|opt| futures::future::ready(Ok(opt)))
             .take(max_entries)
             .try_collect()
             .await
@@ -1455,6 +1594,14 @@ where
     /// when diffing commits with its parent
     /// `path_restrictions` if present will narrow down the diff to given paths
     /// `diff_items` what to include in the output (files, dirs or both)
+    ///
+    /// How restricted-path denials are handled is governed by `policy`:
+    /// `Strict` fails the whole diff on any denial; `SkipAndCollect` applies
+    /// the per-side absent rule instead (a denied new side downgrades
+    /// `Changed` to `Removed` and drops copy info from `Added`, a denied old
+    /// side downgrades `Changed` to `Added`, an entry denied on both sides is
+    /// omitted), recording denials against their denying restriction.
+    /// Repo-auth denials and all other errors still fail the whole diff.
     pub async fn diff(
         &self,
         other: &ChangesetContext<R>,
@@ -1464,6 +1611,7 @@ where
         diff_items: BTreeSet<ChangesetDiffItem>,
         ordering: ChangesetFileOrdering,
         limit: Option<usize>,
+        policy: &RestrictedPathsPolicy,
     ) -> Result<Vec<ChangesetPathDiffContext<R>>, MononokeError>
     where
         R: RepoConfigRef,
@@ -1493,7 +1641,6 @@ where
         let first_parent_is_other = parents.first() == Some(&other.id);
         if comparing_against_parent && include_copies_renames {
             let file_changes = self.file_changes().await?;
-            let mut to_paths = HashSet::new();
             if let Some(overrides) = &self.mutable_history {
                 for (dst_path, mutable_history) in overrides {
                     if let Some((cs_id, path)) = mutable_history.get_copy_from() {
@@ -1502,7 +1649,6 @@ where
                                 .entry(path.clone())
                                 .or_insert_with(Vec::new)
                                 .push(dst_path.clone());
-                            to_paths.insert(dst_path.clone());
                         }
                     }
                 }
@@ -1531,8 +1677,7 @@ where
                                 copy_path_map
                                     .entry(from_path)
                                     .or_insert_with(Vec::new)
-                                    .push(to_path.clone());
-                                to_paths.insert(to_path);
+                                    .push(to_path);
                             }
                         }
                     }
@@ -1541,6 +1686,24 @@ where
                     | FileChange::UntrackedChange(_) => {}
                 }
             }
+
+            // Copy detection below looks up every copy source and destination,
+            // so keep only the entries the diff can read. The diff reads the
+            // copy maps for an added file within the restrictions (through
+            // its source's entry) and for a removed file within the
+            // restrictions (as a source). So every entry it reads has its
+            // source or a destination within the restrictions. An entry's
+            // outcome does not depend on other entries, and a kept entry keeps
+            // all its destinations in order, because the first one that did
+            // not exist in the parent is the move and the rest are copies.
+            if path_restrictions.is_some() {
+                copy_path_map.retain(|from_path, to_paths| {
+                    iter::once(from_path)
+                        .chain(to_paths.iter())
+                        .any(|path| within_restrictions(path, &path_restrictions))
+                });
+            }
+            let to_paths: HashSet<MPath> = copy_path_map.values().flatten().cloned().collect();
 
             let other_root_manifest_id = other.root_content_manifest_id().await?;
 
@@ -1600,7 +1763,7 @@ where
             let results: Vec<_> = stream::iter(subtree_changes.into_iter().filter_map(
                 |(path, change)| {
                     change
-                        .copy_or_deep_copy_source()
+                        .deep_copy_source()
                         .map(|(from_cs_id, from_path)| (path, from_cs_id, from_path.clone()))
                 },
             ))
@@ -1771,43 +1934,64 @@ where
                                     CopyInfo::Move
                                 };
 
-                                let from = ChangesetPathContentContext::new_with_manifest_entry(
-                                    other.clone(),
-                                    (*from_path).clone(),
-                                    from_entry.clone(),
+                                let from = policy_side(
+                                    ChangesetPathContentContext::new_with_manifest_entry(
+                                        other.clone(),
+                                        (*from_path).clone(),
+                                        from_entry.clone(),
+                                    ),
+                                    policy,
                                 )
                                 .await?;
+                                let new_side = policy_side(
+                                    ChangesetPathContentContext::new_with_manifest_entry(
+                                        self.clone(),
+                                        path.clone(),
+                                        entry,
+                                    ),
+                                    policy,
+                                )
+                                .await?;
+                                let Some(new_ctx) = new_side else {
+                                    // New side denied: nothing visible to show.
+                                    return Ok(None);
+                                };
+                                // Copy-from denied: hide provenance, show a
+                                // plain Added rather than leaking the source.
+                                let (from_opt, copy_info) = match from {
+                                    Some(from) => (Some(from), copy_info),
+                                    None => (None, CopyInfo::None),
+                                };
                                 Some(ChangesetPathDiffContext::new_file(
                                     self.clone(),
-                                    path.clone(),
-                                    Some(
-                                        ChangesetPathContentContext::new_with_manifest_entry(
-                                            self.clone(),
-                                            path,
-                                            entry,
-                                        )
-                                        .await?,
-                                    ),
-                                    Some(from),
+                                    path,
+                                    Some(new_ctx),
+                                    from_opt,
                                     copy_info,
                                     None,
                                 )?)
                             } else {
-                                Some(ChangesetPathDiffContext::new_file(
-                                    self.clone(),
-                                    path.clone(),
-                                    Some(
-                                        ChangesetPathContentContext::new_with_manifest_entry(
-                                            self.clone(),
-                                            path,
-                                            entry,
-                                        )
-                                        .await?,
+                                let new_side = policy_side(
+                                    ChangesetPathContentContext::new_with_manifest_entry(
+                                        self.clone(),
+                                        path.clone(),
+                                        entry,
                                     ),
-                                    None,
-                                    CopyInfo::None,
-                                    None,
-                                )?)
+                                    policy,
+                                )
+                                .await?;
+                                match new_side {
+                                    Some(new_ctx) => Some(ChangesetPathDiffContext::new_file(
+                                        self.clone(),
+                                        path,
+                                        Some(new_ctx),
+                                        None,
+                                        CopyInfo::None,
+                                        None,
+                                    )?),
+                                    // New side denied: nothing visible to show.
+                                    None => None,
+                                }
                             }
                         }
                         ManifestDiff::Removed(path, entry @ ManifestEntry::Leaf(_)) => {
@@ -1825,21 +2009,27 @@ where
                                         other,
                                         &path,
                                     )?;
-                                Some(ChangesetPathDiffContext::new_file(
-                                    self.clone(),
-                                    path.clone(),
-                                    None,
-                                    Some(
-                                        ChangesetPathContentContext::new_with_manifest_entry(
-                                            source,
-                                            source_path,
-                                            entry,
-                                        )
-                                        .await?,
+                                let old_side = policy_side(
+                                    ChangesetPathContentContext::new_with_manifest_entry(
+                                        source,
+                                        source_path,
+                                        entry,
                                     ),
-                                    CopyInfo::None,
-                                    replacement_path,
-                                )?)
+                                    policy,
+                                )
+                                .await?;
+                                match old_side {
+                                    Some(old_ctx) => Some(ChangesetPathDiffContext::new_file(
+                                        self.clone(),
+                                        path,
+                                        None,
+                                        Some(old_ctx),
+                                        CopyInfo::None,
+                                        replacement_path,
+                                    )?),
+                                    // Visible side denied: nothing to show.
+                                    None => None,
+                                }
                             }
                         }
                         ManifestDiff::Changed(
@@ -1856,48 +2046,65 @@ where
                                         other,
                                         &path,
                                     )?;
-                                Some(ChangesetPathDiffContext::new_file(
-                                    self.clone(),
-                                    path.clone(),
-                                    Some(
-                                        ChangesetPathContentContext::new_with_manifest_entry(
-                                            self.clone(),
-                                            path.clone(),
-                                            to_entry,
-                                        )
-                                        .await?,
+                                let new_side = policy_side(
+                                    ChangesetPathContentContext::new_with_manifest_entry(
+                                        self.clone(),
+                                        path.clone(),
+                                        to_entry,
                                     ),
-                                    Some(
-                                        ChangesetPathContentContext::new_with_manifest_entry(
-                                            source,
-                                            source_path,
-                                            from_entry,
-                                        )
-                                        .await?,
+                                    policy,
+                                )
+                                .await?;
+                                let old_side = policy_side(
+                                    ChangesetPathContentContext::new_with_manifest_entry(
+                                        source,
+                                        source_path,
+                                        from_entry,
                                     ),
-                                    CopyInfo::None,
-                                    replacement_path,
-                                )?)
+                                    policy,
+                                )
+                                .await?;
+                                if new_side.is_none() && old_side.is_none() {
+                                    // Both sides denied: nothing visible.
+                                    None
+                                } else {
+                                    // One denied side downgrades Changed to
+                                    // Added (old denied) or Removed (new
+                                    // denied); new_file takes Option sides.
+                                    Some(ChangesetPathDiffContext::new_file(
+                                        self.clone(),
+                                        path,
+                                        new_side,
+                                        old_side,
+                                        CopyInfo::None,
+                                        replacement_path,
+                                    )?)
+                                }
                             }
                         }
                         ManifestDiff::Added(path, entry @ ManifestEntry::Tree(_)) => {
                             if !diff_trees || !within_restrictions(&path, &path_restrictions) {
                                 None
                             } else {
-                                Some(ChangesetPathDiffContext::new_tree(
-                                    self.clone(),
-                                    path.clone(),
-                                    Some(
-                                        ChangesetPathContentContext::new_with_manifest_entry(
-                                            self.clone(),
-                                            path,
-                                            entry,
-                                        )
-                                        .await?,
+                                let new_side = policy_side(
+                                    ChangesetPathContentContext::new_with_manifest_entry(
+                                        self.clone(),
+                                        path.clone(),
+                                        entry,
                                     ),
-                                    None,
-                                    None,
-                                )?)
+                                    policy,
+                                )
+                                .await?;
+                                match new_side {
+                                    Some(new_ctx) => Some(ChangesetPathDiffContext::new_tree(
+                                        self.clone(),
+                                        path,
+                                        Some(new_ctx),
+                                        None,
+                                        None,
+                                    )?),
+                                    None => None,
+                                }
                             }
                         }
                         ManifestDiff::Removed(path, entry @ ManifestEntry::Tree(_)) => {
@@ -1910,20 +2117,25 @@ where
                                         other,
                                         &path,
                                     )?;
-                                Some(ChangesetPathDiffContext::new_tree(
-                                    self.clone(),
-                                    path.clone(),
-                                    None,
-                                    Some(
-                                        ChangesetPathContentContext::new_with_manifest_entry(
-                                            source,
-                                            source_path,
-                                            entry,
-                                        )
-                                        .await?,
+                                let old_side = policy_side(
+                                    ChangesetPathContentContext::new_with_manifest_entry(
+                                        source,
+                                        source_path,
+                                        entry,
                                     ),
-                                    replacement_path,
-                                )?)
+                                    policy,
+                                )
+                                .await?;
+                                match old_side {
+                                    Some(old_ctx) => Some(ChangesetPathDiffContext::new_tree(
+                                        self.clone(),
+                                        path,
+                                        None,
+                                        Some(old_ctx),
+                                        replacement_path,
+                                    )?),
+                                    None => None,
+                                }
                             }
                         }
                         ManifestDiff::Changed(
@@ -1940,27 +2152,35 @@ where
                                         other,
                                         &path,
                                     )?;
-                                Some(ChangesetPathDiffContext::new_tree(
-                                    self.clone(),
-                                    path.clone(),
-                                    Some(
-                                        ChangesetPathContentContext::new_with_manifest_entry(
-                                            self.clone(),
-                                            path.clone(),
-                                            to_entry,
-                                        )
-                                        .await?,
+                                let new_side = policy_side(
+                                    ChangesetPathContentContext::new_with_manifest_entry(
+                                        self.clone(),
+                                        path.clone(),
+                                        to_entry,
                                     ),
-                                    Some(
-                                        ChangesetPathContentContext::new_with_manifest_entry(
-                                            source,
-                                            source_path,
-                                            from_entry,
-                                        )
-                                        .await?,
+                                    policy,
+                                )
+                                .await?;
+                                let old_side = policy_side(
+                                    ChangesetPathContentContext::new_with_manifest_entry(
+                                        source,
+                                        source_path,
+                                        from_entry,
                                     ),
-                                    replacement_path,
-                                )?)
+                                    policy,
+                                )
+                                .await?;
+                                if new_side.is_none() && old_side.is_none() {
+                                    None
+                                } else {
+                                    Some(ChangesetPathDiffContext::new_tree(
+                                        self.clone(),
+                                        path,
+                                        new_side,
+                                        old_side,
+                                        replacement_path,
+                                    )?)
+                                }
                             }
                         }
                         // We've already covered all practical possibilities as there are no "changed"
@@ -2017,6 +2237,7 @@ where
                         supplement_after.as_ref(),
                         supplement_before_or_at.as_ref(),
                         supplement_max,
+                        policy,
                     )
                     .await?;
                 insert_sorted_results(&mut change_contexts, supplement, is_ordered);
@@ -2032,12 +2253,14 @@ where
         &self,
         path_restrictions: Option<Vec<MPath>>,
         diff_items: BTreeSet<ChangesetDiffItem>,
+        policy: &RestrictedPathsPolicy,
     ) -> Result<Vec<ChangesetPathDiffContext<R>>, MononokeError> {
         self.diff_root(
             path_restrictions,
             diff_items,
             ChangesetFileOrdering::Unordered,
             None,
+            policy,
         )
         .await
     }
@@ -2047,12 +2270,18 @@ where
     /// `self` is considered the "root/initial/genesis" changeset
     /// `path_restrictions` if present will narrow down the diff to given paths
     /// `diff_items` what to include in the output (files, dirs or both)
+    ///
+    /// How restricted-path denials are handled is governed by `policy`:
+    /// `Strict` fails the whole diff on any denial; `SkipAndCollect` omits
+    /// denied entries, recording them against their denying restriction.
+    /// Repo-auth denials and all other errors still fail.
     pub async fn diff_root(
         &self,
         path_restrictions: Option<Vec<MPath>>,
         diff_items: BTreeSet<ChangesetDiffItem>,
         ordering: ChangesetFileOrdering,
         limit: Option<usize>,
+        policy: &RestrictedPathsPolicy,
     ) -> Result<Vec<ChangesetPathDiffContext<R>>, MononokeError> {
         let diff_files = diff_items.contains(&ChangesetDiffItem::FILES);
         let diff_trees = diff_items.contains(&ChangesetDiffItem::TREES);
@@ -2072,9 +2301,19 @@ where
                 }
             })
             .map_err(MononokeError::from)
+            // Filter-then-limit: the page budget applies to visible entries,
+            // so denied paths never consume it and an all-denied page still
+            // advances past the walked entries.
+            .try_filter_map(|(path, is_tree)| async move {
+                let side = policy_side(
+                    ChangesetPathContentContext::new(self.clone(), path.clone()),
+                    policy,
+                )
+                .await?;
+                Ok(side.map(|base| (base, path, is_tree)))
+            })
             .take(limit.unwrap_or(usize::MAX))
-            .and_then(|(path, is_tree)| async move {
-                let base = ChangesetPathContentContext::new(self.clone(), path.clone()).await?;
+            .and_then(|(base, path, is_tree)| async move {
                 if is_tree {
                     Ok(ChangesetPathDiffContext::new_tree(
                         self.clone(),
@@ -2381,6 +2620,8 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             .await?;
 
         if check_permissions {
+            // TODO(T289977216): Route this through the Both-mode-aware checker
+            // so tri-state factors are reconciled before producing has_access.
             let restriction_checks =
                 check_path_restriction_infos(self.ctx(), &restricted_paths, restriction_infos)
                     .await?;
@@ -2400,62 +2641,6 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                 has_access: None,
             })
             .collect())
-    }
-
-    /// Determine which changed files in this changeset touch restricted paths.
-    ///
-    /// Returns restriction info grouped by restriction root, with the list of
-    /// changed paths under each root.
-    // TODO(T248660146): update this primitive to use AclManifest instead of access logging config.
-    // For draft commit safety (T255927050), the long-term implementation should
-    // resolve ACLs using the closest public ancestor's ACL manifest.
-    /// When `check_permissions` is true, each `PathAccessInfo` will have
-    /// its `has_access` field populated with the result of an ACL check.
-    /// When false, `has_access` will be `None`.
-    pub async fn restricted_paths_changes(
-        &self,
-        check_permissions: bool,
-    ) -> Result<RestrictedPathsChangesInfo, MononokeError> {
-        let file_changes = self.file_changes().await?;
-        let changed_paths: Vec<NonRootMPath> = file_changes.keys().cloned().collect();
-
-        let restriction_results = self
-            .paths_restriction_info(changed_paths, check_permissions)
-            .await?;
-
-        // A path under multiple nested roots will appear in multiple groups.
-        // Expand each (path, infos) into individual (path, info) pairs, then group by root.
-        let groups =
-            restriction_results
-                .into_iter()
-                .flat_map(|(path, infos)| infos.into_iter().map(move |info| (path.clone(), info)))
-                .fold(
-                    std::collections::BTreeMap::<
-                        NonRootMPath,
-                        (PathAccessInfo, Vec<NonRootMPath>),
-                    >::new(),
-                    |mut acc, (path, info)| {
-                        let root = info.restriction_root().clone();
-                        acc.entry(root)
-                            .or_insert_with(|| (info, Vec::new()))
-                            .1
-                            .push(path);
-                        acc
-                    },
-                );
-
-        let restricted_changes = groups
-            .into_values()
-            .map(|(restriction_info, mut changed_paths)| {
-                changed_paths.sort();
-                RestrictedChangeGroup {
-                    restriction_info,
-                    changed_paths,
-                }
-            })
-            .collect();
-
-        Ok(RestrictedPathsChangesInfo { restricted_changes })
     }
 
     /// Check if the repository may have restricted paths.

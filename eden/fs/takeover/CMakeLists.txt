@@ -3,28 +3,17 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-add_fbthrift_cpp_library(
-  eden_takeover_thrift
-  takeover.thrift
+add_library(eden_takeover_thrift)
+thrift_generate(
+  eden_takeover_thrift takeover.thrift
+  LANGUAGE cpp2
+  INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR} ${THRIFT_INCLUDE_DIR}
 )
+target_include_directories(eden_takeover_thrift PUBLIC ${PROJECT_BINARY_DIR})
 
-file(GLOB TAKEOVER_SRCS "*.cpp")
-add_library(
-  eden_takeover STATIC
-  ${TAKEOVER_SRCS}
-)
-target_link_libraries(
-  eden_takeover
-  PUBLIC
-  eden_config
-  eden_utils
-  eden_takeover_thrift
-)
+include(generated_targets.cmake)
+eden_add_directory_library(eden_takeover)
 
-if (NOT WIN32)
-  target_link_libraries(
-    eden_service
-    PUBLIC
-      eden_fuse
-  )
+if(BUILD_TESTS)
+  add_subdirectory(test)
 endif()

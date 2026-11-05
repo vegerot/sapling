@@ -16,10 +16,13 @@ use context::CoreContext;
 use hooks::CrossRepoPushSource;
 use hooks::HookManager;
 use metaconfig_types::LAND_INSTANCE_ID_PUSHVAR_KEY;
+use metaconfig_types::MAINLINE_PARENT_FIRST_PUSHVAR_KEY;
+use metaconfig_types::MERGE_TAKE_INCOMING_PUSHVAR_KEY;
 use metaconfig_types::MergeResolutionOverride;
 use metaconfig_types::PHAB_DIFF_ID_PUSHVAR_KEY;
 use metaconfig_types::PushrebaseFlags;
 use metaconfig_types::RepoConfigRef;
+use metaconfig_types::merge_take_incoming_from_pushvar_value;
 use mononoke_types::BonsaiChangeset;
 use pushrebase::RepoLockPolicy;
 use repo_authorization::AuthorizationContext;
@@ -62,6 +65,11 @@ pub fn pushrebase_flags(
             .and_then(|p| p.get(MergeResolutionOverride::PUSHVAR_KEY))
             .map(|b| b.as_ref()),
     );
+    flags.merge_resolution_take_incoming = merge_take_incoming_from_pushvar_value(
+        pushvars
+            .and_then(|p| p.get(MERGE_TAKE_INCOMING_PUSHVAR_KEY))
+            .map(|b| b.as_ref()),
+    );
     flags.land_instance_id = pushvars
         .and_then(|p| p.get(LAND_INSTANCE_ID_PUSHVAR_KEY))
         .and_then(|b| std::str::from_utf8(b.as_ref()).ok())
@@ -70,6 +78,9 @@ pub fn pushrebase_flags(
         .and_then(|p| p.get(PHAB_DIFF_ID_PUSHVAR_KEY))
         .and_then(|b| std::str::from_utf8(b.as_ref()).ok())
         .map(str::to_owned);
+    flags.mainline_parent_first = pushvars
+        .and_then(|p| p.get(MAINLINE_PARENT_FIRST_PUSHVAR_KEY))
+        .is_some_and(|b| matches!(b.as_ref(), b"true" | b"1"));
     flags
 }
 
@@ -106,16 +117,10 @@ pub async fn prepare_pushrebase(
         .into());
     }
 
-    if repo.repo_config().pushrebase.block_merges {
-        let any_merges = changesets.iter().any(BonsaiChangeset::is_merge);
-        if any_merges {
-            return Err(anyhow!(
-                "Pushrebase blocked because it contains a merge commit.\n\
-                If you need this for a specific use case please contact\n\
-                the Source Control team at https://fburl.com/27qnuyl2"
-            )
-            .into());
-        }
+    if repo.repo_config().pushrebase.block_merges
+        && changesets.iter().any(BonsaiChangeset::is_merge)
+    {
+        return Err(BookmarkMovementError::MergesBlocked);
     }
 
     let reason = BookmarkUpdateReason::Pushrebase;

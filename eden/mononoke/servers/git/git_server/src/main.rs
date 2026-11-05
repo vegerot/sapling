@@ -13,6 +13,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::net::ToSocketAddrs;
+#[cfg(fbcode_build)]
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -340,7 +341,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     let log_middleware = if args.test_friendly_logging {
         LogMiddleware::test_friendly()
     } else {
-        LogMiddleware::tracing("scm/mononoke:request_log_enabled".to_string())
+        LogMiddleware::tracing()
     };
     let will_exit = Arc::new(AtomicBool::new(false));
     let (sm_shutdown_sender, sm_shutdown_receiver) = tokio::sync::oneshot::channel::<bool>();

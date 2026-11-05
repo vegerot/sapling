@@ -39,7 +39,6 @@ class Notifier;
 class PrivHelper;
 class ProcessInfoCache;
 class EdenFsEventsLogger;
-class FsEventLogger;
 class ReloadableConfig;
 
 namespace detail {
@@ -181,9 +180,8 @@ class InvalidatingInodes {
 class FaultInjector;
 
 /**
- * Requests received but not yet answered, for `debugOutstandingNfsCalls`
- * and the sampled `FsEventLogger`. Striped by xid so the worker threads
- * rarely contend on one lock.
+ * Requests received but not yet answered, for `debugOutstandingNfsCalls`.
+ * Striped by xid so the worker threads rarely contend on one lock.
  */
 class NfsRequestTracker {
  public:
@@ -192,15 +190,13 @@ class NfsRequestTracker {
     std::chrono::steady_clock::time_point requestStartTime;
   };
 
-  explicit NfsRequestTracker(std::shared_ptr<FsEventLogger> fsEventLogger);
-
   void start(uint32_t xid, std::chrono::steady_clock::time_point startTime);
 
   /**
-   * Forget the request and log its duration to the FsEventLogger. A xid
-   * that was never started, or was already finished, is ignored.
+   * Forget the request. A xid that was never started, or was already
+   * finished, is ignored.
    */
-  void finish(uint32_t xid, uint32_t procNumber);
+  void finish(uint32_t xid);
 
   std::vector<OutstandingRequest> outstanding() const;
 
@@ -212,19 +208,12 @@ class NfsRequestTracker {
   };
 
   std::array<folly::Synchronized<State>, kStripes> stripes_;
-  const std::shared_ptr<FsEventLogger> fsEventLogger_;
 };
 
 class Nfsd3 final : public FsChannel {
  public:
   /**
    * Create a new RPC NFSv3 program.
-   *
-   * If registerWithRpcbind is set, this NFSv3 program will advertise itself
-   * against the rpcbind daemon allowing it to be visible system wide. Be aware
-   * that for a given transport (tcp/udp) only one NFSv3 program can be
-   * registered with rpcbind, and thus if a real NFS server is running on this
-   * host, EdenFS won't be able to register itself.
    *
    * All the socket processing will be run on the EventBase passed in. This
    * also must be called on that EventBase thread.
@@ -241,7 +230,6 @@ class Nfsd3 final : public FsChannel {
       std::unique_ptr<NfsDispatcher> dispatcher,
       const folly::Logger* straceLogger,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
-      std::shared_ptr<FsEventLogger> fsEventLogger,
       const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       ErrorLogger& errorLogger,
       folly::Duration requestTimeout,
@@ -265,7 +253,7 @@ class Nfsd3 final : public FsChannel {
 
   [[nodiscard]] folly::Future<StopFuture> initialize() override;
 
-  void initialize(folly::SocketAddress addr, bool registerWithRpcbind);
+  void initialize(folly::SocketAddress addr);
   void initialize(folly::File connectedSocket);
 
   /**
@@ -396,10 +384,6 @@ class Nfsd3 final : public FsChannel {
   ImmediateFuture<folly::Unit> completeInvalidations() override;
 
   folly::coro::now_task<folly::Unit> co_completeInvalidations() override;
-
-  uint32_t getProgramNumber();
-
-  uint32_t getProgramVersion();
 
   /**
    * Obtain the address that this NFSv3 program is listening on.

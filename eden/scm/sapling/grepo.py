@@ -15,10 +15,53 @@ References:
 import weakref
 from typing import List
 
+import bindings
+
+from . import git
 from .git import Submodule
 
 # Whether to be compatible with `.repo/`.
 GREPO_REQUIREMENT = "grepo"
+
+MANIFESTS_DIR = ".repo/manifests"
+
+
+def manifest_repo(repo):
+    """Open the manifests repo as a Sapling repo.
+
+    The manifests repo is the Git repo at `.repo/manifests`. Its commits have
+    the same hashes as the commits of `repo`. The returned repo can miss
+    commits that `repo` writes after this call.
+
+    If `.repo/manifests/.git/sl` does not exist, this function creates it.
+    """
+    from . import hg
+
+    path = repo.wvfs.join(MANIFESTS_DIR)
+    bindings.gitcompat.maybeinitdotgit(path)
+    return hg.repository(repo.baseui, path)
+
+
+def checkout_manifest(repo, source, target, force, dry_run=False) -> None:
+    """Update the manifests Git index and worktree from `source` to `target`.
+
+    This does not move the manifests HEAD. With `force`, Git discards local
+    changes. Without `force`, Git refuses local changes to files that differ
+    between `source` and `target`. With `dry_run`, Git writes nothing. A refusal
+    raises the same error as a failed project checkout.
+    """
+    manifest_root = repo.wvfs.join(".repo/manifests")
+    args = ["--work-tree=%s" % manifest_root, "read-tree", "-u"]
+    if dry_run:
+        args.append("-n")
+    if force:
+        args.extend(["--reset", target.hex()])
+    else:
+        args.extend(["-m", source.hex(), target.hex()])
+    try:
+        git.callgit(repo, args)
+    except git.GitCommandError as ex:
+        raise git._projectcheckoutabort([(".repo/manifests", target.node(), ex)])
 
 
 def getgreposubmodules(ctx, repo) -> List[Submodule]:

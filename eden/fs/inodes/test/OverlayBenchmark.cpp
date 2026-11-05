@@ -27,8 +27,8 @@ using namespace folly::string_piece_literals;
 DEFINE_string(overlayPath, "", "Directory where the test overlay is created");
 DEFINE_string(
     overlayType,
-    kDefaultInodeCatalogType == InodeCatalogType::Sqlite ? "Sqlite" : "Legacy",
-    "Type of overlay to be used. Defaults: Windows - Sqlite; Linux|macOS - Legacy");
+    FieldConverter<InodeCatalogType>{}.toDebugString(kInodeCatalogTypeDefault),
+    "Type of overlay to be used. Defaults: Windows - InMemory; Linux|macOS - Legacy");
 DEFINE_uint64(numDirs, 100000, "Number of directories to save/load");
 DEFINE_uint32(threads, 1, "Number of threads for parallel save/load");
 DEFINE_uint32(
@@ -40,10 +40,6 @@ DEFINE_bool(
     directSerialize,
     false,
     "Use direct serialization (skip intermediate std::map)");
-DEFINE_bool(
-    directFileWrites,
-    false,
-    "Write overlay files directly without temp+rename for non-materialized dirs");
 
 namespace {
 
@@ -97,17 +93,12 @@ void benchmarkOverlay(
   auto numThreads = FLAGS_threads;
 
   printf(
-      "Config: dirs=%" SCNu64 ", threads=%u, dirSize=%s, directFileWrites=%s\n",
+      "Config: dirs=%" SCNu64 ", threads=%u, dirSize=%s\n",
       N,
       numThreads,
-      FLAGS_dirSize > 0 ? std::to_string(FLAGS_dirSize).c_str() : "random",
-      FLAGS_directFileWrites ? "true" : "false");
+      FLAGS_dirSize > 0 ? std::to_string(FLAGS_dirSize).c_str() : "random");
 
   auto edenConfig = EdenConfig::createTestEdenConfig();
-  if (FLAGS_directFileWrites) {
-    edenConfig->overlayDirectFileWrites.setValue(
-        true, ConfigSourceType::CommandLine);
-  }
 
   printf("Creating Overlay...\n");
 
@@ -116,7 +107,6 @@ void benchmarkOverlay(
       overlayPath,
       kPathMapDefaultCaseSensitive,
       overlayType,
-      kDefaultInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
@@ -144,8 +134,8 @@ void benchmarkOverlay(
 
   // --- Save benchmark ---
   // 90% of directories are non-materialized (matching source control),
-  // 10% are materialized (user modifications). The direct-file-writes
-  // optimization only applies to non-materialized directories.
+  // 10% are materialized (user modifications). Only non-materialized
+  // directories skip the temp file and rename.
   std::vector<InodeNumber> savedInodes(N);
   std::vector<bool> isMaterialized(N);
   for (uint64_t i = 0; i < N; ++i) {

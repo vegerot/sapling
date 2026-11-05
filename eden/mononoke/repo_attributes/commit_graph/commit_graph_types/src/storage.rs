@@ -46,6 +46,41 @@ pub enum PrefetchTarget {
     },
 }
 
+/// What a prefetch warms the caches with.
+#[derive(Copy, Clone, Debug)]
+pub enum PrefetchScope {
+    /// Fetch the changesets that aren't cached yet, with the prefetch a
+    /// normal read towards `target` would do below each of them.  Cached
+    /// changesets cost one cache lookup each and fill nothing, so the cost
+    /// is linear in the changesets passed and this suits the whole set a
+    /// traversal is about to read.
+    UncachedOnly(PrefetchTarget),
+    /// Walk each first-parent chain through the cache to the first uncached
+    /// ancestor and prefetch `steps` changesets from there, going no further
+    /// back than `generation`.  Each step is a cache lookup per changeset,
+    /// so this suits a few changesets known to be cached, to warm the cache
+    /// beyond them.
+    PastCached {
+        /// Prefetch as far back as this generation.
+        generation: Generation,
+
+        /// Prefetch up to this many steps.
+        steps: u64,
+    },
+}
+
+impl PrefetchScope {
+    /// The target the prefetch asks the backing store for.
+    pub fn target(self) -> PrefetchTarget {
+        match self {
+            PrefetchScope::UncachedOnly(target) => target,
+            PrefetchScope::PastCached { generation, steps } => {
+                PrefetchTarget::LinearAncestors { generation, steps }
+            }
+        }
+    }
+}
+
 /// Indication for additional changesets to be fetched for subsequent
 /// traversals.
 ///
@@ -65,11 +100,21 @@ pub enum Prefetch {
     Include(PrefetchTarget),
 }
 
-/// Number of first-parent steps prefetched by
-/// `Prefetch::for_p1_linear_traversal`.  This is arbitrary, but is a balance
-/// between not overfetching for the cache and reducing the number of
-/// sequential steps.
+/// Number of first-parent steps `Prefetch::for_p1_linear_traversal` asks
+/// for.  This is arbitrary, but is a balance between not overfetching for
+/// the cache and reducing the number of sequential steps.
 pub const P1_LINEAR_PREFETCH_STEPS: u64 = 128;
+
+/// Number of first-parent steps a linear prefetch covers: the steps asked
+/// for, capped by the step limit that bounds every prefetching query.
+/// Callers that rely on a prefetch having covered a distance must use this
+/// rather than the constant.
+pub fn p1_linear_prefetch_steps() -> u64 {
+    P1_LINEAR_PREFETCH_STEPS.min(justknobs::get_as::<u64>(
+        "scm/mononoke:commit_graph_prefetch_step_limit",
+        None,
+    ))
+}
 
 impl Prefetch {
     /// Prepare prefetching for skew-binary traversal over the skip tree.
@@ -81,7 +126,7 @@ impl Prefetch {
     pub fn for_p1_linear_traversal() -> Self {
         Prefetch::Hint(PrefetchTarget::LinearAncestors {
             generation: FIRST_GENERATION,
-            steps: P1_LINEAR_PREFETCH_STEPS,
+            steps: p1_linear_prefetch_steps(),
         })
     }
 
@@ -268,20 +313,13 @@ pub trait CommitGraphStorage: Send + Sync {
         prefetch: Prefetch,
     ) -> Result<HashMap<ChangesetId, FetchedChangesetEdges>>;
 
-    /// Warm any caches this storage has with the edges of these changesets
-    /// and the edges that prefetching towards `target` from them fetches.
-    ///
-    /// Unlike a prefetch hint passed to `fetch_many_edges`, this looks past
-    /// the edges of `cs_ids` themselves: a cache hit for them says nothing
-    /// about what is cached beyond them, so whatever is missing beyond them
-    /// is fetched from the backing store.  Finding out what is missing costs
-    /// up to one cache lookup per changeset per step, so callers should
-    /// bound `cs_ids`.  Storages without caches do nothing.
+    /// Warm any caches this storage has with edges below `cs_ids`, as far as
+    /// `scope` says.  Storages without caches do nothing.
     async fn prefetch_many_edges(
         &self,
         _ctx: &CoreContext,
         _cs_ids: &[ChangesetId],
-        _target: PrefetchTarget,
+        _scope: PrefetchScope,
     ) -> Result<()> {
         Ok(())
     }

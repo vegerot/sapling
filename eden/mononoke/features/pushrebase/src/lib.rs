@@ -61,6 +61,7 @@ use anyhow::Error;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::format_err;
+use async_trait::async_trait;
 use blobrepo_utils::convert_diff_result_into_file_change_for_diamond_merge;
 use blobstore::Loadable;
 use bonsai_git_mapping::BonsaiGitMappingArc;
@@ -92,10 +93,13 @@ use manifest::ManifestOps;
 use manifest::bonsai_diff;
 use maplit::hashmap;
 use mercurial_derivation::DeriveHgChangeset;
+use mercurial_types::HgAugmentedManifestId;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgFileNodeId;
 use mercurial_types::HgManifestId;
 use mercurial_types::NonRootMPath;
+use mercurial_types::blobs::hg_manifests_read_from_augmented;
+use mercurial_types::sharded_augmented_manifest::hg_manifest_bonsai_diff;
 use metaconfig_types::MergeResolutionOverride;
 use metaconfig_types::PushrebaseFlags;
 use metaconfig_types::RepoConfigRef;
@@ -123,19 +127,27 @@ use repo_bookmark_attrs::RepoBookmarkAttrsRef;
 use repo_cross_repo::RepoCrossRepoRef;
 use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
+use scuba_ext::MononokeScubaSampleBuilder;
 use shared_error::std::SharedError;
 use stats::prelude::*;
 use thiserror::Error;
 
 mod merge_resolution_summary;
 mod queue;
+mod take_incoming;
 pub use merge_resolution_summary::MR_PATH_SAMPLE_CAP;
 pub use merge_resolution_summary::MergeResolutionSummary;
 pub use queue::PushrebaseQueue;
 pub use queue::PushrebaseRequest;
 use queue::QueuedPushrebaseRequest;
+use take_incoming::Resolution;
+use take_incoming::TakeIncoming;
+use take_incoming::TakeIncomingScope;
+use take_incoming::log_take_incoming;
+use take_incoming::take_incoming_scope;
 use three_way_merge::MergeResult;
 use three_way_merge::merge_text;
+use three_way_merge::merge_text_prefer_local;
 use tracing::info;
 use tracing::warn;
 
@@ -151,16 +163,36 @@ define_stats! {
     merge_resolution_lost_on_retry: dynamic_timeseries("{}.merge_resolution_lost_on_retry", (reponame: String); Count),
     noop_merge_commits_detected: dynamic_timeseries("{}.noop_merge_commits_detected", (reponame: String); Count),
     noop_merge_commits_rejected: dynamic_timeseries("{}.noop_merge_commits_rejected", (reponame: String); Count),
+    baseline_replay: dynamic_timeseries("{}.baseline_replay.{}.{}", (reponame: String, mode: &'static str, outcome: &'static str); Count),
+    baseline_resolution_source: dynamic_timeseries("{}.baseline_resolution_source.{}", (reponame: String, source: &'static str); Count),
 }
 
 const MAX_REBASE_ATTEMPTS: usize = 100;
 
+/// 0 rejects as before, 1 replays but still rejects, 2 lands the replay.
+const REPLAY_FROM_FORK_JK: &str = "scm/mononoke:pushrebase_replay_from_fork_point";
+/// Longest `fork..head` replayed; longer is rejected as before.
+const REPLAY_MAX_COMMITS: usize = 50;
+/// Changed-path bound for the replay's manifest lookups.
+const REPLAY_MAX_PATHS: usize = 5_000;
+/// Range length reported for an over-cap replay; longer logs as this.
+const REPLAY_LEN_PROBE_CAP: usize = 1_000;
+
 /// Ancestry probes over a baseline's recorded successors. Normally one.
 const BASELINE_SUCCESSOR_CONCURRENCY: usize = 5;
+/// Concurrent changeset loads when attributing a replay conflict.
+const CONFLICT_ATTRIBUTION_CONCURRENCY: usize = 10;
 
 pub const MUTATION_KEYS: &[&str] = &["mutpred", "mutuser", "mutdate", "mutop", "mutsplit"];
 
 pub const FAIL_PUSHREBASE_EXTRA: &str = "failpushrebase";
+
+/// Hg extra, with value `1`, on a merge that pushrebase rebased with its
+/// parents reordered (see `PushrebaseFlags::mainline_parent_first`).
+/// The Mercurial changeset hash does not depend on the order of the parents,
+/// so without it a reordered merge that is otherwise unchanged would have the
+/// same hash as the pushed one.
+pub const PARENTS_SWAPPED_EXTRA: &str = "parents_swapped";
 
 #[derive(Debug, Error)]
 pub enum PushrebaseInternalError {
@@ -180,6 +212,8 @@ pub enum PushrebaseInternalError {
     P2RootRebaseForbidden(HgChangesetId, BookmarkKey),
     #[error("Unexpected file conflicts when adding new file changes to {0}")]
     NewFileChangesConflict(ChangesetId),
+    #[error("Cannot reorder the parents of {0}: it already has the parents_swapped extra")]
+    ParentsAlreadySwapped(ChangesetId),
     #[error("Merge resolution was performed in a previous attempt but lost on retry")]
     MergeResolutionLostOnRetry,
 }
@@ -215,7 +249,7 @@ pub enum PushrebaseError {
 }
 
 /// Why `rebase_stack_onto_with_baseline` could not place a stack on the
-/// branch. Displays as the clause after "baseline <id>"; the wording is
+/// branch. Displays as the clause after `"baseline <id>"`; the wording is
 /// client-visible through Multi-Repo Land's conflict descriptions, where the
 /// stack head is called "the target".
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -227,18 +261,83 @@ pub enum BaselineRejection {
     /// Rewritten onto the branch, but sharing no single fork point with the
     /// head to bound the server range.
     NoSingleForkPoint,
+    /// A commit at or below the baseline did not drop on replay, and the
+    /// branch changed a path it touches.
+    ParentLandedWithChanges(ChangesetId),
+    /// A commit at or below the baseline did not drop on replay, and the
+    /// branch left every path it touches alone.
+    ParentNotLanded(ChangesetId),
+    /// A commit above the baseline is already on the branch.
+    AlreadyLanded(ChangesetId),
+    /// The stack forked from the branch more than `max_commits` ago.
+    HistoryTooLong { max_commits: usize },
+}
+
+impl BaselineRejection {
+    /// The commit the rejection names, for callers that render it in their
+    /// own identifiers.
+    pub fn named_commit(&self) -> Option<ChangesetId> {
+        match self {
+            Self::ParentLandedWithChanges(cs_id)
+            | Self::ParentNotLanded(cs_id)
+            | Self::AlreadyLanded(cs_id) => Some(*cs_id),
+            Self::NotAncestorOfHead
+            | Self::NotOnBranch
+            | Self::NoSingleForkPoint
+            | Self::HistoryTooLong { .. } => None,
+        }
+    }
+}
+
+/// Branch commits that may be the landed form of an off-branch baseline,
+/// found from SCM-specific rewrite metadata the caller owns. Pushrebase
+/// requires exactly one candidate and still proves it by content.
+#[async_trait]
+pub trait BaselineCandidateSource: Send + Sync {
+    /// Logged as the resolution source.
+    fn name(&self) -> &'static str;
+
+    async fn candidates_for(
+        &self,
+        ctx: &CoreContext,
+        baseline: ChangesetId,
+        onto: ChangesetId,
+        fork_point: ChangesetId,
+    ) -> Result<Vec<ChangesetId>>;
 }
 
 impl std::fmt::Display for BaselineRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::NotAncestorOfHead => "is not an ancestor of the target",
-            Self::NotOnBranch => {
+        match self {
+            Self::NotAncestorOfHead => f.write_str("is not an ancestor of the target"),
+            Self::NotOnBranch => f.write_str(
                 "is not an ancestor of the current head and no rewritten form of it is on \
-                 the branch; refusing to rebase across a force-move or unrelated history"
-            }
-            Self::NoSingleForkPoint => "has no single fork point on the current head",
-        })
+                 the branch; refusing to rebase across a force-move or unrelated history",
+            ),
+            Self::NoSingleForkPoint => f.write_str("has no single fork point on the current head"),
+            Self::ParentLandedWithChanges(parent) => write!(
+                f,
+                "is not on the current head, and the stack's parent commit {parent} landed \
+                 with different content than this stack was built on; rebase the stack onto \
+                 the landed form and resubmit"
+            ),
+            Self::ParentNotLanded(parent) => write!(
+                f,
+                "is not on the current head, and the stack's parent commit {parent} has not \
+                 landed on this branch; land it first or land the stack together"
+            ),
+            Self::AlreadyLanded(commit) => write!(
+                f,
+                "is not on the current head, and commit {commit} of this stack is already on \
+                 the branch; nothing new to land"
+            ),
+            Self::HistoryTooLong { max_commits } => write!(
+                f,
+                "is not on the current head, and the stack's history forked from the branch \
+                 more than {max_commits} commits ago; rebase the stack onto the current head \
+                 and resubmit"
+            ),
+        }
     }
 }
 
@@ -487,6 +586,9 @@ pub struct RebasedStack {
     pub dropped: Vec<ChangesetId>,
     /// Old id -> paths whose content was 3-way merged in that commit.
     pub merged_paths: HashMap<ChangesetId, Vec<NonRootMPath>>,
+    /// Stack paths the branch also changed between `root` and `onto`.
+    /// Only `rebase_stack_onto_manifest` fills this.
+    pub server_overlaps: Vec<MPath>,
 }
 
 /// Rebases the linear stack `root..head` onto `onto` with pushrebase's
@@ -619,6 +721,7 @@ pub async fn rebase_stack_onto_with_conflict_base(
         merge_summary: conflict_result.merge_summary,
         dropped: Vec::new(),
         merged_paths: HashMap::new(),
+        server_overlaps: Vec::new(),
     })
 }
 
@@ -627,9 +730,12 @@ pub async fn rebase_stack_onto_with_conflict_base(
 /// an earlier pushrebase may have rewritten it. A baseline on the branch is
 /// the ordinary case. One off the branch is resolved through the pushrebase
 /// mutation mapping: when exactly one recorded successor is an ancestor of
-/// `onto`, the stack's base landed under another identity and the server
-/// range starts at the fork point of `baseline` and `onto`. Anything else is
-/// `UnplaceableBaseline`, never a parent-swap onto unrelated history.
+/// `onto`, or the caller's candidate source names exactly one branch commit
+/// the baseline drops against, the stack's base landed under another identity
+/// and the server range starts at the fork point of `baseline` and `onto`.
+/// Otherwise the stack is replayed from that fork point, and anything that
+/// does not drop the baseline's history is `UnplaceableBaseline`, never a
+/// parent-swap onto unrelated history.
 pub async fn rebase_stack_onto_with_baseline(
     ctx: &CoreContext,
     repo: &(impl Repo + PushrebaseMutationMappingRef),
@@ -637,6 +743,7 @@ pub async fn rebase_stack_onto_with_baseline(
     baseline: ChangesetId,
     head: ChangesetId,
     onto: ChangesetId,
+    candidates: Option<&dyn BaselineCandidateSource>,
 ) -> Result<RebasedStack, PushrebaseError> {
     let unplaceable = |rejection| PushrebaseError::UnplaceableBaseline {
         baseline,
@@ -655,19 +762,22 @@ pub async fn rebase_stack_onto_with_baseline(
     let conflict_base = if baseline_precedes_onto {
         baseline
     } else {
-        if !rewritten_baseline_is_on_branch(ctx, repo, baseline, onto).await {
-            return Err(unplaceable(BaselineRejection::NotOnBranch));
-        }
-        match repo
-            .commit_graph()
-            .common_base(ctx, baseline, onto)
+        // The knob is read here only: an on-branch baseline never reaches it.
+        let mode = ReplayMode::from_knob(repo.repo_identity().name());
+        let fork_point = single_fork_point(ctx, repo, baseline, onto)
             .await
-            .map_err(PushrebaseError::Error)?
-            .as_slice()
+            .map_err(PushrebaseError::Error)?;
+        if !rewritten_baseline_is_on_branch(
+            ctx, repo, config, mode, baseline, onto, fork_point, candidates,
+        )
+        .await
         {
-            [fork_point] => *fork_point,
-            _ => return Err(unplaceable(BaselineRejection::NoSingleForkPoint)),
+            return replay_from_fork_point(
+                ctx, repo, config, mode, baseline, head, onto, fork_point,
+            )
+            .await;
         }
+        fork_point.ok_or_else(|| unplaceable(BaselineRejection::NoSingleForkPoint))?
     };
     rebase_stack_onto_with_conflict_base(ctx, repo, config, baseline, conflict_base, head, onto)
         .await
@@ -751,9 +861,10 @@ pub async fn rebase_stack_onto_manifest(
     .await
     .map_err(PushrebaseError::Error)?;
     let server_cf = manifest_overlaps(&client_cf, &base_states, &onto_states);
+    let overlaps = server_cf.clone();
 
     let reponame = repo.repo_identity().name();
-    let (overrides, conflict_files_count) = match intersect_changed_files(server_cf, client_cf) {
+    let (overrides, conflict_files_count) = match intersect_changed_files(overlaps, client_cf) {
         Ok(()) => (None, 0),
         Err(PushrebaseError::Conflicts(conflicts)) => {
             let merge_enabled = match config.merge_resolution_override {
@@ -784,6 +895,7 @@ pub async fn rebase_stack_onto_manifest(
                 max_conflicts,
                 max_file_size,
                 &config.merge_resolution_excluded_path_prefixes,
+                take_incoming_scope(config, reponame),
             ) {
                 Ok(overrides) => (Some(overrides), conflicts.len() as u64),
                 Err(err) => {
@@ -835,6 +947,7 @@ pub async fn rebase_stack_onto_manifest(
         merge_summary,
         dropped: set.dropped,
         merged_paths: set.merged_paths,
+        server_overlaps: server_cf,
     })
 }
 
@@ -849,10 +962,18 @@ pub async fn rebase_stack_onto_manifest(
 async fn rewritten_baseline_is_on_branch(
     ctx: &CoreContext,
     repo: &(impl Repo + PushrebaseMutationMappingRef),
+    config: &PushrebaseFlags,
+    mode: ReplayMode,
     baseline: ChangesetId,
     onto: ChangesetId,
+    fork_point: Option<ChangesetId>,
+    candidates: Option<&dyn BaselineCandidateSource>,
 ) -> bool {
-    match try_resolve_rewritten_baseline(ctx, repo, baseline, onto).await {
+    match try_resolve_rewritten_baseline(
+        ctx, repo, config, mode, baseline, onto, fork_point, candidates,
+    )
+    .await
+    {
         Ok(resolved) => resolved.is_some(),
         Err(err) => {
             ctx.scuba()
@@ -871,8 +992,12 @@ async fn rewritten_baseline_is_on_branch(
 async fn try_resolve_rewritten_baseline(
     ctx: &CoreContext,
     repo: &(impl Repo + PushrebaseMutationMappingRef),
+    config: &PushrebaseFlags,
+    mode: ReplayMode,
     baseline: ChangesetId,
     onto: ChangesetId,
+    fork_point: Option<ChangesetId>,
+    candidates: Option<&dyn BaselineCandidateSource>,
 ) -> Result<Option<ChangesetId>> {
     let repo_name = repo.repo_identity().name();
     // Deduped: no unique constraint, so a retried land can record a pair twice.
@@ -902,19 +1027,36 @@ async fn try_resolve_rewritten_baseline(
         .try_collect()
         .await?;
 
-    // Exactly one, or we do not guess.
-    let resolved = match on_branch.as_slice() {
-        [only] => Some(*only),
-        _ => None,
-    };
-    // 0/0 is "no row"; n/0 is "recorded but off-branch".
-    ctx.scuba()
-        .clone()
+    let mut scuba = ctx.scuba().clone();
+    scuba
         .add("log_tag", "orphaned_baseline_resolution")
         .add("repo", repo_name)
+        .add("mode", mode.label())
         .add("old_target", baseline.to_string())
+        .add("onto", onto.to_string())
         .add("recorded_successors", successors.len())
-        .add("candidates_on_branch", on_branch.len())
+        .add("candidates_on_branch", on_branch.len());
+    // Exactly one, or we do not guess.
+    let (resolved, source) = match (on_branch.as_slice(), candidates) {
+        ([only], _) => (Some(*only), "mapping"),
+        ([], Some(candidates)) => {
+            match resolve_through_candidate(
+                ctx, repo, config, mode, baseline, onto, fork_point, candidates, &mut scuba,
+            )
+            .await?
+            {
+                Some(landed) => (Some(landed), candidates.name()),
+                None => (None, "none"),
+            }
+        }
+        _ => (None, "none"),
+    };
+    if resolved.is_some() {
+        STATS::baseline_resolution_source.add_value(1, (repo_name.to_string(), source));
+    }
+    // 0/0 is "no row"; n/0 is "recorded but off-branch".
+    scuba
+        .add("resolution_source", source)
         .add(
             "resolved_to",
             resolved.map_or_else(|| "none".to_string(), |cs| cs.to_string()),
@@ -922,6 +1064,463 @@ async fn try_resolve_rewritten_baseline(
         .unsampled()
         .log();
     Ok(resolved)
+}
+
+/// The caller's source picks one branch commit; `fork..baseline` must then
+/// drop against it by content before it stands in for the baseline.
+async fn resolve_through_candidate(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    config: &PushrebaseFlags,
+    mode: ReplayMode,
+    baseline: ChangesetId,
+    onto: ChangesetId,
+    fork_point: Option<ChangesetId>,
+    candidates: &dyn BaselineCandidateSource,
+    scuba: &mut MononokeScubaSampleBuilder,
+) -> Result<Option<ChangesetId>> {
+    if mode == ReplayMode::Off || merging_forced_off(config) {
+        scuba.add("candidate_source", "off");
+        return Ok(None);
+    }
+    let Some(fork_point) = fork_point else {
+        scuba.add("candidate_source", "no_single_fork_point");
+        return Ok(None);
+    };
+    let found = candidates
+        .candidates_for(ctx, baseline, onto, fork_point)
+        .await?;
+    scuba.add("candidate_count", found.len());
+    let [candidate] = found.as_slice() else {
+        scuba.add(
+            "candidate_source",
+            if found.is_empty() {
+                "none"
+            } else {
+                "ambiguous"
+            },
+        );
+        return Ok(None);
+    };
+    let candidate = *candidate;
+    scuba.add("candidate", candidate.to_string());
+    if !repo
+        .commit_graph()
+        .is_ancestor(ctx, candidate, onto)
+        .await?
+    {
+        scuba.add("candidate_source", "candidate_off_branch");
+        return Ok(None);
+    }
+
+    let guard = replay_stack_from_fork(
+        ctx, repo, config, baseline, baseline, candidate, fork_point, scuba,
+    )
+    .await;
+    scuba.add("candidate_guard", guard.label());
+    match (guard, mode) {
+        (ReplayOutcome::Replayed(_), ReplayMode::Enforce) => {
+            scuba.add("candidate_source", "resolved");
+            Ok(Some(candidate))
+        }
+        (ReplayOutcome::Replayed(_), _) => {
+            scuba.add("candidate_source", "shadow_would_resolve");
+            Ok(None)
+        }
+        _ => {
+            scuba.add("candidate_source", "guard_rejected");
+            Ok(None)
+        }
+    }
+}
+
+fn merging_forced_off(config: &PushrebaseFlags) -> bool {
+    matches!(
+        config.merge_resolution_override,
+        MergeResolutionOverride::ForceOff
+    )
+}
+
+async fn single_fork_point(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    baseline: ChangesetId,
+    onto: ChangesetId,
+) -> Result<Option<ChangesetId>> {
+    Ok(
+        match repo
+            .commit_graph()
+            .common_base(ctx, baseline, onto)
+            .await?
+            .as_slice()
+        {
+            [fork_point] => Some(*fork_point),
+            _ => None,
+        },
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayMode {
+    Off,
+    Shadow,
+    Enforce,
+}
+
+impl ReplayMode {
+    fn from_knob(repo_name: &str) -> Self {
+        match justknobs::get_as::<i64>(REPLAY_FROM_FORK_JK, Some(repo_name)) {
+            1 => Self::Shadow,
+            2 => Self::Enforce,
+            _ => Self::Off,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+/// What replaying `fork..head` onto the branch would do.
+enum ReplayOutcome {
+    /// Every commit at or below the baseline dropped as already landed.
+    Replayed(RebasedStack),
+    /// A commit at or below the baseline did not drop or conflicted, and the
+    /// branch changed a path it touches.
+    ParentDiffers(ChangesetId),
+    /// A commit at or below the baseline did not drop, and the branch left
+    /// its paths alone: it never landed.
+    ParentNotLanded(ChangesetId),
+    /// A commit above the baseline dropped: it is already on the branch.
+    AlreadyLanded(ChangesetId),
+    /// The stack's own commits conflict with the branch.
+    Conflict(PushrebaseError),
+    /// Out of bounds; rejected as today.
+    TooLong,
+    TooManyPaths(usize),
+    /// Could not be evaluated; rejected as today.
+    Failed(PushrebaseError),
+}
+
+impl ReplayOutcome {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Replayed(_) => "replayed",
+            Self::ParentDiffers(_) => "parent_differs",
+            Self::ParentNotLanded(_) => "parent_not_landed",
+            Self::AlreadyLanded(_) => "already_landed",
+            Self::Conflict(_) => "conflict",
+            Self::TooLong => "too_long",
+            Self::TooManyPaths(_) => "too_many_paths",
+            Self::Failed(_) => "failed",
+        }
+    }
+}
+
+/// Replays `fork..head` onto the branch; lands only if every parent dropped
+/// and nothing above the baseline did.
+async fn replay_from_fork_point(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    config: &PushrebaseFlags,
+    mode: ReplayMode,
+    baseline: ChangesetId,
+    head: ChangesetId,
+    onto: ChangesetId,
+    fork_point: Option<ChangesetId>,
+) -> Result<RebasedStack, PushrebaseError> {
+    let repo_name = repo.repo_identity().name();
+    let unplaceable = |rejection| PushrebaseError::UnplaceableBaseline {
+        baseline,
+        onto,
+        rejection,
+    };
+    // A caller that forbids content merging cannot have parents drop by content.
+    if mode == ReplayMode::Off || merging_forced_off(config) {
+        return Err(unplaceable(BaselineRejection::NotOnBranch));
+    }
+    let Some(fork_point) = fork_point else {
+        return Err(unplaceable(BaselineRejection::NoSingleForkPoint));
+    };
+
+    let mut scuba = ctx.scuba().clone();
+    scuba
+        .add("log_tag", "baseline_replay_from_fork_point")
+        .add("repo", repo_name)
+        .add("mode", mode.label())
+        .add("resolution_source", "replay")
+        .add("old_target", baseline.to_string())
+        .add("onto", onto.to_string())
+        .add("head", head.to_string());
+    let mut outcome = replay_stack_from_fork(
+        ctx, repo, config, baseline, head, onto, fork_point, &mut scuba,
+    )
+    .await;
+    if let ReplayOutcome::Replayed(rebased) = &outcome {
+        if rebased.rebased_changesets.is_empty() {
+            outcome = ReplayOutcome::AlreadyLanded(head);
+        }
+    }
+    scuba.add("outcome", outcome.label());
+    match &outcome {
+        ReplayOutcome::ParentDiffers(parent) | ReplayOutcome::ParentNotLanded(parent) => {
+            scuba.add("undropped_parent", parent.to_string());
+        }
+        ReplayOutcome::AlreadyLanded(commit) => {
+            scuba.add("already_landed", commit.to_string());
+        }
+        ReplayOutcome::Conflict(err) | ReplayOutcome::Failed(err) => {
+            scuba.add("error", format!("{err:#}"));
+        }
+        ReplayOutcome::TooManyPaths(paths) => {
+            scuba.add("changed_paths", *paths);
+        }
+        ReplayOutcome::Replayed(_) | ReplayOutcome::TooLong => {}
+    }
+    scuba.unsampled().log();
+    STATS::baseline_replay.add_value(1, (repo_name.to_string(), mode.label(), outcome.label()));
+    if matches!(outcome, ReplayOutcome::Replayed(_)) {
+        STATS::baseline_resolution_source.add_value(1, (repo_name.to_string(), "replay"));
+    }
+
+    if mode == ReplayMode::Shadow {
+        return Err(unplaceable(BaselineRejection::NotOnBranch));
+    }
+    match outcome {
+        ReplayOutcome::Replayed(stack) => Ok(stack),
+        ReplayOutcome::ParentDiffers(parent) => Err(unplaceable(
+            BaselineRejection::ParentLandedWithChanges(parent),
+        )),
+        ReplayOutcome::ParentNotLanded(parent) => {
+            Err(unplaceable(BaselineRejection::ParentNotLanded(parent)))
+        }
+        ReplayOutcome::AlreadyLanded(commit) => {
+            Err(unplaceable(BaselineRejection::AlreadyLanded(commit)))
+        }
+        ReplayOutcome::Conflict(err) => Err(err),
+        ReplayOutcome::TooLong => Err(unplaceable(BaselineRejection::HistoryTooLong {
+            max_commits: REPLAY_MAX_COMMITS,
+        })),
+        ReplayOutcome::TooManyPaths(_) | ReplayOutcome::Failed(_) => {
+            Err(unplaceable(BaselineRejection::NotOnBranch))
+        }
+    }
+}
+
+async fn replay_stack_from_fork(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    config: &PushrebaseFlags,
+    baseline: ChangesetId,
+    head: ChangesetId,
+    onto: ChangesetId,
+    fork_point: ChangesetId,
+    scuba: &mut MononokeScubaSampleBuilder,
+) -> ReplayOutcome {
+    scuba.add("fork_point", fork_point.to_string());
+    let (parents, stack) = match try_join(
+        range_ids_above_capped(ctx, repo, fork_point, baseline, REPLAY_MAX_COMMITS),
+        range_ids_above_capped(ctx, repo, fork_point, head, REPLAY_MAX_COMMITS),
+    )
+    .await
+    {
+        Ok((Some(parents), Some(stack))) => (parents, stack),
+        Ok(_) => {
+            // Sized for the cap: how far past it the ranges run.
+            if let Ok((parent_len, replay_len)) = try_join(
+                range_len_capped(ctx, repo, fork_point, baseline, REPLAY_LEN_PROBE_CAP),
+                range_len_capped(ctx, repo, fork_point, head, REPLAY_LEN_PROBE_CAP),
+            )
+            .await
+            {
+                scuba
+                    .add("replay_len", replay_len)
+                    .add("parent_len", parent_len);
+            }
+            return ReplayOutcome::TooLong;
+        }
+        Err(err) => return ReplayOutcome::Failed(PushrebaseError::Error(err)),
+    };
+    let parent_set: HashSet<ChangesetId> = parents.iter().copied().collect();
+    let above: Vec<ChangesetId> = stack
+        .iter()
+        .copied()
+        .filter(|cs_id| !parent_set.contains(cs_id))
+        .collect();
+    scuba
+        .add("replay_len", stack.len())
+        .add("parent_len", parents.len());
+
+    // Dropping a parent means comparing merged content with the branch.
+    let flags = PushrebaseFlags {
+        merge_resolution_override: MergeResolutionOverride::ForceOn,
+        ..config.clone()
+    };
+    let rebased = match rebase_stack_onto_manifest(
+        ctx,
+        repo,
+        &flags,
+        fork_point,
+        head,
+        onto,
+        REPLAY_MAX_PATHS,
+    )
+    .await
+    {
+        Ok(rebased) => rebased,
+        Err(PushrebaseError::TooManyPaths { paths, .. }) => {
+            return ReplayOutcome::TooManyPaths(paths);
+        }
+        Err(err @ PushrebaseError::Conflicts(_))
+        | Err(err @ PushrebaseError::PotentialCaseConflict(_)) => {
+            // Only a conflict no commit above the baseline took part in is the parent's.
+            return match parent_only_conflict(ctx, repo, &parents, &above, &err).await {
+                Ok(Some(parent)) => ReplayOutcome::ParentDiffers(parent),
+                Ok(None) => ReplayOutcome::Conflict(err),
+                Err(load_err) => ReplayOutcome::Failed(PushrebaseError::Error(load_err)),
+            };
+        }
+        Err(err) => return ReplayOutcome::Failed(err),
+    };
+
+    let dropped: HashSet<ChangesetId> = rebased.dropped.iter().copied().collect();
+    let undropped: Vec<ChangesetId> = parents
+        .iter()
+        .copied()
+        .filter(|parent| !dropped.contains(parent))
+        .collect();
+    let landed_above: Vec<ChangesetId> = above
+        .iter()
+        .copied()
+        .filter(|cs_id| dropped.contains(cs_id))
+        .collect();
+    scuba
+        .add("dropped_count", rebased.dropped.len())
+        .add("undropped_below_baseline", undropped.len())
+        .add("dropped_above_baseline", landed_above.len());
+    rebased.merge_summary.add_to_scuba(scuba);
+    if let Some(parent) = undropped.first() {
+        return match branch_touched_parent_paths(ctx, repo, *parent, &rebased.server_overlaps).await
+        {
+            Ok(true) => ReplayOutcome::ParentDiffers(*parent),
+            Ok(false) => ReplayOutcome::ParentNotLanded(*parent),
+            Err(err) => ReplayOutcome::Failed(PushrebaseError::Error(err)),
+        };
+    }
+    if let Some(commit) = landed_above.first() {
+        return ReplayOutcome::AlreadyLanded(*commit);
+    }
+    ReplayOutcome::Replayed(rebased)
+}
+
+/// Whether the branch changed a path `parent` touches, or one under or above
+/// it. `server_overlaps` is already bounded by the replay's path cap.
+async fn branch_touched_parent_paths(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    parent: ChangesetId,
+    server_overlaps: &[MPath],
+) -> Result<bool> {
+    if server_overlaps.is_empty() {
+        return Ok(false);
+    }
+    let overlaps: HashSet<&MPath> = server_overlaps.iter().collect();
+    let bcs = parent.load(ctx, &repo.repo_blobstore()).await?;
+    let parent_paths: HashSet<MPath> = bcs
+        .file_changes_map()
+        .keys()
+        .map(|path| MPath::from(path.clone()))
+        .collect();
+    let under_overlap = parent_paths
+        .iter()
+        .any(|path| path.clone().into_ancestors().any(|p| overlaps.contains(&p)));
+    let over_overlap = server_overlaps.iter().any(|path| {
+        path.clone()
+            .into_ancestors()
+            .any(|p| parent_paths.contains(&p))
+    });
+    Ok(under_overlap || over_overlap)
+}
+
+/// `ancestor..descendant` length without the ancestor, counted up to `cap`.
+async fn range_len_capped(
+    ctx: &CoreContext,
+    repo: &impl CommitGraphRef,
+    ancestor: ChangesetId,
+    descendant: ChangesetId,
+    cap: usize,
+) -> Result<usize> {
+    Ok(repo
+        .commit_graph()
+        .range_stream(ctx, ancestor, descendant)
+        .await?
+        .filter(|cs_id| future::ready(cs_id != &ancestor))
+        .take(cap)
+        .count()
+        .await)
+}
+
+/// `ancestor..descendant`, oldest first, without the ancestor; `None` when
+/// longer than `cap`.
+pub async fn range_ids_above_capped(
+    ctx: &CoreContext,
+    repo: &impl CommitGraphRef,
+    ancestor: ChangesetId,
+    descendant: ChangesetId,
+    cap: usize,
+) -> Result<Option<Vec<ChangesetId>>> {
+    let ids: Vec<ChangesetId> = repo
+        .commit_graph()
+        .range_stream(ctx, ancestor, descendant)
+        .await?
+        .filter(|cs_id| future::ready(cs_id != &ancestor))
+        .take(cap + 1)
+        .collect()
+        .await;
+    Ok((ids.len() <= cap).then_some(ids))
+}
+
+/// The first parent commit that touched a conflicting path no commit above
+/// the baseline touched; the conflict is then the parent's landed form.
+async fn parent_only_conflict(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    parents: &[ChangesetId],
+    above: &[ChangesetId],
+    err: &PushrebaseError,
+) -> Result<Option<ChangesetId>> {
+    let conflict_paths: Vec<MPath> = match err {
+        PushrebaseError::Conflicts(conflicts) => conflicts
+            .iter()
+            .flat_map(|conflict| [conflict.left.clone(), conflict.right.clone()])
+            .collect(),
+        PushrebaseError::PotentialCaseConflict(path) => vec![MPath::from(path.clone())],
+        _ => return Ok(None),
+    };
+    let load_all = |ids: &[ChangesetId]| {
+        stream::iter(ids.to_vec())
+            .map(|cs_id| async move { cs_id.load(ctx, &repo.repo_blobstore()).await })
+            .buffered(CONFLICT_ATTRIBUTION_CONCURRENCY)
+            .try_collect::<Vec<BonsaiChangeset>>()
+    };
+    let (parent_bcs, above_bcs) = try_join(load_all(parents), load_all(above)).await?;
+    let touched = |bcs: &BonsaiChangeset, path: &MPath| {
+        bcs.file_changes_map()
+            .keys()
+            .any(|changed| path.is_related_to(&MPath::from(changed.clone())))
+    };
+    Ok(parent_bcs
+        .iter()
+        .find(|parent| {
+            conflict_paths.iter().any(|path| {
+                touched(parent, path) && !above_bcs.iter().any(|child| touched(child, path))
+            })
+        })
+        .map(|parent| parent.get_changeset_id()))
 }
 
 /// A successfully rebased request pending the CAS bookmark update.
@@ -1303,6 +1902,8 @@ struct MergedFileInfo {
     base: Option<BaseFile>,
     /// `None`: absent in the new parent.
     server: Option<BaseFile>,
+    /// How the cascade resolves a both-sides-changed region of this path.
+    resolution: Resolution,
 }
 
 struct ConflictCheckResult {
@@ -1473,6 +2074,7 @@ async fn check_pushrebase_conflicts_with(
                         max_merge_file_size,
                         derive_manifests,
                         &config.merge_resolution_excluded_path_prefixes,
+                        take_incoming_scope(config, reponame),
                     )
                     .await,
                 )
@@ -1877,7 +2479,7 @@ async fn find_closest_ancestor_root(
     let index = roots
         .get(&id)
         .expect("closest root should be one of the candidate roots");
-    if config.forbid_p2_root_rebases && *index != ChildIndex(0) {
+    if config.forbid_p2_root_rebases && !config.mainline_parent_first && *index != ChildIndex(0) {
         ctx.scuba().clone().log_with_msg(
             "pushrebase_p2_root_rejected",
             Some(format!(
@@ -1959,9 +2561,10 @@ pub async fn find_bonsai_diff<T: Repo>(
     )
     .await?;
 
-    Ok(bonsai_diff(
-        ctx.clone(),
+    Ok(hg_manifest_bonsai_diff(
+        ctx,
         repo.repo_blobstore().clone(),
+        repo.repo_identity().name(),
         d_mf,
         Some(a_mf).into_iter().collect(),
     ))
@@ -2161,9 +2764,9 @@ async fn root_manifest_is_derived(
 
 /// What the stack saw at a path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BaseFile {
-    content_id: ContentId,
-    file_type: FileType,
+pub(crate) struct BaseFile {
+    pub(crate) content_id: ContentId,
+    pub(crate) file_type: FileType,
 }
 
 /// Base content for `paths` from `root`'s manifest, `None` meaning absent,
@@ -2318,6 +2921,7 @@ fn collect_overlap_states(
     max_conflicts: usize,
     max_file_size: u64,
     excluded_path_prefixes: &PrefixTrie,
+    take_incoming: Option<TakeIncomingScope<'_>>,
 ) -> Result<Vec<MergedFileInfo>, MergeResolutionError> {
     if conflicts.iter().any(|c| c.left != c.right) {
         return Err(MergeResolutionError::Skipped(
@@ -2363,6 +2967,20 @@ fn collect_overlap_states(
             if changes.is_empty() {
                 return Err(MergeResolutionError::Skipped(format!(
                     "file {path} not a tracked change in pushed changeset",
+                )));
+            }
+            // Taking the pushed side needs the on-branch range to rule out
+            // content that already landed and was superseded; this mode has
+            // only the two manifests, so a path that would be taken verbatim
+            // keeps today's outcome under a reason of its own, and a text
+            // path merges as usual.
+            if take_incoming.is_some_and(|scope| scope.covers(&path))
+                && changes
+                    .iter()
+                    .all(|fc| matches!(fc, FileChange::Change(tc) if tc.git_lfs().is_lfs_pointer()))
+            {
+                return Err(MergeResolutionError::Skipped(format!(
+                    "file {path} would take the pushed side but the baseline is off-branch",
                 )));
             }
             // Safe to skip the merge guards below: the cascade equalises both
@@ -2426,6 +3044,7 @@ fn collect_overlap_states(
                 path,
                 base: base_state,
                 server: onto_state,
+                resolution: Resolution::Merge,
             })
         })
         .collect()
@@ -2533,6 +3152,7 @@ async fn merge_file_by_content_ids(
     base_content_id: ContentId,
     local_content_id: ContentId,
     other_content_id: ContentId,
+    prefer_incoming: bool,
 ) -> FileMergeOutcome {
     let (base_bytes, local_bytes, other_bytes) = futures::join!(
         filestore::fetch_concat(repo.repo_blobstore(), ctx, base_content_id),
@@ -2540,14 +3160,22 @@ async fn merge_file_by_content_ids(
         filestore::fetch_concat(repo.repo_blobstore(), ctx, other_content_id),
     );
 
-    match (base_bytes, local_bytes, other_bytes) {
-        (Ok(base), Ok(local), Ok(other)) => match merge_text(&base, &local, &other) {
-            MergeResult::Clean(merged) => FileMergeOutcome::Clean(Bytes::from(merged)),
-            MergeResult::Conflict(desc) => {
-                FileMergeOutcome::Conflict(format!("file {path}: {desc}"))
-            }
-        },
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => FileMergeOutcome::Error(e),
+    let (base, local, other) = match (base_bytes, local_bytes, other_bytes) {
+        (Ok(base), Ok(local), Ok(other)) => (base, local, other),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return FileMergeOutcome::Error(e),
+    };
+
+    // A clean merge is a clean merge whatever the path; the pushed side is
+    // preferred only where the ordinary merge conflicts.
+    let merged = match merge_text(&base, &local, &other) {
+        MergeResult::Conflict(_) if prefer_incoming => {
+            merge_text_prefer_local(&base, &local, &other)
+        }
+        merged => merged,
+    };
+    match merged {
+        MergeResult::Clean(merged) => FileMergeOutcome::Clean(Bytes::from(merged)),
+        MergeResult::Conflict(desc) => FileMergeOutcome::Conflict(format!("file {path}: {desc}")),
     }
 }
 
@@ -2592,6 +3220,7 @@ async fn collect_merge_file_info(
     max_file_size: u64,
     derive_manifests: bool,
     excluded_path_prefixes: &PrefixTrie,
+    take_incoming: Option<TakeIncomingScope<'_>>,
 ) -> Result<Vec<MergedFileInfo>, MergeResolutionError> {
     // Only handle exact path matches (not prefix conflicts like dir vs dir/file)
     let exact_conflicts: Vec<_> = conflicts.iter().filter(|c| c.left == c.right).collect();
@@ -2692,6 +3321,12 @@ async fn collect_merge_file_info(
             }
         };
 
+        let resolution = Resolution::for_path(
+            take_incoming,
+            &non_root_path,
+            client_fc.git_lfs().is_lfs_pointer(),
+        );
+
         // Both sides landed the same bytes: nothing to merge, so the LFS and
         // size limits below do not apply. The rebase loop sees it as already
         // applied.
@@ -2705,40 +3340,62 @@ async fn collect_merge_file_info(
                     content_id: server_fc.content_id().clone(),
                     file_type: server_fc.file_type(),
                 }),
+                resolution,
             });
             continue;
         }
 
-        // An LFS-tracked file's bonsai content is the blob behind the pointer;
-        // merged bytes would exist on no LFS server.
-        if client_fc.git_lfs().is_lfs_pointer() {
+        // The pushed content already reached the destination once and has
+        // since been superseded there (a replay of a landed stack, or a push
+        // retry after a lost response). Taking it would re-land stale
+        // content over newer; reject, as the plain merge does.
+        if resolution.takes_incoming()
+            && server_bcs.iter().any(|bcs| {
+                matches!(
+                    bcs.file_changes_map().get(&non_root_path),
+                    Some(FileChange::Change(tc)) if tc.content_id() == client_fc.content_id()
+                )
+            })
+        {
             return Err(MergeResolutionError::Skipped(format!(
-                "file {path} is LFS-tracked",
+                "file {path} was already landed and superseded in the destination",
             )));
         }
 
-        // Skip files that are too large
-        if client_fc.size() > max_file_size {
-            return Err(MergeResolutionError::Skipped(format!(
-                "file {} is too large ({} bytes)",
-                path,
-                client_fc.size(),
-            )));
-        }
+        // An LFS pointer taken verbatim is never fetched, so neither the LFS
+        // restriction nor the merge size limit applies to it.
+        if resolution != Resolution::IncomingVerbatim {
+            // An LFS-tracked file's bonsai content is the blob behind the pointer;
+            // merged bytes would exist on no LFS server.
+            if client_fc.git_lfs().is_lfs_pointer() {
+                return Err(MergeResolutionError::Skipped(format!(
+                    "file {path} is LFS-tracked",
+                )));
+            }
 
-        if server_fc.git_lfs().is_lfs_pointer() {
-            return Err(MergeResolutionError::Skipped(format!(
-                "file {path} is LFS-tracked on server",
-            )));
-        }
+            // Skip files that are too large
+            if client_fc.size() > max_file_size {
+                return Err(MergeResolutionError::Skipped(format!(
+                    "file {} is too large ({} bytes)",
+                    path,
+                    client_fc.size(),
+                )));
+            }
 
-        // Also check server file size
-        if server_fc.size() > max_file_size {
-            return Err(MergeResolutionError::Skipped(format!(
-                "file {} is too large on server ({} bytes)",
-                path,
-                server_fc.size(),
-            )));
+            if server_fc.git_lfs().is_lfs_pointer() {
+                return Err(MergeResolutionError::Skipped(format!(
+                    "file {path} is LFS-tracked on server",
+                )));
+            }
+
+            // Also check server file size
+            if server_fc.size() > max_file_size {
+                return Err(MergeResolutionError::Skipped(format!(
+                    "file {} is too large on server ({} bytes)",
+                    path,
+                    server_fc.size(),
+                )));
+            }
         }
 
         let local_file_type = client_fc.file_type();
@@ -2781,8 +3438,14 @@ async fn collect_merge_file_info(
                 content_id: server_fc.content_id().clone(),
                 file_type: local_file_type,
             }),
+            resolution,
         });
     }
+
+    let take_incoming_count = merged_file_changes
+        .iter()
+        .filter(|info| info.resolution.takes_incoming())
+        .count();
 
     // Log success
     ctx.scuba()
@@ -2790,6 +3453,10 @@ async fn collect_merge_file_info(
         .add("repo_name", repo.repo_identity().name())
         .add("merge_resolution_outcome", "success")
         .add("merge_resolution_files", merged_file_changes.len() as i64)
+        .add(
+            "merge_resolution_take_incoming_files",
+            take_incoming_count as i64,
+        )
         .log_with_msg("Pushrebase merge resolution succeeded", None);
 
     info!(
@@ -2827,7 +3494,11 @@ fn reconcile_merge_file_info(
     for info in delta {
         match by_path.entry(info.path.clone()) {
             Entry::Occupied(mut e) => {
-                e.get_mut().server = info.server;
+                let carried = e.get_mut();
+                carried.server = info.server;
+                // Path-determined, so carried and delta agree unless the
+                // config or knob changed between attempts; the latest wins.
+                carried.resolution = info.resolution;
             }
             Entry::Vacant(e) => {
                 e.insert(info.clone());
@@ -2923,6 +3594,10 @@ async fn create_rebased_changesets_with(
 ) -> Result<RebaseOutput, PushrebaseError> {
     let rebased_set_ids: HashSet<_> = rebased_set.iter().map(|cs| cs.get_changeset_id()).collect();
 
+    // Only consulted for the Scuba row of a path that took the pushed side,
+    // which exists only when a scope was present at eligibility.
+    let take_incoming = take_incoming_scope(config, repo.repo_identity().name())
+        .unwrap_or(TakeIncomingScope::Requested);
     let date = if config.rewritedates {
         Some(Timestamp::now())
     } else {
@@ -2936,12 +3611,14 @@ async fn create_rebased_changesets_with(
     let mut merge_paths: HashSet<NonRootMPath> = HashSet::new();
     let mut old_parent_content: HashMap<NonRootMPath, Option<BaseFile>> = HashMap::new();
     let mut new_parent_content: HashMap<NonRootMPath, Option<BaseFile>> = HashMap::new();
+    let mut resolutions: HashMap<NonRootMPath, Resolution> = HashMap::new();
 
     if let Some(ref overrides) = merged_file_overrides {
         for info in overrides {
             merge_paths.insert(info.path.clone());
             old_parent_content.insert(info.path.clone(), info.base);
             new_parent_content.insert(info.path.clone(), info.server);
+            resolutions.insert(info.path.clone(), info.resolution);
         }
     }
 
@@ -2996,6 +3673,37 @@ async fn create_rebased_changesets_with(
                 _ => return Err(same_path_conflict(path)),
             };
 
+            let resolution = resolutions.get(path).copied().unwrap_or(Resolution::Merge);
+
+            // Under a take-incoming prefix, the pushed LFS pointer is the
+            // result: nothing to fetch or merge, and the rebased commit keeps
+            // the pushed change exactly (pointer flag included).
+            if resolution == Resolution::IncomingVerbatim {
+                // The pushed commit did not change the file (a touch): the
+                // destination's change is the only real one and there is
+                // nothing of the pushed side to take.
+                if base == local_file {
+                    return Err(same_path_conflict(path));
+                }
+                log_take_incoming(
+                    ctx,
+                    repo,
+                    TakeIncoming {
+                        bcs: &bcs_old,
+                        path,
+                        resolution,
+                        scope: take_incoming,
+                        base: &base,
+                        local: &local_file,
+                        other: &other_file,
+                    },
+                );
+                merged_paths.entry(id_old).or_default().push(path.clone());
+                old_parent_content.insert(path.clone(), local);
+                new_parent_content.insert(path.clone(), local);
+                continue;
+            }
+
             match merge_file_by_content_ids(
                 ctx,
                 repo,
@@ -3003,10 +3711,26 @@ async fn create_rebased_changesets_with(
                 base.content_id,
                 local_file.content_id,
                 other_file.content_id,
+                resolution == Resolution::PreferIncoming,
             )
             .await
             {
                 FileMergeOutcome::Clean(merged_bytes) => {
+                    if resolution == Resolution::PreferIncoming {
+                        log_take_incoming(
+                            ctx,
+                            repo,
+                            TakeIncoming {
+                                bcs: &bcs_old,
+                                path,
+                                resolution,
+                                scope: take_incoming,
+                                base: &base,
+                                local: &local_file,
+                                other: &other_file,
+                            },
+                        );
+                    }
                     let size = merged_bytes.len() as u64;
                     let meta = filestore::store(
                         repo.repo_blobstore(),
@@ -3096,6 +3820,7 @@ async fn create_rebased_changesets_with(
             &rebased_set_ids,
             hooks,
             overrides_ref,
+            config.mainline_parent_first,
         )
         .await?;
         let timestamp = Timestamp::from(*bcs_new.author_date());
@@ -3175,17 +3900,40 @@ async fn rebase_changeset(
     rebased_set: &HashSet<ChangesetId>,
     hooks: &mut [Box<dyn PushrebaseCommitHook>],
     merged_file_overrides: Option<&Vec<(NonRootMPath, FileChange)>>,
+    mainline_parent_first: bool,
 ) -> Result<BonsaiChangeset> {
     let orig_cs_id = bcs.get_changeset_id();
     let new_file_changes =
         generate_additional_bonsai_file_changes(ctx, &bcs, root, onto, repo, rebased_set).await?;
     let mut bcs = bcs.into_mut();
 
+    // With `mainline_parent_first`, a merge whose first parent is not rebased
+    // takes its mainline parent, the first of its parents that is rebased or
+    // is the root, as its first parent, keeping the order of the others, and
+    // is marked with `PARENTS_SWAPPED_EXTRA`. A bonsai merge's file changes do
+    // not depend on the order of its parents.
+    let swap_index = bcs
+        .parents
+        .iter()
+        .position(|p| p == root || rebased_set.contains(p))
+        .filter(|index| mainline_parent_first && *index > 0);
     bcs.parents = bcs
         .parents
         .into_iter()
         .map(|p| remapping.get(&p).map(|(cs, _)| cs).cloned().unwrap_or(p))
         .collect();
+    if let Some(index) = swap_index {
+        // The marker must make the hash differ from the pushed commit's.
+        if bcs.hg_extra.contains_key(PARENTS_SWAPPED_EXTRA) {
+            return Err(PushrebaseInternalError::ParentsAlreadySwapped(orig_cs_id).into());
+        }
+        bcs.parents[..=index].rotate_right(1);
+        bcs.hg_extra
+            .insert(PARENTS_SWAPPED_EXTRA.to_string(), b"1".to_vec());
+        ctx.scuba()
+            .clone()
+            .log_with_msg("pushrebase_parents_swapped", Some(orig_cs_id.to_string()));
+    }
 
     match timestamp {
         Some(timestamp) => {
@@ -3378,14 +4126,25 @@ async fn generate_additional_bonsai_file_changes(
     // o   D <- commit D doesn't have file.txt, so no conflicts possible after pushrebase
     // | /
     // B
+    let read_from_augmented = hg_manifests_read_from_augmented(repo.repo_identity().name());
     let mut futs = vec![];
     for p in non_root_parents_outside_of_rebase_set {
         let paths = paths.clone();
         futs.push(async move {
             let mfid = id_to_manifestid(ctx, repo, *p).await?;
-            let stale = mfid
-                .find_entries(ctx.clone(), repo.repo_blobstore().clone(), paths)
-                .try_filter_map(async |(path, _)| Ok(Option::<NonRootMPath>::from(path)))
+            let blobstore = repo.repo_blobstore().clone();
+            let found = if read_from_augmented {
+                HgAugmentedManifestId::new(mfid.into_nodehash())
+                    .find_entries(ctx.clone(), blobstore, paths)
+                    .map_ok(|(path, _)| path)
+                    .left_stream()
+            } else {
+                mfid.find_entries(ctx.clone(), blobstore, paths)
+                    .map_ok(|(path, _)| path)
+                    .right_stream()
+            };
+            let stale = found
+                .try_filter_map(async |path| Ok(Option::<NonRootMPath>::from(path)))
                 .try_collect::<HashSet<_>>()
                 .await?;
             Result::<_, Error>::Ok(stale)

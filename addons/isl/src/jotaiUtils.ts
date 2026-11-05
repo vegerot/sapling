@@ -7,7 +7,7 @@
 
 import type {Atom, Getter, WritableAtom} from 'jotai';
 import type {Json} from 'shared/typeUtils';
-import type {Platform} from './platform';
+import type {PersistedStateOptions, Platform} from './platform';
 import type {ConfigName, LocalStorageName, SettableConfigName} from './types';
 
 import {atom, getDefaultStore, useStore} from 'jotai';
@@ -27,7 +27,7 @@ export type MutAtom<T> = WritableAtom<T, [T | ((prev: T) => T)], void>;
  * The store being used. Do not use this directly. Alternatives are:
  * - use `readAtom` instead of `store.get`.
  * - use `writeAtom` instead of `store.set`.
- * - use `atomWithOnChange` instead of `store.sub`.
+ * - use `atomWithOnChange` or `subscribeAtom` instead of `store.sub`.
  */
 let store = getDefaultStore();
 
@@ -116,19 +116,34 @@ export function configBackedAtom<T extends Json>(
  * and persists any changes back to it.
  * Useful for some customizations that don't warrant a user-visible sl config,
  * for example UI expansion state.
+ *
+ * `portable` marks a preference that means the same on every machine (never per-repo, per-commit
+ * or per-machine state), which an embedding platform may keep across machines; `validate` narrows
+ * what such a value may be, beyond having the default's JSON type.
  */
 export function localStorageBackedAtom<T extends Json>(
   name: LocalStorageName,
   defaultValue: T,
+  options?: {portable: true; validate?: (value: Json) => boolean},
 ): MutAtom<T> {
-  const primitiveAtom = atom<T>(platform.getPersistedState<T>(name) ?? defaultValue);
+  const persisted: PersistedStateOptions | undefined =
+    options == null ? undefined : {...options, defaultValue};
+  const stored =
+    persisted == null
+      ? platform.getPersistedState<T>(name)
+      : platform.getPersistedState<T>(name, persisted);
+  const primitiveAtom = atom<T>(stored ?? defaultValue);
 
   return atom(
     get => get(primitiveAtom),
     (get, set, update) => {
       const newValue = typeof update === 'function' ? update(get(primitiveAtom)) : update;
       set(primitiveAtom, newValue);
-      platform.setPersistedState(name, newValue);
+      if (persisted == null) {
+        platform.setPersistedState(name, newValue);
+      } else {
+        platform.setPersistedState(name, newValue, persisted);
+      }
     },
   );
 }
@@ -207,8 +222,19 @@ export function readAtom<T>(atom: Atom<T>): T {
   return store.get(atom);
 }
 
-export function writeAtom<T>(atom: MutAtom<T>, value: T | ((prev: T) => T)) {
-  store.set(atom, value);
+export function writeAtom<Value, Args extends Array<unknown>, Result>(
+  atom: WritableAtom<Value, Args, Result>,
+  ...args: Args
+): Result {
+  return store.set(atom, ...args);
+}
+
+/**
+ * Subscribe to changes of an atom. Returns a function to unsubscribe.
+ * Prefer derived atoms or `atomWithOnChange`; this is for one-off listeners.
+ */
+export function subscribeAtom(atom: Atom<unknown>, callback: () => void): () => void {
+  return store.sub(atom, callback);
 }
 
 export function refreshAtom<T>(atom: WritableAtom<T, [], void>) {

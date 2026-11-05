@@ -78,6 +78,9 @@ mod linear;
 mod segments;
 mod writer;
 
+#[cfg(test)]
+mod tests;
+
 /// Commit Graph.
 ///
 /// This contains the graph of all commits known to Mononoke for a particular
@@ -424,6 +427,10 @@ impl CommitGraph {
             return Ok(false);
         }
 
+        if descendant_edges.parent_count() > 1 {
+            return Ok(false);
+        }
+
         if let Some(merge_ancestor) = descendant_edges.merge_ancestor_or_root::<Parents>()
             && merge_ancestor.generation::<Parents>() > FIRST_GENERATION
             && merge_ancestor.generation::<Parents>() >= target_gen
@@ -495,7 +502,7 @@ impl<E: EdgeType> CommitGraphOps<E> {
             monotonic_property(node.cs_id)
         };
 
-        while let Some(ancestors_frontier_extension) = self
+        while let Some((ancestors_frontier_extension, _)) = self
             .lower_frontier_step(ctx, &mut frontier, &monotonic_property, Prefetch::None)
             .await?
         {

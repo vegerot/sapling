@@ -8,24 +8,25 @@ edition = "2024"
 homepage = "https://sapling-scm.com/"
 repository = "https://github.com/facebook/sapling"
 license = "MIT"
+exclude = ["BUCK"]
 
 [lib]
 name = "sparse"
 
 [dependencies]
 anyhow = "1.0.104"
-futures = { version = "0.3.34", features = ["async-await", "compat"], optional = true }
+futures = { version = "0.3.34", features = ["async-await", "executor", "std"], optional = true, default-features = false }
 globset = { version = "0.4.20", features = ["serde1"] }
 regex = "1.13.1"
 sapling-pathmatcher = { version = "0.1.0", path = "../pathmatcher" }
-sapling-rewrite-macros = { version = "0.1.0", path = "../util/rewrite-macros" }
+sapling-rewrite-macros = { version = "0.2.0", path = "../util/rewrite-macros" }
 sapling-types = { version = "0.1.0", path = "../types" }
 thiserror = "2.0.21"
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"], optional = true }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"], optional = true }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 
 [features]
 async = ["futures", "tokio"]

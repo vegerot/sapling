@@ -21,6 +21,11 @@ impl AddScubaResponse for i64 {}
 impl AddScubaResponse for Vec<thrift::Repo> {}
 
 impl AddScubaResponse for thrift::RepoExistsResponse {}
+impl AddScubaResponse for thrift::StorageConfigExistsResponse {}
+impl AddScubaResponse for thrift::CreateOrgStorageConfigToken {}
+impl AddScubaResponse for thrift::DeleteOrgStorageConfigToken {}
+impl AddScubaResponse for thrift::OrgStorageConfigPollResponse {}
+impl AddScubaResponse for thrift::OrgStorageConfigResponse {}
 
 impl AddScubaResponse for thrift::RepoInfo {}
 
@@ -92,6 +97,17 @@ impl AddScubaResponse for thrift::RepoListBookmarksResponse {}
 
 impl AddScubaResponse for thrift::RepoResolveBookmarkResponse {}
 
+impl AddScubaResponse for thrift::RepoResolveP4FileRevisionResponse {
+    fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("response_found", self.commit.is_some());
+        scuba.add("response_exists", self.exists);
+        if let Some(changelist) = self.changelist {
+            scuba.add("response_changelist", changelist);
+        }
+        scuba.add("response_commits_walked", self.commits_walked);
+    }
+}
+
 impl AddScubaResponse for thrift::RepoResolveCommitPrefixResponse {}
 
 impl AddScubaResponse for thrift::RepoBookmarkInfoResponse {}
@@ -114,7 +130,7 @@ impl AddScubaResponse for thrift::CommitFileDiffsResponse {
             .path_diffs
             .iter()
             .filter_map(|response| match &response.diff {
-                thrift::Diff::metadata_diff(metadata) => match (
+                Some(thrift::Diff::metadata_diff(metadata)) => match (
                     metadata.old_file_info.file_content_type,
                     metadata.new_file_info.file_content_type,
                 ) {

@@ -1,7 +1,7 @@
 load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_treehugger")
+oncall("scm_server_infra")
 
 rust_library(
     name = "warm_bookmarks_cache",
@@ -32,7 +32,16 @@ rust_library(
         "//eden/mononoke/repo_factory:test_repo_factory",
         "//eden/mononoke/tests/fixtures:fixtures",
         "//eden/mononoke/tests/utils:tests_utils",
-    ],
+    ]
+    + (
+        []
+        if rust_oss.is_oss_build()
+        else [
+            "fbsource//third-party/rust:serde_json",
+            "fbsource//third-party/rust:tempfile",
+            "//eden/mononoke/features/repo_update_logger:repo_update_logger",
+        ]
+    ),
     deps = (
         [
             "fbsource//third-party/rust:anyhow",
@@ -83,6 +92,7 @@ rust_library(
             []
             if rust_oss.is_oss_build()
             else [
+                "//common/rust/shed/fbinit:fbinit",
                 "//eden/mononoke/facebook/ods3_schemas:MononokeWarmBookmarkCacheStats_ods3-rs_bindings",
             ]
         )

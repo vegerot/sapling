@@ -7,6 +7,11 @@ sl_rust_library(
     srcs = glob(["src/**/*.rs"]),
     autocargo = {
         "cargo_toml_config": {
+            "dependencies_override": {
+                "dependencies": {
+                    "futures": {"features": ["std", "async-await", "executor"]},
+                },
+            },
             # Cargo feature-gated deps ("async" feature not enabled in Buck).
             "extra_buck_dependencies": {
                 "dependencies": [
@@ -23,14 +28,6 @@ sl_rust_library(
                     "tokio",
                 ],
                 "default": [],
-            },
-            "lib": {"name": "sparse"},
-            "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
-                "license": "MIT",
-                "name": "sapling-sparse",
-                "repository": "https://github.com/facebook/sapling",
             },
         },
     },
@@ -51,16 +48,6 @@ sl_rust_library(
     name = "sparse-async",
     srcs = glob(["src/**/*.rs"]),
     autocargo = {
-        "cargo_toml_config": {
-            "lib": {"name": "sparse"},
-            "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-                "homepage": "https://sapling-scm.com/",
-                "license": "MIT",
-                "name": "sapling-sparse",
-                "repository": "https://github.com/facebook/sapling",
-            },
-        },
         "ignore_rule": True,
     },
     crate = "sparse",

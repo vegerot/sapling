@@ -5,7 +5,7 @@
  * GNU General Public License version 2.
  */
 
-#![feature(error_generic_member_access)]
+#![cfg_attr(fbcode_build, feature(error_generic_member_access))]
 #![feature(trait_alias)]
 
 use std::collections::HashMap;
@@ -55,8 +55,13 @@ pub use crate::changeset::ChangesetHistoryOptions;
 pub use crate::changeset::ChangesetLinearHistoryOptions;
 pub use crate::changeset::FingerprintVersion;
 pub use crate::changeset::Generation;
+pub use crate::changeset::PathVisibility;
 pub use crate::changeset_path::ChangesetPathContentContext;
 pub use crate::changeset_path::ChangesetPathHistoryOptions;
+pub use crate::changeset_path::P4ChangesetRevisions;
+pub use crate::changeset_path::P4LastChange;
+pub use crate::changeset_path::P4PathRevision;
+pub use crate::changeset_path::P4RevisionSearch;
 pub use crate::changeset_path::PathEntry;
 pub use crate::changeset_path_diff::ChangesetPathDiffContext;
 pub use crate::changeset_path_diff::CopyInfo;
@@ -94,9 +99,21 @@ pub use crate::repo::create_changeset::CreateInfo;
 pub use crate::repo::land_stack::PushrebaseOutcome;
 pub use crate::repo::update_submodule_expansion::SubmoduleExpansionUpdate;
 pub use crate::repo::update_submodule_expansion::SubmoduleExpansionUpdateCommitInfo;
+pub use crate::restricted_paths::ChangedPathRestrictionInfo;
+pub use crate::restricted_paths::ChangedPathRestrictionSides;
+pub use crate::restricted_paths::ChangedPathsRestrictionOptions;
+pub use crate::restricted_paths::DenyingRestriction;
+pub use crate::restricted_paths::OmissionCollector;
 pub use crate::restricted_paths::PathAccessInfo;
+pub use crate::restricted_paths::PathPermissionChangeInfo;
+pub use crate::restricted_paths::PathPolicyInfo;
+pub use crate::restricted_paths::PathRestrictionCopySourceInfo;
 pub use crate::restricted_paths::RestrictedChangeGroup;
 pub use crate::restricted_paths::RestrictedPathsChangesInfo;
+pub use crate::restricted_paths::RestrictedPathsPolicy;
+pub use crate::restricted_paths::SCS_ENABLE_PARTIAL_RESPONSES_JK;
+pub use crate::restricted_paths::SubtreeSourceMapping;
+pub use crate::restricted_paths::SubtreeSourcePolicyInfo;
 pub use crate::specifiers::ChangesetId;
 pub use crate::specifiers::ChangesetIdPrefix;
 pub use crate::specifiers::ChangesetPrefixSpecifier;
@@ -133,7 +150,7 @@ impl<R> Mononoke<R> {
     /// so the tier list could be derived on demand. We deliberately keep the
     /// pre-computed ArcSwap: deriving from configs would iterate ~thousands of
     /// repos per `list_repos` call and would require plumbing `MononokeConfigs`
-    /// through to here, which Mononoke<R> intentionally does not depend on.
+    /// through to here, which `Mononoke<R>` intentionally does not depend on.
     pub fn new(
         repos: Arc<MononokeRepos<R>>,
         repo_names_in_tier: Arc<ArcSwap<HashMap<String, CommitIdentityScheme>>>,

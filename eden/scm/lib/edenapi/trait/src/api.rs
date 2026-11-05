@@ -36,6 +36,7 @@ use edenapi_types::CommitLocationToHashResponse;
 use edenapi_types::CommitMutationsResponse;
 use edenapi_types::CommitRevlogData;
 use edenapi_types::CommitTranslateIdResponse;
+use edenapi_types::EphemeralExtendRequest;
 use edenapi_types::EphemeralExtendResponse;
 use edenapi_types::EphemeralPrepareResponse;
 use edenapi_types::FetchSnapshotRequest;
@@ -249,7 +250,9 @@ pub trait SaplingRemoteApi: Send + Sync + 'static {
 
     /// List bookmarks matching patterns (replacement for wireproto listkeyspatterns).
     /// Patterns can be exact bookmark names or prefix patterns ending with '*'.
-    /// `kinds` specifies which bookmark kinds to include; empty means PullDefaultPublishing only.
+    /// A prefix pattern matches every non-scratch bookmark with that prefix, and
+    /// scratch bookmarks too if `kinds` contains `Scratch`; `kinds` does not tell
+    /// the other kinds apart. An exact name matches a bookmark of any kind.
     async fn list_bookmark_patterns(
         &self,
         patterns: Vec<String>,
@@ -298,9 +301,13 @@ pub trait SaplingRemoteApi: Send + Sync + 'static {
     ///
     /// * bookmark: the name of the bookmark to land to.
     /// * head: the head commit of the stack that is to be landed.
-    /// * base: the parent of the bottom of the stack that is to be landed. This must
-    ///   match the merge base of the head commit with respect to the current
-    ///   bookmark location.
+    /// * base: the merge base of the head commit and the bookmark. A caller
+    ///   whose view of the bookmark is behind the server's passes the same
+    ///   commit; the server rejects any other. The commits that descend from
+    ///   it and are ancestors of the head are rebased onto the bookmark, and
+    ///   must not be public. Other ancestors of the head that are not
+    ///   ancestors of the bookmark, such as the other side of a merge, land
+    ///   unchanged.
     /// * pushvars: the pushvars to use when landing the stack.
     async fn land_stack(
         &self,
@@ -397,10 +404,9 @@ pub trait SaplingRemoteApi: Send + Sync + 'static {
 
     async fn ephemeral_extend(
         &self,
-        bubble_id: NonZeroU64,
-        custom_duration_secs: Option<u64>,
+        request: EphemeralExtendRequest,
     ) -> Result<EphemeralExtendResponse, SaplingRemoteApiError> {
-        let _ = (bubble_id, custom_duration_secs);
+        let _ = request;
         Err(SaplingRemoteApiError::NotSupported)
     }
 

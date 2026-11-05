@@ -31,11 +31,9 @@ use futures::future::FutureExt;
 use futures::stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
-use manifest::BonsaiDiffFileChange;
 use manifest::Diff;
 use manifest::ManifestOps;
 use manifest::PathTree;
-use manifest::bonsai_diff;
 use mononoke_macros::mononoke;
 use mononoke_types::BlobstoreKey;
 use mononoke_types::BonsaiChangeset;
@@ -92,9 +90,8 @@ use crate::mapping::RootDeletedManifestIdCommon;
 ///    deleted manifest for. In this case the other parent is resurrecting that
 ///    entry and we have to accommodate for that.
 ///
-/// 2. When the the path is a directory in one of the parents but a file in
-///    unode for current commit. In this case we descend into all paths in replaced
-///    directory.
+/// 2. When the path is a directory in one of the parents but is absent or a file
+///    in the current commit. In this case we descend into the removed directory.
 pub(crate) struct DeletedManifestDeriver<Manifest: DeletedManifestCommon>(
     std::marker::PhantomData<Manifest>,
 );
@@ -153,38 +150,6 @@ struct DeletedManifestUnfoldNode<Manifest: DeletedManifestCommon> {
     known_entries: PathTree<Option<Option<Manifest::Id>>>,
 }
 
-async fn get_changes_bonsai(
-    ctx: &CoreContext,
-    blobstore: &Arc<dyn KeyedBlobstore>,
-    bonsai: &BonsaiChangeset,
-    unode: ManifestUnodeId,
-    parents: impl Iterator<Item = ManifestUnodeId>,
-) -> Result<PathTree<()>, Error> {
-    if bonsai.has_manifest_altering_subtree_changes() {
-        // This bonsai includes subtree operations that alter the manifest.
-        // Recompute the bonsai changes ignoring the subtree operations.
-        Ok(PathTree::from_iter(
-            bonsai_diff(ctx.clone(), blobstore.clone(), unode, parents.collect())
-                .map_ok(|diff| async move {
-                    match diff {
-                        BonsaiDiffFileChange::Changed(path, _) => Ok((path, ())),
-                        BonsaiDiffFileChange::ChangedReusedId(path, _) => Ok((path, ())),
-                        BonsaiDiffFileChange::Deleted(path) => Ok((path, ())),
-                    }
-                })
-                .try_buffered(100)
-                .try_collect::<Vec<_>>()
-                .await?,
-        ))
-    } else {
-        Ok(PathTree::from_iter(
-            bonsai
-                .file_changes()
-                .map(|(path, _change)| (path.clone(), ())),
-        ))
-    }
-}
-
 impl<Manifest: DeletedManifestCommon> DeletedManifestDeriver<Manifest> {
     /// Derives a Deleted Manifest for a single commit (canonical, whole-tree).
     /// Thin wrapper over `derive_subtree` seeded at the repo root with no
@@ -196,14 +161,11 @@ impl<Manifest: DeletedManifestCommon> DeletedManifestDeriver<Manifest> {
         parents: Vec<(ChangesetId, Manifest::Id, ManifestUnodeId)>,
         current_unode: ManifestUnodeId,
     ) -> Result<Manifest::Id, Error> {
-        let changes: PathTree<()> = get_changes_bonsai(
-            ctx,
-            blobstore,
-            &bonsai,
-            current_unode,
-            parents.iter().map(|(_, _, unode)| *unode),
-        )
-        .await?;
+        let changes: PathTree<()> = PathTree::from_iter(
+            bonsai
+                .file_changes()
+                .map(|(path, _change)| (path.clone(), ())),
+        );
         let cs_id = bonsai.get_changeset_id();
         let parent_deleted_manifests = parents
             .iter()
@@ -476,21 +438,12 @@ impl<Manifest: DeletedManifestCommon> DeletedManifestDeriver<Manifest> {
             DeletedManifestChangeType::CreateDeleted
         };
 
-        // Special case of bonsais where a file is replacing a tree in the
-        // parent. We need to recurse into that parent tree to mark the whole
-        // thing as deleted even though newly deleted files weren't listed
-        // in bonsai's changes.
-        if let Some(UnodeEntry::File(_mf_unode)) = current_unode_id {
-            for (parent_unode_entry, _parent_cs_ids) in parents_unode_ids.iter() {
-                if let UnodeEntry::Directory(parent_unode) = parent_unode_entry {
-                    let entries: Vec<_> = parent_unode
-                        .list_all_entries(ctx.clone(), blobstore.clone())
-                        .try_collect()
-                        .await?;
-                    for (path, _) in entries {
-                        counters.file_dir.inc();
-                        changes.insert(path, ());
-                    }
+        // Directory replacement can delete descendants absent from Bonsai's changes.
+        if !matches!(current_unode_id, Some(UnodeEntry::Directory(_))) {
+            for (parent_unode, _) in &parent_tree_unodes {
+                for (name, _) in parent_unode.subentries() {
+                    counters.file_dir.inc();
+                    changes.insert(MPath::from(vec![name.clone()]), ());
                 }
             }
         }

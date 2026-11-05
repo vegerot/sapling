@@ -20,6 +20,7 @@ use commit_graph_types::edges::Parents;
 use commit_graph_types::storage::CommitGraphStorage;
 use commit_graph_types::storage::Prefetch;
 use context::CoreContext;
+use context::PerfCounterType;
 use futures::FutureExt;
 use futures::stream::TryStreamExt;
 use in_memory_commit_graph_storage::InMemoryCommitGraphStorage;
@@ -57,11 +58,13 @@ macro_rules! impl_commit_graph_tests {
             test_is_ancestor_skew_ancestors_prefetching,
             test_filter_ancestors,
             test_is_linear_stack,
+            test_is_linear_stack_merge_descendant,
             test_skip_tree,
             test_p1_linear_tree,
             test_parents_and_subtree_sources_tree,
             test_ancestors_difference,
             test_ancestors_difference_many_stacks,
+            test_lower_frontier_batch_prefetch,
             test_ancestors_difference_segment_slices,
             test_find_by_prefix,
             test_add_recursive,
@@ -587,6 +590,49 @@ pub async fn test_is_linear_stack(
     Ok(())
 }
 
+/// A merge commit is never the top of a linear stack: the stack includes `descendant`,
+/// and a linear stack has no changeset with more than one parent.
+pub async fn test_is_linear_stack_merge_descendant(
+    ctx: CoreContext,
+    storage: Arc<dyn CommitGraphStorageTest>,
+) -> Result<()> {
+    let graph = from_dag(
+        &ctx,
+        r"
+             A-B-C-D-G-H-I
+              \     /
+               E---F
+         ",
+        storage.clone(),
+    )
+    .await?;
+    storage.flush();
+
+    // G is a merge of D and F, so no stack whose top is G is linear.
+    assert!(
+        !graph
+            .is_linear_stack(&ctx, name_cs_id("D"), name_cs_id("G"))
+            .await?
+    );
+    assert!(
+        !graph
+            .is_linear_stack(&ctx, name_cs_id("A"), name_cs_id("G"))
+            .await?
+    );
+    assert!(
+        !graph
+            .is_linear_stack(&ctx, name_cs_id("F"), name_cs_id("G"))
+            .await?
+    );
+    assert!(
+        !graph
+            .is_linear_stack(&ctx, name_cs_id("G"), name_cs_id("G"))
+            .await?
+    );
+
+    Ok(())
+}
+
 pub async fn test_skip_tree(
     ctx: CoreContext,
     storage: Arc<dyn CommitGraphStorageTest>,
@@ -847,6 +893,56 @@ pub async fn test_ancestors_difference_many_stacks(
             "scm/mononoke:commit_graph_pull_optimizations".to_string() => KnobVal::Bool(false),
         }),
         assert_many_stacks(&graph, &ctx).boxed(),
+    )
+    .await
+}
+
+pub async fn test_lower_frontier_batch_prefetch(
+    ctx: CoreContext,
+    storage: Arc<dyn CommitGraphStorageTest>,
+) -> Result<()> {
+    // Every commit on the main line merges in an unrelated two-commit
+    // branch, so lowering a frontier below each merge adds a changeset
+    // above the target.
+    let graph = from_dag(
+        &ctx,
+        r"
+                A-B-C-D-E-F
+                 / / / / /
+              L-G / / / /
+               M-H / / /
+                N-I / /
+                 O-J /
+                  P-K
+        ",
+        storage.clone(),
+    )
+    .await?;
+    storage.flush();
+
+    with_just_knobs_async(
+        JustKnobsInMemory::new(hashmap! {
+            "scm/mononoke:commit_graph_pull_optimizations".to_string() => KnobVal::Bool(true),
+            "scm/mononoke:commit_graph_prefetch_step_limit".to_string() => KnobVal::Int(4),
+        }),
+        async {
+            assert!(
+                graph
+                    .is_ancestor(&ctx, name_cs_id("A"), name_cs_id("F"))
+                    .await?
+            );
+            // Lowering F to A's generation batches E and K, then D and J,
+            // then C and I, then B and H, as each merge adds its branch to
+            // the frontier.  Each is batched once however many times the
+            // frontier grows afterwards.
+            assert_eq!(
+                ctx.perf_counters()
+                    .get_counter(PerfCounterType::CommitGraphBatchPrefetchScanned),
+                8
+            );
+            Ok(())
+        }
+        .boxed(),
     )
     .await
 }
@@ -1831,7 +1927,7 @@ pub async fn test_segmented_slice_ancestors(
     .await?;
 
     // Each slice is assigned the correct boundary: ("L", "L") depends on nothing,
-    // ("M", "M") depends on "L" and so onn.
+    // ("M", "M") depends on "L" and so on.
     assert_segmented_slice_ancestors_with_per_slice_boundaries(
         &graph,
         &ctx,

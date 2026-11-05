@@ -36,6 +36,7 @@ PathMatcherError = bindings.error.PathMatcherError
 WorkingCopyError = bindings.error.WorkingCopyError
 RepoInitError = bindings.error.RepoInitError
 PermissionDeniedError = bindings.error.PermissionDeniedError
+RepoAccessDeniedError = bindings.error.RepoAccessDeniedError
 UncategorizedNativeError = bindings.error.UncategorizedNativeError
 TlsError = bindings.error.TlsError
 
@@ -49,6 +50,11 @@ def _tobytes(exc) -> Union[bytes, str]:
     return b"(%s)" % b", ".join(b"'%s'" % str(a) for a in exc.args)
 
 
+# Sampling metadata shared with the Rust dispatcher and telemetry wrapper.
+USAGE_ERROR = "usage"
+CERTIFICATE_ERROR = "certificate"
+
+
 class Hint:
     """Mix-in to provide a hint of an error
 
@@ -59,6 +65,18 @@ class Hint:
     def __init__(self, *args, **kwargs):
         self.hint = kwargs.pop(r"hint", None)
         super(Hint, self).__init__(*args, **kwargs)
+
+
+class ErrorCategory:
+    """Mix-in to attach a telemetry category to an exception."""
+
+    error_category = None
+
+    def __init__(self, *args, **kwargs):
+        category = kwargs.pop("error_category", None)
+        if category is not None:
+            self.error_category = category
+        super().__init__(*args, **kwargs)
 
 
 class Context:
@@ -137,6 +155,7 @@ class CommandError(Exception):
     """Exception raised on errors in parsing the command line."""
 
     __bytes__ = _tobytes
+    error_category = USAGE_ERROR
 
 
 class InterventionRequired(Hint, Context, Exception):
@@ -145,7 +164,7 @@ class InterventionRequired(Hint, Context, Exception):
     __bytes__ = _tobytes
 
 
-class Abort(Hint, Context, Component, Exception):
+class Abort(Hint, Context, Component, ErrorCategory, Exception):
     """Raised if a command needs to print an error and exit."""
 
     __bytes__ = _tobytes
@@ -236,7 +255,7 @@ class EvalError(ParseError):
     """A type/value error evaluating on of our DSLs"""
 
 
-class RepoError(Hint, Context, Exception):
+class RepoError(Hint, Context, ErrorCategory, Exception):
     __bytes__ = _tobytes
 
 
@@ -352,12 +371,14 @@ class UnknownCommand(Exception):
     """Exception raised if command is not in the command table."""
 
     __bytes__ = _tobytes
+    error_category = USAGE_ERROR
 
 
 class AmbiguousCommand(Exception):
     """Exception raised if command shortcut matches more than one command."""
 
     __bytes__ = _tobytes
+    error_category = USAGE_ERROR
 
 
 class UnknownSubcommand(Exception):
@@ -365,6 +386,7 @@ class UnknownSubcommand(Exception):
     command that requires subcommands."""
 
     __bytes__ = _tobytes
+    error_category = USAGE_ERROR
 
 
 # derived from KeyboardInterrupt to simplify some breakout code

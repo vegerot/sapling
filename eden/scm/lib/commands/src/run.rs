@@ -20,6 +20,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::channel;
 use std::thread;
@@ -58,6 +59,19 @@ use tracing_subscriber::layer::SubscriberExt;
 use crate::HgPython;
 use crate::commands;
 
+/// Number of `run_command` calls in progress.
+static RUNNING_COMMANDS: AtomicUsize = AtomicUsize::new(0);
+
+struct RunningCommand;
+
+impl Drop for RunningCommand {
+    fn drop(&mut self) {
+        if RUNNING_COMMANDS.fetch_sub(1, Ordering::AcqRel) == 1 {
+            crate::deinit();
+        }
+    }
+}
+
 /// Run a Rust or Python command.
 ///
 /// Have side effect on `io` and return the command exit code.
@@ -94,6 +108,9 @@ pub fn run_command(args: Vec<String>, io: &IO) -> i32 {
         return hgpython.run_python(&args, io) as i32;
     }
 
+    RUNNING_COMMANDS.fetch_add(1, Ordering::AcqRel);
+    let running_command = RunningCommand;
+
     // Extra initialization based on global flags.
     let global_opts = dispatch::parse_global_opts(&args[1..]).ok();
 
@@ -116,6 +133,8 @@ pub fn run_command(args: Vec<String>, io: &IO) -> i32 {
 
     let scenario = failpoint::setup_fail_points();
     constructors::init();
+    #[cfg(all(feature = "cas", fbcode_build))]
+    casd_native_client::register();
 
     // This is intended to be "process start". Since run_command is very close
     // to process start, it should reflect the duration of the command
@@ -195,7 +214,10 @@ pub fn run_command(args: Vec<String>, io: &IO) -> i32 {
         failpoint::teardown_fail_points(scenario);
     }
 
-    crate::deinit();
+    // A nested command runs while the Python code that called it, ex. a hook
+    // calling `bindings.commands.run`, is still on the stack, so only the last
+    // command to exit may finalize Python.
+    drop(running_command);
 
     exit_code
 }
@@ -296,6 +318,8 @@ fn dispatch_command(
                     config,
                     already_ran_pre_hooks,
                 )
+            } else if is_broken_pipe(&err) {
+                BROKEN_PIPE_EXIT_CODE
             } else {
                 if exiting_via_signal.load(Ordering::Acquire) {
                     // If were were interrupted (e.g. SIGINT), atexit handlers running async in
@@ -313,7 +337,17 @@ fn dispatch_command(
                     Some(dispatcher.config().as_ref()),
                     dispatcher.global_opts().traceback,
                 );
-                errors::upload_traceback(&err, start_time.epoch_ms());
+                let category = errors::error_category(&err);
+                if let Some(category) = category {
+                    if let Err(err) =
+                        sampling::log!(target: "command_info", error_category = category)
+                    {
+                        tracing::warn!(?err, "could not log command error category");
+                    }
+                }
+                if !matches!(category, Some("usage" | "certificate")) {
+                    errors::upload_traceback(&err, start_time.epoch_ms());
+                }
                 255
             }
         }
@@ -321,6 +355,9 @@ fn dispatch_command(
 
     if !fell_back {
         if let Err(err) = io.wait_pager().context("error flushing command output") {
+            if is_broken_pipe(&err) {
+                return BROKEN_PIPE_EXIT_CODE;
+            }
             errors::print_error(
                 &err,
                 io,
@@ -371,6 +408,18 @@ fn dispatch_command(
     }
 
     exit_code
+}
+
+/// Exit code when the reader closes our output early (`sl log | head`):
+/// 128 + SIGPIPE, what a shell reports for git and other tools killed by
+/// SIGPIPE. It stays non-zero, but callers can tell it from a real error (255).
+const BROKEN_PIPE_EXIT_CODE: i32 = 128 + 13;
+
+fn is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        e.downcast_ref::<io::Error>()
+            .is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe)
+    })
 }
 
 /// Similar to `std::env::current_dir`. But does some extra things:

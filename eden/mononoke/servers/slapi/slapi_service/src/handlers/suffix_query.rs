@@ -48,12 +48,16 @@ impl SaplingRemoteApiHandler for SuffixQueryHandler {
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
-        let prefixes = request.prefixes.map(|prefixes| {
-            prefixes
-                .into_iter()
-                .map(|prefix| MPath::try_from(&prefix).unwrap())
-                .collect()
-        });
+        let prefixes = request
+            .prefixes
+            .map(|prefixes| {
+                prefixes
+                    .into_iter()
+                    .map(MPath::new)
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .transpose()
+            .map_err(HttpError::e400)?;
         let suffixes = Vec1::try_from_vec(request.basename_suffixes)
             .with_context(|| anyhow!("No suffixes provided"))
             .map_err(HttpError::e400)?;
@@ -87,5 +91,73 @@ impl SaplingRemoteApiHandler for SuffixQueryHandler {
             }
         }
         .boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use context::CoreContext;
+    use edenapi_types::CommitId;
+    use fbinit::FacebookInit;
+    use gotham::extractor::NoopQueryStringExtractor;
+    use gotham_ext::handler::SlapiCommitIdentityScheme;
+    use gotham_ext::middleware::request_context::RequestContext;
+    use mononoke_api::Mononoke;
+    use mononoke_api_hg::RepoContextHgExt;
+    use mononoke_macros::mononoke;
+    use test_repo_factory::TestRepoFactory;
+    use types::HgId;
+
+    use super::*;
+    use crate::context::ServerContext;
+    use crate::handlers::handler::BasicPathExtractor;
+
+    type TestContext = SaplingRemoteApiContext<BasicPathExtractor, NoopQueryStringExtractor, Repo>;
+
+    async fn suffix_query_context(fb: FacebookInit) -> anyhow::Result<TestContext> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: Repo = TestRepoFactory::new(fb)?.build().await?;
+        let mononoke = Arc::new(Mononoke::new_test(vec![("test".to_string(), repo)]).await?);
+        let hg_repo = mononoke
+            .repo(ctx.clone(), "test")
+            .await?
+            .expect("test repo is loaded")
+            .build()
+            .await?
+            .hg();
+        let sctx = ServerContext::new(mononoke, Arc::new(AtomicBool::new(false)));
+        Ok(SaplingRemoteApiContext::new(
+            RequestContext { ctx },
+            sctx,
+            hg_repo,
+            BasicPathExtractor {
+                repo: vec!["test".to_string()],
+            },
+            NoopQueryStringExtractor,
+            SlapiCommitIdentityScheme::Hg,
+        ))
+    }
+
+    /// A client-supplied `prefixes` entry that is not a valid `MPath` is rejected with HTTP 400
+    /// instead of panicking inside the handler.
+    #[mononoke::fbinit_test]
+    async fn test_suffix_query_invalid_prefix(fb: FacebookInit) -> anyhow::Result<()> {
+        let ectx = suffix_query_context(fb).await?;
+        let request = SuffixQueryRequest {
+            commit: CommitId::Hg(HgId::null_id().clone()),
+            basename_suffixes: vec![".rs".to_string()],
+            prefixes: Some(vec!["..".to_string()]),
+        };
+
+        let error: HttpError = match SuffixQueryHandler::handler(ectx, request).await {
+            Ok(_) => panic!("an invalid prefix must be rejected"),
+            Err(error) => error.into(),
+        };
+
+        assert_eq!(error.status_code, http::StatusCode::BAD_REQUEST);
+        Ok(())
     }
 }

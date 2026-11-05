@@ -41,6 +41,29 @@ impl AddScubaParams for BTreeSet<thrift::CommitIdentityScheme> {
 impl AddScubaParams for thrift::ListReposParams {}
 
 impl AddScubaParams for thrift::RepoExistsParams {}
+impl AddScubaParams for thrift::StorageConfigExistsParams {}
+impl AddScubaParams for thrift::CreateOrgStorageConfigParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("org_slug", self.org.clone());
+        scuba.add("manifold_bucket", self.manifold_bucket.clone());
+        scuba.add("xdb_shard", self.xdb_shard.clone());
+    }
+}
+impl AddScubaParams for thrift::DeleteOrgStorageConfigParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("org_slug", self.org.clone());
+    }
+}
+impl AddScubaParams for thrift::OrgStorageConfigPollParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("mutation_id", self.mutation_id);
+    }
+}
+impl AddScubaParams for thrift::OrgStorageConfigParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("org_slug", self.org.clone());
+    }
+}
 
 impl AddScubaParams for thrift::RepoCreateCommitParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
@@ -65,6 +88,16 @@ impl AddScubaParams for thrift::RepoCreateCommitParams {
         self.identity_schemes.add_scuba_params(scuba);
         if let Some(service_identity) = self.service_identity.as_deref() {
             scuba.add("service_identity", service_identity);
+        }
+        if let Some(mutation_info) = self.mutation_info.as_ref() {
+            scuba.add("param_mutation_op", mutation_info.op.as_str());
+            if let Some(user) = mutation_info.user.as_deref() {
+                scuba.add("param_mutation_user", user);
+            }
+            scuba.add(
+                "param_mutation_predecessor_count",
+                mutation_info.predecessors.len(),
+            );
         }
     }
 }
@@ -95,6 +128,9 @@ impl AddScubaParams for thrift::RepoFoldCommitsParams {
         if let Some(mutation_info) = self.mutation_info.as_ref() {
             scuba.add("param_mutation_op", mutation_info.op.as_str());
             scuba.add("param_mutation_user", mutation_info.user.as_str());
+        }
+        if self.keep_folded_commits {
+            scuba.add("param_keep_folded_commits", true);
         }
     }
 }
@@ -132,6 +168,18 @@ impl AddScubaParams for thrift::RepoCreateStackParams {
         self.identity_schemes.add_scuba_params(scuba);
         if let Some(service_identity) = self.service_identity.as_deref() {
             scuba.add("service_identity", service_identity);
+        }
+        let mutation_ops = self
+            .commits
+            .iter()
+            .filter_map(|commit| commit.mutation_info.as_ref())
+            .map(|mutation_info| mutation_info.op.clone())
+            .collect::<BTreeSet<_>>();
+        if !mutation_ops.is_empty() {
+            scuba.add(
+                "param_mutation_ops",
+                mutation_ops.into_iter().collect::<ScubaValue>(),
+            );
         }
     }
 }
@@ -233,6 +281,17 @@ impl AddScubaParams for thrift::RepoListBookmarksParams {
 impl AddScubaParams for thrift::RepoResolveBookmarkParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
         scuba.add("bookmark_name", self.bookmark_name.as_str());
+        self.identity_schemes.add_scuba_params(scuba);
+    }
+}
+
+impl AddScubaParams for thrift::RepoResolveP4FileRevisionParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("param_path", self.path.as_str());
+        scuba.add("param_revision", self.revision);
+        if let Some(bookmark) = &self.bookmark {
+            scuba.add("param_bookmark", bookmark.as_str());
+        }
         self.identity_schemes.add_scuba_params(scuba);
     }
 }
@@ -540,7 +599,22 @@ impl AddScubaParams for thrift::CommitPathInfoParams {}
 
 impl AddScubaParams for thrift::CommitRestrictedPathsAccessParams {}
 impl AddScubaParams for thrift::CommitFindRestrictedPathsParams {}
-impl AddScubaParams for thrift::CommitRestrictedPathsChangesParams {}
+impl AddScubaParams for thrift::CommitRestrictedPathsChangesParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        if let Some(other_commit_id) = self.other_commit_id.as_ref() {
+            scuba.add("other_commit", other_commit_id.to_string());
+        }
+        if let Some(format) = self.format {
+            scuba.add("param_restriction_format", format.to_string());
+        }
+        if let Some(ordered) = &self.ordered_params {
+            scuba.add("param_limit", ordered.limit);
+            if let Some(after_path) = &ordered.after_path {
+                scuba.add("param_after_path", after_path.as_str());
+            }
+        }
+    }
+}
 
 impl AddScubaParams for thrift::RepoInfoParams {}
 
@@ -555,6 +629,7 @@ impl AddScubaParams for thrift::CommitMultiplePathInfoParams {
 impl AddScubaParams for thrift::CommitPathLastChangedParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
         self.identity_schemes.add_scuba_params(scuba);
+        scuba.add("param_include_p4_revision", self.include_p4_revision);
     }
 }
 
@@ -568,6 +643,7 @@ impl AddScubaParams for thrift::CommitMultiplePathLastChangedParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
         scuba.add("param_paths", self.paths.iter().collect::<ScubaValue>());
         self.identity_schemes.add_scuba_params(scuba);
+        scuba.add("param_include_p4_revision", self.include_p4_revision);
     }
 }
 

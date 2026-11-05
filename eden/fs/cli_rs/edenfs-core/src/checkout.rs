@@ -70,6 +70,8 @@ const SNAPSHOT_MAGIC_4: &[u8] = b"eden\x00\x00\x00\x04";
 #[derive(Deserialize, Serialize, Debug, PartialEq, VariantNames, EnumString)]
 #[serde(rename_all = "lowercase")]
 enum RepositoryType {
+    // The daemon no longer mounts "git" checkouts; the CLI keeps recognising
+    // the type so existing ones can still be listed and removed.
     #[strum(serialize = "git")]
     Git,
     #[strum(serialize = "hg")]
@@ -96,14 +98,8 @@ enum MountProtocol {
 enum InodeCatalogType {
     #[strum(serialize = "legacy")]
     Legacy,
-    #[strum(serialize = "sqlite")]
-    Sqlite,
     #[strum(serialize = "inmemory")]
     InMemory,
-    #[strum(serialize = "lmdb")]
-    Lmdb,
-    #[strum(serialize = "legacydev")]
-    LegacyDev,
     #[strum(serialize = "legacyephemeral")]
     LegacyEphemeral,
 }
@@ -136,13 +132,6 @@ struct Repository {
     #[serde(rename = "require-utf8-path", default = "default_require_utf8_path")]
     require_utf8_path: bool,
 
-    #[serde(
-        rename = "enable-sqlite-overlay",
-        default = "default_sqlite_overlay",
-        deserialize_with = "deserialize_sqlite_overlay"
-    )]
-    enable_sqlite_overlay: bool,
-
     #[serde(rename = "use-write-back-cache", default)]
     use_write_back_cache: bool,
 
@@ -155,23 +144,6 @@ struct Repository {
 
     #[serde(rename = "off-mount-repo-dir", default)]
     off_mount_repo_dir: bool,
-}
-
-fn default_sqlite_overlay() -> bool {
-    cfg!(target_os = "windows")
-}
-
-fn deserialize_sqlite_overlay<'de, D>(deserializer: D) -> Result<bool, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s = bool::deserialize(deserializer)?;
-
-    if cfg!(target_os = "windows") {
-        Ok(true)
-    } else {
-        Ok(s)
-    }
 }
 
 fn deserialize_repo_type<'de, D>(deserializer: D) -> Result<RepositoryType, D::Error>

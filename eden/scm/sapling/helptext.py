@@ -1681,6 +1681,10 @@ Controls recording of commit mutation metadata.
     Set to true to automatically convert obsmarkers to mutation metadata during
     automigration at the start of pull.
 
+``allow-divergence``
+    Set to true to allow operations to deliberately create divergence by
+    rewriting or rebasing onto obsolete commits. (default: False)
+
 ``pager``
 ---------
 
@@ -2048,6 +2052,7 @@ have a definite end point.
 ----------
 
 ``evolution.allowdivergence``
+    Deprecated alias for ``mutation.allow-divergence``; still honored.
     Default to False, when True allow creating divergence when performing
     rebase of obsolete changesets.
 
@@ -2084,30 +2089,10 @@ Controls generic server settings.
     Older @Product@ clients only support zlib compression and this setting
     has no effect for legacy clients.
 
-``uncompressed``
-    Whether to allow clients to clone a repository using the
-    uncompressed streaming protocol. This transfers about 40% more
-    data than a regular clone, but uses less memory and CPU on both
-    server and client. Over a LAN (100 Mbps or better) or a very fast
-    WAN, an uncompressed streaming clone is a lot faster (~10x) than a
-    regular clone. Over most WAN connections (anything slower than
-    about 6 Mbps), uncompressed streaming is slower, because of the
-    extra data transfer overhead. This mode will also temporarily hold
-    the write lock while determining what data to transfer.
-    (default: True)
-
-``uncompressedallowsecret``
-    Whether to allow stream clones when the repository contains secret
-    changesets. (default: False)
-
-``preferuncompressed``
-    When set, clients will try to use the uncompressed streaming
-    protocol. (default: False)
-
 ``disablefullbundle``
     When set, servers will refuse attempts to do pull-based clones.
-    If this option is set, ``preferuncompressed`` and/or clone bundles
-    are highly recommended. Partial clones will still be allowed.
+    If this option is set, clone bundles are highly recommended. Partial
+    clones will still be allowed.
     (default: False)
 
 ``validate``

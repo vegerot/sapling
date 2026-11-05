@@ -16,10 +16,17 @@ use crate::client::Client;
 use crate::errors::SaplingRemoteApiError;
 
 mod files;
+mod keys;
+mod streaming_clone;
 mod trees;
+mod uploads;
 
 pub(crate) use files::RetryableFileAttrs;
+pub(crate) use keys::BorrowedKey;
+pub(crate) use keys::RetryableKeys;
+pub(crate) use streaming_clone::RetryableStreamingClone;
 pub(crate) use trees::RetryableTrees;
+pub(crate) use uploads::RetryableUploads;
 
 #[async_trait]
 pub(crate) trait RetryableStreamRequest: Sized + Sync + Send + 'static {

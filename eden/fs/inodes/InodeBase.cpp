@@ -139,6 +139,16 @@ InodeBase::~InodeBase() {
   }
 }
 
+#ifndef _WIN32
+struct stat InodeBase::getStatForCorruptOverlay() const noexcept {
+  struct stat st = {};
+  st.st_ino = getNodeId().get();
+  st.st_mode = getInitialMode() & S_IFMT;
+  st.st_nlink = 1;
+  return st;
+}
+#endif
+
 void InodeBase::removeOverlayData() noexcept {
   try {
     auto* overlay = mount_->getOverlay();
@@ -209,9 +219,9 @@ folly::Future<folly::Unit> InodeBase::access(int /*mask*/) {
 }
 #endif
 
-void InodeBase::updateLastFsRequestTime() {
+void InodeBase::markGcRef() {
   auto now = getNow();
-  lastFsRequestTime_.exchange(now, std::memory_order_relaxed);
+  lastGcRefTime_.exchange(now, std::memory_order_relaxed);
 }
 
 bool InodeBase::isUnlinked() const {
@@ -618,18 +628,6 @@ void InodeBase::updateJournal() {
   auto path = getPath();
   if (path.has_value()) {
     getMount()->getJournal().recordChanged(std::move(path.value()), getType());
-  }
-}
-
-void InodeBase::notifyParentOfStat(
-    bool isFile,
-    const ObjectFetchContext& context) {
-  // This is called from a hot function, so it would be nice to avoid needing to
-  // increment the parent's reference count, but the location lock is the bottom
-  // of the lock hierarchy. Therefore, it is not safe to acquire the parent's
-  // contents lock, which is necessary for prefetching.
-  if (auto parent = location_.rlock()->parent) {
-    parent->childWasStat(isFile, context);
   }
 }
 

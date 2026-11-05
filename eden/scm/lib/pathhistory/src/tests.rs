@@ -26,6 +26,7 @@ use manifest::FileType;
 use manifest::Manifest;
 use manifest::PersistOpts;
 use manifest_tree::TreeManifest;
+use manifest_tree::TreeResolver;
 use sha1::Digest;
 use sha1::Sha1;
 use storemodel::InsertOpts;
@@ -40,6 +41,12 @@ use types::RepoPath;
 use types::RepoPathBuf;
 
 use crate::PathHistory;
+use crate::PathHistoryTreeSource;
+
+#[ctor::ctor]
+fn init_tree_parser() {
+    manifest_tree::init();
+}
 
 #[derive(Clone, Default)]
 pub struct TestHistory {
@@ -137,9 +144,34 @@ impl TestHistory {
             .map(|s| RepoPath::from_str(s).unwrap().to_owned())
             .collect();
 
-        PathHistory::new_content_tracer(set, paths, Arc::new(self.clone()), Arc::new(self.clone()))
-            .await
-            .unwrap()
+        PathHistory::new_content_tracer(
+            set,
+            paths,
+            Arc::new(self.clone()),
+            PathHistoryTreeSource::TreeManifest(Arc::new(self.clone())),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn paths_history_with_tree_store(
+        &self,
+        params: impl Into<BuildSetParam>,
+        paths: &[&str],
+    ) -> PathHistory {
+        let set = self.build_set(params.into()).await;
+        let paths = paths
+            .iter()
+            .map(|s| RepoPath::from_str(s).unwrap().to_owned())
+            .collect();
+        PathHistory::new_content_tracer(
+            set,
+            paths,
+            Arc::new(self.clone()),
+            PathHistoryTreeSource::TreeStore(Arc::new(self.clone())),
+        )
+        .await
+        .unwrap()
     }
 
     /// Obtain the access log.
@@ -198,17 +230,43 @@ impl TestHistory {
         }
     }
 
-    // Obtain a `PathHistory` for tracing existence.
-    pub async fn rename_tracer(&self, params: impl Into<BuildSetParam>, path: &str) -> PathHistory {
-        let set = self.build_set(params.into()).await;
+    /// Return one existence `PathHistory` for each tree source, with the name of the source.
+    pub async fn rename_tracers(
+        &self,
+        params: impl Into<BuildSetParam>,
+        path: &str,
+    ) -> Vec<(&'static str, PathHistory)> {
+        let params = params.into();
         let path = RepoPath::from_str(path).unwrap().to_owned();
-        PathHistory::new_existence_tracer(set, path, Arc::new(self.clone()), Arc::new(self.clone()))
+        let tree_sources = [
+            (
+                "tree_manifest",
+                PathHistoryTreeSource::TreeManifest(Arc::new(self.clone())),
+            ),
+            (
+                "tree_store",
+                PathHistoryTreeSource::TreeStore(Arc::new(self.clone())),
+            ),
+        ];
+        let mut tracers = Vec::with_capacity(tree_sources.len());
+        for (name, tree_source) in tree_sources {
+            let set = self.build_set(params.clone()).await;
+            let tracer = PathHistory::new_existence_tracer(
+                set,
+                path.clone(),
+                Arc::new(self.clone()),
+                tree_source,
+            )
             .await
-            .unwrap()
+            .unwrap();
+            tracers.push((name, tracer));
+        }
+        tracers
     }
 }
 
 /// Used by `build_set`. Specifies the graph size and the subset passed to PathHistory.
+#[derive(Clone)]
 pub struct BuildSetParam(u64, Option<Vec<u64>>);
 
 impl From<u64> for BuildSetParam {
@@ -280,6 +338,24 @@ impl KeyStore for TestHistory {
 impl TreeStore for TestHistory {
     fn clone_tree_store(&self) -> Box<dyn TreeStore> {
         Box::new(self.clone())
+    }
+}
+
+impl TreeResolver for TestHistory {
+    fn get(&self, commit_id: &HgId) -> Result<TreeManifest> {
+        self.get_by_root_id(&self.get_root_id(commit_id)?)
+    }
+
+    fn get_root_id(&self, commit_id: &HgId) -> Result<HgId> {
+        Ok(self.commit_to_tree(*commit_id))
+    }
+
+    fn get_by_root_id(&self, root_id: &HgId) -> Result<TreeManifest> {
+        if root_id.is_null() {
+            Ok(TreeManifest::ephemeral(Arc::new(self.clone())))
+        } else {
+            Ok(TreeManifest::durable(Arc::new(self.clone()), *root_id))
+        }
     }
 }
 
@@ -380,6 +456,15 @@ async fn test_log_files() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tree_store_rollback_backend_matches_tree_manifest() {
+    let t = TestHistory::from_history(&[(0, "a", 1, R), (50, "a", 2, E), (100, "a", 0, R)]);
+
+    let mut manifest = t.paths_history(100, &["a"]).await;
+    let mut tree_store = t.paths_history_with_tree_store(100, &["a"]).await;
+    assert_eq!(manifest.next_n(10).await, tree_store.next_n(10).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_dirs() {
     let t = TestHistory::from_history(&[
         (0, "a/b/c/d", 1, R),
@@ -418,22 +503,19 @@ async fn test_log_dirs() {
             "Trees: [10831/a, 6f98e/a, 4429c/h]",
             "Commits: [15, 31, 47, 63, 79, 95, 111, 127, 143, 159, 175, 191, 207, 223, 239]",
             "Trees: [21f04/, 4b825/, 991a1/, e25ad/]",
-            "Trees: [10831/a, 8b8c5/a, 4429c/h]",
+            "Trees: [8b8c5/a, 4429c/h]",
             "Commits: [240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254]",
             "Trees: [991a1/, d8714/]",
-            "Trees: [6f98e/a, 4429c/h]",
+            "Trees: [4429c/h]",
             "Commits: [192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206]",
             "Trees: [4b825/, 991a1/]",
             "Trees: [4429c/h]",
             "Commits: [144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158]",
             "Trees: [4b825/, e25ad/]",
-            "Trees: [8b8c5/a]",
             "Commits: [96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110]",
             "Trees: [21f04/, e25ad/]",
-            "Trees: [10831/a, 8b8c5/a]",
             "Commits: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]",
-            "Trees: [21f04/]",
-            "Trees: [10831/a]"
+            "Trees: [21f04/]"
         ]
     );
 }
@@ -593,6 +675,16 @@ async fn test_log_with_mode_only_changes() {
 mod rename_tracer_tests {
     use super::*;
 
+    async fn assert_traced(t: &TestHistory, head: u64, path: &str, expected: &[u64]) {
+        for (tree_source, mut tracer) in t.rename_tracers(head, path).await {
+            assert_eq!(
+                tracer.next_n(10).await,
+                expected,
+                "tree source: {tree_source}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_trace_rename_files() {
         let t = TestHistory::from_history(&[
@@ -605,13 +697,11 @@ mod rename_tracer_tests {
             (250, "b", 5, E),
         ]);
 
-        let mut r = t.rename_tracer(250, "b").await;
-        assert_eq!(r.next_n(2).await, [150]);
+        assert_traced(&t, 250, "b", &[150]).await;
 
         // commit 150 did the rename (b -> a), so we search commit 149 (150-1)
         // with name "a"
-        let mut r = t.rename_tracer(149, "a").await;
-        assert_eq!(r.next_n(2).await, [0]);
+        assert_traced(&t, 149, "a", &[0]).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -626,13 +716,11 @@ mod rename_tracer_tests {
             (250, "a/2", 5, E),
         ]);
 
-        let mut r = t.rename_tracer(250, "a/2").await;
-        assert_eq!(r.next_n(2).await, [150]);
+        assert_traced(&t, 250, "a/2", &[150]).await;
 
         // commit 150 did the rename (b -> a), so we search commit 149 (150-1)
         // with name "a"
-        let mut r = t.rename_tracer(149, "a/b/1").await;
-        assert_eq!(r.next_n(2).await, [0]);
+        assert_traced(&t, 149, "a/b/1", &[0]).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -648,10 +736,21 @@ mod rename_tracer_tests {
             (250, "b", 7, E),
         ]);
 
-        let mut r = t.rename_tracer(250, "a").await;
-        assert_eq!(r.next_n(2).await, [0]);
+        assert_traced(&t, 250, "a", &[0]).await;
+        assert_traced(&t, 250, "b", &[150]).await;
+    }
 
-        let mut r = t.rename_tracer(250, "b").await;
-        assert_eq!(r.next_n(2).await, [150]);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_trace_directory_ignores_content_changes() {
+        let t = TestHistory::from_history(&[
+            (0, "x", 1, R),
+            (100, "d/a", 1, R),
+            (150, "d/a", 2, R),
+            (200, "d/b", 3, R),
+            (250, "d/a", 0, R),
+            (300, "d/b", 0, R),
+        ]);
+
+        assert_traced(&t, 300, "d", &[300, 100]).await;
     }
 }

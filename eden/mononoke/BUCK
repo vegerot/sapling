@@ -3,7 +3,7 @@ load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/target_determinator/macros:ci.bzl", "ci")
 load("//eden/mononoke/facebook:lib.bzl", "tokio_dependency_test")
 
-oncall("scm_server_treehugger")
+oncall("scm_server_infra")
 
 rust_binary(
     name = "mononoke",
@@ -42,6 +42,7 @@ rust_binary(
             []
             if rust_oss.is_oss_build()
             else [
+                "//contextprop/rust:contextprop",
                 "//eden/mononoke/features/pushrebase:pushrebase_client",
             ]
         )

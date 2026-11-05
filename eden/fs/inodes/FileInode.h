@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <folly/ExceptionWrapper.h>
 #include <folly/Synchronized.h>
 #include <folly/coro/safe/NowTask.h>
 #include <folly/futures/SharedPromise.h>
@@ -541,6 +542,12 @@ class FileInode final : public InodeBaseMetadata<FileInodeState> {
       const ObjectFetchContextPtr& fetchContext);
 
   /**
+   * Give the walk detector the parent directory's entry counts along with
+   * the blob load, unless `experimental:walk-dir-size-hints` is off.
+   */
+  void attachParentDirEntryCounts(const ObjectFetchContextPtr& fetchContext);
+
+  /**
    * Complete the load of a blob.
    *
    * Called internally by startLoadingData when the load completes or the
@@ -604,6 +611,21 @@ class FileInode final : public InodeBaseMetadata<FileInodeState> {
    */
   void materializeInParent();
 
+#ifndef _WIN32
+  /**
+   * Finish a materialization started at startTime: mark this FileInode
+   * materialized in its parent directory, then publish the MATERIALIZE END
+   * trace event.
+   *
+   * Returns the exception thrown while updating the parent, or an empty
+   * exception_wrapper on success. The END event is published either way.
+   *
+   * The state_ lock must not be held when calling this method.
+   */
+  folly::exception_wrapper completeMaterialization(
+      std::chrono::system_clock::time_point startTime);
+#endif // !_WIN32
+
   /**
    * Helper function for isSameAs().
    *
@@ -615,6 +637,12 @@ class FileInode final : public InodeBaseMetadata<FileInodeState> {
   std::optional<bool> isSameAsFast(
       const ObjectId& blobID,
       TreeEntryType entryType);
+
+  /**
+   * Returns the size of the file's contents if it is materialized, and
+   * std::nullopt otherwise. Costs at most an fstat of the overlay file.
+   */
+  std::optional<uint64_t> getMaterializedSize();
 
   /**
    * Helper function for isSameAs().

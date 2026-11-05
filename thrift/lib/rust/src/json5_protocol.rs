@@ -90,6 +90,7 @@ pub enum Json5Mode {
 pub struct Json5WriterOptions {
     mode: Json5Mode,
     indent_width: usize,
+    binary_as_base64_string: bool,
 }
 
 impl Default for Json5WriterOptions {
@@ -97,6 +98,7 @@ impl Default for Json5WriterOptions {
         Self {
             mode: Json5Mode::BasicJson,
             indent_width: 0,
+            binary_as_base64_string: false,
         }
     }
 }
@@ -106,6 +108,7 @@ impl Json5WriterOptions {
         Self {
             mode: Json5Mode::BasicJson,
             indent_width: 0,
+            binary_as_base64_string: false,
         }
     }
 
@@ -113,6 +116,7 @@ impl Json5WriterOptions {
         Self {
             mode: Json5Mode::Json5,
             indent_width: 0,
+            binary_as_base64_string: false,
         }
     }
 
@@ -123,6 +127,12 @@ impl Json5WriterOptions {
         );
         self.indent_width = indent_width;
         Ok(self)
+    }
+
+    /// Encode binary values as standard unpadded base64 strings instead of tagged objects.
+    pub const fn with_binary_as_base64_string(mut self, enabled: bool) -> Self {
+        self.binary_as_base64_string = enabled;
+        self
     }
 }
 
@@ -537,14 +547,10 @@ fn compare_values(left: &Value, right: &Value) -> Ordering {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
         (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
-        (Value::Float32(left), Value::Float32(right)) => {
-            left.partial_cmp(right).unwrap_or(Ordering::Equal)
-        }
-        (Value::Float64(left), Value::Float64(right)) => {
-            left.partial_cmp(right).unwrap_or(Ordering::Equal)
-        }
+        (Value::Float32(left), Value::Float32(right)) => left.total_cmp(right),
+        (Value::Float64(left), Value::Float64(right)) => left.total_cmp(right),
         (Value::ParsedFloat { value: left, .. }, Value::ParsedFloat { value: right, .. }) => {
-            left.partial_cmp(right).unwrap_or(Ordering::Equal)
+            left.total_cmp(right)
         }
         (Value::Enum { value: left, .. }, Value::Enum { value: right, .. }) => left.cmp(right),
         (Value::String(left), Value::String(right)) => left.cmp(right),
@@ -554,6 +560,7 @@ fn compare_values(left: &Value, right: &Value) -> Ordering {
             left,
             right,
             |(left_id, _, left_value), (right_id, _, right_value)| {
+                // A struct missing the lower field id sorts before one that has it.
                 right_id
                     .cmp(left_id)
                     .then_with(|| compare_values(left_value, right_value))
@@ -641,6 +648,14 @@ fn write_value(
                 .as_bytes(),
         ),
         Value::String(value) => write_string(output, value, options, object_name),
+        Value::Binary(value) if options.binary_as_base64_string => {
+            write_string(
+                output,
+                &STANDARD_NO_PAD_INDIFFERENT.encode(value),
+                options,
+                object_name,
+            );
+        }
         Value::Binary(value) => {
             let (encoding, encoded) = match printable_utf8(value) {
                 Some(text) => ("utf-8", text.to_owned()),
@@ -991,6 +1006,9 @@ impl ProtocolReader for Json5ProtocolDeserializer {
             _ => bail!("expected a JSON5 object or key-value array for a Thrift map"),
         };
         let len = entries.len();
+        if len == 0 {
+            return Ok((TType::Stop, TType::Stop, Some(0)));
+        }
         self.stack.push(ReadFrame::Map {
             entries,
             pending_value: None,
@@ -1047,6 +1065,9 @@ impl ProtocolReader for Json5ProtocolDeserializer {
             bail!("expected a JSON5 array for a Thrift list");
         };
         let len = values.len();
+        if len == 0 {
+            return Ok((TType::Stop, Some(0)));
+        }
         self.stack.push(ReadFrame::List(values.into()));
         Ok((TType::Stop, Some(len)))
     }
@@ -1705,6 +1726,10 @@ where
 pub trait Serializable: Serialize<Json5ProtocolSerializer<BytesMut>> {}
 
 impl<T> Serializable for T where T: Serialize<Json5ProtocolSerializer<BytesMut>> {}
+
+pub trait DeserializeSlice: Deserialize<Json5ProtocolDeserializer> {}
+
+impl<T> DeserializeSlice for T where T: Deserialize<Json5ProtocolDeserializer> {}
 
 /// Serializes a Thrift value as compact, deterministic basic JSON.
 pub fn serialize<T>(value: T) -> Bytes

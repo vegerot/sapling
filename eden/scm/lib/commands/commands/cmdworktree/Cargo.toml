@@ -8,18 +8,25 @@ edition = "2024"
 homepage = "https://sapling-scm.com/"
 repository = "https://github.com/facebook/sapling"
 license = "GPL-2.0-only"
+exclude = ["BUCK"]
 
 [dependencies]
 anyhow = "1.0.104"
-chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 cmdutil = { version = "0.1.0", path = "../../cmdutil" }
-fs-err = { version = "3.3.1", features = ["tokio"] }
+edenfs-core = { version = "0.1.0", path = "../../../../../fs/cli_rs/edenfs-core", optional = true }
+edenfs-remove = { version = "0.1.0", path = "../../../../../fs/cli_rs/edenfs-remove", optional = true }
+fs-err = "3.3.2"
+sapling-agentdetect = { version = "0.1.0", path = "../../../agentdetect" }
+sapling-async-runtime = { version = "0.1.0", path = "../../../async-runtime", optional = true }
 sapling-clidispatch = { version = "0.1.0", path = "../../../clidispatch" }
 sapling-clone = { version = "0.1.0", path = "../../../clone" }
-sapling-edenfs-client = { version = "0.1.0", path = "../../../edenfs-client" }
+sapling-configmodel = { version = "0.2.0", path = "../../../config/model" }
+sapling-edenfs-client = { version = "0.1.0", path = "../../../edenfs-client", optional = true }
 sapling-encoding = { version = "0.1.0", path = "../../../encoding" }
 sapling-filters = { version = "0.1.0", path = "../../../filters" }
 sapling-formatter = { version = "0.1.0", path = "../../../formatter" }
+sapling-gitcompat = { version = "0.1.0", path = "../../../gitcompat" }
+sapling-hg-metrics = { version = "0.1.0", path = "../../../hg-metrics" }
 sapling-hook = { version = "0.1.0", path = "../../../hook" }
 sapling-identity = { version = "0.1.0", path = "../../../identity" }
 sapling-pathmatcher = { version = "0.1.0", path = "../../../pathmatcher" }
@@ -28,9 +35,15 @@ sapling-spawn-ext = { version = "0.1.0", path = "../../../spawn-ext" }
 sapling-status = { version = "0.1.0", path = "../../../status" }
 sapling-treestate = { version = "0.1.0", path = "../../../treestate" }
 sapling-types = { version = "0.1.0", path = "../../../types" }
-sapling-util = { version = "0.1.0", path = "../../../util" }
+sapling-util = { version = "0.2.0", path = "../../../util" }
 sapling-vfs = { version = "0.1.0", path = "../../../vfs" }
 sapling-workingcopy = { version = "0.1.0", path = "../../../workingcopy" }
 sapling-worktree-registry = { version = "0.1.0", path = "../../../worktree" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 slex = { version = "0.1.0", path = "../../../slex" }
+tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
+
+[features]
+default = []
+eden = ["sapling-clone/eden", "sapling-edenfs-client"]
+fb = ["edenfs-core", "edenfs-remove", "sapling-async-runtime"]

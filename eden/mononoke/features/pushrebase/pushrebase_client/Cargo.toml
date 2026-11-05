@@ -12,7 +12,7 @@ path = "lib.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-arc-swap = { version = "1.9.2", features = ["weak"] }
+arc-swap = { version = "1.9.3", features = ["weak"] }
 async-trait = "0.1.92"
 bookmarks = { version = "0.1.0", path = "../../../repo_attributes/bookmarks" }
 bookmarks_movement = { version = "0.1.0", path = "../../../repo_attributes/bookmarks/bookmarks_movement" }
@@ -23,11 +23,17 @@ futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimen
 hook_manager = { version = "0.1.0", path = "../../../repo_attributes/hook_manager/hook_manager" }
 hooks = { version = "0.1.0", path = "../../hooks" }
 justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
+land_service_if = { version = "0.1.0", path = "../../../servers/land_service/if" }
+land_service_if_clients = { version = "0.1.0", path = "../../../servers/land_service/if/clients" }
 metaconfig_types = { version = "0.1.0", path = "../../../metaconfig/types" }
 mononoke_types = { version = "0.1.0", path = "../../../mononoke_types" }
+oss_thrift_transport = { version = "0.1.0", path = "../../../common/oss/thrift_transport" }
 pushrebase = { version = "0.1.0", path = ".." }
 pushrebase_hooks = { version = "0.1.0", path = "../pushrebase_hooks" }
 repo_authorization = { version = "0.1.0", path = "../../../repo_authorization" }
 repo_identity = { version = "0.1.0", path = "../../../repo_attributes/repo_identity" }
 scuba_ext = { version = "0.1.0", path = "../../../common/scuba_ext" }
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
+
+[lints]
+workspace = true

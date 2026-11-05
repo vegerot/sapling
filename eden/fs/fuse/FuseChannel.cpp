@@ -39,7 +39,6 @@
 #include "eden/fs/telemetry/EdenErrorInfoBuilder.h"
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
-#include "eden/fs/telemetry/FsEventLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/StaticAssert.h"
 #include "eden/fs/utils/Thread.h"
@@ -154,7 +153,6 @@ std::string rename(FuseArg arg) {
   return fmt::format("old={}, newdir={}, new={}", oldName, in.newdir, newName);
 }
 
-#ifdef __linux__
 std::string rename2(FuseArg arg) {
   auto& in = arg.read<fuse_rename2_in>();
   auto oldName = arg.readz();
@@ -166,7 +164,6 @@ std::string rename2(FuseArg arg) {
       newName,
       in.flags);
 }
-#endif
 
 std::string link(FuseArg arg) {
   auto& in = arg.read<fuse_link_in>();
@@ -191,14 +188,9 @@ constexpr RenderFn release = default_render;
 constexpr RenderFn fsync = default_render;
 
 std::string setxattr(FuseArg arg) {
-#ifdef __linux__
   // Skip the compat-sized setxattr_in (8 bytes) because EdenFS does not
   // negotiate FUSE_SETXATTR_EXT, so the kernel sends the old 2-field layout.
   arg.skip(FUSE_COMPAT_SETXATTR_IN_SIZE);
-#else
-  auto& in = arg.read<fuse_setxattr_in>();
-  (void)in;
-#endif
   auto name = arg.readz();
   return fmt::format("name={}", name);
 }
@@ -286,7 +278,6 @@ struct HandlerEntry {
       FuseStats::CounterPtr cS,
       FuseStats::CounterPtr cF,
       AccessType at = AccessType::FsChannelOther,
-      SamplingGroup samplingGroup = SamplingGroup::DropAll,
       FuseStats::CounterPtr dispatchImmediateCounter = nullptr,
       FuseStats::CounterPtr dispatchDeferredCounter = nullptr)
       : name{n},
@@ -295,7 +286,6 @@ struct HandlerEntry {
         duration{d},
         countSuccessful{cS},
         countFailure{cF},
-        samplingGroup{samplingGroup},
         accessType{at},
         dispatchImmediate{dispatchImmediateCounter},
         dispatchDeferred{dispatchDeferredCounter} {}
@@ -325,7 +315,6 @@ struct HandlerEntry {
   FuseStats::DurationPtr duration = nullptr;
   FuseStats::CounterPtr countSuccessful = nullptr;
   FuseStats::CounterPtr countFailure = nullptr;
-  SamplingGroup samplingGroup = SamplingGroup::DropAll;
   AccessType accessType = AccessType::FsChannelOther;
   FuseStats::CounterPtr dispatchImmediate = nullptr;
   FuseStats::CounterPtr dispatchDeferred = nullptr;
@@ -346,7 +335,6 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::lookupSuccessful,
       &FuseStats::lookupFailure,
       Read,
-      SamplingGroup::Four,
       &FuseStats::dispatchLookupImmediate,
       &FuseStats::dispatchLookupDeferred};
   handlers[FUSE_FORGET] = {
@@ -364,7 +352,6 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::getattrSuccessful,
       &FuseStats::getattrFailure,
       Read,
-      SamplingGroup::Three,
       &FuseStats::dispatchGetattrImmediate,
       &FuseStats::dispatchGetattrDeferred};
   handlers[FUSE_SETATTR] = {
@@ -374,8 +361,7 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::setattr,
       &FuseStats::setattrSuccessful,
       &FuseStats::setattrFailure,
-      Write,
-      SamplingGroup::Two};
+      Write};
   handlers[FUSE_READLINK] = {
       "FUSE_READLINK",
       &FuseChannel::fuseReadLink,
@@ -384,7 +370,6 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::readlinkSuccessful,
       &FuseStats::readlinkFailure,
       Read,
-      SamplingGroup::DropAll,
       &FuseStats::dispatchReadlinkImmediate,
       &FuseStats::dispatchReadlinkDeferred};
   handlers[FUSE_SYMLINK] = {
@@ -410,8 +395,7 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::mkdir,
       &FuseStats::mkdirSuccessful,
       &FuseStats::mkdirFailure,
-      Write,
-      SamplingGroup::One};
+      Write};
   handlers[FUSE_UNLINK] = {
       "FUSE_UNLINK",
       &FuseChannel::fuseUnlink,
@@ -427,8 +411,7 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::rmdir,
       &FuseStats::rmdirSuccessful,
       &FuseStats::rmdirFailure,
-      Write,
-      SamplingGroup::One};
+      Write};
   handlers[FUSE_RENAME] = {
       "FUSE_RENAME",
       &FuseChannel::fuseRename,
@@ -436,8 +419,7 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::rename,
       &FuseStats::renameSuccessful,
       &FuseStats::renameFailure,
-      Write,
-      SamplingGroup::One};
+      Write};
   handlers[FUSE_LINK] = {
       "FUSE_LINK",
       &FuseChannel::fuseLink,
@@ -454,7 +436,6 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::openSuccessful,
       &FuseStats::openFailure,
       AccessType::FsChannelOther,
-      SamplingGroup::DropAll,
       &FuseStats::dispatchOpenImmediate,
       &FuseStats::dispatchOpenDeferred};
   handlers[FUSE_READ] = {
@@ -465,7 +446,6 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::readSuccessful,
       &FuseStats::readFailure,
       Read,
-      SamplingGroup::Three,
       &FuseStats::dispatchReadImmediate,
       &FuseStats::dispatchReadDeferred};
   handlers[FUSE_WRITE] = {
@@ -475,8 +455,7 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::write,
       &FuseStats::writeSuccessful,
       &FuseStats::writeFailure,
-      Write,
-      SamplingGroup::Two};
+      Write};
   handlers[FUSE_STATFS] = {
       "FUSE_STATFS",
       &FuseChannel::fuseStatFs,
@@ -516,7 +495,6 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::getxattrSuccessful,
       &FuseStats::getxattrFailure,
       Read,
-      SamplingGroup::Three,
       &FuseStats::dispatchGetxattrImmediate,
       &FuseStats::dispatchGetxattrDeferred};
   handlers[FUSE_LISTXATTR] = {
@@ -526,8 +504,7 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::listxattr,
       &FuseStats::listxattrSuccessful,
       &FuseStats::listxattrFailure,
-      Read,
-      SamplingGroup::Two};
+      Read};
   handlers[FUSE_REMOVEXATTR] = {
       "FUSE_REMOVEXATTR",
       &FuseChannel::fuseRemoveXAttr,
@@ -559,7 +536,6 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::readdirSuccessful,
       &FuseStats::readdirFailure,
       Read,
-      SamplingGroup::Three,
       &FuseStats::dispatchReaddirImmediate,
       &FuseStats::dispatchReaddirDeferred};
   handlers[FUSE_RELEASEDIR] = {
@@ -595,8 +571,7 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::create,
       &FuseStats::createSuccessful,
       &FuseStats::createFailure,
-      Write,
-      SamplingGroup::One};
+      Write};
   handlers[FUSE_INTERRUPT] = {"FUSE_INTERRUPT"};
   handlers[FUSE_BMAP] = {
       "FUSE_BMAP",
@@ -624,7 +599,6 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::fallocateSuccessful,
       &FuseStats::fallocateFailure,
       Write};
-#ifdef __linux__
   handlers[FUSE_READDIRPLUS] = {"FUSE_READDIRPLUS", Read};
   handlers[FUSE_RENAME2] = {
       "FUSE_RENAME2",
@@ -633,20 +607,19 @@ constexpr auto kFuseHandlers = [] {
       &FuseStats::rename2,
       &FuseStats::rename2Successful,
       &FuseStats::rename2Failure,
-      Write,
-      SamplingGroup::One};
+      Write};
   handlers[FUSE_LSEEK] = {"FUSE_LSEEK"};
   handlers[FUSE_COPY_FILE_RANGE] = {"FUSE_COPY_FILE_RANGE", Write};
   handlers[FUSE_SETUPMAPPING] = {"FUSE_SETUPMAPPING", Read};
   handlers[FUSE_REMOVEMAPPING] = {"FUSE_REMOVEMAPPING", Read};
-#endif
   return handlers;
 }();
 
 // Separate to avoid bloating the FUSE opcode table; CUSE_INIT is 4096.
 constexpr HandlerEntry kCuseInitHandler{"CUSE_INIT"};
 
-constexpr const HandlerEntry* lookupFuseHandlerEntry(uint32_t opcode) {
+constexpr const HandlerEntry* FOLLY_NULLABLE
+lookupFuseHandlerEntry(uint32_t opcode) {
   if (CUSE_INIT == opcode) {
     return &kCuseInitHandler;
   }
@@ -665,7 +638,6 @@ constexpr std::pair<uint64_t, const char*> kCapsLabels[] = {
     {FUSE_BIG_WRITES, "BIG_WRITES"},
     {FUSE_DONT_MASK, "DONT_MASK"},
     {FUSE_FLOCK_LOCKS, "FLOCK_LOCKS"},
-#ifdef __linux__
     {FUSE_SPLICE_WRITE, "SPLICE_WRITE"},
     {FUSE_SPLICE_MOVE, "SPLICE_MOVE"},
     {FUSE_SPLICE_READ, "SPLICE_READ"},
@@ -685,7 +657,6 @@ constexpr std::pair<uint64_t, const char*> kCapsLabels[] = {
     {FUSE_MAX_PAGES, "MAX_PAGES"},
     {FUSE_CACHE_SYMLINKS, "CACHE_SYMLINKS"},
     {FUSE_EXPLICIT_INVAL_DATA, "EXPLICIT_INVAL_DATA"},
-#endif
 #ifdef FUSE_NO_OPEN_SUPPORT
     {FUSE_NO_OPEN_SUPPORT, "NO_OPEN_SUPPORT"},
 #endif
@@ -787,7 +758,7 @@ void installSignalHandler() {
   action.sa_handler = sigusr2Handler;
   sigemptyset(&action.sa_mask);
   action.sa_flags = 0; // We intentionally turn off SA_RESTART
-  struct sigaction oldAction;
+  struct sigaction oldAction{};
   folly::checkUnixError(
       sigaction(SIGUSR2, &action, &oldAction), "failed to set SIGUSR2 handler");
 }
@@ -800,11 +771,6 @@ iovec make_iovec(const T& t) {
   iov.iov_base = const_cast<T*>(&t);
   iov.iov_len = sizeof(t);
   return iov;
-}
-
-SamplingGroup fuseOpcodeSamplingGroup(uint32_t opcode) {
-  auto* entry = lookupFuseHandlerEntry(opcode);
-  return entry ? entry->samplingGroup : SamplingGroup::DropAll;
 }
 
 } // namespace
@@ -928,7 +894,7 @@ void FuseChannel::sendReply(
     const FuseTransport& source,
     const fuse_in_header& request,
     folly::fbvector<iovec>&& vec) const {
-  fuse_out_header out;
+  fuse_out_header out{};
   out.unique = request.unique;
   out.error = 0;
 
@@ -941,7 +907,7 @@ void FuseChannel::sendReply(
     const FuseTransport& source,
     const fuse_in_header& request,
     const folly::IOBuf& buf) const {
-  fuse_out_header out;
+  fuse_out_header out{};
   out.unique = request.unique;
   out.error = 0;
 
@@ -957,11 +923,11 @@ void FuseChannel::sendReply(
     const FuseTransport& source,
     const fuse_in_header& request,
     folly::ByteRange bytes) const {
-  fuse_out_header out;
+  fuse_out_header out{};
   out.unique = request.unique;
   out.error = 0;
 
-  std::array<iovec, 2> iov;
+  std::array<iovec, 2> iov{};
   iov[0].iov_base = &out;
   iov[0].iov_len = sizeof(out);
   iov[1].iov_base = const_cast<uint8_t*>(bytes.data());
@@ -1017,7 +983,6 @@ FuseChannel::FuseChannel(
     std::unique_ptr<FuseDispatcher> dispatcher,
     const folly::Logger* straceLogger,
     std::shared_ptr<ProcessInfoCache> processInfoCache,
-    std::shared_ptr<FsEventLogger> fsEventLogger,
     const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
     ErrorLogger& errorLogger,
     folly::Duration requestTimeout,
@@ -1056,7 +1021,6 @@ FuseChannel::FuseChannel(
       dispatcher_(std::move(dispatcher)),
       straceLogger_(straceLogger),
       edenFsEventsLogger_(edenFsEventsLogger),
-      fsEventLogger_(std::move(fsEventLogger)),
       errorLogger_(errorLogger),
       mountPath_(mountPath),
       requestTimeout_(requestTimeout),
@@ -1079,6 +1043,7 @@ FuseChannel::FuseChannel(
       busyPoll_{busyPoll},
       fuseDevice_(std::move(fuseDevice)),
       transport_(std::make_unique<DevFuseTransport>()),
+      transportName_{transport_->getName()},
       invalidationQueue_{
           numInvalidationThreads_,
           [this](InvalidationEntry& entry) { sendInvalidation(entry); },
@@ -1120,13 +1085,37 @@ FuseChannel::FuseChannel(
   initializeInflightRequestsRateLimiter(maximumInFlightRequests);
 }
 
+FsStopReason FuseChannel::StopData::getStopReason() const {
+  switch (reason) {
+    case StopReason::RUNNING:
+      return {"running", false};
+    case StopReason::INIT_FAILED:
+      return {"fuse_init_failed", false};
+    case StopReason::UNMOUNTED:
+      return {"fuse_unmounted", true};
+    case StopReason::TAKEOVER:
+      return {"takeover", false};
+    case StopReason::DESTRUCTOR:
+      return {"fuse_destructor", false};
+    case StopReason::FUSE_READ_ERROR:
+      return {"fuse_read_error", true};
+    case StopReason::FUSE_WRITE_ERROR:
+      return {"fuse_write_error", true};
+    case StopReason::FUSE_TRUNCATED_REQUEST:
+      return {"fuse_truncated_request", true};
+    case StopReason::WORKER_EXCEPTION:
+      return {"worker_exception", true};
+  }
+  return {"unknown", false};
+}
+
 FuseChannel::~FuseChannel() {
   XCHECK_EQ(1, traceBus_.use_count())
       << "This shared_ptr should not be copied; see attached comment.";
 }
 
 const char* FuseChannel::getTransportName() const {
-  return transport_ ? transport_->getName() : "unknown";
+  return transportName_.load(std::memory_order_relaxed);
 }
 
 const char* FuseChannel::getDesiredTransportName() const {
@@ -1251,6 +1240,7 @@ FuseChannel::StopFuture FuseChannel::initializeFromTakeover(
     // has proven itself on fresh mounts.
     transport_ = std::make_unique<IoUringFuseTransport>(
         ioUringQueueDepth_, ioUringDisableIoWait_, ioUringSkipSelfWakeup_);
+    transportName_.store(transport_->getName(), std::memory_order_relaxed);
   }
   updateEffectiveWorkerThreadCount();
   dispatcher_->initConnection(connInfo);
@@ -1455,16 +1445,16 @@ void FuseChannel::sendInvalidateInode(
     int64_t off,
     int64_t len) {
   XLOGF(DBG3, "sendInvalidateInode(ino={}, off={}, len={})", ino, off, len);
-  fuse_notify_inval_inode_out notify;
+  fuse_notify_inval_inode_out notify{};
   notify.ino = ino.get();
   notify.off = off;
   notify.len = len;
 
-  fuse_out_header out;
+  fuse_out_header out{};
   out.unique = 0;
   out.error = FUSE_NOTIFY_INVAL_INODE;
 
-  std::array<iovec, 2> iov;
+  std::array<iovec, 2> iov{};
 
   iov[0].iov_base = &out;
   iov[0].iov_len = sizeof(out);
@@ -1519,11 +1509,11 @@ void FuseChannel::sendInvalidateEntry(
   notify.parent = parent.get();
   notify.namelen = namePiece.size();
 
-  fuse_out_header out;
+  fuse_out_header out{};
   out.unique = 0;
   out.error = FUSE_NOTIFY_INVAL_ENTRY;
 
-  std::array<iovec, 4> iov;
+  std::array<iovec, 4> iov{};
 
   iov[0].iov_base = &out;
   iov[0].iov_len = sizeof(out);
@@ -1611,13 +1601,6 @@ void FuseChannel::recordRequestFinish(
   // never started; a zero-length sample would only hide that.
   XDCHECK(duration.has_value())
       << "FUSE request " << requestId << " finished without a start";
-  if (fsEventLogger_ && duration) {
-    fsEventLogger_->log({
-        *duration,
-        fuseOpcodeSamplingGroup(header.opcode),
-        fuseOpcodeName(header.opcode),
-    });
-  }
   // A subscriber may have attached after this request started and learned
   // of it through debugOutstandingFuseCalls, as `eden trace fs` does.
   if (traceBus_->hasSubscription()) {
@@ -1693,8 +1676,7 @@ bool FuseChannel::requestSessionExitLocked(
   if (state->stopReason != StopReason::RUNNING) {
     // Update state->stopReason only if the old stop reason left the FUSE
     // device in a still usable state but the new reason does not.
-    if (isFuseDeviceValid(state->stopReason) &&
-        !isFuseDeviceValid(state->stopReason)) {
+    if (isFuseDeviceValid(state->stopReason) && !isFuseDeviceValid(reason)) {
       state->stopReason = reason;
     }
     return false;
@@ -1704,6 +1686,7 @@ bool FuseChannel::requestSessionExitLocked(
   // Record the reason we are stopping and then notify worker threads to
   // stop.
   state->stopReason = reason;
+  state->stopRequestedAt = std::chrono::steady_clock::now();
 
   // Update stop_ so that worker threads will break out of their loop.
   stop_.store(true, std::memory_order_relaxed);
@@ -1948,7 +1931,6 @@ void FuseChannel::readInitPacket() {
   // We handle writes of any size.
   want |= FUSE_BIG_WRITES;
 
-#ifdef __linux__
   // We don't support setuid and setgid mode bits anyway.
   want |= FUSE_HANDLE_KILLPRIV;
 #ifdef FUSE_HANDLE_KILLPRIV_V2
@@ -1969,7 +1951,6 @@ void FuseChannel::readInitPacket() {
   want |= FUSE_CACHE_SYMLINKS;
   // We can handle almost any request in parallel.
   want |= FUSE_PARALLEL_DIROPS;
-#endif
 
 #ifdef FUSE_MAX_PAGES
   if (fuseMaxPages_ > 0) {
@@ -2131,6 +2112,7 @@ void FuseChannel::readInitPacket() {
               ioUringQueueDepth_,
               ioUringDisableIoWait_,
               ioUringSkipSelfWakeup_);
+    transportName_.store(transport_->getName(), std::memory_order_relaxed);
   }
   updateEffectiveWorkerThreadCount();
 
@@ -2291,7 +2273,6 @@ void FuseChannel::dispatchRequest(
       replyError(source, header, ENOSYS);
       break;
 
-#ifdef __linux__
     case FUSE_LSEEK:
       // We only support stateless file handles, so lseek() is meaningless
       // for us.  Returning ENOSYS causes the kernel to implement it for us,
@@ -2299,7 +2280,6 @@ void FuseChannel::dispatchRequest(
       XLOG(DBG7, "FUSE_LSEEK");
       replyError(source, header, ENOSYS);
       break;
-#endif
 
     case FUSE_POLL:
       // We do not currently implement FUSE_POLL.
@@ -2475,8 +2455,14 @@ void FuseChannel::dispatchRequest(
                        request,
                        requestId,
                        headerCopy,
-                       requestPermit = std::move(requestPermit)] {
-                finishRequest(requestId, headerCopy, request->getResult());
+                       requestPermit = std::move(requestPermit)]() mutable {
+                // finishRequest() deletes this channel when it completes the
+                // last request of a destroyed session, and the request's
+                // RequestContext records into the channel's ProcessAccessLog
+                // when it is destroyed, so it has to go first.
+                auto result = request->getResult();
+                request.reset();
+                finishRequest(requestId, headerCopy, result);
               });
         }
         break;
@@ -2524,6 +2510,7 @@ void FuseChannel::sessionComplete(folly::Synchronized<State>::LockedPtr state) {
 
   auto data = std::make_unique<StopData>();
   data->reason = state->stopReason;
+  data->stopRequestedAt = state->stopRequestedAt;
   // Unlock the state before the remaining steps
   state.unlock();
 
@@ -2791,7 +2778,6 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseRename(
       .thenValue([&request](auto&&) { request.replyError(0); });
 }
 
-#ifdef __linux__
 ImmediateFuture<folly::Unit> FuseChannel::fuseRename2(
     FuseRequestContext& request,
     const fuse_in_header& header,
@@ -2819,7 +2805,6 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseRename2(
           request.getObjectFetchContext())
       .thenValue([&request](auto&&) { request.replyError(0); });
 }
-#endif
 
 ImmediateFuture<folly::Unit> FuseChannel::fuseLink(
     FuseRequestContext& request,
@@ -2889,9 +2874,8 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseFsync(
   XLOG(DBG7, "FUSE_FSYNC");
 
   auto ino = InodeNumber{header.nodeid};
-  return dispatcher_->fsync(ino, datasync).thenValue([&request](auto&&) {
-    request.replyError(0);
-  });
+  return dispatcher_->fsync(ino, datasync, request.getObjectFetchContext())
+      .thenValue([&request](auto&&) { request.replyError(0); });
 }
 
 ImmediateFuture<folly::Unit> FuseChannel::fuseSetXAttr(
@@ -2899,17 +2883,12 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseSetXAttr(
     const fuse_in_header& header,
     ByteRange arg) {
   const auto setxattr = reinterpret_cast<const fuse_setxattr_in*>(arg.data());
-#ifdef __linux__
   // Use the compat size (8 bytes) because EdenFS does not negotiate
   // FUSE_SETXATTR_EXT, so the kernel sends the old 2-field struct.
   // sizeof(fuse_setxattr_in) is 16 bytes in FUSE 7.33+, which would
   // overshoot the name offset.
   const auto nameStr =
       reinterpret_cast<const char*>(arg.data()) + FUSE_COMPAT_SETXATTR_IN_SIZE;
-#else
-  // On macOS, fuse_setxattr_in is the original struct.
-  const auto nameStr = reinterpret_cast<const char*>(setxattr + 1);
-#endif
   const StringPiece attrName{nameStr};
   const auto bufPtr = nameStr + attrName.size() + 1;
   const StringPiece value(bufPtr, setxattr->size);
@@ -2951,8 +2930,9 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseListXAttr(
   const auto listattr = reinterpret_cast<const fuse_getxattr_in*>(arg.data());
   XLOG(DBG7, "FUSE_LISTXATTR");
   InodeNumber ino{header.nodeid};
-  return dispatcher_->listxattr(ino).thenValue(
-      [&request, size = listattr->size](std::vector<std::string> attrs) {
+  return dispatcher_->listxattr(ino, request.getObjectFetchContext())
+      .thenValue([&request, size = listattr->size](
+                     const std::vector<std::string>& attrs) {
         // Initialize count to include the \0 for each
         // entry.
         size_t count = attrs.size();
@@ -3130,7 +3110,7 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseBmap(
   return dispatcher_
       ->bmap(InodeNumber{header.nodeid}, bmap->blocksize, bmap->block)
       .thenValue([&request](uint64_t resultIdx) {
-        fuse_bmap_out out;
+        fuse_bmap_out out{};
         out.block = resultIdx;
         request.sendReply(out);
       });

@@ -818,3 +818,27 @@ Test combining --exclude with --to
      +foo
      +more
   
+
+Test pending adds, removes and copies of files not passed to --to
+  $ newclientrepo
+  $ echo a > a
+  $ echo b > b
+  $ echo c > c
+  $ echo r > r
+  $ sl ci -m "one" -Aq
+  $ echo more >> a
+  $ sl ci -m "two" -q
+  $ echo more >> b
+  $ echo new > new
+  $ sl add new
+  $ sl rm r
+  $ sl cp c c2
+  $ sl amend --to .^ b
+  $ sl cat -r .^ b
+  b
+  more
+  $ sl status -C
+  A c2
+    c
+  A new
+  R r

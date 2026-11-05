@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {ParsedDiff} from 'shared/patch/types';
 import type {IGrammar} from 'vscode-textmate';
 import type {ThemeColor} from '../../theme';
 import type {
@@ -16,8 +17,9 @@ import type {
 
 import {CancellationToken} from 'shared/CancellationToken';
 import FilepathClassifier from 'shared/textmate-lib/FilepathClassifier';
-import {tokenizeLines} from 'shared/textmate-lib/tokenize';
+import {tokenizeLines, tokenizeLinesFromState} from 'shared/textmate-lib/tokenize';
 import {loadWASM} from 'vscode-oniguruma';
+import {INITIAL} from 'vscode-textmate';
 import {grammars, languages} from '../../generated/textmate/TextMateGrammarManifest';
 import {getGrammar, getGrammarStore} from './grammar';
 
@@ -31,6 +33,32 @@ const URL_TO_ONIG_WASM = './generated/textmate/onig.wasm';
  */
 let globalBaseUri: string;
 
+/**
+ * VS Code's webview service worker doesn't serve resource requests made from a WebWorker,
+ * so in VS Code webviews the main thread fetches resources on our behalf.
+ */
+let fetchThroughHost = false;
+let postMessageToHost: ((msg: SyntaxWorkerResponse) => unknown) | undefined;
+let nextFetchId = 0;
+const pendingFetches = new Map<
+  number,
+  {resolve: (result: string | ArrayBuffer) => void; reject: (error: Error) => void}
+>();
+
+function fetchFromHost(url: URL, as: 'text'): Promise<string>;
+function fetchFromHost(url: URL, as: 'arrayBuffer'): Promise<ArrayBuffer>;
+function fetchFromHost(url: URL, as: 'text' | 'arrayBuffer'): Promise<string | ArrayBuffer> {
+  const fetchId = nextFetchId++;
+  return new Promise((resolve, reject) => {
+    pendingFetches.set(fetchId, {resolve, reject});
+    postMessageToHost?.({type: 'fetchResource', fetchId, url: url.href, as});
+  });
+}
+
+function fetchText(url: URL): Promise<string> {
+  return fetchThroughHost ? fetchFromHost(url, 'text') : fetch(url).then(r => r.text());
+}
+
 async function loadGrammar(
   theme: ThemeColor,
   path: string,
@@ -43,7 +71,7 @@ async function loadGrammar(
     return undefined;
   }
 
-  const store = getGrammarStore(theme, globalBaseUri, colorMap => {
+  const store = getGrammarStore(theme, globalBaseUri, fetchText, colorMap => {
     // tell client the newest colorMap
     postMessage({type: 'cssColorMap', colorMap} as SyntaxWorkerResponse);
   });
@@ -99,6 +127,18 @@ export function handleMessage(
   switch (data.type) {
     case 'setBaseUri': {
       globalBaseUri = data.base;
+      fetchThroughHost = data.fetchThroughHost ?? false;
+      postMessageToHost = postMessage;
+      break;
+    }
+    case 'fetchResourceResult': {
+      const pending = pendingFetches.get(data.fetchId);
+      pendingFetches.delete(data.fetchId);
+      if (data.result != null) {
+        pending?.resolve(data.result);
+      } else {
+        pending?.reject(new Error(data.error ?? 'Failed to fetch resource'));
+      }
       break;
     }
     case 'tokenizeContents': {
@@ -113,7 +153,7 @@ export function handleMessage(
     case 'tokenizeHunks': {
       workQueue.push(async () => {
         const grammar = await loadGrammar(data.theme, data.path, postMessage);
-        const result = tokenizeHunks(grammar, data.hunks, token);
+        const result = tokenizeHunks(grammar, data.hunks, data.contextLinesBefore, token);
         postMessage({type: data.type, id: data.id, result});
         cancellationTokenForId.delete(data.id);
       });
@@ -134,7 +174,8 @@ if (typeof self.document === 'undefined') {
 
 function tokenizeHunks(
   grammar: IGrammar | undefined,
-  hunks: Array<{lines: Array<string>}>,
+  hunks: ParsedDiff['hunks'],
+  contextLinesBefore: Array<string> | undefined,
   cancellationToken: CancellationToken,
 ): TokenizedDiffHunks | undefined {
   if (grammar == null) {
@@ -146,11 +187,32 @@ function tokenizeHunks(
     return undefined;
   }
 
-  const tokenizedPatches: TokenizedDiffHunks = hunks
-    .map(hunk => recoverFileContentsFromPatchLines(hunk.lines))
-    .map(([before, after]) => [tokenizeLines(before, grammar), tokenizeLines(after, grammar)]);
+  if (contextLinesBefore == null) {
+    return hunks
+      .map(hunk => recoverFileContentsFromPatchLines(hunk.lines))
+      .map(([before, after]) => [tokenizeLines(before, grammar), tokenizeLines(after, grammar)]);
+  }
 
-  return tokenizedPatches;
+  let beforeState = INITIAL;
+  let afterState = INITIAL;
+  // 1-indexed line number in the "before" file of the first line not yet tokenized.
+  let nextLine = 1;
+  return hunks.map(hunk => {
+    // A hunk that only adds lines comes after line `oldStart`, rather than starting at it.
+    const hunkStart = hunk.oldLines === 0 ? hunk.oldStart + 1 : hunk.oldStart;
+    // Lines between hunks are unchanged, so they are the same on both sides.
+    const unchangedLines = contextLinesBefore.slice(nextLine - 1, hunkStart - 1);
+    beforeState = tokenizeLinesFromState(unchangedLines, grammar, beforeState).state;
+    afterState = tokenizeLinesFromState(unchangedLines, grammar, afterState).state;
+    nextLine = hunkStart + hunk.oldLines;
+
+    const [before, after] = recoverFileContentsFromPatchLines(hunk.lines);
+    const tokenizedBefore = tokenizeLinesFromState(before, grammar, beforeState);
+    const tokenizedAfter = tokenizeLinesFromState(after, grammar, afterState);
+    beforeState = tokenizedBefore.state;
+    afterState = tokenizedAfter.state;
+    return [tokenizedBefore.tokens, tokenizedAfter.tokens];
+  });
 }
 
 function tokenizeContent(
@@ -203,6 +265,10 @@ function ensureOnigurumaIsLoaded(base: string): Promise<void> {
 
 async function loadOniguruma(base: string): Promise<void> {
   const url = new URL(URL_TO_ONIG_WASM, base);
+  if (fetchThroughHost) {
+    await loadWASM({data: await fetchFromHost(url, 'arrayBuffer')});
+    return;
+  }
   const onigurumaWASMRequest = fetch(url);
   const response = await onigurumaWASMRequest;
 

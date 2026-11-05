@@ -171,6 +171,9 @@ def run(args, fin, fout, ferr, rctx: rscontext, skipprehooks: bool):
             errormsg = err.strerror.encode()
             req.ui.ferr.write(b"abort: %s\n" % errormsg)
         req.ui.ferr.flush()
+    if err is not None and err.errno == errno.EPIPE:
+        # A closed pipe (`sl log | head`): exit like a process killed by SIGPIPE.
+        status = 128 + 13
     sys.exit(status & 255)
 
 
@@ -1050,6 +1053,7 @@ def _dispatch(req):
                                     hint=_(
                                         "use 'cd' to go to a directory inside a repository and try again"
                                     ),
+                                    error_category=error.USAGE_ERROR,
                                 )
                             raise
                 if repo:

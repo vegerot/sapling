@@ -1,6 +1,6 @@
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_treehugger")
+oncall("scm_server_infra")
 
 rust_library(
     name = "mononoke_configs",
@@ -21,6 +21,7 @@ rust_library(
         "//common/rust/shed/cloned:cloned",
         "//common/rust/shed/stats:stats",
         "//configerator/structs/scm/mononoke/repos:repos-rust",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/metaconfig:metaconfig_parser",
         "//eden/mononoke/metaconfig:metaconfig_types",
     ],

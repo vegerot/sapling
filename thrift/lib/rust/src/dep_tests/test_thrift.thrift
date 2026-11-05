@@ -97,10 +97,60 @@ struct FloatingPoint {
   2: double f64;
 }
 
+struct TerseEnum {
+  @thrift.TerseWrite
+  1: En e;
+}
+
+struct TerseUnion {
+  @thrift.TerseWrite
+  1: Un u;
+}
+
 @rust.NewType
 @rust.Ord
 @rust.Type{name = "OrderedFloat<f64>"}
 typedef double Double
+
+@rust.NewType
+typedef i32 NewInt
+
+struct TerseNewType {
+  @thrift.TerseWrite
+  1: NewInt i;
+  @thrift.TerseWrite
+  2: Double d;
+}
+
+struct Emptiable {
+  1: optional i32 opt;
+  @thrift.TerseWrite
+  2: string terse;
+}
+
+exception EmptiableException {
+  1: optional string message;
+}
+
+struct TerseStruct {
+  @thrift.TerseWrite
+  1: Emptiable emptiable;
+  @thrift.TerseWrite
+  2: Small never_empty;
+  @thrift.TerseWrite
+  3: EmptiableException ex;
+}
+
+struct TerseAdapted {
+  @rust.Adapter{name = "::fbthrift::adapter::IdentityAdapter<>", serde = true}
+  @thrift.TerseWrite
+  1: string s;
+}
+
+struct TerseAdaptedStruct {
+  @thrift.TerseWrite
+  1: TerseAdapted adapted;
+}
 
 safe stateful server exception TestException {
   1: string message;

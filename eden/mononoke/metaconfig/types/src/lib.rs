@@ -186,8 +186,6 @@ pub struct RepoConfig {
     pub enabled: bool,
     /// Persistent storage for this repo
     pub storage_config: StorageConfig,
-    /// How large a cache to use (in bytes) for RepoGenCache derived information
-    pub generation_cache_size: usize,
     /// Numerical repo id of the repo.
     pub repoid: RepositoryId,
     /// Scuba table for logging hook executions
@@ -208,8 +206,6 @@ pub struct RepoConfig {
     pub pushrebase: PushrebaseParams,
     /// LFS configuration options
     pub lfs: LfsParams,
-    /// What percent of read request verifies that returned content matches the hash
-    pub hash_validation_percentage: usize,
     /// Should this repo reject write attempts
     pub readonly: RepoReadOnly,
     /// Should files be checked for redaction
@@ -292,8 +288,6 @@ pub struct RepoConfig {
     pub git_configs: GitConfigs,
     /// Configuration for the modern sync job
     pub modern_sync_config: Option<ModernSyncConfig>,
-    /// Expose continuous stats about repo contents, this is for when mononoke server is the receiving end of a sync
-    pub log_repo_stats: bool,
     /// Configuration controlling the caching mechanism used for different types of Mononoke metadata
     /// (e.g. bookmarks, bonsai hash mappings, git symref mappings, etc.)
     pub metadata_cache_config: Option<MetadataCacheConfig>,
@@ -308,6 +302,9 @@ pub struct RepoConfig {
     pub remote_diff_config: Option<RemoteDiffConfig>,
     /// Configuration for commit rate limiting.
     pub commit_rate_limit_config: Option<CommitRateLimitConfig>,
+    /// The Perforce depot this repo mirrors; set only on repos under
+    /// `repos/p4/`.
+    pub p4_source: Option<P4SourceConfig>,
     /// Version of the per-repo config snapshot this config was parsed from
     /// (the last content-changing parse); `None` unless loaded via a
     /// per-repo config handle.
@@ -378,6 +375,8 @@ pub enum ShardedService {
     DerivationPipelineTailer,
     /// Derivation Pipeline Worker
     DerivationPipelineWorker,
+    /// Perforce mirror tailer (p4import)
+    P4Sync,
 }
 
 /// Indicates types of commit hashes used in a repo context.
@@ -390,6 +389,9 @@ pub enum CommitIdentityScheme {
     GIT,
     /// Hashes are Bonsai hashes.
     BONSAI,
+    /// Commits are identified by the Perforce changelist they were imported
+    /// from (Perforce mirror repos).
+    P4,
     /// Hashes are of unknown scheme.
     UNKNOWN,
 }
@@ -405,9 +407,6 @@ pub struct DerivedDataConfig {
 
     /// All available configs for derived data types
     pub available_configs: HashMap<String, DerivedDataTypesConfig>,
-
-    /// Name of scuba table to log all derivation queue operations
-    pub derivation_queue_scuba_table: Option<String>,
 
     /// Name of scuba table to log every bonsai<->hg mapping write to
     pub bonsai_hg_mapping_scuba_table: Option<String>,
@@ -878,11 +877,6 @@ pub struct BookmarkParams {
     /// bookmark. That also implies that it's not longer possible to
     /// pushrebase to these bookmarks.
     pub ensure_ancestor_of: Option<BookmarkKey>,
-    /// This option allows moving a bookmark to a commit that's already
-    /// public while bypassing all the hooks. Note that should be fine,
-    /// because commit is already public, meaning that hooks already
-    /// should have been run when the commit was first made public.
-    pub allow_move_to_public_commits_without_hooks: bool,
 }
 
 /// The type of the hook
@@ -906,83 +900,120 @@ impl FromStr for HookType {
     }
 }
 
-/// Hook bypass
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct HookBypass {
-    /// Bypass that checks that a string is in the commit message
-    commit_message_bypass: Option<String>,
-    /// Bypass that checks that a string is in the commit message
-    pushvar_name_and_value: Option<(String, String)>,
-    /// AMP group restricting who can use bypass. When set, only group members
-    /// can bypass this hook.
-    permission_group: Option<String>,
+/// Who may use a hook bypass condition.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum HookBypassActor {
+    /// Pushes that are not made by an agent.
+    #[default]
+    Human,
+    /// Pushes made by an agent.
+    Agent,
+    /// Any push.
+    Any,
 }
 
-impl HookBypass {
-    /// Create commit-message-only bypass
-    pub fn new_with_commit_msg(msg: String) -> Self {
+impl HookBypassActor {
+    /// Whether a push, made by an agent or not, may use the condition.
+    pub fn allows(self, is_agent: bool) -> bool {
+        match self {
+            Self::Human => !is_agent,
+            Self::Agent => is_agent,
+            Self::Any => true,
+        }
+    }
+}
+
+/// One way to bypass a hook. The condition matches a push when every
+/// requirement it sets is met, and sets at least one of `commit_message`,
+/// `pushvar`, `permission_group` and `identities`.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct HookBypassCondition {
+    /// String that must appear in the commit message.
+    pub commit_message: Option<String>,
+    /// Pushvar name and value that the push must set.
+    pub pushvar: Option<(String, String)>,
+    /// AMP group whose members may use the condition. Membership is checked
+    /// for the commit's author, or for the pusher when the author has no
+    /// usable identity; with
+    /// `scm/mononoke:check_hook_bypass_permission_group_with_client_identities`
+    /// the pusher's membership is accepted too.
+    pub permission_group: Option<String>,
+    /// Identities, one of which the pusher's own identities must include.
+    /// Unlike `permission_group`, this never considers the commit's author.
+    /// Empty means no requirement.
+    pub identities: Vec<MononokeIdentity>,
+    /// Whether humans, agents or both may use the condition.
+    pub actor: HookBypassActor,
+}
+
+impl HookBypassCondition {
+    /// A condition that requires `marker` in the commit message.
+    pub fn commit_message(marker: impl Into<String>) -> Self {
         Self {
-            commit_message_bypass: Some(msg),
-            pushvar_name_and_value: None,
-            permission_group: None,
+            commit_message: Some(marker.into()),
+            ..Default::default()
         }
     }
 
-    /// Create pushvar-only bypass
-    pub fn new_with_pushvar(name: String, value: String) -> Self {
+    /// A condition that requires the pushvar `name` set to `value`.
+    pub fn pushvar(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
-            commit_message_bypass: None,
-            pushvar_name_and_value: Some((name, value)),
-            permission_group: None,
+            pushvar: Some((name.into(), value.into())),
+            ..Default::default()
         }
     }
 
-    /// Create a bypass with both a commit message and a pushvar
-    pub fn new_with_commit_msg_and_pushvar(
-        msg: String,
-        pushvar_name: String,
-        pushvar_value: String,
-    ) -> Self {
+    /// A condition that requires membership of `group`.
+    pub fn permission_group(group: impl Into<String>) -> Self {
         Self {
-            commit_message_bypass: Some(msg),
-            pushvar_name_and_value: Some((pushvar_name, pushvar_value)),
-            permission_group: None,
+            permission_group: Some(group.into()),
+            ..Default::default()
         }
     }
 
-    /// Get commit message bypass params
-    pub fn commit_message_bypass(&self) -> Option<&String> {
-        self.commit_message_bypass.as_ref()
+    /// A condition that requires one of `identities`.
+    pub fn identities(identities: impl IntoIterator<Item = MononokeIdentity>) -> Self {
+        Self {
+            identities: identities.into_iter().collect(),
+            ..Default::default()
+        }
     }
 
-    /// Get pushvar bypass params
-    pub fn pushvar_bypass(&self) -> Option<(&String, &String)> {
-        self.pushvar_name_and_value
-            .as_ref()
-            .map(|name_and_value| (&name_and_value.0, &name_and_value.1))
-    }
-
-    /// Set the permission group (builder pattern)
-    pub fn with_permission_group(mut self, group: Option<String>) -> Self {
-        self.permission_group = group;
+    /// Also require membership of `group`.
+    pub fn with_permission_group(mut self, group: impl Into<String>) -> Self {
+        self.permission_group = Some(group.into());
         self
     }
 
-    /// Get the permission group
-    pub fn permission_group(&self) -> Option<&str> {
-        self.permission_group.as_deref()
+    /// Restrict the condition to `actor`.
+    pub fn with_actor(mut self, actor: HookBypassActor) -> Self {
+        self.actor = actor;
+        self
+    }
+
+    /// Whether the condition sets none of the requirements that identify who
+    /// may bypass. Such a condition is invalid.
+    pub fn is_empty(&self) -> bool {
+        self.commit_message.is_none()
+            && self.pushvar.is_none()
+            && self.permission_group.is_none()
+            && self.identities.is_empty()
     }
 }
 
 /// Configs that are being passed to the hook during runtime
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct HookConfig {
-    /// An optional way to bypass a hook
-    pub bypass: Option<HookBypass>,
+    /// Ways to bypass the hook. The hook is bypassed when any of them matches.
+    pub bypasses: Vec<HookBypassCondition>,
     /// Configuration options (in JSON format)
     pub options: Option<String>,
     /// Whether this hook is log-only
     pub log_only: bool,
+    /// The hook's name, as configured.
+    pub name: String,
+    /// Replacement text for the hook's messages, keyed by message name
+    pub messages: HashMap<String, String>,
 
     // Deprecated config options
     /// Map of config to it's value. Values here are strings
@@ -1061,6 +1092,23 @@ pub struct PushrebaseFlags {
     /// them will be rejected as before so downstream checks (e.g. Hack
     /// type-checking in CI land) still trigger.
     pub merge_resolution_excluded_path_prefixes: PrefixTrie,
+    /// Path prefixes under which a merge-resolution conflict resolves to the
+    /// pushed side instead of rejecting the pushrebase (see
+    /// `RawPushrebaseParams.merge_resolution_take_incoming_prefixes`).
+    /// Checked after `merge_resolution_excluded_path_prefixes`; gated by the
+    /// `pushrebase_take_incoming_enabled` JustKnob. Empty everywhere by
+    /// default, in which case merge resolution is unchanged.
+    ///
+    /// Deprecated in favour of the caller asking per request
+    /// (`merge_resolution_take_incoming`); kept while the prebuilt ingestion
+    /// jobs move to the pushvar.
+    pub merge_resolution_take_incoming_prefixes: PrefixTrie,
+    /// Per-request: the caller asked for every content conflict in this push
+    /// to resolve to the pushed side (`MERGE_TAKE_INCOMING_PUSHVAR_KEY`), the
+    /// way `git rebase -X theirs` would on a checkout. Gated by the
+    /// `pushrebase_take_incoming_enabled` JustKnob per repo. Request-scoped,
+    /// never loaded from configerator (mirrors `merge_resolution_override`).
+    pub merge_resolution_take_incoming: bool,
     /// Per-request override for `pushrebase_enable_merge_resolution`.
     /// `UseJk` defers to the JustKnob; `ForceOn`/`ForceOff` wins. Request-scoped,
     /// never loaded from configerator — set on a cloned `PushrebaseFlags`
@@ -1070,6 +1118,14 @@ pub struct PushrebaseFlags {
     pub land_instance_id: Option<String>,
     /// Per-request Phabricator diff FBID (`PHAB_DIFF_ID` pushvar); stamped on Scuba for per-diff attribution (join key back to Landcastle/Phabricator datasets). Observability only.
     pub phab_diff_id: Option<String>,
+    /// Per-request (`MAINLINE_PARENT_FIRST` pushvar). The mainline parent of
+    /// a rebased merge is the parent that leads to the destination bookmark:
+    /// the one through which it descends from the rebase root. With this
+    /// flag, pushrebase makes it the merge's first parent, so the bookmark's
+    /// first-parent history stays linear, and marks a merge whose parents it
+    /// reorders with pushrebase's `PARENTS_SWAPPED_EXTRA`. A rebase root that
+    /// is not a first parent is then allowed despite `forbid_p2_root_rebases`.
+    pub mainline_parent_first: bool,
 }
 
 /// Pushvar key for the Sandcastle land instance id (see `PushrebaseFlags::land_instance_id`).
@@ -1077,6 +1133,26 @@ pub const LAND_INSTANCE_ID_PUSHVAR_KEY: &str = "LAND_INSTANCE_ID";
 
 /// Pushvar key for the Phabricator diff FBID (see `PushrebaseFlags::phab_diff_id`).
 pub const PHAB_DIFF_ID_PUSHVAR_KEY: &str = "PHAB_DIFF_ID";
+
+/// Pushvar key for the caller's take-incoming request (see
+/// `PushrebaseFlags::merge_resolution_take_incoming`). Spelled as a git push
+/// header so a direct `git push` sets it with
+/// `-c http.extraHeader='x-git-merge-take-incoming: true'`; Landcastle sends
+/// the same key for a tagged diff.
+pub const MERGE_TAKE_INCOMING_PUSHVAR_KEY: &str = "x-git-merge-take-incoming";
+
+/// Whether a pushvar value asks for take-incoming: `"true"` or `"1"`,
+/// case-insensitive. Missing, empty or anything else is a no.
+pub fn merge_take_incoming_from_pushvar_value(raw: Option<&[u8]>) -> bool {
+    matches!(
+        raw.map(<[u8]>::to_ascii_lowercase).as_deref(),
+        Some(b"true" | b"1")
+    )
+}
+
+/// Pushvar key that sets `PushrebaseFlags::mainline_parent_first`
+/// when its value is `true` or `1`.
+pub const MAINLINE_PARENT_FIRST_PUSHVAR_KEY: &str = "MAINLINE_PARENT_FIRST";
 
 /// Per-request override for the `pushrebase_enable_merge_resolution` JustKnob.
 ///
@@ -1197,9 +1273,12 @@ impl Default for PushrebaseFlags {
             not_generated_filenodes_limit: 500,
             monitoring_bookmark: None,
             merge_resolution_excluded_path_prefixes: PrefixTrie::new(),
+            merge_resolution_take_incoming_prefixes: PrefixTrie::new(),
+            merge_resolution_take_incoming: false,
             merge_resolution_override: MergeResolutionOverride::UseJk,
             land_instance_id: None,
             phab_diff_id: None,
+            mainline_parent_first: false,
         }
     }
 }
@@ -1801,7 +1880,7 @@ pub struct SmallRepoGitSubmoduleConfig {
     /// as file changes from the submodule dependencies might need to be copied.
     pub submodule_dependencies: HashMap<NonRootMPath, RepositoryId>,
     /// Each submodule expansion in the large repo will have a metadata file
-    /// named "<PREFIX><SUBMODULE_PATH>", e.g. ".x-repo-submodule-voip".
+    /// named `"<PREFIX><SUBMODULE_PATH>"`, e.g. `".x-repo-submodule-voip"`.
     /// This file will store the git commit that the expansion corresponds to.
     pub submodule_metadata_file_prefix: String,
 
@@ -2269,6 +2348,11 @@ pub struct ModernSyncChannelConfig {
     pub channel_size: i64,
     /// Interval between flushes in milliseconds.
     pub flush_interval_ms: i64,
+    /// Max EdenAPI flushes in flight per channel. 1 means serial flushes.
+    pub max_concurrent_flushes: i64,
+    /// Max bytes held by in-flight flushes. Only the content channel tracks
+    /// bytes (trees and filenodes carry bare IDs); other channels ignore it.
+    pub max_bytes_in_flight: i64,
 }
 
 /// Destination for telemetry logging.
@@ -2311,8 +2395,8 @@ pub struct MetadataLoggerConfig {
     /// Bookmarks to log repo metadata for
     pub bookmarks: Vec<BookmarkKey>,
     /// The interval time in secs for which the repo metadata logger sleeps between
-    /// successive iterations of its incremental mode execution
-    pub sleep_interval_secs: u64,
+    /// successive iterations of its incremental mode execution. `None` means no sleep.
+    pub sleep_interval_secs: Option<u64>,
 }
 
 /// Configuration for connecting to Zelos
@@ -2397,6 +2481,17 @@ pub struct GitConfigs {
     pub preloaded_cgdm_blobstore_key: Option<String>,
 }
 
+/// The Perforce depot a `repos/p4/` mirror imports from: one repo mirrors one
+/// depot of one server.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct P4SourceConfig {
+    /// The server, as the p4_sync job names it in `--p4-server-alias`
+    /// (e.g. `test1`), not a P4PORT.
+    pub server_alias: String,
+    /// The depot root as a depot path, `//name/`.
+    pub depot: String,
+}
+
 /// Configuration for x repo syncs
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct XRepoSyncSourceConfig {
@@ -2461,8 +2556,14 @@ pub enum MetadataCacheUpdateMode {
 /// Configuration for Mononoke metadata cache
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct MetadataCacheConfig {
-    /// Mode for updating the warm bookmark metadata cache
+    /// Mode for updating the warm bookmark metadata cache from legacy notifications
     pub wbc_update_mode: Option<MetadataCacheUpdateMode>,
+    /// Mode for updating the warm bookmark metadata cache from EventRouter notifications
+    pub wbc_event_router_update_mode: Option<MetadataCacheUpdateMode>,
+    /// Whether WBC processes EventRouter bookmark notifications instead of legacy updates
+    pub wbc_process_bookmark_notifications: bool,
+    /// Whether to batch EventRouter bookmark notifications; requires notification processing.
+    pub wbc_event_router_batching_enabled: bool,
     /// Mode for updating the tags metadata cache
     pub tags_update_mode: Option<MetadataCacheUpdateMode>,
     /// Mode for updating the content refs metadata cache
@@ -2473,6 +2574,14 @@ impl MetadataCacheConfig {
     /// Returns the scribe category to tail for warm bookmark cache updates if it exists
     pub fn wbc_scribe_category(&self) -> Option<String> {
         match &self.wbc_update_mode {
+            Some(MetadataCacheUpdateMode::Tailing { category }) => Some(category.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Returns the EventRouter scribe category to tail for warm bookmark cache updates
+    pub fn wbc_event_router_scribe_category(&self) -> Option<String> {
+        match &self.wbc_event_router_update_mode {
             Some(MetadataCacheUpdateMode::Tailing { category }) => Some(category.to_string()),
             _ => None,
         }
@@ -2569,7 +2678,9 @@ pub struct EnforcementConditionSet {
     /// If true, this set always matches — skips the request matchers and
     /// require_client_request_flag checks.
     pub always_enabled: bool,
-    /// Temporary: if true, client must send server_side_tenting=true in metadata.
+    /// Temporary: if true, the client must also flag enforcement support:
+    /// server_side_tenting=true in SLAPI request metadata, or either
+    /// partial-responses header on SCS thrift requests.
     /// Used during the initial rollout stage so clients can opt in to enforcement
     /// and disable it if it causes issues. Should be removed once rollout is complete.
     // TODO(T248658346): Remove this field once path ACL enforcement is fully rolled out.
@@ -2956,21 +3067,6 @@ mod tests {
             ..pipeline_config(vec![("", stage(vec![]))])
         };
         assert_rejects(config, "at least one derivable type");
-    }
-
-    #[mononoke::test]
-    fn test_pipeline_config_accepts_hg_augmented_manifests_v2() {
-        // Given: an otherwise-valid pipeline config enabling augmented
-        // manifests v2.
-        let config = DerivationPipelineConfig {
-            types: BTreeSet::from([DerivableType::HgAugmentedManifestsV2]),
-            ..pipeline_config(vec![("", stage(vec![]))])
-        };
-
-        // When/Then: validation accepts the pipeline-derivable type.
-        config
-            .validate()
-            .expect("augmented manifests v2 should support derivation pipelines");
     }
 
     #[mononoke::test]

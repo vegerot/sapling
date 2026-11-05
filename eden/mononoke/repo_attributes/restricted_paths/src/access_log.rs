@@ -30,9 +30,9 @@ use crate::RestrictedManifestId;
 use crate::RestrictedPaths;
 use crate::restriction_check;
 use crate::restriction_check::EnforcementDecision;
-use crate::restriction_check::ManifestRestrictionSource;
 use crate::restriction_check::PathRestrictionSource;
 use crate::restriction_check::RestrictionCheckResult;
+use crate::restriction_check::RestrictionSource;
 use crate::restriction_check::SharedFetchHandle;
 use crate::restriction_check::SourceRestrictionCheck;
 use crate::restriction_check::SourceRestrictionChecks;
@@ -175,7 +175,7 @@ pub(crate) async fn log_source_comparison_access_by_manifest_if_restricted(
         restricted_paths,
         manifest_id.clone(),
         manifest_type.clone(),
-        ManifestRestrictionSource::Config,
+        RestrictionSource::Config,
     )
     .await
     .map(SourceRestrictionChecks::new)
@@ -188,7 +188,7 @@ pub(crate) async fn log_source_comparison_access_by_manifest_if_restricted(
                 restricted_paths,
                 manifest_id.clone(),
                 manifest_type.clone(),
-                ManifestRestrictionSource::AclManifest,
+                RestrictionSource::AclManifest,
             )
             .await
             .map(SourceRestrictionChecks::new)
@@ -272,6 +272,8 @@ fn restriction_check_result_for_source_results<T: SourceRestrictionCheck>(
     acl_manifest_result: Option<&SourceRestrictionResult<T>>,
 ) -> Result<RestrictionCheckResult> {
     let summary = if acl_manifest_mode == AclManifestMode::Both {
+        // TODO(T289977216): Reconcile tri-state factors by restriction instead
+        // of merging successful sources through legacy boolean aggregation.
         SourceRestrictionSummary::from_check_union(
             successful_source_checks(Some(config_result))
                 .chain(successful_source_checks(acl_manifest_result)),
@@ -519,6 +521,8 @@ fn aggregate_summary_for_source_results<T: SourceRestrictionCheck>(
 
     let any_source_succeeded = config_source.is_some() || acl_manifest_source.is_some();
     any_source_succeeded.then(|| {
+        // TODO(T289977216): Reconcile tri-state factors by restriction instead
+        // of merging successful sources through legacy boolean aggregation.
         SourceRestrictionSummary::from_check_union(
             successful_source_checks(Some(config_result))
                 .chain(successful_source_checks(acl_manifest_result)),
@@ -1009,6 +1013,9 @@ mod schematized_logger {
         if !data.forwarded_cats_token_verifiers.is_empty() {
             logger.set_forwarded_cats_token_verifiers(data.forwarded_cats_token_verifiers.clone());
         }
+        if let Some(ref client_id) = data.upstream_client_id {
+            logger.set_client_id(client_id.clone());
+        }
 
         if let Some(ref hostname) = data.source_hostname {
             logger.set_source_hostname(hostname.clone());
@@ -1187,6 +1194,7 @@ fn log_access_to_scuba(
         "client_path_acl_compatibility",
         ctx.metadata().client_path_acl_compatibility().as_str(),
     );
+    scuba.add_opt("client_id", ctx.metadata().upstream_client_id());
 
     if let Some(user_agent) = ctx.metadata().user_agent() {
         scuba.add("http_user_agent", user_agent);

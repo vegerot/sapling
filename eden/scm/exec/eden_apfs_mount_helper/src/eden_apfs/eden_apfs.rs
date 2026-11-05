@@ -263,12 +263,18 @@ impl<T: SystemCommand> ApfsUtil<T> {
         let mut stale_volumes = vec![];
         for container in containers {
             for vol in container.volumes {
+                // EdenFS mounts a volume at the path its name encodes. macOS mounts
+                // every volume at boot, putting the ones EdenFS hasn't mounted
+                // under /Volumes, so a volume mounted anywhere else isn't in use.
                 if !vol.is_edenfs_managed_volume()
                     || vol
                         .get_current_mount_point(&self.mount, Some(&mount_table))
-                        .is_some()
+                        .is_some_and(|mount_point| {
+                            vol.name.as_ref()
+                                == Some(&encode_mount_point_as_volume_name(&mount_point))
+                        })
                 {
-                    // ignore currently mounted or volumes not managed by EdenFS
+                    // ignore volumes EdenFS has mounted or doesn't manage
                     continue;
                 }
 
@@ -284,9 +290,9 @@ impl<T: SystemCommand> ApfsUtil<T> {
     // Returns stale eden APFS redirection volumes based on checkout names.
     //
     // Note that because this implementation only takes into account checkout
-    // names, it may incorrectly indicate that an unmounted redirection volume
-    // with a hashed name is "stale", even if it is currently configured for
-    // some checkout.
+    // names, it may incorrectly indicate that a redirection volume with a
+    // hashed name that EdenFS hasn't mounted is "stale", even if it is
+    // currently configured for some checkout.
     pub fn list_stale_volumes_unsafe(&self, all_checkouts: &[String]) -> Result<Vec<ApfsVolume>> {
         self.list_stale_volumes_impl(|vol| {
             all_checkouts
@@ -1223,6 +1229,41 @@ map -fstab on /Network/Servers (autofs, automounted, nobrowse)
                     .to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn test_list_stale_volumes_includes_volumes_macos_mounted_under_volumes() {
+        // At boot macOS mounts every volume under /Volumes. ~/fbsource is still
+        // a checkout, but ~/test was removed before the reboot.
+        let mut apfs_util = fake_apfs_util(
+            &[
+                (
+                    "disk3s8",
+                    "edenfs:/Users/me/fbsource/fbcode/buck-out",
+                    "00000000-0000-0000-0000-000000000008",
+                ),
+                (
+                    "disk3s10",
+                    "edenfs:/Users/me/test/buck-out",
+                    "00000000-0000-0000-0000-000000000010",
+                ),
+            ],
+            [],
+        );
+        apfs_util.mount.set_stdout(
+            &[],
+            "/dev/disk3s8 on /Volumes/edenfs::Users:me:fbsource:fbcode:buck-out (apfs, local, journaled, protect)\n\
+             /dev/disk3s10 on /Volumes/edenfs::Users:me:test:buck-out (apfs, local, journaled, protect)\n",
+        );
+
+        let stale_volume_names = apfs_util
+            .list_stale_volumes_unsafe(&["/Users/me/fbsource".to_string()])
+            .expect("listing stale volumes should succeed")
+            .into_iter()
+            .map(|vol| vol.name.expect("EdenFS volumes should have names"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(stale_volume_names, ["edenfs:/Users/me/test/buck-out"]);
     }
 
     fn volume_list_plist(volumes: &[(&str, &str, &str)]) -> String {

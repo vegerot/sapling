@@ -9,15 +9,19 @@ import type {ParsedDiff} from 'shared/patch/types';
 import type {
   SyntaxWorkerRequest,
   SyntaxWorkerResponse,
-  ThemeColor,
   TokenizedDiffHunks,
   TokenizedHunk,
 } from './syntaxHighlightingTypes';
 
+import {useAtomValue} from 'jotai';
 import {useEffect, useState} from 'react';
 import {CancellationToken} from 'shared/CancellationToken';
 import {updateTextMateGrammarCSS} from 'shared/textmate-lib/textmateStyles';
 import {isVscode} from '../../environment';
+import {themeState} from '../../theme';
+// Vite generates this module at build time, so the import plugin can't see its default export.
+// eslint-disable-next-line import/default
+import syntaxHighlightingWorkerUrl from './syntaxHighlightingWorker?worker&url';
 import {SynchronousWorker, WorkerApi} from './workerApi';
 
 // Syntax highlighting is done in a WebWorker. This file contains APIs
@@ -35,6 +39,7 @@ function getWorker(): Promise<WorkerApi<SyntaxWorkerRequest, SyntaxWorkerRespons
   }
   cachedWorkerPromise = (async () => {
     let worker: WorkerApi<SyntaxWorkerRequest, SyntaxWorkerResponse>;
+    let fetchThroughHost = false;
     if (isVscode()) {
       if (process.env.NODE_ENV === 'development') {
         // NOTE: when using vscode in dev mode, because the web worker is not compiled to a single file,
@@ -46,27 +51,55 @@ function getWorker(): Promise<WorkerApi<SyntaxWorkerRequest, SyntaxWorkerRespons
       } else {
         // Production vscode build: webworkers in vscode webviews
         // are very particular and can only be loaded via blob: URL.
-        // Vite will have built a special worker js asset due to the imports in this file.
-        const PATH_TO_WORKER = './worker/syntaxHighlightingWorker.js';
-        const blobUrl = await fetch(PATH_TO_WORKER)
+        const blobUrl = await fetch(syntaxHighlightingWorkerUrl)
           .then(r => r.blob())
           .then(b => URL.createObjectURL(b));
 
-        worker = new WorkerApi(new Worker(blobUrl));
+        try {
+          worker = new WorkerApi(new Worker(blobUrl));
+        } finally {
+          URL.revokeObjectURL(blobUrl);
+        }
+        // VS Code's webview service worker never answers resource requests from a blob worker,
+        // so the worker can't fetch its wasm or grammars itself.
+        fetchThroughHost = true;
       }
     } else if (window.Worker && !forceDisableWorkers) {
       // Non-vscode environments: web workers should work normally
       worker = new WorkerApi(
         new Worker(new URL('./syntaxHighlightingWorker', import.meta.url), {type: 'module'}),
       );
-    } else {
+    } else if (process.env.NODE_ENV !== 'production') {
+      // Tests (jsdom) have no WebWorker. Gated on NODE_ENV so production builds don't
+      // emit a second, non-worker copy of syntaxHighlightingWorker just for this fallback.
       worker = new WorkerApi(
         new SynchronousWorker(() => import('./syntaxHighlightingWorker')) as unknown as Worker,
       );
+    } else {
+      throw new Error('WebWorkers are not available; syntax highlighting is disabled');
     }
 
     // Explicitly set the base URI so the worker can make fetch requests.
-    worker.worker.postMessage({type: 'setBaseUri', base: document.baseURI} as SyntaxWorkerRequest);
+    worker.worker.postMessage({
+      type: 'setBaseUri',
+      base: document.baseURI,
+      fetchThroughHost,
+    } as SyntaxWorkerRequest);
+
+    if (fetchThroughHost) {
+      worker.listen('fetchResource', async ({fetchId, url, as}) => {
+        try {
+          const response = await fetch(url);
+          if (!response.ok) {
+            throw new Error(`Failed to fetch ${url}: ${response.status}`);
+          }
+          const result = as === 'text' ? await response.text() : await response.arrayBuffer();
+          worker.worker.postMessage({type: 'fetchResourceResult', fetchId, result});
+        } catch (err) {
+          worker.worker.postMessage({type: 'fetchResourceResult', fetchId, error: String(err)});
+        }
+      });
+    }
 
     worker.listen('cssColorMap', msg => {
       // During testing-library tear down (ex. syntax highlighting was canceled),
@@ -86,29 +119,31 @@ function getWorker(): Promise<WorkerApi<SyntaxWorkerRequest, SyntaxWorkerRespons
  * Given a set of hunks from a diff view,
  * asynchronously provide syntax highlighting by tokenizing.
  *
- * Note that we reconstruct the file contents from the diff,
- * so syntax highlighting can be inaccurate since it's missing full context.
+ * Note that we reconstruct the file contents from the diff. Without `contextLinesBefore`,
+ * syntax highlighting can be inaccurate since it's missing the lines above each hunk.
  */
 export function useTokenizedHunks(
   path: string,
   hunks: ParsedDiff['hunks'],
-  useThemeHook: () => ThemeColor,
+  contextLinesBefore?: Array<string>,
 ): TokenizedDiffHunks | undefined {
-  const theme = useThemeHook();
+  const theme = useAtomValue(themeState);
 
   const [tokenized, setTokenized] = useState<TokenizedDiffHunks | undefined>(undefined);
 
   useEffect(() => {
     const token = newTrackedCancellationToken();
     getWorker().then(worker =>
-      worker.request({type: 'tokenizeHunks', theme, path, hunks}, token).then(result => {
-        if (!token.isCancelled) {
-          setTokenized(result.result);
-        }
-      }),
+      worker
+        .request({type: 'tokenizeHunks', theme, path, hunks, contextLinesBefore}, token)
+        .then(result => {
+          if (!token.isCancelled) {
+            setTokenized(result.result);
+          }
+        }),
     );
     return () => token.cancel();
-  }, [theme, path, hunks]);
+  }, [theme, path, hunks, contextLinesBefore]);
   return tokenized;
 }
 
@@ -118,9 +153,8 @@ export function useTokenizedHunks(
 export function useTokenizedContents(
   path: string,
   content: Array<string> | undefined,
-  useThemeHook: () => ThemeColor,
 ): TokenizedHunk | undefined {
-  const theme = useThemeHook();
+  const theme = useAtomValue(themeState);
 
   const [tokenized, setTokenized] = useState<TokenizedHunk | undefined>(undefined);
 
@@ -153,9 +187,8 @@ export function useTokenizedContentsOnceVisible(
   contentBefore: Array<string> | undefined,
   contentAfter: Array<string> | undefined,
   parentNode: React.MutableRefObject<HTMLElement | null>,
-  useThemeHook: () => ThemeColor,
 ): [TokenizedHunk, TokenizedHunk] | undefined {
-  const theme = useThemeHook();
+  const theme = useAtomValue(themeState);
   const [tokenized, setTokenized] = useState<[TokenizedHunk, TokenizedHunk] | undefined>(undefined);
   const [hasBeenVisible, setHasBeenVisible] = useState(false);
 

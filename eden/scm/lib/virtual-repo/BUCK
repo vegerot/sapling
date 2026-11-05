@@ -10,13 +10,14 @@ sl_rust_library(
     ]),
     autocargo = {
         "cargo_toml_config": {
+            "dependencies_override": {
+                "dependencies": {
+                    "twox-hash": {"features": ["std", "xxhash3_64"]},
+                },
+            },
             "package": {
-                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
+                "autobenches": False,
                 "description": "Generate source control repo data on demand for testing purpose.",
-                "homepage": "https://sapling-scm.com/",
-                "license": "MIT",
-                "name": "sapling-virtual-repo",
-                "repository": "https://github.com/facebook/sapling",
             },
         },
     },

@@ -8,11 +8,12 @@
 import type {JSX, ReactNode} from 'react';
 import type {FieldConfig} from './types';
 
+import {Button} from 'isl-components/Button';
 import {Icon} from 'isl-components/Icon';
 import {extractTokens, TokensList} from 'isl-components/Tokens';
 import {DOCUMENTATION_DELAY, Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
-import {Fragment} from 'react';
+import {Fragment, Suspense} from 'react';
 import {InternalFieldName} from 'shared/constants';
 import {tracker} from '../analytics';
 import {Copyable} from '../Copyable';
@@ -105,12 +106,14 @@ export function CommitInfoField({
               <Icon icon={field.icon} />
               {field.key}
             </SmallCapsTitle>
-            <CustomEditorComponent
-              field={field}
-              content={editedFieldContent}
-              setEditedField={setEditedField}
-              autoFocus={autofocus ?? false}
-            />
+            <Suspense fallback={null}>
+              <CustomEditorComponent
+                field={field}
+                content={editedFieldContent}
+                setEditedField={setEditedField}
+                autoFocus={autofocus ?? false}
+              />
+            </Suspense>
             {extra}
           </Section>
         );
@@ -149,7 +152,11 @@ export function CommitInfoField({
         const CustomDisplayComponent = field.renderDisplay;
         const fieldContent =
           content == null ? '' : Array.isArray(content) ? content.join(', ') : content;
-        renderedContent = <CustomDisplayComponent content={fieldContent} />;
+        renderedContent = (
+          <Suspense fallback={null}>
+            <CustomDisplayComponent content={fieldContent} />
+          </Suspense>
+        );
       } else if (field.type === 'field') {
         const tokens = Array.isArray(content) ? content : extractTokens(content)[0];
         renderedContent = (
@@ -269,9 +276,9 @@ function ClickToEditField({
 function EditFieldButton({onClick}: {onClick: () => void}) {
   return (
     <Tooltip title="Edit field" delayMs={DOCUMENTATION_DELAY}>
-      <button className="hover-edit-button" onClick={onClick}>
+      <Button icon className="hover-edit-button" onClick={onClick}>
         <Icon icon="edit" />
-      </button>
+      </Button>
     </Tooltip>
   );
 }
@@ -279,9 +286,9 @@ function EditFieldButton({onClick}: {onClick: () => void}) {
 function CopyFromParentButton({onClick}: {onClick: () => void}) {
   return (
     <Tooltip title="Copy from previous commit" delayMs={DOCUMENTATION_DELAY}>
-      <button className="hover-edit-button" onClick={onClick}>
+      <Button icon className="hover-edit-button" onClick={onClick}>
         <Icon icon="clippy" />
-      </button>
+      </Button>
     </Tooltip>
   );
 }

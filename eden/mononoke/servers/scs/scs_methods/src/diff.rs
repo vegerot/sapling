@@ -32,6 +32,15 @@ use mononoke_types::NonRootMPath;
 use scs_errors::ServiceError;
 use source_control as thrift;
 
+#[cfg(fbcode_build)]
+mod facebook;
+#[cfg(fbcode_build)]
+use facebook as platform;
+#[cfg(not(fbcode_build))]
+mod oss;
+#[cfg(not(fbcode_build))]
+use oss as platform;
+
 /// Trait for extracting declared errors from diff-service RPC failures.
 trait DiffServiceError {
     fn request_error(&self) -> Option<&diff_service_if::RequestError>;
@@ -144,46 +153,18 @@ impl<'a> DiffRouter<'a> {
         &self,
         repo_name: &str,
     ) -> Result<DiffServiceClient, ServiceError> {
-        let result = match self.remote_diff_config {
-            Some(RemoteDiffConfig::HostPort(host_port)) => {
-                DiffServiceClient::from_host_port(self.fb, host_port.clone()).map_err(|e| {
-                    format!(
-                        "Failed to create diff service client from host:port '{host_port}': {e}"
-                    )
-                })
-            }
-            Some(RemoteDiffConfig::SmcTier(smc_tier)) => {
-                DiffServiceClient::from_tier_name(self.fb, smc_tier.clone()).map_err(|e| {
-                    format!(
-                        "Failed to create diff service client from SMC tier '{smc_tier}': {e}"
-                    )
-                })
-            }
-            Some(RemoteDiffConfig::ShardManagerTier(sm_tier)) => {
-                DiffServiceClient::from_sm_tier_name(
-                    self.fb,
-                    sm_tier.clone(),
-                    repo_name.to_string(),
-                )
-                .map_err(|e| {
-                    format!(
-                        "Failed to create diff service client from ShardManager tier '{sm_tier}': {e}"
-                    )
-                })
-            }
-            None => {
-                // Fallback to default Service Manager discovery
-                DiffServiceClient::new_with_sm(self.fb, repo_name.to_string()).map_err(|e| {
-                    format!(
-                        "Failed to create diff service client for repo '{repo_name}': {e}"
-                    )
-                })
-            }
-        };
-        result.map_err(|e| scs_errors::internal_error(e).into())
+        platform::create_diff_service_client(self.fb, self.remote_diff_config, repo_name)
+            .map_err(|e| scs_errors::internal_error(format!("{e:#}")).into())
     }
 
     /// Check if remote diff should be used for this repo
+    #[cfg_attr(
+        not(fbcode_build),
+        expect(
+            unused_variables,
+            reason = "OSS gates on config, not per-repo JustKnobs"
+        )
+    )]
     fn should_use_remote_diff(&self, repo_name: &str) -> bool {
         // Gate 1: CLI flag must be enabled
         if !self.diff_options.diff_remotely {
@@ -191,7 +172,13 @@ impl<'a> DiffRouter<'a> {
         }
 
         // Gate 2: Check JK - this is the kill switch in production
-        justknobs::eval("scm/mononoke:remote_diff", None, Some(repo_name))
+        #[cfg(fbcode_build)]
+        return justknobs::eval("scm/mononoke:remote_diff", None, Some(repo_name));
+
+        // OSS has no JustKnobs rollout, so route remotely exactly when an
+        // address is configured.
+        #[cfg(not(fbcode_build))]
+        self.remote_diff_config.is_some()
     }
 
     /// Generate headerless unified diff between two files.
@@ -275,6 +262,13 @@ impl<'a> DiffRouter<'a> {
 
     /// Check if remote commit_compare should be used for this repo.
     /// Uses a separate JK from file-level diffs for independent rollout.
+    #[cfg_attr(
+        not(fbcode_build),
+        expect(
+            unused_variables,
+            reason = "OSS gates on config, not per-repo JustKnobs"
+        )
+    )]
     pub fn should_use_remote_commit_compare(&self, repo_name: &str) -> bool {
         // Gate 1: CLI flag must be enabled
         if !self.diff_options.diff_remotely {
@@ -282,7 +276,13 @@ impl<'a> DiffRouter<'a> {
         }
 
         // Gate 2: Check JK - this is the kill switch in production
-        justknobs::eval("scm/mononoke:remote_commit_compare", None, Some(repo_name))
+        #[cfg(fbcode_build)]
+        return justknobs::eval("scm/mononoke:remote_commit_compare", None, Some(repo_name));
+
+        // OSS has no JustKnobs rollout, so route remotely exactly when an
+        // address is configured.
+        #[cfg(not(fbcode_build))]
+        self.remote_diff_config.is_some()
     }
 
     /// Forward a commit_compare request to the remote diff_service.
@@ -302,6 +302,15 @@ impl<'a> DiffRouter<'a> {
             .commit_compare(ctx, commit_id, params)
             .await
             .map_err(convert_diff_service_error)?;
+        // Propagate diff_service's verdict so the remote route sets the
+        // same flag (and `nocache`) as the local path.
+        if response
+            .partial_info
+            .as_ref()
+            .is_some_and(|info| info.partial)
+        {
+            ctx.set_partial_response();
+        }
 
         Ok(response)
     }
@@ -372,9 +381,19 @@ impl<'a> DiffRouter<'a> {
         let path = NonRootMPath::try_from(content.path().clone())
             .map_err(|e| remote_infra_error(format!("{e:?}")))?
             .to_string();
-        let changeset_id = content.changeset().id();
+        let bonsai_id = content.changeset().id().as_ref().to_vec();
+        let commit_id = match content.repo_ctx().bubble_id() {
+            Some(bubble_id) => {
+                diff_service_if::CommitId::ephemeral_bonsai(diff_service_if::EphemeralBonsai {
+                    bonsai_id,
+                    bubble_id: bubble_id.into(),
+                    ..Default::default()
+                })
+            }
+            None => diff_service_if::CommitId::bonsai(bonsai_id),
+        };
         Ok(diff_service_client::DiffInput::CommitPath {
-            commit_id: diff_service_if::CommitId::bonsai(changeset_id.as_ref().to_vec()),
+            commit_id,
             path,
             replacement_path,
         })
@@ -654,7 +673,7 @@ impl<'a> DiffRouter<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(fbcode_build, test))]
 mod tests {
     use environment::RemoteDiffOptions;
     use justknobs::test_helpers::JustKnobsInMemory;

@@ -62,7 +62,6 @@ filtersuspectsymlink=true
 
 [experimental]
 exportstack-max-bytes=1M
-allow-non-interactive-editor=true
 
 log-implicit-follow-threshold=10000
 
@@ -277,7 +276,6 @@ bookmarks-pushkey-compat=True
 bundle1=True
 compressionengines=<class 'list'>
 maxhttpheaderlen=1024
-uncompressed=True
 zliblevel=-1
 
 [smallcommitmetadata]

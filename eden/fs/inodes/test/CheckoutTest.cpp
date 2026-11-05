@@ -41,6 +41,7 @@
 #include "eden/fs/service/gen-cpp2/eden_types.h"
 #include "eden/fs/store/DiffContext.h"
 #include "eden/fs/store/IObjectStore.h"
+#include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/store/ScmStatusDiffCallback.h"
 #include "eden/fs/store/TreeCache.h"
@@ -849,8 +850,11 @@ void testModifyConflict(
       break;
   }
 
-  // Unmount and remount the mount point, and verify the changes persisted
-  // across the remount as expected.
+    // Unmount and remount the mount point, and verify the changes persisted
+    // across the remount as expected.
+#ifndef _WIN32
+  // A Windows remount rebuilds the InMemory overlay from the ProjFS scan, and
+  // TestMount has no projected disk state, so materialized changes revert.
   postInode.reset();
   testMount.remount();
   postInode = testMount.getFileInode(path);
@@ -870,6 +874,7 @@ void testModifyConflict(
       EXPECT_FILE_INODE(ddddInode, "new dddd contents\n", 0644);
       break;
   }
+#endif
 }
 
 void runModifyConflictTests(CheckoutMode checkoutMode, bool useCoroutines) {
@@ -1426,6 +1431,51 @@ TEST_P(CheckoutTest, checkoutCaseChangedTreeInsensitive) {
       testMount.getFileInode("dir/file1"_relpath), "lower one", 0644);
 }
 
+TEST_P(CheckoutTest, checkoutRememberedChildWithDifferentCaseInsensitive) {
+  FakeTreeBuilder builder;
+  TestMount testMount{builder, true, true, CaseSensitivity::Insensitive};
+  applyParam(testMount);
+  testMount.addFile("Foo", "local\n");
+
+  auto child = testMount.getFileInode("Foo");
+  auto childNumber = child->getNodeId();
+  child->incFsRefcount();
+  child.reset();
+  auto* inodeMap = testMount.getEdenMount()->getInodeMap();
+  SCOPE_EXIT {
+    inodeMap->decFsRefcount(childNumber);
+  };
+  testMount.getRootInode()->unloadChildrenNow();
+  ASSERT_TRUE(inodeMap->isInodeRemembered(childNumber));
+  {
+    auto contents = testMount.getRootInode()->lockContentsRead();
+    auto it = contents->entries.find("foo"_pc);
+    ASSERT_NE(it, contents->entries.end());
+    ASSERT_EQ(it->first, "Foo"_pc);
+    ASSERT_EQ(it->second.getInode(), nullptr);
+  }
+
+  FakeTreeBuilder targetBuilder;
+  targetBuilder.setFile("foo", "tracked\n");
+  targetBuilder.finalize(testMount.getBackingStore(), true);
+  testMount.getBackingStore()->putCommit("2", targetBuilder)->setReady();
+
+  auto executor = testMount.getServerExecutor().get();
+  auto result = testMount.getEdenMount()
+                    ->checkout(
+                        testMount.getRootInode(),
+                        RootId{"2"},
+                        ObjectFetchContext::getNullContext(),
+                        __func__,
+                        CheckoutMode::FORCE)
+                    .semi()
+                    .via(executor)
+                    .getVia(executor);
+  ASSERT_EQ(result.conflicts.size(), 1);
+  EXPECT_EQ(*result.conflicts[0].type(), ConflictType::UNTRACKED_ADDED);
+  EXPECT_FILE_INODE(testMount.getFileInode("foo"), "tracked\n", 0644);
+}
+
 TEST_P(CheckoutTest, checkoutCaseChangedTreeToFileInsensitive) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("root", "root");
@@ -1591,7 +1641,8 @@ TEST_P(CheckoutTest, checkoutUpdatesUnlinkedStatusForLoadedTrees) {
   // unlinked bit wasn't set correctly.
   subTree = testMount.getEdenMount()
                 ->getInodeMap()
-                ->lookupTreeInode(subInodeNumber)
+                ->lookupTreeInode(
+                    subInodeNumber, ObjectFetchContext::getNullContext())
                 .get(1ms);
   {
     auto subTreeContents = subTree->lockContentsRead();
@@ -1645,11 +1696,13 @@ TEST_P(CheckoutTest, checkoutRemembersInodeNumbersAfterCheckoutAndTakeover) {
 
   // Try to load the same tree by its inode number and verify its parents have
   // the same inode numbers.
-  auto subTreeFut = testMount.getEdenMount()
-                        ->getInodeMap()
-                        ->lookupTreeInode(subInodeNumber)
-                        .semi()
-                        .via(executor);
+  auto subTreeFut =
+      testMount.getEdenMount()
+          ->getInodeMap()
+          ->lookupTreeInode(
+              subInodeNumber, ObjectFetchContext::getNullContext())
+          .semi()
+          .via(executor);
   testMount.drainServerExecutor();
 
   subTree = std::move(subTreeFut).get(1ms);
@@ -1805,7 +1858,9 @@ TEST_P(CheckoutTest, testSetPathObjectIdConflict) {
   testMount.drainServerExecutor();
 
   auto result = std::move(setPathObjectIdResultAndTimes).get();
-  ASSERT_TRUE(result.result.conflicts().has_value());
+  ASSERT_TRUE(
+      apache::thrift::is_non_optional_field_set_manually_or_by_serializer(
+          result.result.conflicts()));
   EXPECT_EQ(1, result.result.conflicts()->size());
   EXPECT_THAT(
       std::move(result).result.conflicts().value(),
@@ -2096,14 +2151,19 @@ TYPED_TEST(
 
   auto edenMount = testMount.getEdenMount();
 
-  abcfile1 =
-      edenMount->getInodeMap()->lookupFileInode(abcfile1InodeNumber).get(1ms);
+  abcfile1 = edenMount->getInodeMap()
+                 ->lookupFileInode(
+                     abcfile1InodeNumber, ObjectFetchContext::getNullContext())
+                 .get(1ms);
   EXPECT_TRUE(abcfile1->isUnlinked());
 
   // Referenced but modified directories are not unlinked - they're updated in
   // place.
 
-  auto def = edenMount->getInodeMap()->lookupTreeInode(defInodeNumber).get(1ms);
+  auto def = edenMount->getInodeMap()
+                 ->lookupTreeInode(
+                     defInodeNumber, ObjectFetchContext::getNullContext())
+                 .get(1ms);
   EXPECT_FALSE(def->isUnlinked());
 }
 #endif
@@ -2346,6 +2406,126 @@ TEST_P(CheckoutTest, checkoutFailsOnInProgressCheckout) {
   EXPECT_FALSE(testMount.getEdenMount()->tryStartInodeGC());
   gcAfterCheckout.reset();
   EXPECT_TRUE(testMount.getEdenMount()->tryStartInodeGC());
+}
+
+TEST_P(CheckoutTest, checkoutFailureBeforeStartPreservesParentState) {
+  for (bool resuming : {false, true}) {
+    SCOPED_TRACE(resuming);
+    FakeTreeBuilder builder1;
+    builder1.setFile("src/main.c", "old contents\n");
+    TestMount testMount{RootId{"1"}, builder1};
+    applyParam(testMount);
+
+    auto builder2 = builder1.clone();
+    builder2.replaceFile("src/main.c", "new contents\n");
+    builder2.finalize(testMount.getBackingStore(), true);
+    testMount.getBackingStore()->putCommit("2", builder2)->setReady();
+
+    auto checkoutTo2 = [&] {
+      auto executor = testMount.getServerExecutor().get();
+      return testMount.getEdenMount()
+          ->checkout(
+              testMount.getRootInode(),
+              RootId{"2"},
+              ObjectFetchContext::getNullContext(),
+              __func__)
+          .semi()
+          .via(executor)
+          .getVia(executor);
+    };
+
+    auto& faults = testMount.getServerState()->getFaultInjector();
+    if (resuming) {
+      faults.injectError(
+          "TreeInode::checkout",
+          ".*",
+          folly::make_exception_wrapper<std::runtime_error>("checkout failed"),
+          1);
+      EXPECT_THROW(checkoutTo2(), EdenError);
+    }
+    const auto parentBefore =
+        testMount.getEdenMount()->getCheckoutConfig()->getParentCommit();
+    const auto rootBefore = testMount.getEdenMount()->getCheckedOutRootId();
+    const auto contentsBefore = testMount.readFile("src/main.c");
+
+    faults.injectError(
+        "waitForPendingWrites",
+        ".*",
+        folly::make_exception_wrapper<std::runtime_error>(
+            "checkout not started"),
+        1);
+    EXPECT_THROW(checkoutTo2(), EdenError);
+    // FIXME: This should equal resuming: a failure before start() must restore
+    // the prior state because the working copy has not changed.
+    EXPECT_TRUE(testMount.getEdenMount()->isCheckoutInProgress());
+    EXPECT_EQ(
+        parentBefore,
+        testMount.getEdenMount()->getCheckoutConfig()->getParentCommit());
+    EXPECT_EQ(rootBefore, testMount.getEdenMount()->getCheckedOutRootId());
+    EXPECT_EQ(contentsBefore, testMount.readFile("src/main.c"));
+
+    testMount.remount();
+    EXPECT_EQ(resuming, testMount.getEdenMount()->isCheckoutInProgress());
+    EXPECT_NO_THROW(checkoutTo2());
+    EXPECT_FALSE(testMount.getEdenMount()->isCheckoutInProgress());
+    EXPECT_EQ("new contents\n", testMount.readFile("src/main.c"));
+  }
+}
+
+TEST_P(CheckoutTest, dryRunAfterInterruptedCheckoutKeepsInProgressMarker) {
+  auto builder1 = FakeTreeBuilder();
+  builder1.setFile("src/main.c", "// Some code.\n");
+  TestMount testMount{RootId{"1"}, builder1};
+  applyParam(testMount);
+
+  auto builder2 = builder1.clone();
+  builder2.replaceFile("src/main.c", "// New code.\n");
+  builder2.finalize(testMount.getBackingStore(), true);
+  testMount.getBackingStore()->putCommit("2", builder2)->setReady();
+
+  auto checkoutTo2 = [&](CheckoutMode mode) {
+    auto executor = testMount.getServerExecutor().get();
+    return testMount.getEdenMount()
+        ->checkout(
+            testMount.getRootInode(),
+            RootId{"2"},
+            ObjectFetchContext::getNullContext(),
+            __func__,
+            mode)
+        .semi()
+        .via(executor)
+        .getVia(executor);
+  };
+
+  // Fail the NORMAL checkout after it has written the in-progress marker.
+  testMount.getServerState()->getFaultInjector().injectError(
+      "TreeInode::checkout",
+      ".*",
+      folly::make_exception_wrapper<std::runtime_error>("checkout failed"),
+      1);
+  EXPECT_THROW(checkoutTo2(CheckoutMode::NORMAL), EdenError);
+  EXPECT_TRUE(testMount.getEdenMount()
+                  ->getCheckoutConfig()
+                  ->getParentCommit()
+                  .isCheckoutInProgress());
+
+  // Sapling sends a DRY_RUN before resuming the interrupted checkout.
+  EXPECT_NO_THROW(checkoutTo2(CheckoutMode::DRY_RUN));
+  EXPECT_TRUE(testMount.getEdenMount()->isCheckoutInProgress());
+  EXPECT_TRUE(testMount.getEdenMount()
+                  ->getCheckoutConfig()
+                  ->getParentCommit()
+                  .isCheckoutInProgress());
+
+  testMount.remount();
+  EXPECT_TRUE(testMount.getEdenMount()->isCheckoutInProgress());
+
+  EXPECT_NO_THROW(checkoutTo2(CheckoutMode::NORMAL));
+  EXPECT_FALSE(testMount.getEdenMount()->isCheckoutInProgress());
+  EXPECT_FALSE(testMount.getEdenMount()
+                   ->getCheckoutConfig()
+                   ->getParentCommit()
+                   .isCheckoutInProgress());
 }
 
 TEST_P(CheckoutTest, overlappingCheckoutInhibitorsBlockInodeGC) {
@@ -2890,10 +3070,12 @@ TEST(Checkout, forceCheckoutRemovesLoadedRestrictedTree) {
   ASSERT_TRUE(checkoutResult.isReady());
   EXPECT_EQ(0, checkoutResult.value().conflicts.size());
 
-  restrictedTree = testMount.getEdenMount()
-                       ->getInodeMap()
-                       ->lookupTreeInode(restrictedInodeNumber)
-                       .get(1ms);
+  restrictedTree =
+      testMount.getEdenMount()
+          ->getInodeMap()
+          ->lookupTreeInode(
+              restrictedInodeNumber, ObjectFetchContext::getNullContext())
+          .get(1ms);
   EXPECT_TRUE(restrictedTree->isUnlinked());
 
   EXPECT_THROW_ERRNO(
@@ -2975,10 +3157,12 @@ TEST(Checkout, forceCheckoutReplacesLoadedRestrictedTreeWithFile) {
   ASSERT_TRUE(checkoutResult.isReady());
   EXPECT_EQ(0, checkoutResult.value().conflicts.size());
 
-  restrictedTree = testMount.getEdenMount()
-                       ->getInodeMap()
-                       ->lookupTreeInode(restrictedInodeNumber)
-                       .get(1ms);
+  restrictedTree =
+      testMount.getEdenMount()
+          ->getInodeMap()
+          ->lookupTreeInode(
+              restrictedInodeNumber, ObjectFetchContext::getNullContext())
+          .get(1ms);
   EXPECT_TRUE(restrictedTree->isUnlinked());
   EXPECT_FILE_INODE(
       testMount.getFileInode("project/notes/restricted_child"_relpath),
@@ -3405,7 +3589,10 @@ TEST_P(
   EXPECT_EQ(0, std::move(checkoutResult).get().conflicts.size());
 
   EXPECT_TRUE(outer->isRestricted());
-  child = inodeMap->lookupTreeInode(childInodeNumber).get(1ms);
+  child = inodeMap
+              ->lookupTreeInode(
+                  childInodeNumber, ObjectFetchContext::getNullContext())
+              .get(1ms);
   ASSERT_TRUE(child->getObjectId().has_value());
   EXPECT_EQ(childTreeId, *child->getObjectId());
 }

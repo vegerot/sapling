@@ -50,7 +50,8 @@ use metaconfig_types::GitDeltaManifestV2Config;
 use metaconfig_types::GitDeltaManifestV3Config;
 use metaconfig_types::GitDeltaManifestVersion;
 use metaconfig_types::GlobalrevConfig;
-use metaconfig_types::HookBypass;
+use metaconfig_types::HookBypassActor;
+use metaconfig_types::HookBypassCondition;
 use metaconfig_types::HookConfig;
 use metaconfig_types::HookManagerParams;
 use metaconfig_types::HookParams;
@@ -67,6 +68,7 @@ use metaconfig_types::MetadataLoggerConfig;
 use metaconfig_types::ModernSyncChannelConfig;
 use metaconfig_types::ModernSyncConfig;
 use metaconfig_types::MononokeCasSyncConfig;
+use metaconfig_types::P4SourceConfig;
 use metaconfig_types::PathRestrictionMetadata;
 use metaconfig_types::PushParams;
 use metaconfig_types::PushrebaseFlags;
@@ -126,6 +128,8 @@ use repos::RawGitConcurrencyParams;
 use repos::RawGitConfigs;
 use repos::RawGitDeltaManifestV2Config;
 use repos::RawGitDeltaManifestV3Config;
+use repos::RawHookBypassActor;
+use repos::RawHookBypassCondition;
 use repos::RawHookConfig;
 use repos::RawHookManagerParams;
 use repos::RawInferredCopyFromConfig;
@@ -138,6 +142,7 @@ use repos::RawMetadataCacheConfig;
 use repos::RawMetadataCacheUpdateMode;
 use repos::RawMetadataLoggerConfig;
 use repos::RawModernSyncConfig;
+use repos::RawP4SourceConfig;
 use repos::RawPathRestrictionMetadata;
 use repos::RawPushParams;
 use repos::RawPushrebaseParams;
@@ -165,6 +170,9 @@ use repos::RawZelosConfig;
 
 use crate::convert::Convert;
 use crate::errors::ConfigurationError;
+
+#[cfg(test)]
+mod metadata_cache_tests;
 
 impl Convert for RawCacheWarmupConfig {
     type Output = CacheWarmupParams;
@@ -194,39 +202,125 @@ impl Convert for RawHookManagerParams {
     }
 }
 
+fn parse_pushvar(pushvar: String) -> Result<(String, String)> {
+    match pushvar.split('=').collect::<Vec<_>>().as_slice() {
+        [name, value] => Ok((name.to_string(), value.to_string())),
+        _ => Err(ConfigurationError::InvalidPushvar(pushvar).into()),
+    }
+}
+
+/// The bypass conditions equivalent to a hook's `bypass_*` fields: the pushvar
+/// and the commit message marker each bypass, and with
+/// `bypass_implicit_for_group` so does membership of the permission group
+/// alone. The permission group, when set, restricts every condition to its
+/// members and to humans unless `allow_agent_bypass` is set. Without a group
+/// anyone, including agents, may use the markers.
+fn legacy_bypass_conditions(
+    commit_message: Option<String>,
+    pushvar: Option<String>,
+    permission_group: Option<String>,
+    implicit_for_group: bool,
+    allow_agent: bool,
+) -> Result<Vec<HookBypassCondition>> {
+    let actor = if permission_group.is_none() || allow_agent {
+        HookBypassActor::Any
+    } else {
+        HookBypassActor::Human
+    };
+    let restrict = |condition: HookBypassCondition| HookBypassCondition {
+        permission_group: permission_group.clone(),
+        actor,
+        ..condition
+    };
+    let mut conditions = Vec::new();
+    if let Some(pushvar) = pushvar {
+        let (name, value) = parse_pushvar(pushvar)?;
+        conditions.push(restrict(HookBypassCondition::pushvar(name, value)));
+    }
+    if let Some(marker) = commit_message {
+        conditions.push(restrict(HookBypassCondition::commit_message(marker)));
+    }
+    // Without a group the flag is inert rather than a load error, so a config
+    // mistake cannot stop the repo from initialising.
+    if implicit_for_group && permission_group.is_some() {
+        conditions.push(restrict(HookBypassCondition::default()));
+    }
+    Ok(conditions)
+}
+
+impl Convert for RawHookBypassCondition {
+    type Output = HookBypassCondition;
+
+    fn convert(self) -> Result<Self::Output> {
+        let actor = match self.actor {
+            None | Some(RawHookBypassActor::HUMAN) => HookBypassActor::Human,
+            Some(RawHookBypassActor::AGENT) => HookBypassActor::Agent,
+            Some(RawHookBypassActor::ANY) => HookBypassActor::Any,
+            Some(v) => return Err(anyhow!("Invalid value {v} for enum HookBypassActor")),
+        };
+        let condition = HookBypassCondition {
+            commit_message: self.commit_message,
+            pushvar: self.pushvar.map(parse_pushvar).transpose()?,
+            permission_group: self.permission_group,
+            identities: self
+                .identities
+                .unwrap_or_default()
+                .iter()
+                .map(|identity| MononokeIdentity::from_str(identity))
+                .collect::<Result<_>>()?,
+            actor,
+        };
+        ensure!(
+            !condition.is_empty(),
+            "A bypass condition must set at least one of commit_message, pushvar, \
+             permission_group and identities"
+        );
+        Ok(condition)
+    }
+}
+
 impl Convert for RawHookConfig {
     type Output = HookParams;
 
     fn convert(self) -> Result<Self::Output> {
-        let bypass_commit_message = self.bypass_commit_string;
-
-        let bypass_pushvar = self
-            .bypass_pushvar
-            .map(|s| {
-                let parts: Vec<_> = s.split('=').collect();
-                match parts.as_slice() {
-                    [name, value] => Ok((name.to_string(), value.to_string())),
-                    _ => Err(ConfigurationError::InvalidPushvar(s)),
-                }
-            })
-            .transpose()?;
-
-        let permission_group = self.bypass_permission_group;
-
-        let bypass = match (bypass_commit_message, bypass_pushvar) {
-            (Some(msg), None) => Some(HookBypass::new_with_commit_msg(msg)),
-            (None, Some((name, value))) => Some(HookBypass::new_with_pushvar(name, value)),
-            (Some(msg), Some((name, value))) => Some(HookBypass::new_with_commit_msg_and_pushvar(
-                msg, name, value,
-            )),
-            (None, None) => None,
+        let bypasses = match self.bypasses {
+            Some(conditions) => {
+                ensure!(
+                    self.bypass_commit_string.is_none()
+                        && self.bypass_pushvar.is_none()
+                        && self.bypass_permission_group.is_none()
+                        && self.bypass_implicit_for_group.is_none()
+                        && self.allow_agent_bypass.is_none(),
+                    "Hook {} sets bypasses, so it must not set bypass_commit_string, \
+                     bypass_pushvar, bypass_permission_group, bypass_implicit_for_group or \
+                     allow_agent_bypass",
+                    self.name,
+                );
+                conditions
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, condition)| {
+                        condition.convert().with_context(|| {
+                            format!("Invalid bypass condition {index} for hook {}", self.name)
+                        })
+                    })
+                    .collect::<Result<_>>()?
+            }
+            None => legacy_bypass_conditions(
+                self.bypass_commit_string,
+                self.bypass_pushvar,
+                self.bypass_permission_group,
+                self.bypass_implicit_for_group.unwrap_or_default(),
+                self.allow_agent_bypass.unwrap_or_default(),
+            )?,
         };
-        let bypass = bypass.map(|b| b.with_permission_group(permission_group));
 
         let config = HookConfig {
-            bypass,
+            bypasses,
             options: self.config_json,
             log_only: self.log_only.unwrap_or_default(),
+            name: self.name.clone(),
+            messages: self.messages.unwrap_or_default(),
             strings: self.config_strings.unwrap_or_default(),
             ints: self.config_ints.unwrap_or_default(),
             ints_64: self.config_ints_64.unwrap_or_default(),
@@ -287,9 +381,6 @@ impl Convert for RawBookmarkConfig {
             .map(BookmarkKey::new)
             .collect::<Result<Vec<_>, _>>()?;
         let ensure_ancestor_of = self.ensure_ancestor_of.map(BookmarkKey::new).transpose()?;
-        let allow_move_to_public_commits_without_hooks = self
-            .allow_move_to_public_commits_without_hooks
-            .unwrap_or(false);
 
         Ok(BookmarkParams {
             bookmark: bookmark_or_regex,
@@ -300,7 +391,6 @@ impl Convert for RawBookmarkConfig {
             rewrite_dates,
             hooks_skip_ancestors_of,
             ensure_ancestor_of,
-            allow_move_to_public_commits_without_hooks,
         })
     }
 }
@@ -328,6 +418,7 @@ impl Convert for RawCommitIdentityScheme {
             RawCommitIdentityScheme::HG => CommitIdentityScheme::HG,
             RawCommitIdentityScheme::GIT => CommitIdentityScheme::GIT,
             RawCommitIdentityScheme::BONSAI => CommitIdentityScheme::BONSAI,
+            RawCommitIdentityScheme::P4 => CommitIdentityScheme::P4,
             RawCommitIdentityScheme::UNKNOWN => CommitIdentityScheme::UNKNOWN,
             v => return Err(anyhow!("Invalid value {v} for enum CommitIdentityScheme")),
         };
@@ -403,9 +494,30 @@ impl Convert for RawPushrebaseParams {
                     })
                     .transpose()?
                     .unwrap_or_default(),
+                // `NonRootMPath::new`, not `new_opt`: an empty string would
+                // parse to the root prefix, which matches every path.
+                merge_resolution_take_incoming_prefixes: self
+                    .merge_resolution_take_incoming_prefixes
+                    .map(|raw| {
+                        raw.into_iter()
+                            .map(|path| {
+                                NonRootMPath::new(path.as_bytes())
+                                    .map(MPath::from)
+                                    .with_context(|| {
+                                        format!(
+                                            "merge_resolution_take_incoming_prefixes entry {path:?} must be a non-root path"
+                                        )
+                                    })
+                            })
+                            .collect::<Result<PrefixTrie>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
+                merge_resolution_take_incoming: false, // request-scoped, not loaded from config
                 merge_resolution_override: MergeResolutionOverride::UseJk, // request-scoped, not loaded from config
                 land_instance_id: None, // request-scoped, not loaded from config
                 phab_diff_id: None,     // request-scoped, not loaded from config
+                mainline_parent_first: false, // request-scoped, not loaded from config
             },
             block_merges: self.block_merges.unwrap_or(default.block_merges),
             emit_obsmarkers: self.emit_obsmarkers.unwrap_or(default.emit_obsmarkers),
@@ -581,13 +693,6 @@ impl Convert for RawDerivedDataTypesConfig {
             .into_iter()
             .map(|(k, _v)| Ok((DerivableType::from_name(&k)?, _v)))
             .collect::<Result<_>>()?;
-        if mapping_key_prefixes.contains_key(&DerivableType::HgAugmentedManifestsV2) {
-            return Err(anyhow!(
-                "mapping_key_prefixes cannot contain hg_augmented_manifests_v2; \
-                 augmented manifests v2 shares the hg_augmented_manifests root mapping namespace, \
-                 so configure hg_augmented_manifests instead"
-            ));
-        }
         let unode_version = match self.unode_version {
             None => UnodeVersion::default(),
             Some(1) => return Err(anyhow!("unode version 1 has been deprecated")),
@@ -721,7 +826,6 @@ impl Convert for RawDerivedDataConfig {
                 .into_iter()
                 .map(|(s, raw_config)| Ok((s, raw_config.convert()?)))
                 .collect::<Result<_, anyhow::Error>>()?,
-            derivation_queue_scuba_table: self.derivation_queue_scuba_table,
             bonsai_hg_mapping_scuba_table: self.bonsai_hg_mapping_scuba_table,
             remote_derivation_config: self
                 .remote_derivation_config
@@ -1052,30 +1156,77 @@ impl Convert for RawModernSyncConfig {
     type Output = ModernSyncConfig;
 
     fn convert(self) -> Result<Self::Output> {
+        if self.max_blob_bytes < 1 {
+            // Channels without an explicit max_bytes_in_flight fall back to
+            // max_blob_bytes; clamping that fallback to 1 makes every batch
+            // oversized, so the affected channels' flushes run exclusively.
+            tracing::warn!(
+                "modern_sync max_blob_bytes={} is not positive; max_bytes_in_flight fallbacks clamp to 1",
+                self.max_blob_bytes,
+            );
+        }
+        // Channels without an explicit max_bytes_in_flight fall back to
+        // max_blob_bytes; store the clamped value so downstream users see
+        // the same bound the fallback uses.
+        let max_blob_bytes = self.max_blob_bytes.max(1);
         Ok(ModernSyncConfig {
             url: self.url,
             chunk_size: self.chunk_size,
             single_db_query_entries_limit: self.single_db_query_entries_limit,
             changeset_concurrency: self.changeset_concurrency,
-            max_blob_bytes: self.max_blob_bytes,
-            content_channel_config: self.content_channel_config.convert()?,
-            filenodes_channel_config: self.filenodes_channel_config.convert()?,
-            trees_channel_config: self.trees_channel_config.convert()?,
-            changesets_channel_config: self.changesets_channel_config.convert()?,
+            max_blob_bytes,
+            content_channel_config: convert_channel_config(
+                self.content_channel_config,
+                max_blob_bytes,
+            )?,
+            filenodes_channel_config: convert_channel_config(
+                self.filenodes_channel_config,
+                max_blob_bytes,
+            )?,
+            trees_channel_config: convert_channel_config(
+                self.trees_channel_config,
+                max_blob_bytes,
+            )?,
+            changesets_channel_config: convert_channel_config(
+                self.changesets_channel_config,
+                max_blob_bytes,
+            )?,
         })
     }
 }
 
-impl Convert for RawModernSyncChannelConfig {
-    type Output = ModernSyncChannelConfig;
-
-    fn convert(self) -> Result<Self::Output> {
-        Ok(ModernSyncChannelConfig {
-            batch_size: self.batch_size,
-            channel_size: self.channel_size,
-            flush_interval_ms: self.flush_interval_ms,
-        })
+fn warn_if_nonpositive(field: &str, value: Option<i64>) {
+    if let Some(v) = value {
+        if v < 1 {
+            tracing::warn!("modern_sync {field}={v} is not positive; clamping to 1");
+        }
     }
+}
+
+fn convert_channel_config(
+    raw: RawModernSyncChannelConfig,
+    default_max_bytes_in_flight: i64,
+) -> Result<ModernSyncChannelConfig> {
+    // Returns Result to compose with the surrounding `Convert::convert`
+    // via `?`; currently infallible since out-of-range bounds clamp.
+    // Clamp instead of rejecting: this runs in the shared metaconfig parser,
+    // so a hard error would make the whole repo config unloadable for every
+    // binary, not just modern_sync. Non-positive values can only come from
+    // explicit misconfiguration or a non-positive max_blob_bytes fallback.
+    warn_if_nonpositive("max_concurrent_flushes", raw.max_concurrent_flushes);
+    warn_if_nonpositive("max_bytes_in_flight", raw.max_bytes_in_flight);
+    let max_concurrent_flushes = raw.max_concurrent_flushes.unwrap_or(1).max(1);
+    let max_bytes_in_flight = raw
+        .max_bytes_in_flight
+        .unwrap_or(default_max_bytes_in_flight)
+        .max(1);
+    Ok(ModernSyncChannelConfig {
+        batch_size: raw.batch_size,
+        channel_size: raw.channel_size,
+        flush_interval_ms: raw.flush_interval_ms,
+        max_concurrent_flushes,
+        max_bytes_in_flight,
+    })
 }
 
 impl Convert for RawLoggingDestination {
@@ -1132,7 +1283,7 @@ impl Convert for RawMetadataLoggerConfig {
                 .into_iter()
                 .map(BookmarkKey::new)
                 .collect::<Result<_>>()?,
-            sleep_interval_secs: self.sleep_interval_secs.try_into()?,
+            sleep_interval_secs: self.sleep_interval_secs.map(u64::try_from).transpose()?,
         })
     }
 }
@@ -1205,6 +1356,10 @@ impl Convert for RawShardedService {
             RawShardedService::DERIVATION_PIPELINE_TAILER => {
                 ShardedService::DerivationPipelineTailer
             }
+            RawShardedService::DERIVATION_PIPELINE_WORKER => {
+                ShardedService::DerivationPipelineWorker
+            }
+            RawShardedService::P4_SYNC => ShardedService::P4Sync,
             v => return Err(anyhow!("Invalid value {v} for enum ShardedService")),
         };
         Ok(service)
@@ -1282,6 +1437,32 @@ impl Convert for RawGitConfigs {
     }
 }
 
+impl Convert for RawP4SourceConfig {
+    type Output = P4SourceConfig;
+
+    fn convert(self) -> Result<Self::Output> {
+        // A depot root, `//name/`: the importer appends `...` to it.
+        let name = self
+            .depot
+            .strip_prefix("//")
+            .and_then(|rest| rest.strip_suffix('/'))
+            .filter(|name| !name.is_empty() && !name.contains('/'));
+        ensure!(
+            name.is_some(),
+            "p4_source.depot must be a depot root of the form //name/, got {:?}",
+            self.depot
+        );
+        ensure!(
+            !self.server_alias.is_empty(),
+            "p4_source.server_alias must not be empty"
+        );
+        Ok(P4SourceConfig {
+            server_alias: self.server_alias,
+            depot: self.depot,
+        })
+    }
+}
+
 impl Convert for RawXRepoSyncSourceConfig {
     type Output = XRepoSyncSourceConfig;
 
@@ -1337,11 +1518,26 @@ impl Convert for RawMetadataCacheUpdateMode {
 impl Convert for RawMetadataCacheConfig {
     type Output = MetadataCacheConfig;
     fn convert(self) -> Result<Self::Output> {
+        ensure!(
+            self.wbc_event_router_batching_enabled != Some(true)
+                || self.wbc_process_bookmark_notifications == Some(true),
+            "wbc_event_router_batching_enabled requires wbc_process_bookmark_notifications=true"
+        );
         Ok(MetadataCacheConfig {
             wbc_update_mode: self
                 .wbc_update_mode
                 .map(|mode| mode.convert())
                 .transpose()?,
+            wbc_event_router_update_mode: self
+                .wbc_event_router_update_mode
+                .map(|mode| mode.convert())
+                .transpose()?,
+            wbc_process_bookmark_notifications: self
+                .wbc_process_bookmark_notifications
+                .unwrap_or(false),
+            wbc_event_router_batching_enabled: self
+                .wbc_event_router_batching_enabled
+                .unwrap_or(false),
             tags_update_mode: self
                 .tags_update_mode
                 .map(|mode| mode.convert())
@@ -1655,33 +1851,6 @@ mod tests {
             stages: Default::default(),
             batch_size,
         }
-    }
-
-    #[mononoke::test]
-    fn test_parse_derived_data_types_config_rejects_hg_augmented_manifests_v2_mapping_key_prefix() {
-        // Given a derived-data config that tries to assign a distinct root
-        // mapping namespace to augmented manifests v2.
-        let raw = RawDerivedDataTypesConfig {
-            mapping_key_prefixes: std::collections::BTreeMap::from([(
-                "hg_augmented_manifests_v2".to_string(),
-                "v2-prefix.".to_string(),
-            )]),
-            ..Default::default()
-        };
-
-        // When converting the raw config into Mononoke's typed config.
-        let result: Result<DerivedDataTypesConfig> = raw.convert();
-
-        // Then parsing rejects the v2-specific prefix instead of silently
-        // ignoring it while v2 uses the v1 root mapping namespace.
-        let err = result.unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("hg_augmented_manifests_v2")
-                && msg.contains("shares the hg_augmented_manifests root mapping namespace")
-                && msg.contains("configure hg_augmented_manifests instead"),
-            "expected v2 augmented-manifest prefix rejection, got: {msg}",
-        );
     }
 
     #[mononoke::test]

@@ -1529,3 +1529,44 @@ async fn filestore_exists(fb: FacebookInit) -> Result<()> {
 
     Ok(())
 }
+
+#[mononoke::fbinit_test]
+async fn filestore_range_inclusive_u64_max(fb: FacebookInit) -> Result<()> {
+    let req = request(HELLO_WORLD);
+    let content_id = canonical(HELLO_WORLD);
+    let blob = KeyedMemblob::default();
+    let ctx = CoreContext::test_mock(fb);
+    borrowed!(ctx, blob, req);
+
+    filestore::store(
+        blob,
+        DEFAULT_CONFIG,
+        ctx,
+        req,
+        stream::once(future::ready(Ok(Bytes::from(HELLO_WORLD)))),
+    )
+    .await?;
+
+    let range = filestore::Range::range_inclusive(5, u64::MAX)?;
+
+    let (stream, size) = filestore::fetch_range_with_size(
+        blob.clone(),
+        ctx,
+        &FetchKey::Canonical(content_id),
+        range,
+    )
+    .await?
+    .ok_or_else(|| Error::msg("Object does not exist"))?;
+    let bytes = stream
+        .try_fold(BytesMut::new(), |mut buff, chunk| async move {
+            buff.extend_from_slice(&chunk);
+            Result::<_, Error>::Ok(buff)
+        })
+        .await?
+        .freeze();
+
+    assert_eq!(bytes, Bytes::from(&HELLO_WORLD[5..]));
+    assert_eq!(size, (HELLO_WORLD.len() - 5) as u64);
+
+    Ok(())
+}

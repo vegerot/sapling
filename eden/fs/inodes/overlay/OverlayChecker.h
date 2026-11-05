@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include <folly/CppAttributes.h>
 
@@ -213,6 +214,13 @@ class OverlayChecker {
   PathComponent findChildName(
       const fsck::InodeInfo& parentInfo,
       InodeNumber child);
+  /**
+   * All names in the parent directory that refer to the child inode, in
+   * directory order. Nullopt when the directory could not be read.
+   */
+  std::optional<std::vector<PathComponent>> findChildNames(
+      const fsck::InodeInfo& parentInfo,
+      InodeNumber child);
   template <typename Fn>
   PathInfo cachedPathComputation(InodeNumber number, Fn&& fn);
 
@@ -230,9 +238,6 @@ class OverlayChecker {
       ShardID shardID,
       folly::Synchronized<std::vector<std::unique_ptr<Error>>>& errors) const;
   std::optional<fsck::InodeInfo> loadInodeInfoFromFileContentStore(
-      InodeNumber number,
-      folly::Synchronized<std::vector<std::unique_ptr<Error>>>& errors) const;
-  std::optional<fsck::InodeInfo> loadInodeInfoFromInodeCatalog(
       InodeNumber number,
       folly::Synchronized<std::vector<std::unique_ptr<Error>>>& errors) const;
   std::optional<fsck::InodeInfo> loadDirectoryChildren(

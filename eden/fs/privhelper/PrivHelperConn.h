@@ -46,9 +46,11 @@ class PrivHelperConn {
     REQ_TAKEOVER_STARTUP = 6,
     REQ_SET_LOG_FILE = 7,
     REQ_UNMOUNT_BIND = 8,
-    // Legacy macOS FUSE configuration requests. Older daemons can send these
-    // startup requests even when using NFS. Keep the request IDs as no-ops
-    // while old daemons may start against this helper.
+    // Legacy macOS FUSE configuration requests. Daemons built before
+    // D110407629 (July 2026) send REQ_SET_DAEMON_TIMEOUT at startup on every
+    // platform, and `eden start` runs whichever daemon binary it is given
+    // against the system privhelper, so both requests stay answered as no-ops
+    // until no such daemon can start against this helper.
     REQ_SET_DAEMON_TIMEOUT = 9,
     REQ_SET_USE_EDENFS = 10,
     REQ_MOUNT_NFS = 11,
@@ -61,6 +63,7 @@ class PrivHelperConn {
     REQ_SET_FUSE_READ_AHEAD = 18,
     REQ_SET_RESTART_ARGS = 19,
     REQ_NOTIFY_CLEAN_SHUTDOWN = 20,
+    REQ_SET_NFS_FSTYPE_OVERRIDE = 21,
   };
 
   // This structure should never change. If fields need to be added to the
@@ -233,6 +236,13 @@ class PrivHelperConn {
       std::string& mountPath,
       uint32_t& readAheadKb);
 
+  static UnixSocket::Message serializeSetNfsFstypeOverrideRequest(
+      uint32_t xid,
+      bool enabled);
+  static void parseSetNfsFstypeOverrideRequest(
+      folly::io::Cursor& cursor,
+      bool& enabled);
+
   /**
    * Framing bounds for a REQ_SET_RESTART_ARGS message, so that nothing in it
    * can size an allocation in the root privhelper. They say nothing about
@@ -397,6 +407,9 @@ struct formatter<facebook::eden::PrivHelperConn::MsgType>
         break;
       case facebook::eden::PrivHelperConn::REQ_NOTIFY_CLEAN_SHUTDOWN:
         name = "REQ_NOTIFY_CLEAN_SHUTDOWN";
+        break;
+      case facebook::eden::PrivHelperConn::REQ_SET_NFS_FSTYPE_OVERRIDE:
+        name = "REQ_SET_NFS_FSTYPE_OVERRIDE";
         break;
       default:
         name = "Unknown PrivHelperConn::MsgType";

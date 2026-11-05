@@ -4,8 +4,6 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
-
 import os
 import pathlib
 import subprocess
@@ -202,10 +200,6 @@ class StartWithRepoTest(testcase.EdenRepoTest):
         self.repo.write_file("hello", "hola\n")
         self.repo.commit("Initial commit.")
 
-    def select_storage_engine(self) -> str:
-        """we need to persist data across restarts"""
-        return "rocksdb"
-
 
 @testcase.eden_test
 class DirectInvokeTest(testcase.IntegrationTestCase):
@@ -287,7 +281,7 @@ class StartFakeEdenFSTestBase(ServiceTestCaseBase):
 
         def cleanup():
             stop_cmd = base_args + ["stop"]
-            subprocess.call(stop_cmd, env=env)
+            subprocess.check_call(stop_cmd, env=env)
 
         self.exit_stack.callback(cleanup)
 
@@ -428,7 +422,7 @@ class StartFakeEdenFSTest(StartFakeEdenFSTestBase):
             argv = get_fake_edenfs_argv(resolved_path)
             self.assert_eden_dir(argv, resolved_path)
         finally:
-            subprocess.call(stop_cmd)
+            subprocess.check_call(stop_cmd, env=env)
 
     def assert_eden_dir(self, argv: List[str], expected: pathlib.Path) -> None:
         try:

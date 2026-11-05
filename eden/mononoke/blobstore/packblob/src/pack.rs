@@ -322,6 +322,11 @@ pub(crate) fn decode_pack(
                     }
                     relevant_compressed_size += compressed_size;
                     decoded_blobs.insert(next_key, decoded);
+                } else if v.dict_key == next_key || keys_to_decode.contains(&v.dict_key) {
+                    bail!(
+                        "Key {key} needs dictionary {} but it forms a cycle in the pack",
+                        v.dict_key
+                    );
                 } else {
                     // Can't yet decode it - push the keys we need to decode this onto the work queue in order.
                     keys_to_decode.push(next_key.clone());
@@ -645,5 +650,27 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[mononoke::test]
+    fn decode_pack_cyclic_dict_chain() {
+        // A pack whose only entry says "my dictionary is myself". The in-tree Pack builder cannot
+        // produce this, but decode_pack reads PackedFormat straight from the blobstore.
+        let packed = PackedFormat {
+            key: "repo0000.packed.pack".to_string(),
+            entries: vec![PackedEntry {
+                key: "0".to_string(),
+                data: PackedValue::ZstdFromDict(ZstdFromDictValue {
+                    dict_key: "0".to_string(),
+                    zstd: Bytes::new(),
+                }),
+            }],
+        };
+        let err = decode_pack(packed, "repo0000.0")
+            .expect_err("decode_pack must reject a cyclic dictionary chain");
+        assert!(
+            err.to_string().contains("cycle"),
+            "expected a cycle error, got: {err}"
+        );
     }
 }
