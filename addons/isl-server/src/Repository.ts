@@ -109,6 +109,8 @@ import {
 
 const SMARTLOG_TOO_MANY_COMMITS_WARNING =
   /^smartlog: too many \((\d+)\) commits, not rendering all of them$/m;
+// Sapling's 1,000-commit default can include extra heads and connecting ancestors.
+const MAX_SMARTLOG_COMMITS_TO_RENDER = 1500;
 
 /**
  * This class is responsible for providing information about the working copy
@@ -740,7 +742,7 @@ export class Repository {
             continue;
         }
       }
-      if (!isFreeTextValue(args) && isIllegalOperationFlag(arg)) {
+      if (isIllegalOperationFlag(arg)) {
         throw new Error(`argument '${arg}' is not allowed`);
       }
       args.push(arg);
@@ -1117,29 +1119,56 @@ export class Repository {
         this.initialConnectionContext,
       );
       const tooManyCommitsMatch = SMARTLOG_TOO_MANY_COMMITS_WARNING.exec(proc.stderr);
-      if (tooManyCommitsMatch != null) {
-        if (!this.isShowingTooManyCommits) {
-          this.isShowingTooManyCommits = true;
-          this.initialConnectionContext.tracker.track('SmartlogTooManyCommits', {
-            extras: {
-              numCommits: parseInt(tooManyCommitsMatch[1], 10),
-              visibleCommitDayRange: visibleCommitDayRange ?? null,
-            },
-          });
-        }
-        throw new Error(ErrorShortMessages.TooManyCommits);
-      }
-      this.isShowingTooManyCommits = false;
-      const commits = parseCommitInfoOutput(
+      let commits = parseCommitInfoOutput(
         this.initialConnectionContext.logger,
         proc.stdout.trim(),
         this.info.codeReviewSystem,
       );
-      if (commits.length === 0) {
-        throw new Error(ErrorShortMessages.NoCommitsFetched);
+      // This describes the requested graph; a focused retry still omits its other stacks.
+      const requestedGraphLimitWarning = tooManyCommitsMatch
+        ? {numCommits: parseInt(tooManyCommitsMatch[1], 10)}
+        : commits.length > MAX_SMARTLOG_COMMITS_TO_RENDER
+          ? {numCommits: commits.length}
+          : undefined;
+      if (requestedGraphLimitWarning != null) {
+        if (!this.isShowingTooManyCommits) {
+          this.isShowingTooManyCommits = true;
+          this.initialConnectionContext.tracker.track('SmartlogTooManyCommits', {
+            extras: {
+              numCommits: requestedGraphLimitWarning.numCommits,
+              visibleCommitDayRange: visibleCommitDayRange ?? null,
+            },
+          });
+        }
+      } else {
+        this.isShowingTooManyCommits = false;
       }
-      attachStableLocations(commits, this.stableLocations);
+      if (commits.length > MAX_SMARTLOG_COMMITS_TO_RENDER) {
+        // Smartlog truncation retains every requested head, so many stacks can exceed its limit.
+        // Refetch the current stack rather than slicing away parents or the checkout.
+        const focusedProc = await this.runCommand(
+          ['log', '--template', template, '--rev', 'smartlog(.)'],
+          'LogCommand',
+          this.initialConnectionContext,
+        );
+        commits = parseCommitInfoOutput(
+          this.initialConnectionContext.logger,
+          focusedProc.stdout.trim(),
+          this.info.codeReviewSystem,
+        );
+      }
+      if (commits.length === 0) {
+        throw new Error(
+          requestedGraphLimitWarning
+            ? ErrorShortMessages.TooManyCommits
+            : ErrorShortMessages.NoCommitsFetched,
+        );
+      }
+      if (commits.length > MAX_SMARTLOG_COMMITS_TO_RENDER) {
+        throw new Error(ErrorShortMessages.TooManyCommits);
+      }
 
+      attachStableLocations(commits, this.stableLocations);
       if (this.fullRepoBranchModule) {
         this.fullRepoBranchModule.populateSmartlogCommits(commits);
       }
@@ -1148,6 +1177,7 @@ export class Repository {
         fetchStartTimestamp,
         fetchCompletedTimestamp: Date.now(),
         commits: {value: commits},
+        tooManyCommits: requestedGraphLimitWarning,
       };
       this.smartlogCommitsChangesEmitter.emit('change', this.smartlogCommits);
     } catch (err) {
@@ -1982,15 +2012,6 @@ export function isIllegalOperationFlag(arg: string): boolean {
   return /^-[a-zA-Z]*R/.test(arg);
 }
 
-/** Flags whose value is free text, such as a commit message that may start with `-`. */
-const FREE_TEXT_FLAGS = new Set(['--message', '-m', '--user', '-u']);
-
-/** Whether the next arg is the value of a {@link FREE_TEXT_FLAGS} flag, which `sl` never parses as a flag. */
-function isFreeTextValue(precedingArgs: ReadonlyArray<string>): boolean {
-  const prev = precedingArgs[precedingArgs.length - 1];
-  return prev != null && FREE_TEXT_FLAGS.has(prev);
-}
-
 /**
  * `--tool` (`-t`) names an external program to run for merges, which is as powerful as `--config`.
  * Allow only built-in tools and the merge tool the user configured in `ui.merge`.
@@ -2000,9 +2021,7 @@ export function validateMergeToolArgs(args: ReadonlyArray<string>, configuredToo
     tool != null && (/^(internal)?:[a-z0-9-]+$/i.test(tool) || tool === configuredTool);
   args.forEach((arg, i) => {
     let tool: string | undefined;
-    if (isFreeTextValue(args.slice(0, i))) {
-      return;
-    } else if (arg === '--tool') {
+    if (arg === '--tool') {
       tool = args[i + 1];
     } else if (arg.startsWith('--tool=')) {
       tool = arg.slice('--tool='.length);

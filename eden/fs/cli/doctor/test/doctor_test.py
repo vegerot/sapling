@@ -114,6 +114,70 @@ class SnapshotFormatTest(DoctorTestBase):
         self.assertEqual("11223344556677889900" * 2, self.checkout.get_snapshot()[0])
 
 
+class CheckoutConfigCorruptionRepoTypeTest(DoctorTestBase):
+    """
+    EdenCheckoutConfigCorruption rebuilds config.toml, so it cannot read the
+    scm_type or the repo dir layout from it. Validate that it recovers both
+    from the checkout's own repo dir.
+    """
+
+    def _problem(self, tmp_dir: str) -> doctor.EdenCheckoutConfigCorruption:
+        instance = FakeEdenInstance(tmp_dir)
+        checkout_info = CheckoutInfo(
+            typing.cast(EdenInstance, instance),
+            Path(tmp_dir) / "mount",
+        )
+        return doctor.EdenCheckoutConfigCorruption(checkout_info, Exception("corrupt"))
+
+    def test_in_mount_layout(self) -> None:
+        tmp_dir = self.make_temporary_directory()
+        state_dir = Path(tmp_dir) / "state"
+        state_dir.mkdir()
+        hg_dir = Path(tmp_dir) / "mount" / ".hg"
+        hg_dir.mkdir(parents=True)
+        (hg_dir / "requires").write_text("eden\nstore\n")
+
+        self.assertEqual(("hg", False), self._problem(tmp_dir).get_repo_type(state_dir))
+
+    def test_sl_dot_dir(self) -> None:
+        tmp_dir = self.make_temporary_directory()
+        state_dir = Path(tmp_dir) / "state"
+        state_dir.mkdir()
+        sl_dir = Path(tmp_dir) / "mount" / ".sl"
+        sl_dir.mkdir(parents=True)
+        (sl_dir / "requires").write_text("eden\nedensparse\nstore\n")
+
+        self.assertEqual(
+            ("filteredhg", False), self._problem(tmp_dir).get_repo_type(state_dir)
+        )
+
+    @unittest.skipIf(sys.platform == "win32", "requires symlink creation")
+    def test_off_mount_layout(self) -> None:
+        # The repo dir lives in the state dir, and the mount only holds a
+        # symlink to it. The regenerated config has to say so.
+        tmp_dir = self.make_temporary_directory()
+        state_dir = Path(tmp_dir) / "state"
+        repo_dir = state_dir / "sl-repo-dir"
+        repo_dir.mkdir(parents=True)
+        (repo_dir / "requires").write_text("eden\nedensparse\nstore\n")
+        mount_path = Path(tmp_dir) / "mount"
+        mount_path.mkdir()
+        os.symlink(repo_dir, mount_path / ".hg", target_is_directory=True)
+
+        self.assertEqual(
+            ("filteredhg", True), self._problem(tmp_dir).get_repo_type(state_dir)
+        )
+
+    def test_no_requires_found(self) -> None:
+        tmp_dir = self.make_temporary_directory()
+        state_dir = Path(tmp_dir) / "state"
+        state_dir.mkdir()
+
+        self.assertEqual(
+            ("other", False), self._problem(tmp_dir).get_repo_type(state_dir)
+        )
+
+
 class DoctorTest(DoctorTestBase):
     # The diffs for what is written to stdout can be large.
     # pyre-fixme[4]: Attribute must be annotated.
@@ -3092,6 +3156,58 @@ Remounting {checkout.path}...<green>fixed<reset>
 {checkout.path} is not currently mounted
 Remounting {checkout.path}...
 Mount failed. Running `sl doctor` in the backing repo and then will retry the mount.
+<green>fixed<reset>
+
+""",
+            out.getvalue(),
+        )
+
+    def test_is_transient_mount_error(self) -> None:
+        # Both wrappers observed in production.
+        for msg in (
+            "SaplingBackingStoreError: Network Error: The request was dropped "
+            "before it could complete",
+            "EdenError: sapling::SaplingBackingStoreError: Network Error: The "
+            "request was dropped before it could complete",
+        ):
+            self.assertTrue(doctor.is_transient_mount_error(Exception(msg)))
+
+        # A backing store error that is not a network failure stays on the
+        # `sl doctor` path.
+        self.assertFalse(
+            doctor.is_transient_mount_error(
+                Exception("SaplingBackingStoreError: key fetch failed ae8c078a")
+            )
+        )
+        self.assertFalse(
+            doctor.is_transient_mount_error(Exception("is too short for header"))
+        )
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_eden_instance.FakeEdenInstance.mount")
+    def test_missing_mount_transient_error_retried(
+        self,
+        mock_mount: MagicMock,
+    ) -> None:
+        mock_mount.side_effect = [
+            Exception(
+                "SaplingBackingStoreError: Network Error: The request was "
+                "dropped before it could complete"
+            ),
+            0,
+            1,
+        ]
+        fixer, out, checkout = self.setUpEdenMountTest()
+
+        self.assertEqual(mock_mount.call_count, 3)
+        self.assertEqual(fixer.num_fixed_problems, 1)
+        # `sl doctor` must not run: it cannot repair a backing store fetch, and
+        # on failure it reports the repo may be corrupted beyond repair.
+        self.assertEqual(
+            f"""\
+<yellow>- Found problem:<reset>
+{checkout.path} is not currently mounted
+Remounting {checkout.path}...
+Mount failed with a transient backing store error. Retrying (1/3)...
 <green>fixed<reset>
 
 """,

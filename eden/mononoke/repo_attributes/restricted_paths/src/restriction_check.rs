@@ -10,6 +10,7 @@
 
 use std::cell::OnceCell;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::str::FromStr;
@@ -26,17 +27,21 @@ use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
 use futures::stream;
+use itertools::Either;
 use itertools::Itertools;
 use metaconfig_types::EnforcementConditionSet;
 use metaconfig_types::RequestMatchers;
 use metaconfig_types::RestrictedPathsConfig;
 use mononoke_macros::mononoke;
 use mononoke_types::ChangesetId;
+use mononoke_types::MPath;
 use mononoke_types::NonRootMPath;
 use permission_checker::AclProvider;
 use permission_checker::MononokeIdentity;
 use permission_checker::MononokeIdentitySet;
 use permission_checker::PermissionCheckerBuilder;
+use serde_json::Value;
+use serde_json::json;
 use tokio::task::JoinHandle;
 
 use crate::DenyingRestriction;
@@ -169,10 +174,12 @@ pub struct RestrictionCheckResult {
     pub restriction_roots: Vec<NonRootMPath>,
 }
 
-/// Authorization flags produced by evaluating the caller against one source.
+/// Authorization factors from evaluating the caller against one restriction
+/// check, or aggregated over a request (see `SourceRestrictionSummary` for
+/// what an aggregate factor means).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AuthorizationCheckResult {
-    /// Whether the caller has direct read access to every matching path ACL.
+    /// Whether the caller has direct read access to the restriction's ACL.
     has_acl_access: FactorResult,
     /// Whether the caller is in the tooling allowlist group.
     is_allowlisted_tooling: FactorResult,
@@ -189,7 +196,8 @@ pub(crate) struct AuthorizationCheckResult {
 /// `NotSet` represents absent policy, while `Unauthorized` represents a
 /// configured policy that the caller did not satisfy. Fetch and evaluation
 /// failures remain errors and never become factor observations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::AsRefStr)]
+#[strum(serialize_all = "snake_case")]
 enum FactorResult {
     NotSet,
     Authorized,
@@ -475,6 +483,8 @@ pub(crate) trait SourceRestrictionCheck: Clone {
     fn restriction_root(&self) -> Option<&NonRootMPath>;
     /// Whether this check type carries restriction roots independent of source.
     fn reports_restriction_roots() -> bool;
+    /// This check with its authorization replaced.
+    fn with_authorization(self, authorization: AuthorizationCheckResult) -> Self;
 }
 
 impl SourceRestrictionCheck for PathRestrictionCheckResult {
@@ -496,6 +506,13 @@ impl SourceRestrictionCheck for PathRestrictionCheckResult {
 
     fn reports_restriction_roots() -> bool {
         true
+    }
+
+    fn with_authorization(self, authorization: AuthorizationCheckResult) -> Self {
+        Self {
+            authorization,
+            ..self
+        }
     }
 }
 
@@ -519,22 +536,292 @@ impl SourceRestrictionCheck for ManifestRestrictionCheckResult {
     fn reports_restriction_roots() -> bool {
         false
     }
+
+    fn with_authorization(self, authorization: AuthorizationCheckResult) -> Self {
+        Self {
+            authorization,
+            ..self
+        }
+    }
 }
 
-/// Aggregate view over one source's typed restriction checks.
+/// Aggregate view over typed restriction checks from one source or a
+/// reconciled multi-source request.
 ///
-/// Logging and enforcement derive authorization, ACL, and restriction-root
-/// summaries from this shared type so their source aggregation semantics stay in
-/// sync.
+/// Logging derives authorization, ACL, and restriction-root summaries from
+/// this type. `has_authorization` is the decision for the checks that loaded,
+/// made as enforcement makes it: every restriction is authorized by at least
+/// one of its own factors. For one source, or the union of the checks that
+/// loaded when a source failed, ACL access and rollout hold only when they
+/// hold for every restriction. For a reconciled request they hold when they
+/// authorize at least one restriction, so they report the factors that
+/// contributed. Tooling and admin are repo-wide in both.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceRestrictionSummary {
+    has_authorization: bool,
     authorization: AuthorizationCheckResult,
     repo_region_acls: Vec<String>,
     restriction_roots: Vec<NonRootMPath>,
 }
 
+/// Authorization of a request whose config and AclManifest checks were both
+/// read, reconciled by restriction (see `RestrictionGroup`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReconciledAuthorization {
+    has_authorization: bool,
+    authorization: AuthorizationCheckResult,
+    repo_region_acls: Vec<MononokeIdentity>,
+    root_authorization: BTreeMap<NonRootMPath, AuthorizationCheckResult>,
+}
+
+/// A check paired with the source it was read from.
+struct NamedCheck<'a, T> {
+    source: RestrictionSource,
+    check: &'a T,
+}
+
+/// The checks for one restriction: both sources' checks for a known root, or
+/// one rootless check.
+struct RestrictionGroup<'a, T> {
+    root: Option<&'a NonRootMPath>,
+    checks: Vec<NamedCheck<'a, T>>,
+}
+
+impl<'a, T: SourceRestrictionCheck> RestrictionGroup<'a, T> {
+    /// Group both sources' checks by restriction: known roots in path order,
+    /// then each rootless check on its own.
+    fn from_sources(config: &'a [T], acl_manifest: &'a [T]) -> Vec<Self> {
+        let (rooted, rootless): (Vec<_>, Vec<_>) = config
+            .iter()
+            .map(|check| NamedCheck {
+                source: RestrictionSource::Config,
+                check,
+            })
+            .chain(acl_manifest.iter().map(|check| NamedCheck {
+                source: RestrictionSource::AclManifest,
+                check,
+            }))
+            .partition_map(|named| match named.check.restriction_root() {
+                Some(root) => Either::Left((root, named)),
+                None => Either::Right(named),
+            });
+        rooted
+            .into_iter()
+            .into_group_map()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(root, checks)| Self {
+                root: Some(root),
+                checks,
+            })
+            .chain(rootless.into_iter().map(|named| Self {
+                root: None,
+                checks: vec![named],
+            }))
+            .collect()
+    }
+
+    /// Direct ACL access needs every distinct ACL, and the rollout group is
+    /// AclManifest's when set and config's otherwise, so a source without a
+    /// group never overrules the other source's group.
+    fn authorization(&self, allowlist: AllowlistAuthorization) -> AuthorizationCheckResult {
+        let acl = FactorResult::from_authorized(
+            self.checks
+                .iter()
+                .all(|named| named.check.authorization().acl_result().is_authorized()),
+        );
+        let source_rollout = |source| {
+            reduce_configured_factor(
+                self.checks
+                    .iter()
+                    .filter(|named| named.source == source)
+                    .map(|named| named.check.authorization().rollout_result()),
+            )
+        };
+        let rollout = match source_rollout(RestrictionSource::AclManifest) {
+            FactorResult::NotSet => source_rollout(RestrictionSource::Config),
+            acl_manifest_rollout => acl_manifest_rollout,
+        };
+        allowlist.into_authorization_check_result(acl, rollout)
+    }
+}
+
+/// Both sources' checks grouped by restriction, each group with its
+/// authorization, plus the request-wide allowlist factors they used.
+struct EvaluatedGroups<'a, T> {
+    allowlist: AllowlistAuthorization,
+    groups: Vec<(RestrictionGroup<'a, T>, AuthorizationCheckResult)>,
+}
+
+impl<'a, T: SourceRestrictionCheck> EvaluatedGroups<'a, T> {
+    fn new(config: &'a [T], acl_manifest: &'a [T]) -> Self {
+        let allowlist = repo_wide_allowlist(config.iter().chain(acl_manifest));
+        let groups = RestrictionGroup::from_sources(config, acl_manifest)
+            .into_iter()
+            .map(|group| {
+                let authorization = group.authorization(allowlist);
+                (group, authorization)
+            })
+            .collect();
+        Self { allowlist, groups }
+    }
+}
+
+impl ReconciledAuthorization {
+    pub(crate) fn new<T: SourceRestrictionCheck>(config: &[T], acl_manifest: &[T]) -> Self {
+        Self::from_evaluated(
+            config,
+            acl_manifest,
+            &EvaluatedGroups::new(config, acl_manifest),
+        )
+    }
+
+    /// Reconcile both sources and also return the raw-Scuba detail of each
+    /// restriction (see `authorization_detail`).
+    pub(crate) fn new_with_detail<T: SourceRestrictionCheck>(
+        config: &[T],
+        acl_manifest: &[T],
+    ) -> (Self, Value) {
+        let evaluated = EvaluatedGroups::new(config, acl_manifest);
+        (
+            Self::from_evaluated(config, acl_manifest, &evaluated),
+            authorization_detail(config, acl_manifest, &evaluated),
+        )
+    }
+
+    pub(crate) fn to_source_summary(&self) -> SourceRestrictionSummary {
+        SourceRestrictionSummary {
+            has_authorization: self.has_authorization,
+            authorization: self.authorization,
+            repo_region_acls: self
+                .repo_region_acls
+                .iter()
+                .map(ToString::to_string)
+                .sorted()
+                .collect(),
+            restriction_roots: self.root_authorization.keys().cloned().collect(),
+        }
+    }
+
+    fn from_evaluated<T: SourceRestrictionCheck>(
+        config: &[T],
+        acl_manifest: &[T],
+        evaluated: &EvaluatedGroups<'_, T>,
+    ) -> Self {
+        let allowlist = evaluated.allowlist;
+        let group_results = evaluated
+            .groups
+            .iter()
+            .map(|(group, result)| (group.root, *result))
+            .collect::<Vec<_>>();
+        let has_authorization = group_results
+            .iter()
+            .all(|(_, result)| result.has_authorization());
+        let has_acl_access = group_results
+            .iter()
+            .any(|(_, result)| result.acl_result().is_authorized());
+        let is_rollout_allowlisted = group_results
+            .iter()
+            .any(|(_, result)| result.rollout_result().is_authorized());
+
+        Self {
+            has_authorization,
+            authorization: allowlist.into_authorization_check_result(
+                FactorResult::from_authorized(has_acl_access),
+                FactorResult::from_authorized(is_rollout_allowlisted),
+            ),
+            repo_region_acls: reconciled_acls(config, acl_manifest),
+            root_authorization: group_results
+                .into_iter()
+                .filter_map(|(root, result)| root.map(|root| (root.clone(), result)))
+                .collect(),
+        }
+    }
+
+    fn authorization_for_root(&self, root: &NonRootMPath) -> Option<AuthorizationCheckResult> {
+        self.root_authorization.get(root).copied()
+    }
+}
+
+/// Enforcement outcome of reconciled checks: enforced when the pre-filter
+/// matched definitely or an active condition set names one of the checks'
+/// ACLs, carrying the reconciled denial.
+pub(crate) fn reconciled_enforcement_outcome<T: SourceRestrictionCheck>(
+    config: &[T],
+    acl_manifest: &[T],
+    candidates: &[&EnforcementConditionSet],
+    pre_filter_variant: &PreFilterVariant,
+) -> AccessEnforcementOutcome {
+    if enforcement_applies(
+        candidates,
+        pre_filter_variant,
+        &reconciled_acls(config, acl_manifest),
+    ) {
+        AccessEnforcementOutcome::Enforced {
+            denial: reconciled_denial(config, acl_manifest),
+        }
+    } else {
+        AccessEnforcementOutcome::NotEnforced
+    }
+}
+
+/// The denial to report when a restriction denies the caller: among the
+/// denied restrictions' checks whose ACL the caller lacks, the first in
+/// `compare_reconciled_denials` order. A restriction is denied only when it
+/// fails ACL access, so it always holds such a check.
+fn reconciled_denial<T: SourceRestrictionCheck>(
+    config: &[T],
+    acl_manifest: &[T],
+) -> Option<DenyingRestriction> {
+    let allowlist = repo_wide_allowlist(config.iter().chain(acl_manifest));
+    RestrictionGroup::from_sources(config, acl_manifest)
+        .into_iter()
+        .filter(|group| !group.authorization(allowlist).has_authorization())
+        .flat_map(|group| group.checks)
+        .filter(|named| !named.check.authorization().acl_result().is_authorized())
+        .min_by(compare_reconciled_denials)
+        .map(|named| DenyingRestriction {
+            restriction_root: named.check.restriction_root().cloned(),
+            repo_region_acl: named.check.repo_region_identity().clone(),
+            permission_request_group: named.check.permission_request_group().clone(),
+        })
+}
+
+/// Every distinct ACL of both sources' checks, sorted.
+fn reconciled_acls<T: SourceRestrictionCheck>(
+    config: &[T],
+    acl_manifest: &[T],
+) -> Vec<MononokeIdentity> {
+    config
+        .iter()
+        .chain(acl_manifest)
+        .map(|check| check.repo_region_identity().clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The tooling and admin factors of a request. Both groups are repo-wide, so
+/// every check of the request carries the same result for them.
+fn repo_wide_allowlist<'a, T: SourceRestrictionCheck + 'a>(
+    mut checks: impl Iterator<Item = &'a T>,
+) -> AllowlistAuthorization {
+    checks.next().map_or(
+        AllowlistAuthorization {
+            is_allowlisted_tooling: FactorResult::NotSet,
+            is_admin_bypass: FactorResult::NotSet,
+        },
+        |check| AllowlistAuthorization {
+            is_allowlisted_tooling: check.authorization().tooling_result(),
+            is_admin_bypass: check.authorization().admin_result(),
+        },
+    )
+}
+
 impl SourceRestrictionSummary {
     pub(crate) fn from_checks(checks: &[impl SourceRestrictionCheck]) -> Self {
+        let has_authorization = all_checks_authorized(checks);
         let authorization = aggregate_single_source_authorization(checks);
         let repo_region_acls = checks
             .iter()
@@ -547,6 +834,7 @@ impl SourceRestrictionSummary {
             .collect();
 
         Self {
+            has_authorization,
             authorization,
             repo_region_acls,
             restriction_roots,
@@ -558,6 +846,7 @@ impl SourceRestrictionSummary {
         T: SourceRestrictionCheck + 'a,
     {
         let checks = checks.into_iter().collect::<Vec<_>>();
+        let has_authorization = all_checks_authorized(checks.iter().copied());
         let has_acl_access = checks
             .iter()
             .all(|check| check.authorization().has_acl_access());
@@ -586,6 +875,7 @@ impl SourceRestrictionSummary {
             .collect();
 
         Self {
+            has_authorization,
             authorization: AuthorizationCheckResult::new(
                 has_acl_access,
                 is_allowlisted_tooling,
@@ -598,7 +888,7 @@ impl SourceRestrictionSummary {
     }
 
     pub(crate) fn has_authorization(&self) -> bool {
-        self.authorization.has_authorization()
+        self.has_authorization
     }
 
     pub(crate) fn has_acl_access(&self) -> bool {
@@ -776,6 +1066,10 @@ async fn has_repo_region_acls_for_action(
     action: &str,
 ) -> Result<bool> {
     let identities = ctx.metadata().identities();
+    // Another caller could get another answer: a server whose response cache
+    // does not key on the caller must not store this response (AGENTS.md,
+    // decision 9).
+    ctx.set_response_depends_on_caller();
     stream::iter(acls.iter().copied())
         .map(|acl| async move {
             let checker = acl_provider
@@ -830,6 +1124,7 @@ pub(crate) async fn is_part_of_group(
             );
         })?;
 
+    ctx.set_response_depends_on_caller();
     Ok(membership_checker
         .is_member(ctx.metadata().identities())
         .await)
@@ -936,8 +1231,23 @@ pub(crate) async fn get_path_restriction_root_check(
     cs_id: Option<ChangesetId>,
     paths: &[NonRootMPath],
 ) -> Result<Vec<PathRestrictionCheckResult>> {
-    // TODO(T289977216): In Both mode, fetch both sources and reconcile their
-    // tri-state factors instead of selecting one source's metadata.
+    if restricted_paths.reconciles_both_mode_sources() {
+        return reconciled_path_checks(
+            ctx,
+            restricted_paths,
+            cs_id,
+            restriction_info::get_path_restriction_root_info_from_config(restricted_paths, paths),
+            |cs_id| {
+                restriction_info::get_path_restriction_root_info_from_acl_manifest(
+                    restricted_paths,
+                    ctx,
+                    cs_id,
+                    paths,
+                )
+            },
+        )
+        .await;
+    }
     let restriction_info =
         restriction_info::get_path_restriction_root_info(restricted_paths, ctx, cs_id, paths)
             .await?;
@@ -951,10 +1261,55 @@ pub(crate) async fn get_path_restriction_check(
     cs_id: Option<ChangesetId>,
     paths: &[NonRootMPath],
 ) -> Result<Vec<PathRestrictionCheckResult>> {
-    // TODO(T289977216): In Both mode, fetch both sources and reconcile their
-    // tri-state factors instead of selecting one source's metadata.
+    if restricted_paths.reconciles_both_mode_sources() {
+        return reconciled_path_checks(
+            ctx,
+            restricted_paths,
+            cs_id,
+            restriction_info::get_path_restriction_info_from_config(restricted_paths, paths),
+            |cs_id| {
+                restriction_info::get_path_restriction_info_from_acl_manifest(
+                    restricted_paths,
+                    ctx,
+                    cs_id,
+                    paths,
+                )
+            },
+        )
+        .await;
+    }
     let restriction_info =
         restriction_info::get_path_restriction_info(restricted_paths, ctx, cs_id, paths).await?;
+    check_path_restriction_infos(ctx, restricted_paths, restriction_info).await
+}
+
+/// Find descendant restriction roots and authorize them without reloading
+/// source metadata after discovery.
+pub(crate) async fn find_restricted_descendant_checks(
+    restricted_paths: &RestrictedPaths,
+    ctx: &CoreContext,
+    cs_id: Option<ChangesetId>,
+    roots: Vec<MPath>,
+) -> Result<Vec<PathRestrictionCheckResult>> {
+    if restricted_paths.reconciles_both_mode_sources() {
+        return reconciled_path_checks(
+            ctx,
+            restricted_paths,
+            cs_id,
+            restriction_info::find_restricted_descendants_from_config(restricted_paths, &roots),
+            |cs_id| {
+                restriction_info::find_restricted_descendants_from_acl_manifest(
+                    restricted_paths,
+                    ctx,
+                    cs_id,
+                    roots,
+                )
+            },
+        )
+        .await;
+    }
+    let restriction_info =
+        restriction_info::find_restricted_descendants(restricted_paths, ctx, cs_id, roots).await?;
     check_path_restriction_infos(ctx, restricted_paths, restriction_info).await
 }
 
@@ -996,8 +1351,27 @@ pub(crate) async fn get_manifest_restriction_check_for_current_behavior(
     manifest_id: &RestrictedManifestId,
     manifest_type: &ManifestType,
 ) -> Result<Vec<ManifestRestrictionCheckResult>> {
-    // TODO(T289977216): In Both mode, fetch both sources and reconcile their
-    // tri-state factors instead of selecting one source's metadata.
+    if restricted_paths.reconciles_both_mode_sources()
+        && *manifest_type == ManifestType::HgAugmented
+    {
+        let (config, acl_manifest) = tokio::try_join!(
+            get_manifest_restriction_check(
+                restricted_paths,
+                ctx,
+                manifest_id,
+                manifest_type,
+                RestrictionSource::Config,
+            ),
+            get_manifest_restriction_check(
+                restricted_paths,
+                ctx,
+                manifest_id,
+                manifest_type,
+                RestrictionSource::AclManifest,
+            ),
+        )?;
+        return Ok(reconcile_check_results(config, acl_manifest));
+    }
     let restriction_info = restriction_info::get_manifest_restriction_info(
         restricted_paths,
         ctx,
@@ -1242,13 +1616,7 @@ pub(crate) fn authoritative_sources_enforcement_outcome(
 /// are available. Rootless manifest checks sort after rooted checks, and the
 /// permission request group breaks ties.
 fn compare_denied_checks<T: SourceRestrictionCheck>(left: &T, right: &T) -> Ordering {
-    match (left.restriction_root(), right.restriction_root()) {
-        (Some(left_root), Some(right_root)) => left_root.cmp(right_root),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
-    .then_with(|| {
+    compare_restriction_roots(left, right).then_with(|| {
         left.permission_request_group()
             .cmp(right.permission_request_group())
     })
@@ -1334,7 +1702,7 @@ pub(crate) fn spawn_manifest_restriction_check(
     SharedFetchHandle::from_join_handle(handle)
 }
 
-pub async fn check_path_restriction_infos(
+pub(crate) async fn check_path_restriction_infos(
     ctx: &CoreContext,
     restricted_paths: &RestrictedPaths,
     restriction_info: Vec<PathRestrictionInfo>,
@@ -1526,6 +1894,15 @@ fn all_rollout_allowlisted(flags: impl IntoIterator<Item = bool>) -> bool {
     flags.peek().is_some() && flags.all(|allowlisted| allowlisted)
 }
 
+/// Whether every restriction is authorized by at least one of its own factors.
+fn all_checks_authorized<'a, T: SourceRestrictionCheck + 'a>(
+    checks: impl IntoIterator<Item = &'a T>,
+) -> bool {
+    checks
+        .into_iter()
+        .all(|check| check.authorization().has_authorization())
+}
+
 /// Calculate enforcement after one source fetch has completed successfully.
 ///
 /// `Definite` always produces `Enforced`; `NeedsFetch` produces `Enforced` only
@@ -1541,18 +1918,13 @@ fn completed_source_enforcement_outcome<T>(
 where
     T: SourceRestrictionCheck,
 {
-    let any_match = match pre_filter_variant {
-        PreFilterVariant::Definite => true,
-        PreFilterVariant::NeedsFetch => {
-            let restriction_acls = result
-                .iter()
-                .map(SourceRestrictionCheck::repo_region_identity)
-                .collect::<Vec<_>>();
-            condition_sets_match_restriction_acls(candidates, &restriction_acls)
-        }
-    };
-
-    if !any_match {
+    if !enforcement_applies(
+        candidates,
+        pre_filter_variant,
+        result
+            .iter()
+            .map(SourceRestrictionCheck::repo_region_identity),
+    ) {
         return AccessEnforcementOutcome::NotEnforced;
     }
 
@@ -1570,4 +1942,182 @@ where
         });
 
     AccessEnforcementOutcome::Enforced { denial }
+}
+
+/// Reduce one source's observations of a per-restriction factor: `NotSet` when
+/// none is configured, otherwise authorized only when every configured
+/// observation is.
+fn reduce_configured_factor(results: impl IntoIterator<Item = FactorResult>) -> FactorResult {
+    results
+        .into_iter()
+        .fold(FactorResult::NotSet, |reduced, result| {
+            match (reduced, result) {
+                (_, FactorResult::NotSet) => reduced,
+                (FactorResult::Unauthorized, _) | (_, FactorResult::Unauthorized) => {
+                    FactorResult::Unauthorized
+                }
+                _ => FactorResult::Authorized,
+            }
+        })
+}
+
+/// Give each check its restriction's reconciled authorization, keeping one
+/// check per known root (AclManifest's when both sources restrict it) followed
+/// by the rootless checks.
+fn reconcile_check_results<T: SourceRestrictionCheck>(
+    config: Vec<T>,
+    acl_manifest: Vec<T>,
+) -> Vec<T> {
+    let reconciled = ReconciledAuthorization::new(&config, &acl_manifest);
+    let (rooted, rootless): (BTreeMap<_, _>, Vec<_>) = config
+        .into_iter()
+        .chain(acl_manifest)
+        .partition_map(|check| match check.restriction_root().cloned() {
+            Some(root) => {
+                let authorization = reconciled
+                    .authorization_for_root(&root)
+                    .unwrap_or(*check.authorization());
+                Either::Left((root, check.with_authorization(authorization)))
+            }
+            None => Either::Right(check),
+        });
+    rooted.into_values().chain(rootless).collect()
+}
+
+/// Check both sources' path restrictions and reconcile them. The config
+/// checks run while the AclManifest restrictions load.
+async fn reconciled_path_checks<Fut>(
+    ctx: &CoreContext,
+    restricted_paths: &RestrictedPaths,
+    cs_id: Option<ChangesetId>,
+    config_info: Vec<PathRestrictionInfo>,
+    acl_manifest_info: impl FnOnce(ChangesetId) -> Fut,
+) -> Result<Vec<PathRestrictionCheckResult>>
+where
+    Fut: Future<Output = Result<Vec<PathRestrictionInfo>>>,
+{
+    let cs_id =
+        cs_id.context("ChangesetId is required for ACL manifest-based restriction lookup")?;
+    let (config, acl_manifest) = tokio::try_join!(
+        check_path_restriction_infos(ctx, restricted_paths, config_info),
+        async {
+            let acl_manifest_info = acl_manifest_info(cs_id).await?;
+            check_path_restriction_infos(ctx, restricted_paths, acl_manifest_info).await
+        },
+    )?;
+    Ok(reconcile_check_results(config, acl_manifest))
+}
+
+/// Whether enforcement applies to restrictions with these ACLs: always after a
+/// definite pre-filter match, otherwise only when an active condition set
+/// matches one of them.
+fn enforcement_applies<'a>(
+    candidates: &[&EnforcementConditionSet],
+    pre_filter_variant: &PreFilterVariant,
+    restriction_acls: impl IntoIterator<Item = &'a MononokeIdentity>,
+) -> bool {
+    match pre_filter_variant {
+        PreFilterVariant::Definite => true,
+        PreFilterVariant::NeedsFetch => condition_sets_match_restriction_acls(
+            candidates,
+            &restriction_acls.into_iter().collect::<Vec<_>>(),
+        ),
+    }
+}
+
+/// Order checks by restriction root: known roots by path, then rootless
+/// checks.
+fn compare_restriction_roots<T: SourceRestrictionCheck>(left: &T, right: &T) -> Ordering {
+    match (left.restriction_root(), right.restriction_root()) {
+        (Some(left_root), Some(right_root)) => left_root.cmp(right_root),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Order denied checks from both sources to pick a stable reported denial:
+/// AclManifest's denials before config's, as for source errors, then as
+/// `compare_denied_checks` orders one source's denials, then by ACL.
+fn compare_reconciled_denials<T: SourceRestrictionCheck>(
+    left: &NamedCheck<'_, T>,
+    right: &NamedCheck<'_, T>,
+) -> Ordering {
+    let is_config = |named: &NamedCheck<'_, T>| named.source == RestrictionSource::Config;
+    is_config(left)
+        .cmp(&is_config(right))
+        .then_with(|| compare_denied_checks(left.check, right.check))
+        .then_with(|| {
+            left.check
+                .repo_region_identity()
+                .cmp(right.check.repo_region_identity())
+        })
+}
+
+/// Raw-Scuba detail of reconciled checks: one object per restriction, in
+/// `RestrictionGroup::from_sources` order, recording its root, sorted `acls`,
+/// whether it is `authorized`, the `contributing_factors`, and each source's
+/// tri-state observations. A source absent from a restriction reports
+/// `not_set` for ACL and rollout and keeps its request-wide tooling and admin
+/// observations.
+fn authorization_detail<T: SourceRestrictionCheck>(
+    config: &[T],
+    acl_manifest: &[T],
+    evaluated: &EvaluatedGroups<'_, T>,
+) -> Value {
+    let allowlist = evaluated.allowlist;
+    let source_allowlist = |source| match source {
+        RestrictionSource::Config => repo_wide_allowlist(config.iter()),
+        RestrictionSource::AclManifest => repo_wide_allowlist(acl_manifest.iter()),
+    };
+    Value::Array(
+        evaluated
+            .groups
+            .iter()
+            .map(|(group, result)| {
+                let contributing_factors = [
+                    ("acl", result.acl_result()),
+                    ("rollout_allowlist", result.rollout_result()),
+                    ("tooling_allowlist", allowlist.is_allowlisted_tooling),
+                    ("admin_bypass", allowlist.is_admin_bypass),
+                ]
+                .into_iter()
+                .filter_map(|(name, factor)| factor.is_authorized().then_some(name))
+                .collect::<Vec<_>>();
+                let source_observation = |source: RestrictionSource| {
+                    let factor = |result: fn(&AuthorizationCheckResult) -> FactorResult| {
+                        reduce_configured_factor(
+                            group
+                                .checks
+                                .iter()
+                                .filter(|named| named.source == source)
+                                .map(|named| result(named.check.authorization())),
+                        )
+                    };
+                    let allowlist = source_allowlist(source);
+                    json!({
+                        "acl": factor(AuthorizationCheckResult::acl_result).as_ref(),
+                        "rollout_allowlist": factor(AuthorizationCheckResult::rollout_result).as_ref(),
+                        "tooling_allowlist": allowlist.is_allowlisted_tooling.as_ref(),
+                        "admin_bypass": allowlist.is_admin_bypass.as_ref(),
+                    })
+                };
+                let acls = group
+                    .checks
+                    .iter()
+                    .map(|named| named.check.repo_region_identity().to_string())
+                    .collect::<BTreeSet<_>>();
+                json!({
+                    "restriction_root": group.root.map(ToString::to_string),
+                    "acls": acls,
+                    "authorized": result.has_authorization(),
+                    "contributing_factors": contributing_factors,
+                    "sources": {
+                        "config": source_observation(RestrictionSource::Config),
+                        "acl_manifest": source_observation(RestrictionSource::AclManifest),
+                    },
+                })
+            })
+            .collect(),
+    )
 }

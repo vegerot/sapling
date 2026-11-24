@@ -20,18 +20,28 @@ use bookmarks::BookmarkTransactionHook;
 use bookmarks::BookmarkUpdateReason;
 use context::CoreContext;
 use dbbookmarks::transaction::AddBookmarkLog;
+use dbbookmarks::transaction::AddBookmarkLogLock;
+use dbbookmarks::transaction::BookmarkLogWriter;
 use dbbookmarks::transaction::DeleteBookmarkIf;
-use dbbookmarks::transaction::FindMaxBookmarkLogId;
 use dbbookmarks::transaction::InsertBookmarks;
 use dbbookmarks::transaction::MoveLockedBookmarks;
+use dbbookmarks::transaction::NextBookmarkLogId;
 use dbbookmarks::transaction::SelectBookmarksForUpdate;
 use dbbookmarks::transaction::UpdateBookmark;
+use dbbookmarks::transaction::bookmark_log_guard_enabled;
+use dbbookmarks::transaction::bookmark_log_guard_required;
+use dbbookmarks::transaction::bookmark_log_ids_by_name;
+use dbbookmarks::transaction::find_next_bookmark_log_ids;
+use dbbookmarks::transaction::find_next_bookmark_log_lock_id;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
 use mononoke_types::Timestamp;
 use sql_ext::Connection;
 use sql_ext::Transaction as SqlTransaction;
 use stats::prelude::*;
+
+#[cfg(test)]
+mod mixed_modes_tests;
 
 define_stats! {
     prefix = "mononoke.multi_repo_land.commit";
@@ -62,7 +72,7 @@ impl UpdateOp {
         (self.repo_id, *self.bookmark.category())
     }
 
-    fn push_log(&self, log: &mut TransactionLog) -> u64 {
+    fn push_log(&self, log: &mut TransactionLog) -> Result<u64> {
         log.push(
             self.repo_id,
             &self.bookmark,
@@ -78,7 +88,7 @@ impl UpdateOp {
         txn: SqlTransaction,
         log: &mut TransactionLog,
     ) -> Result<SqlTransaction, BookmarkTransactionError> {
-        let log_id = self.push_log(log);
+        let log_id = self.push_log(log)?;
         let (txn, result) = UpdateBookmark::query_with_transaction(
             txn,
             &self.repo_id,
@@ -146,7 +156,7 @@ impl BookmarkOp {
                 cs_id,
                 reason,
             } => {
-                let log_id = log.push(*repo_id, bookmark, None, Some(*cs_id), *reason);
+                let log_id = log.push(*repo_id, bookmark, None, Some(*cs_id), *reason)?;
                 let data = [(
                     repo_id,
                     &Some(log_id),
@@ -167,7 +177,7 @@ impl BookmarkOp {
                 old_cs_id,
                 reason,
             } => {
-                log.push(*repo_id, bookmark, Some(*old_cs_id), None, *reason);
+                log.push(*repo_id, bookmark, Some(*old_cs_id), None, *reason)?;
                 let (txn, result) = DeleteBookmarkIf::query_with_transaction(
                     txn,
                     repo_id,
@@ -187,7 +197,8 @@ impl BookmarkOp {
 
 /// Accumulates log entries and assigns IDs sequentially per repo.
 struct TransactionLog {
-    next_log_ids: HashMap<RepositoryId, u64>,
+    next_log_ids: HashMap<RepositoryId, NextBookmarkLogId>,
+    next_lock_ids: HashMap<RepositoryId, Option<u64>>,
     entries: Vec<LogEntry>,
 }
 
@@ -201,9 +212,13 @@ struct LogEntry {
 }
 
 impl TransactionLog {
-    fn new(next_log_ids: HashMap<RepositoryId, u64>) -> Self {
+    fn new(
+        next_log_ids: HashMap<RepositoryId, NextBookmarkLogId>,
+        next_lock_ids: HashMap<RepositoryId, Option<u64>>,
+    ) -> Self {
         Self {
             next_log_ids,
+            next_lock_ids,
             entries: Vec::new(),
         }
     }
@@ -215,10 +230,12 @@ impl TransactionLog {
         old: Option<ChangesetId>,
         new: Option<ChangesetId>,
         reason: BookmarkUpdateReason,
-    ) -> u64 {
-        let next_id = self.next_log_ids.entry(repo_id).or_insert(1);
-        let id = *next_id;
-        *next_id += 1;
+    ) -> Result<u64> {
+        let id = self
+            .next_log_ids
+            .get_mut(&repo_id)
+            .ok_or_else(|| anyhow!("missing log ID state for repo {repo_id}"))?
+            .next(bookmark.name())?;
 
         self.entries.push(LogEntry {
             id,
@@ -228,13 +245,26 @@ impl TransactionLog {
             new,
             reason,
         });
-        id
+        Ok(id)
     }
 
     /// Write all accumulated log entries into the SQL transaction.
     async fn write(self, mut txn: SqlTransaction) -> Result<SqlTransaction> {
         let timestamp = Timestamp::now();
+        let mut next_lock_ids = self.next_lock_ids;
         for chunk in self.entries.chunks(LOG_CHUNK) {
+            let mut lock_data = Vec::with_capacity(chunk.len());
+            for entry in chunk {
+                let ticket = next_lock_ids.get_mut(&entry.repo_id).ok_or_else(|| {
+                    anyhow!("missing migration guard state for repo {}", entry.repo_id)
+                })?;
+                if let Some(next_id) = ticket {
+                    lock_data.push((entry.repo_id, *next_id));
+                    *next_id = next_id
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("bookmark log migration ticket range overflow"))?;
+                }
+            }
             let data: Vec<_> = chunk
                 .iter()
                 .map(|entry| {
@@ -253,6 +283,12 @@ impl TransactionLog {
             txn = AddBookmarkLog::query_with_transaction(txn, &data[..])
                 .await?
                 .0;
+            if !lock_data.is_empty() {
+                let locks: Vec<_> = lock_data.iter().map(|(repo, id)| (repo, id)).collect();
+                txn = AddBookmarkLogLock::query_with_transaction(txn, &locks[..])
+                    .await?
+                    .0;
+            }
         }
         Ok(txn)
     }
@@ -376,6 +412,17 @@ impl MultiRepoBookmarksTransaction {
         self,
         hooks: Vec<BookmarkTransactionHook>,
     ) -> Result<MultiRepoBookmarksTransactionResult> {
+        self.commit_with_hooks_and_mode(hooks, |repo_id| {
+            bookmark_log_ids_by_name(repo_id, BookmarkLogWriter::MultiRepo)
+        })
+        .await
+    }
+
+    async fn commit_with_hooks_and_mode(
+        self,
+        hooks: Vec<BookmarkTransactionHook>,
+        by_name_for_repo: impl Fn(RepositoryId) -> bool,
+    ) -> Result<MultiRepoBookmarksTransactionResult> {
         // No ops means no bookmark moved, so there is nothing for a hook to
         // record either — returning before running them is deliberate.
         if self.ops.is_empty() {
@@ -386,15 +433,8 @@ impl MultiRepoBookmarksTransaction {
             justknobs::get_as::<u64>("scm/mononoke:multi_repo_bookmark_max_retry_attempts", None)
                 .max(1);
 
-        let Self {
-            ctx,
-            write_connection,
-            ops,
-            ..
-        } = self;
-
-        retry_commit_loop(&ctx, max_attempts, || {
-            attempt_commit(&ctx, &write_connection, &ops, &hooks)
+        retry_commit_loop(&self.ctx, max_attempts, || {
+            attempt_commit(&self, &hooks, &by_name_for_repo)
         })
         .await
     }
@@ -429,12 +469,24 @@ async fn run_transaction_hooks(
 /// transient SQL errors that the caller should retry, and
 /// `Err(Other(_))` for non-retryable infrastructure errors.
 async fn attempt_commit(
-    ctx: &CoreContext,
-    write_connection: &Connection,
-    ops: &[BookmarkOp],
+    request: &MultiRepoBookmarksTransaction,
     hooks: &[BookmarkTransactionHook],
+    by_name_for_repo: impl Fn(RepositoryId) -> bool,
 ) -> Result<MultiRepoBookmarksTransactionResult, BookmarkTransactionError> {
-    let repo_ids: HashSet<_> = ops.iter().map(|op| op.repo_id()).collect();
+    let ctx = &request.ctx;
+    let write_connection = &request.write_connection;
+    let ops = &request.ops;
+    let mut repo_names = HashMap::<RepositoryId, HashSet<BookmarkName>>::new();
+    for op in ops {
+        repo_names
+            .entry(op.repo_id())
+            .or_default()
+            .insert(op.bookmark().name().clone());
+    }
+    let repo_names: HashMap<_, _> = repo_names
+        .into_iter()
+        .map(|(repo_id, names)| (repo_id, (by_name_for_repo(repo_id), names)))
+        .collect();
 
     let txn = write_connection
         .start_transaction(ctx.sql_query_telemetry())
@@ -443,12 +495,29 @@ async fn attempt_commit(
 
     // Hooks keep whatever error class they report, so a transient failure here
     // is retried rather than being flattened into a fatal one.
-    let txn = run_transaction_hooks(ctx, txn, hooks).await?;
+    let mut txn = run_transaction_hooks(ctx, txn, hooks).await?;
 
-    let (txn, next_log_ids) = find_next_log_ids(txn, &repo_ids)
+    let mut next_lock_ids = HashMap::new();
+    for (&repo_id, (by_name, _)) in &repo_names {
+        let enabled = bookmark_log_guard_enabled(repo_id, BookmarkLogWriter::MultiRepo);
+        let next_lock_id = if bookmark_log_guard_required(
+            repo_id,
+            BookmarkLogWriter::MultiRepo,
+            *by_name,
+            enabled,
+        )? {
+            let (next_txn, id) = find_next_bookmark_log_lock_id(txn, repo_id).await?;
+            txn = next_txn;
+            Some(id)
+        } else {
+            None
+        };
+        next_lock_ids.insert(repo_id, next_lock_id);
+    }
+    let (txn, next_log_ids) = find_next_log_ids(txn, repo_names)
         .await
         .map_err(BookmarkTransactionError::Other)?;
-    let mut log = TransactionLog::new(next_log_ids);
+    let mut log = TransactionLog::new(next_log_ids, next_lock_ids);
 
     let txn = execute_ops(txn, ops, &mut log).await?;
 
@@ -529,7 +598,10 @@ async fn execute_update_chunk(
             )));
         }
     }
-    let log_ids: Vec<u64> = chunk.iter().map(|update| update.push_log(log)).collect();
+    let log_ids: Vec<u64> = chunk
+        .iter()
+        .map(|update| update.push_log(log))
+        .collect::<Result<_>>()?;
     let names: Vec<BookmarkName> = chunk
         .iter()
         .map(|update| update.bookmark.name().clone())
@@ -652,22 +724,12 @@ where
 /// Find the next bookmark update log ID for each repo within the transaction.
 async fn find_next_log_ids(
     mut txn: SqlTransaction,
-    repo_ids: &HashSet<RepositoryId>,
-) -> Result<(SqlTransaction, HashMap<RepositoryId, u64>)> {
+    repo_names: HashMap<RepositoryId, (bool, HashSet<BookmarkName>)>,
+) -> Result<(SqlTransaction, HashMap<RepositoryId, NextBookmarkLogId>)> {
     let mut next_ids = HashMap::new();
-    for &repo_id in repo_ids {
-        let (txn_, max_id_entries) =
-            FindMaxBookmarkLogId::query_with_transaction(txn, &repo_id).await?;
-        txn = txn_;
-        let next_id = match &max_id_entries[..] {
-            [(None,)] => 1,
-            [(Some(max_existing),)] => *max_existing + 1,
-            _ => {
-                return Err(anyhow!(
-                    "FindMaxBookmarkLogId returned multiple entries for repo {repo_id}: {max_id_entries:?}"
-                ));
-            }
-        };
+    for (repo_id, (by_name, names)) in repo_names {
+        let (next_txn, next_id) = find_next_bookmark_log_ids(txn, repo_id, &names, by_name).await?;
+        txn = next_txn;
         next_ids.insert(repo_id, next_id);
     }
     Ok((txn, next_ids))

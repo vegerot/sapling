@@ -330,6 +330,7 @@ class RemoveTest(RemoveTestBase):
 
     @parameterized.expand(
         [
+            ("rust", {"EDENFSCTL_ONLY_RUST": "1"}),
             ("python", {"EDENFSCTL_SKIP_RUST": "1"}),
         ]
     )
@@ -413,6 +414,7 @@ class RemoveTest(RemoveTestBase):
 
     @parameterized.expand(
         [
+            ("rust", {"EDENFSCTL_ONLY_RUST": "1"}),
             ("python", {"EDENFSCTL_SKIP_RUST": "1"}),
         ]
     )
@@ -437,14 +439,72 @@ class RemoveTest(RemoveTestBase):
             ("python", {"EDENFSCTL_SKIP_RUST": "1"}),
         ]
     )
+    def test_remove_unmounted_checkout(self, impl: str, env: dict) -> None:
+        mount_path = pathlib.Path(self.mount)
+        self.eden.unmount(mount_path)
+
+        result = self.eden.run_unchecked(
+            "remove",
+            "--yes",
+            self.mount,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            0,
+            result.returncode,
+            f"{impl} eden remove should remove an unmounted checkout. stderr={result.stderr}",
+        )
+        self.assertNotIn(self.mount, self.load_directory_map())
+        self.assertFalse(mount_path.exists())
+
+    @parameterized.expand(
+        [
+            ("rust", {"EDENFSCTL_ONLY_RUST": "1"}),
+            ("python", {"EDENFSCTL_SKIP_RUST": "1"}),
+        ]
+    )
+    def test_remove_cleans_up_a_leftover_mount_point(
+        self, impl: str, env: dict
+    ) -> None:
+        """A removal interrupted before the mount point was deleted leaves an
+        unregistered directory holding only EdenFS's README; a retry removes
+        it. A directory with other content is left alone."""
+        self.eden.run_cmd("remove", "--yes", self.mount, env=env)
+        os.mkdir(self.mount)
+        with open(os.path.join(self.mount, "README_EDEN.txt"), "w") as f:
+            f.write("not mounted\n")
+
+        self.eden.run_cmd("remove", "--yes", self.mount, env=env)
+        self.assertFalse(
+            os.path.exists(self.mount),
+            f"eden remove ({impl}) should delete a leftover mount point",
+        )
+
+        os.mkdir(self.mount)
+        user_file = os.path.join(self.mount, "notes.txt")
+        with open(user_file, "w") as f:
+            f.write("keep me\n")
+        result = self.eden.run_unchecked(
+            "remove", "--yes", self.mount, env=env, capture_output=True, text=True
+        )
+        self.assertNotEqual(
+            0,
+            result.returncode,
+            f"eden remove ({impl}) must not delete a directory with other content",
+        )
+        self.assertTrue(os.path.exists(user_file))
+
+    @parameterized.expand(
+        [
+            ("rust", {"EDENFSCTL_ONLY_RUST": "1"}),
+            ("python", {"EDENFSCTL_SKIP_RUST": "1"}),
+        ]
+    )
     def test_remove_succeeds_when_config_toml_is_missing(
         self, impl: str, env: dict
     ) -> None:
-        if sys.platform == "win32":
-            self.skipTest(
-                "On Windows, .eden\\config stays after `eden unmount`, so `eden rm` "
-                "takes the checkout for a mounted one and fails to unmount it"
-            )
         mount_path = pathlib.Path(self.mount)
         self.eden.unmount(mount_path)
         (self.eden.client_dir_for_mount(mount_path) / "config.toml").unlink()
@@ -492,3 +552,68 @@ class RemoveTest(RemoveTestBase):
         )
         self.assertNotIn(self.mount, self.load_directory_map())
         self.assertFalse(client_dir.exists())
+
+    @parameterized.expand(
+        [
+            ("rust", {"EDENFSCTL_ONLY_RUST": "1"}),
+            ("python", {"EDENFSCTL_SKIP_RUST": "1"}),
+        ]
+    )
+    def test_retry_removes_checkout_whose_folder_deletion_failed(
+        self, impl: str, env: dict
+    ) -> None:
+        if sys.platform == "win32":
+            self.skipTest(
+                "A read-only directory doesn't stop deleting its files on Windows"
+            )
+        mount_path = pathlib.Path(self.mount)
+        client_dir = self.eden.client_dir_for_mount(mount_path)
+        self.eden.unmount(mount_path)
+        locked_dir = mount_path / "locked"
+        locked_dir.mkdir()
+        (locked_dir / "file").touch()
+        locked_dir.chmod(0o500)
+        try:
+            result = self.eden.run_unchecked(
+                "remove",
+                "--yes",
+                self.mount,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            locked_dir.chmod(0o700)
+        self.assertNotEqual(
+            0,
+            result.returncode,
+            f"{impl} eden remove should fail to delete the locked directory",
+        )
+        self.assertIn(self.mount, self.load_directory_map())
+        self.assertTrue(client_dir.exists())
+
+        self.eden.run_cmd("remove", "--yes", self.mount, env=env)
+        self.assertNotIn(self.mount, self.load_directory_map())
+        self.assertFalse(mount_path.exists())
+        self.assertFalse(client_dir.exists())
+
+    def test_python_remove_succeeds_when_client_dir_is_missing(self) -> None:
+        # Another `eden rm` of the same checkout, or an interrupted one, can
+        # leave the checkout registered after deleting its client dir.
+        mount_path = pathlib.Path(self.mount)
+        client_dir = self.eden.client_dir_for_mount(mount_path)
+        self.eden.unmount(mount_path)
+        shutil.rmtree(client_dir)
+
+        result = self.eden.run_unchecked(
+            "remove",
+            "--yes",
+            self.mount,
+            env={"EDENFSCTL_SKIP_RUST": "1"},
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertNotIn(self.mount, self.load_directory_map())
+        self.assertFalse(os.path.exists(self.mount))

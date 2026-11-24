@@ -24,7 +24,7 @@ bytes = { version = "1.12.1", features = ["serde"] }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 commit_graph = { version = "0.1.0", path = "../../repo_attributes/commit_graph/commit_graph" }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
-encoding_rs = "0.8.42"
+encoding_rs = "0.8.44"
 filestore = { version = "0.1.0", path = "../../repo_attributes/filestore" }
 futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -35,7 +35,7 @@ gix-hash = { version = "0.26.2", features = ["sha1"] }
 gix-object = "0.64.1"
 http = "1.5.0"
 http-body-util = "0.1.5"
-hyper-openssl = { version = "0.10", features = ["client-legacy", "tokio"] }
+hyper-openssl = { version = "0.10.3", features = ["client-legacy", "tokio"] }
 hyper-proxy2 = { version = "0.1", features = ["rustls"], default-features = false }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
 import_common = { version = "0.1.0", path = "../../features/import_common" }
@@ -54,7 +54,7 @@ sapling-clientinfo = { version = "0.1.0", path = "../../../scm/lib/clientinfo" }
 sapling-repourl = { version = "0.1.0", path = "../../../scm/lib/repo/url" }
 scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }
 serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
-smallvec = { version = "1.16.4", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
+smallvec = { version = "1.16.5", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 tls = { version = "0.1.0", path = "../../cmdlib/mononoke_app/tls" }
 tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }

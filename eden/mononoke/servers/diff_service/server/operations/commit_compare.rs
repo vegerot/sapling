@@ -141,6 +141,7 @@ impl DiffServiceImpl {
     ) -> Result<source_control_thrift::CommitCompareResponse, ServerError> {
         let repo_name = &request.repo_name;
         let mut params = request.params;
+        let include_paths = RestrictedPathsPolicy::paths_requested(params.partial_options.as_ref());
         let specifier = commit_id_to_specifier(&request.commit_id)?;
         let other_specifier = params
             .other_commit_id
@@ -154,7 +155,7 @@ impl DiffServiceImpl {
                 max_paths: operations::unordered_max_paths()?,
             },
         };
-        let internal_page_size = select_internal_page_size(&params, &mode);
+        let internal_page_size = select_internal_page_size(repo_name, &params, &mode);
 
         // Create separate repo contexts for each changeset to support cross-bubble diffs.
         // Each ephemeral changeset may live in a different bubble, so we need
@@ -201,7 +202,11 @@ impl DiffServiceImpl {
         let max_limit = source_control_thrift::consts::COMMIT_COMPARE_ORDERED_MAX_LIMIT as u64;
         // Build the policy once: it selects the omission path below and
         // the stamped verdict, so the two cannot disagree.
-        let policy = RestrictedPathsPolicy::for_scs_request(&ctx, repo_name);
+        let policy = RestrictedPathsPolicy::for_scs_request(
+            &ctx,
+            repo_name,
+            params.partial_options.as_ref(),
+        );
         let estimated_path_count = match &mode {
             CommitCompareMode::Ordered { ordered_params } => {
                 (ordered_params.limit as u64).min(max_limit)
@@ -263,7 +268,7 @@ impl DiffServiceImpl {
 
         let result = result.map_err(map_commit_compare_error)?;
         let mut response = result.response;
-        response.partial_info = crate::service::partial_response_info(&policy);
+        response.partial_info = crate::service::partial_response_info(&policy, include_paths);
         Ok(response)
     }
 }
@@ -349,6 +354,7 @@ async fn paged_commit_compare(
                     ..ordered_params.clone()
                 });
 
+                let entries_before = policy.omitted_entry_count().unwrap_or(0);
                 let page = operations::commit_compare_with_generation_logging(
                     ctx,
                     repo,
@@ -368,6 +374,11 @@ async fn paged_commit_compare(
                 }
 
                 let page_diff_count = page.diff_count;
+                // Scanned entries in this page: visible plus omitted. The
+                // supplement can overfill past the page budget, so the
+                // remaining budget saturates instead of underflowing.
+                let page_scanned =
+                    page_diff_count + (policy.omitted_entry_count().unwrap_or(0) - entries_before);
                 let source_control_thrift::CommitCompareResponse {
                     diff_files,
                     other_commit_ids,
@@ -383,7 +394,7 @@ async fn paged_commit_compare(
                 *page_count += 1;
                 *completed_path_count += page_diff_count;
                 diff_count += page_diff_count;
-                remaining -= page_diff_count;
+                remaining = remaining.saturating_sub(page_scanned);
 
                 if remaining == 0 {
                     if let Some(max_paths) = unordered_max_paths {
@@ -401,7 +412,7 @@ async fn paged_commit_compare(
                     break;
                 }
 
-                if page_diff_count < page_limit {
+                if page_scanned < page_limit {
                     response.last_path = None;
                     break;
                 }
@@ -422,6 +433,7 @@ async fn paged_commit_compare(
 }
 
 fn select_internal_page_size(
+    repo_name: &str,
     params: &source_control_thrift::CommitCompareParams,
     mode: &CommitCompareMode,
 ) -> Option<usize> {
@@ -430,7 +442,7 @@ fn select_internal_page_size(
     }
 
     let configured_page_size =
-        justknobs::get_as::<usize>(COMMIT_COMPARE_INTERNAL_PAGE_SIZE_JK, None);
+        justknobs::get_as::<usize>(COMMIT_COMPARE_INTERNAL_PAGE_SIZE_JK, Some(repo_name));
     let ordered_page_max = source_control_thrift::consts::COMMIT_COMPARE_ORDERED_MAX_LIMIT as usize;
     match mode {
         CommitCompareMode::Ordered { ordered_params } => {
@@ -480,7 +492,12 @@ impl AddScubaParams for thrift::CommitCompareRequest {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use fbinit::FacebookInit;
+    use justknobs::test_helpers::JustKnobsInMemory;
+    use justknobs::test_helpers::KnobVal;
+    use justknobs::test_helpers::with_just_knobs;
     use mononoke_macros::mononoke;
 
     use super::*;
@@ -499,6 +516,113 @@ mod tests {
         params.compare_items.clear();
         params.follow_mutable_file_history = Some(true);
         assert!(!has_stable_paging_cursor(&params));
+    }
+
+    fn select_with_page_size(
+        page_size: i64,
+        params: &source_control_thrift::CommitCompareParams,
+        mode: &CommitCompareMode,
+    ) -> Option<usize> {
+        let knobs = JustKnobsInMemory::new(HashMap::from([(
+            COMMIT_COMPARE_INTERNAL_PAGE_SIZE_JK.to_string(),
+            KnobVal::Int(page_size),
+        )]));
+        with_just_knobs(knobs, || select_internal_page_size("repo", params, mode))
+    }
+
+    fn ordered(limit: i64) -> CommitCompareMode {
+        CommitCompareMode::Ordered {
+            ordered_params: source_control_thrift::CommitCompareOrderedParams {
+                limit,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn unordered(max_paths: usize) -> CommitCompareMode {
+        CommitCompareMode::Unordered { max_paths }
+    }
+
+    #[mononoke::test]
+    fn ordered_requests_page_only_below_their_limit() {
+        let params = source_control_thrift::CommitCompareParams::default();
+        let max_limit = source_control_thrift::consts::COMMIT_COMPARE_ORDERED_MAX_LIMIT;
+
+        assert_eq!(
+            select_with_page_size(128, &params, &ordered(1_000)),
+            Some(128),
+            "a page smaller than the limit should be used"
+        );
+        assert_eq!(
+            select_with_page_size(128, &params, &ordered(128)),
+            None,
+            "a page that covers the whole limit should stay one-shot"
+        );
+        assert_eq!(
+            select_with_page_size(0, &params, &ordered(1_000)),
+            None,
+            "a zero page size should disable paging"
+        );
+        assert_eq!(
+            select_with_page_size(128, &params, &ordered(max_limit + 1)),
+            None,
+            "a limit above the ordered maximum should stay one-shot"
+        );
+        assert_eq!(
+            select_with_page_size(128, &params, &ordered(-1)),
+            None,
+            "a negative limit should stay one-shot"
+        );
+    }
+
+    #[mononoke::test]
+    fn unordered_requests_cap_the_page() {
+        let params = source_control_thrift::CommitCompareParams::default();
+
+        assert_eq!(
+            select_with_page_size(128, &params, &unordered(10_000)),
+            Some(128),
+            "a page smaller than max_paths should be used as is"
+        );
+        assert_eq!(
+            select_with_page_size(1_000, &params, &unordered(100)),
+            Some(100),
+            "the page should be capped at max_paths"
+        );
+        assert_eq!(
+            select_with_page_size(20_000, &params, &unordered(50_000)),
+            Some(10_000),
+            "the page should be capped at the ordered maximum limit of 10,000"
+        );
+        assert_eq!(
+            select_with_page_size(128, &params, &unordered(0)),
+            Some(1),
+            "a zero max_paths should still page one entry at a time"
+        );
+        assert_eq!(
+            select_with_page_size(0, &params, &unordered(10_000)),
+            None,
+            "a zero page size should disable paging"
+        );
+    }
+
+    #[mononoke::test]
+    fn unstable_cursors_are_never_paged() {
+        let mut params = source_control_thrift::CommitCompareParams::default();
+        params
+            .compare_items
+            .insert(source_control_thrift::CommitCompareItem::TREES);
+
+        assert_eq!(
+            select_with_page_size(1, &params, &ordered(1_000)),
+            None,
+            "an ordered tree comparison should stay one-shot"
+        );
+        assert_eq!(
+            select_with_page_size(1, &params, &unordered(1_000)),
+            None,
+            "an unordered tree comparison should stay one-shot"
+        );
     }
 
     #[mononoke::fbinit_test]

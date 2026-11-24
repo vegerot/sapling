@@ -1075,6 +1075,21 @@ class SingleBackingStoreFactory : public BackingStoreFactory {
   std::shared_ptr<BackingStore> store_;
 };
 
+// A checkout mounted at <dir>/mount, read from the client directory
+// <dir>/client, which this creates along with the mount point.
+std::unique_ptr<CheckoutConfig> createCheckoutConfig(AbsolutePathPiece dir) {
+  auto clientDir = dir + "client"_pc;
+  ensureDirectoryExists(clientDir + "local"_pc);
+  auto mountPath = dir + "mount"_pc;
+  ensureDirectoryExists(mountPath);
+  writeFile(
+      clientDir + "config.toml"_pc,
+      folly::ByteRange{folly::StringPiece{
+          "[repository]\npath = \"/repo\"\ntype = \"hg\"\n"}})
+      .value();
+  return CheckoutConfig::loadFromClientDirectory(mountPath, clientDir);
+}
+
 } // namespace
 
 // A server that can mount a checkout over a FakeFuse through EdenServer::mount,
@@ -1098,20 +1113,18 @@ class EdenServerMountTest : public ::testing::Test {
     return *testServer_;
   }
 
+  // The checkout's config, read from its client directory; the first call
+  // creates the client directory and the mount point.
+  std::unique_ptr<CheckoutConfig> checkoutConfig() {
+    auto config = createCheckoutConfig(testServer_->getTmpDir());
+    mountPath_ = config->getMountPath();
+    config->setCheckedOutCommit(kCommit);
+    return config;
+  }
+
   std::shared_ptr<EdenMount> mountCheckout() {
     auto& server = testServer_->getServer();
-    auto clientDir = testServer_->getTmpDir() + "client"_pc;
-    ensureDirectoryExists(clientDir + "local"_pc);
-    mountPath_ = testServer_->getTmpDir() + "mount"_pc;
-    ensureDirectoryExists(mountPath_);
-    writeFile(
-        clientDir + "config.toml"_pc,
-        folly::ByteRange{folly::StringPiece{
-            "[repository]\npath = \"/repo\"\ntype = \"hg\"\n"}})
-        .value();
-    auto config =
-        CheckoutConfig::loadFromClientDirectory(mountPath_, clientDir);
-    config->setCheckedOutCommit(kCommit);
+    auto config = checkoutConfig();
 
     auto* privHelper =
         dynamic_cast<FakePrivHelper*>(server.getServerState()->getPrivHelper());
@@ -1182,6 +1195,93 @@ TEST_F(EdenServerMountTest, StopWhileAMountIsShuttingDown) {
   // fulfills, so the stop waits for the shutdown and exits cleanly.
   EXPECT_TRUE(server.performCleanup());
   EXPECT_NO_THROW(std::move(unmountFuture).get(1s));
+}
+
+// Unmount recovery remounts a checkout that config.json lists and
+// mountPoints_ does not, unless the intentional-unmount marker is set, so
+// addToMountPoints() clears the marker once the mount is in mountPoints_. A
+// mount that fails before that point, here because the path is already
+// mounted, leaves the marker alone.
+TEST_F(EdenServerMountTest, RefusedMountLeavesTheIntentionalMarker) {
+  auto& server = testServer().getServer();
+  auto mount = mountCheckout();
+  mount->getCheckoutConfig()->setIntentionallyUnmountedFlag();
+
+  EXPECT_THROW_RE(
+      (void)server.mount(checkoutConfig(), /*readOnly=*/false),
+      EdenError,
+      "already mounted");
+  EXPECT_TRUE(mount->getCheckoutConfig()->isIntentionallyUnmounted());
+  EXPECT_EQ(MountState::RUNNING, mount->getState());
+}
+
+// A mount refused because the path is already mounted records no stop: the
+// checkout is still served.
+TEST_F(EdenServerMountTest, RefusedMountRecordsNoStop) {
+  auto& server = testServer().getServer();
+  auto mount = mountCheckout();
+
+  EXPECT_THROW_RE(
+      (void)server.mount(checkoutConfig(), /*readOnly=*/false),
+      EdenError,
+      "already mounted");
+  EXPECT_EQ("", server.getCheckoutStopReason(mountPath()));
+}
+
+// A mount that fails before it is in mountPoints_ never reaches
+// mountFinished(), so mount() records the stop itself. The health check then
+// reports the checkout as mount_failed rather than as not mounted since the
+// daemon started.
+TEST(EdenServerMountFailureTest, FailureBeforeRegistrationRecordsTheStop) {
+  // The default TestServer cannot create a backing store.
+  TestServer testServer;
+  auto& server = testServer.getServer();
+  auto config = createCheckoutConfig(testServer.getTmpDir());
+  const auto mountPath = config->getMountPath();
+
+  EXPECT_THROW_RE(
+      (void)server.mount(std::move(config), /*readOnly=*/false),
+      std::logic_error,
+      "no BackingStores");
+  EXPECT_EQ("mount_failed", server.getCheckoutStopReason(mountPath));
+}
+
+// An unmount that finds the mount right after its registration writes the
+// marker and cancels the start. The clear runs under the mountPoints_ lock
+// that unmount() takes to find the entry, so it cannot run after that
+// unmount's write: the marker survives the cancelled start, and unmount
+// recovery leaves the checkout alone.
+TEST_F(EdenServerMountTest, UnmountDuringMountStartKeepsItsMarker) {
+  auto& server = testServer().getServer();
+  auto& faultInjector = server.getServerState()->getFaultInjector();
+  faultInjector.injectBlock("mountRegistered", ".*");
+  auto config = checkoutConfig();
+  // The same client directory, to read the marker from.
+  auto checkout = checkoutConfig();
+
+  // mount() blocks at the fault until the unmount below has found the entry.
+  auto mountFuture = folly::Future<std::shared_ptr<EdenMount>>::makeEmpty();
+  std::thread mounter([&] {
+    mountFuture = server.mount(std::move(config), /*readOnly=*/false)
+                      .semi()
+                      .via(server.getServerState()->getThreadPool().get());
+  });
+  ASSERT_TRUE(faultInjector.waitUntilBlocked("mountRegistered", 5s));
+  auto unmountFuture = server.unmount(mountPath(), UnmountOptions{});
+  EXPECT_TRUE(checkout->isIntentionallyUnmounted());
+  faultInjector.removeFault("mountRegistered", ".*");
+  faultInjector.unblock("mountRegistered", ".*");
+  mounter.join();
+
+  // The cancelled start is torn down on the main event base.
+  ASSERT_TRUE(
+      driveMainEventBaseUntil(server, [&] { return mountFuture.isReady(); }));
+  EXPECT_THROW(std::move(mountFuture).get(), EdenMountCancelled);
+  std::move(unmountFuture)
+      .via(server.getMainEventBase())
+      .getVia(server.getMainEventBase());
+  EXPECT_TRUE(checkout->isIntentionallyUnmounted());
+  EXPECT_TRUE(server.getAllMountPoints().empty());
 }
 
 TEST_F(EdenServerMountTest, FailedUnmountClearsIntentionalMarker) {

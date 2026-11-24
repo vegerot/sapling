@@ -10,11 +10,11 @@
 //! 1. Node stream `(node, parents)` -> `GraphRowShape`.
 //!    Computes edge shapes and column layout.
 //! 2. `GraphRowShape`s -> `PrefixLine`s.
-//!    Converts abstract graph rows into left-side graph prefixes.
+//!    Converts abstract graph rows into left-side graph prefixes with optional line IDs.
 //!    Does not know about messages or node glyphs.
-//! 3. `PrefixLine`s + glyph + message -> text.
+//! 3. `PrefixLine`s + glyph + message -> text fragments.
 //!    Produces the final lines by filling the glyph, repeating prefixes,
-//!    and placing message text.
+//!    and placing message text. Fragments retain IDs for styling by the caller.
 //!
 //! Design principle: minimal coupling -> reusable, cacheable. For example:
 //! - Step 1 is not coupled with glyph or message.
@@ -28,6 +28,13 @@
 //!   Step 2 result (since the commit graph is not changing), and only update
 //!   the message part later.
 
+#[cfg(feature = "coloring")]
+pub mod coloring;
+#[cfg(not(feature = "coloring"))]
+pub mod coloring {
+    /// No color metadata is stored when graph coloring is disabled.
+    pub type PrefixLineColor = ();
+}
 pub mod graph_text_renderer;
 pub mod graph_to_row_shape;
 pub mod prefix_lines_to_text;
@@ -50,6 +57,18 @@ pub use self::types::PrefixLineRenderer;
 mod tests {
     use super::*;
     use crate::test_utils::indent;
+
+    #[cfg(not(feature = "coloring"))]
+    #[test]
+    fn test_disabled_prefix_color_size() {
+        use types::PrefixLinePart;
+
+        assert_eq!(std::mem::size_of::<coloring::PrefixLineColor>(), 0);
+        assert_eq!(
+            std::mem::size_of::<(PrefixLinePart, coloring::PrefixLineColor)>(),
+            std::mem::size_of::<PrefixLinePart>(),
+        );
+    }
 
     #[test]
     fn test_graph_text_renderer_example() {
@@ -258,9 +277,10 @@ mod tests {
                 NodeLine::Blank,
             ],
             link_line: None,
-            link_line_from_node: None,
             term_line: None,
             ancestry_line: vec![PadLine::Ancestor, PadLine::Parent, PadLine::Blank],
+            #[cfg(feature = "coloring")]
+            line_ids: None,
         };
 
         assert!(row.has_indirect_ancestor());
@@ -349,7 +369,7 @@ mod tests {
                         let text: String = line
                             .parts
                             .iter()
-                            .map(|part| match part {
+                            .map(|(part, _)| match part {
                                 PrefixLinePart::Text(text) => text.as_str(),
                                 PrefixLinePart::NodeGlyph => "o",
                             })

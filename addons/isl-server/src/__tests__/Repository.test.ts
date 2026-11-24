@@ -36,6 +36,8 @@ import {
 import {ErrorShortMessages} from '../constants';
 import {type ServerPlatform} from '../serverPlatform';
 import {type RepositoryContext} from '../serverTypes';
+import * as templates from '../templates';
+import {COMMIT_END_MARK, mainFetchTemplateFields} from '../templates';
 
 /* eslint-disable require-await */
 
@@ -103,6 +105,7 @@ describe('Repository', () => {
   let ctx: RepositoryContext;
   beforeEach(() => {
     ctx = {
+      agentSessionMetadata: undefined,
       cmd: 'sl',
       cwd: '/path/to/cwd',
       logger: mockLogger,
@@ -539,14 +542,17 @@ describe('Repository', () => {
       );
     });
 
-    it('allows free-text values that look like flags', async () => {
-      await runOperation({
-        args: ['commit', '--message', '-Refactor --config handling'],
-      });
+    it.each([
+      [['status', '-m', '--config', 'hooks.pre-status=true']],
+      [['status', '-u', '-R/tmp']],
+      [['annotate', '--user', '--config', 'hooks.pre-annotate=true']],
+      [['commit', '--message', '-R/tmp']],
+    ])('checks args after flags that may take a value %j', async args => {
+      await runOperation({args});
 
-      expect(ejecaSpy).toHaveBeenCalledWith(
+      expect(ejecaSpy).not.toHaveBeenCalledWith(
         'sl',
-        ['commit', '--message', '-Refactor --config handling', '--noninteractive'],
+        expect.arrayContaining(args),
         expect.anything(),
       );
     });
@@ -595,10 +601,6 @@ describe('Repository', () => {
     it('allows the configured ui.merge tool', () => {
       expect(() => validateMergeToolArgs(['resolve', '--tool', 'mytool'], 'mytool')).not.toThrow();
       expect(() => validateMergeToolArgs(['resolve', '--tool', 'other'], 'mytool')).toThrow();
-    });
-
-    it('ignores free-text values', () => {
-      expect(() => validateMergeToolArgs(['commit', '--message', '-tidy up'])).not.toThrow();
     });
   });
 
@@ -716,6 +718,116 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
       );
     });
 
+    const commitFields: Record<string, string> = {
+      hash: 'abcdef',
+      title: 'Current commit',
+      author: 'Test author',
+      date: '2026-11-11 12:00:00 -0800',
+      phase: 'draft',
+      isDot: '@',
+      totalFileCount: '0',
+      isFollower: 'false',
+      description: 'Current commit',
+    };
+    const commitOutput = [
+      ...Object.keys(mainFetchTemplateFields(repoInfo.codeReviewSystem)).map(
+        field => commitFields[field] ?? '',
+      ),
+      COMMIT_END_MARK,
+    ].join('\n');
+
+    it('returns truncated smartlog commits instead of discarding them', async () => {
+      const repo = new Repository(repoInfo, ctx);
+      const onChange = jest.fn();
+      repo.subscribeToSmartlogCommitsChanges(onChange);
+      mockEjeca([
+        [
+          /^sl log/,
+          {
+            stdout: commitOutput,
+            stderr: 'smartlog: too many (2000) commits, not rendering all of them\n',
+          },
+        ],
+      ]);
+
+      await repo.fetchSmartlogCommits();
+
+      expect(onChange).toHaveBeenCalledWith(
+        expect.objectContaining({
+          commits: {value: [expect.objectContaining({hash: 'abcdef', isDot: true})]},
+          tooManyCommits: {numCommits: 2000},
+        }),
+      );
+      expect(repo.getSmartlogCommits()).toEqual(onChange.mock.calls[0][0]);
+    });
+
+    const manyHeadsOutput = [
+      ...Array.from({length: 1501}, (_, i) =>
+        commitOutput.replace('abcdef', `head${i}`).replace('\n@\n', '\n\n'),
+      ),
+      commitOutput,
+    ].join('\n');
+
+    it.each(['', 'smartlog: too many (6000) commits, not rendering all of them\n'])(
+      'refetches the current stack when many heads exceed the rendering budget (stderr: %p)',
+      async stderr => {
+        const repo = new Repository(repoInfo, ctx);
+        const onChange = jest.fn();
+        repo.subscribeToSmartlogCommitsChanges(onChange);
+        const ejecaSpy = mockEjeca([
+          [/--rev smartlog\(\.\)/, {stdout: commitOutput}],
+          [/^sl log/, {stdout: manyHeadsOutput, stderr}],
+        ]);
+
+        await repo.fetchSmartlogCommits();
+
+        expectCalledWithRevset(ejecaSpy, 'smartlog(.)');
+        expect(onChange).toHaveBeenCalledWith(
+          expect.objectContaining({
+            commits: {value: [expect.objectContaining({hash: 'abcdef', isDot: true})]},
+            tooManyCommits: {numCommits: stderr ? 6000 : 1502},
+          }),
+        );
+      },
+    );
+
+    it('does not enrich or send an oversized focused graph to the renderer', async () => {
+      const repo = new Repository(repoInfo, ctx);
+      const onChange = jest.fn();
+      const attachSpy = jest.spyOn(templates, 'attachStableLocations').mockClear();
+      repo.subscribeToSmartlogCommitsChanges(onChange);
+      mockEjeca([[/^sl log/, {stdout: manyHeadsOutput}]]);
+
+      await repo.fetchSmartlogCommits();
+
+      expect(attachSpy).not.toHaveBeenCalled();
+      expect(onChange).toHaveBeenCalledWith(
+        expect.objectContaining({
+          commits: {error: expect.objectContaining({message: ErrorShortMessages.TooManyCommits})},
+        }),
+      );
+      expect(repo.getSmartlogCommits()).toBeNull();
+      attachSpy.mockRestore();
+    });
+
+    it('preserves command failures during a focused refetch', async () => {
+      const repo = new Repository(repoInfo, ctx);
+      const onChange = jest.fn();
+      repo.subscribeToSmartlogCommitsChanges(onChange);
+      mockEjeca([
+        [/--rev smartlog\(\.\)/, new Error('focused fetch failed')],
+        [/^sl log/, {stdout: manyHeadsOutput}],
+      ]);
+
+      await repo.fetchSmartlogCommits();
+
+      expect(onChange).toHaveBeenCalledWith(
+        expect.objectContaining({
+          commits: {error: expect.objectContaining({message: 'focused fetch failed'})},
+        }),
+      );
+    });
+
     it('reports when smartlog finds too many commits to render', async () => {
       const repo = new Repository(repoInfo, ctx);
       const onChange = jest.fn();
@@ -750,7 +862,10 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
       const trackSpy = jest.spyOn(ctx.tracker, 'track').mockClear();
       const tooManyCommits: [RegExp, {stdout: string; stderr: string}] = [
         /^sl log/,
-        {stdout: '', stderr: 'smartlog: too many (2000) commits, not rendering all of them\n'},
+        {
+          stdout: commitOutput,
+          stderr: 'smartlog: too many (2000) commits, not rendering all of them\n',
+        },
       ];
       const countTracked = () =>
         trackSpy.mock.calls.filter(([name]) => name === 'SmartlogTooManyCommits').length;
@@ -760,8 +875,9 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
       await repo.fetchSmartlogCommits();
       expect(countTracked()).toEqual(1);
 
-      mockEjeca([[/^sl log/, {stdout: ''}]]);
+      mockEjeca([[/^sl log/, {stdout: commitOutput}]]);
       await repo.fetchSmartlogCommits();
+      expect(repo.getSmartlogCommits()?.tooManyCommits).toBeUndefined();
 
       mockEjeca([tooManyCommits]);
       await repo.fetchSmartlogCommits();
@@ -1269,6 +1385,7 @@ describe('absolutePathForFileInRepo', () => {
   let ctx: RepositoryContext;
   beforeEach(() => {
     ctx = {
+      agentSessionMetadata: undefined,
       cmd: 'sl',
       cwd: '/path/to/cwd',
       logger: mockLogger,
@@ -1332,6 +1449,7 @@ describe('getCwdInfo', () => {
         cb(null, p)) as unknown as typeof fs.realpath);
     await expect(
       Repository.getCwdInfo({
+        agentSessionMetadata: undefined,
         cmd: 'sl',
         cwd: '/path/to/myRepo/some/subdir',
         logger: mockLogger,
@@ -1353,6 +1471,7 @@ describe('getCwdInfo', () => {
         cb(null, toRealPath(p))) as unknown as typeof fs.realpath);
     await expect(
       Repository.getCwdInfo({
+        agentSessionMetadata: undefined,
         cmd: 'sl',
         cwd: '/home/name/myRepo/some/subdir',
         logger: mockLogger,
@@ -1373,6 +1492,7 @@ describe('getCwdInfo', () => {
         cb(new Error('ENOENT'))) as unknown as typeof fs.realpath);
     await expect(
       Repository.getCwdInfo({
+        agentSessionMetadata: undefined,
         cmd: 'sl',
         cwd: '/path/to/myRepo/some/subdir',
         logger: mockLogger,
@@ -1389,6 +1509,7 @@ describe('getCwdInfo', () => {
     mockEjeca([[/^sl root/, new Error('not a repository')]]);
     await expect(
       Repository.getCwdInfo({
+        agentSessionMetadata: undefined,
         cmd: 'sl',
         cwd: '/path/ro/myRepo/some/subdir',
         logger: mockLogger,
@@ -1406,6 +1527,7 @@ describe('fetchSubmoduleMap', () => {
   beforeEach(() => {
     myRepoRoot = '/data/users/name/myRepo';
     ctx = {
+      agentSessionMetadata: undefined,
       cmd: 'sl',
       cwd: myRepoRoot,
       logger: mockLogger,

@@ -42,6 +42,7 @@ use serde::Serialize;
 use serde::Serializer;
 use serde::ser::SerializeMap;
 use strum::EnumString;
+use strum::IntoStaticStr;
 use strum::VariantNames;
 use thrift_types::edenfs::MountInfo;
 use thrift_types::edenfs::MountState;
@@ -67,22 +68,38 @@ const SNAPSHOT_MAGIC_4: &[u8] = b"eden\x00\x00\x00\x04";
 // List of supported repository types. This should stay in sync with the list
 // in the Python CLI at fs/cli_rs/edenfs-client/src/checkout.rs and the list in
 // the Daemon's CheckoutConfig at fs/config/CheckoutConfig.h.
-#[derive(Deserialize, Serialize, Debug, PartialEq, VariantNames, EnumString)]
+#[derive(
+    Deserialize,
+    Serialize,
+    Debug,
+    PartialEq,
+    VariantNames,
+    EnumString,
+    IntoStaticStr
+)]
 #[serde(rename_all = "lowercase")]
 enum RepositoryType {
-    // The daemon no longer mounts "git" checkouts; the CLI keeps recognising
-    // the type so existing ones can still be listed and removed.
+    // The daemon no longer mounts "git" or "recas" checkouts; the CLI keeps
+    // recognising the types so existing ones can still be listed and removed.
     #[strum(serialize = "git")]
     Git,
-    #[strum(serialize = "hg")]
-    Hg,
     #[strum(serialize = "recas")]
     Recas,
+    #[strum(serialize = "hg")]
+    Hg,
     #[strum(serialize = "filteredhg")]
     FilteredHg,
 }
 
-#[derive(Deserialize, Serialize, Debug, PartialEq, VariantNames, EnumString)]
+#[derive(
+    Deserialize,
+    Serialize,
+    Debug,
+    PartialEq,
+    VariantNames,
+    EnumString,
+    IntoStaticStr
+)]
 #[serde(rename_all = "lowercase")]
 enum MountProtocol {
     #[strum(serialize = "fuse")]
@@ -93,7 +110,15 @@ enum MountProtocol {
     Prjfs,
 }
 
-#[derive(Deserialize, Serialize, Debug, PartialEq, VariantNames, EnumString)]
+#[derive(
+    Deserialize,
+    Serialize,
+    Debug,
+    PartialEq,
+    VariantNames,
+    EnumString,
+    IntoStaticStr
+)]
 #[serde(rename_all = "lowercase")]
 enum InodeCatalogType {
     #[strum(serialize = "legacy")]
@@ -358,6 +383,27 @@ impl CheckoutConfig {
         Ok(config)
     }
 
+    /// The repository type, such as `hg` or `git`.
+    pub fn scm_type(&self) -> &'static str {
+        (&self.repository.repo_type).into()
+    }
+
+    /// The filesystem protocol the checkout mounts with: `fuse`, `nfs` or
+    /// `prjfs`.
+    pub fn mount_protocol(&self) -> &'static str {
+        (&self.repository.protocol).into()
+    }
+
+    /// Whether the checkout treats paths as case sensitive.
+    pub fn case_sensitive(&self) -> bool {
+        self.repository.case_sensitive
+    }
+
+    /// The inode catalog type, if the config sets one.
+    pub fn inode_catalog_type(&self) -> Option<&'static str> {
+        self.repository.inode_catalog_type.as_ref().map(Into::into)
+    }
+
     pub fn get_prefetch_profiles(&self) -> Result<&Vec<String>> {
         if let Some(profiles) = &self.profiles {
             Ok(&profiles.active)
@@ -540,6 +586,8 @@ pub struct EdenFsCheckout {
     #[serde(skip_serializing_if = "Option::is_none")]
     fuse_transport: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    nfs_transport: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     visible_in_daemon_namespace: Option<bool>,
     #[serde(skip)]
     pub(crate) redirections: Option<BTreeMap<PathBuf, RedirectionType>>,
@@ -575,7 +623,8 @@ impl EdenFsCheckout {
         };
 
         let transport_str = if verbose {
-            match (&self.fs_channel_type, &self.fuse_transport) {
+            let transport = self.fuse_transport.as_ref().or(self.nfs_transport.as_ref());
+            match (&self.fs_channel_type, transport) {
                 (Some(channel), Some(transport)) => format!(" ({channel}, {transport})"),
                 (Some(channel), None) => format!(" ({channel})"),
                 _ => String::new(),
@@ -742,13 +791,15 @@ impl EdenFsCheckout {
             },
             fs_channel_type: thrift_mount.fsChannelType,
             fuse_transport: thrift_mount.fuseTransport,
+            nfs_transport: thrift_mount.nfsTransport,
             visible_in_daemon_namespace: thrift_mount.visibleInDaemonNamespace,
             redirections: None,
             redirection_targets: None,
         })
     }
 
-    fn from_config(path: PathBuf, data_dir: PathBuf, config: CheckoutConfig) -> EdenFsCheckout {
+    /// A configured checkout at `path` whose client state is in `data_dir`.
+    pub fn from_config(path: PathBuf, data_dir: PathBuf, config: CheckoutConfig) -> EdenFsCheckout {
         EdenFsCheckout {
             path,
             data_dir,
@@ -757,6 +808,7 @@ impl EdenFsCheckout {
             backing_repo: Some(config.repository.path.clone()),
             fs_channel_type: None,
             fuse_transport: None,
+            nfs_transport: None,
             visible_in_daemon_namespace: None,
             redirections: Some(config.redirections),
             redirection_targets: Some(config.redirection_targets),
@@ -826,7 +878,7 @@ impl fmt::Display for EdenFsCheckout {
     }
 }
 
-fn has_missing_checkout_state(error: &EdenFsError) -> bool {
+pub fn has_missing_checkout_state(error: &EdenFsError) -> bool {
     match error {
         EdenFsError::IOError(err) => err.kind() == ErrorKind::NotFound,
         EdenFsError::Other(err) => err
@@ -923,6 +975,26 @@ struct WindowsEdenConfig {
     config: WindowsEdenConfigInner,
 }
 
+/// The client directory a mount's `.eden` metadata names: the `.eden/client` link on
+/// Unix, the `client` key of `.eden/config` on Windows. `None` when the metadata is
+/// absent or unreadable.
+pub fn dot_eden_client_dir(path: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let config = std::fs::read_to_string(path.join(".eden").join("config")).ok()?;
+        Some(
+            toml::from_str::<WindowsEdenConfig>(&config)
+                .ok()?
+                .config
+                .client,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        fs::read_link(path.join(".eden").join("client")).ok()
+    }
+}
+
 #[cfg(windows)]
 fn get_checkout_root_state(path: &Path) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
     let mut checkout_root = None;
@@ -1013,8 +1085,10 @@ mod tests {
     use edenfs_error::EdenFsError;
     use edenfs_error::Result;
     use edenfs_error::ResultExt;
+    use serde_json::json;
     use tempfile::TempDir;
     use tempfile::tempdir;
+    use thrift_types::edenfs::MountInfo;
     use thrift_types::edenfs::MountState;
 
     use crate::checkout::CheckoutConfig;
@@ -1113,6 +1187,38 @@ mod tests {
     }
 
     #[test]
+    fn test_repository_accessors() -> Result<()> {
+        let temp_dir = tempdir().context("couldn't create temp dir")?;
+        std::fs::write(
+            temp_dir.path().join(MOUNT_CONFIG),
+            r#"
+            [repository]
+            path = "/tmp/"
+            type = "git"
+            protocol = "nfs"
+            case-sensitive = false
+            inode-catalog-type = "legacyephemeral"
+
+            [redirections]
+            "#,
+        )
+        .from_err()?;
+        let config = CheckoutConfig::parse_config(temp_dir.path())?;
+        assert_eq!(config.scm_type(), "git");
+        assert_eq!(config.mount_protocol(), "nfs");
+        assert!(!config.case_sensitive());
+        assert_eq!(config.inode_catalog_type(), Some("legacyephemeral"));
+
+        let config = CheckoutConfig::parse_config(create_test_checkout_config()?.path())?;
+        assert_eq!(
+            config.inode_catalog_type(),
+            None,
+            "the default config sets no inode catalog type"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_mount_visibility_display_and_json() {
         let checkout = EdenFsCheckout {
             path: PathBuf::from("/tmp/mount"),
@@ -1122,6 +1228,7 @@ mod tests {
             backing_repo: None,
             fs_channel_type: None,
             fuse_transport: None,
+            nfs_transport: None,
             visible_in_daemon_namespace: Some(false),
             redirections: None,
             redirection_targets: None,
@@ -1135,6 +1242,76 @@ mod tests {
         assert_eq!(
             Some(&serde_json::Value::Bool(false)),
             value.get("visible_in_daemon_namespace")
+        );
+    }
+
+    /// Returns the `eden list -v` line and the `eden list --json` entry for a running mount.
+    fn list_verbose_and_json(
+        fs_channel_type: &str,
+        fuse_transport: Option<&str>,
+        nfs_transport: Option<&str>,
+    ) -> (String, serde_json::Value) {
+        let mount = MountInfo {
+            mountPoint: b"/tmp/mount".to_vec(),
+            edenClientPath: b"/tmp/client".to_vec(),
+            state: MountState::RUNNING,
+            fsChannelType: Some(fs_channel_type.to_string()),
+            fuseTransport: fuse_transport.map(str::to_string),
+            nfsTransport: nfs_transport.map(str::to_string),
+            ..Default::default()
+        };
+        let checkout = EdenFsCheckout::from_mount_info(PathBuf::from("/tmp/mount"), mount)
+            .expect("mount info should convert");
+        let display = checkout.display(true);
+        let value = serde_json::to_value(checkout).expect("failed to serialize checkout");
+        (display, value)
+    }
+
+    #[test]
+    fn test_list_shows_fs_channel_transport() {
+        assert_eq!(
+            (
+                "/tmp/mount (fuse, devfuse) (unconfigured)".to_string(),
+                json!({
+                    "data_dir": "/tmp/client",
+                    "state": "RUNNING",
+                    "configured": false,
+                    "backing_repo": null,
+                    "fs_channel_type": "fuse",
+                    "fuse_transport": "devfuse",
+                })
+            ),
+            list_verbose_and_json("fuse", Some("devfuse"), None),
+            "a FUSE mount should show its FUSE transport and have no nfs_transport key"
+        );
+        assert_eq!(
+            (
+                "/tmp/mount (nfs3, unix) (unconfigured)".to_string(),
+                json!({
+                    "data_dir": "/tmp/client",
+                    "state": "RUNNING",
+                    "configured": false,
+                    "backing_repo": null,
+                    "fs_channel_type": "nfs3",
+                    "nfs_transport": "unix",
+                })
+            ),
+            list_verbose_and_json("nfs3", None, Some("unix")),
+            "an NFS mount should show its NFS transport, as the Python CLI does"
+        );
+        assert_eq!(
+            (
+                "/tmp/mount (nfs3) (unconfigured)".to_string(),
+                json!({
+                    "data_dir": "/tmp/client",
+                    "state": "RUNNING",
+                    "configured": false,
+                    "backing_repo": null,
+                    "fs_channel_type": "nfs3",
+                })
+            ),
+            list_verbose_and_json("nfs3", None, None),
+            "a mount without a transport should show only its channel and have no transport keys"
         );
     }
 

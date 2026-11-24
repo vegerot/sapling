@@ -10,6 +10,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use acl_manifest::DirectoryAclInputs;
 use acl_manifest::RootAclManifestId;
@@ -18,25 +22,31 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use async_trait::async_trait;
+use blobstore::Blobstore;
 use blobstore::BlobstoreBytes;
 use blobstore::BlobstoreGetData;
 use blobstore::BlobstoreIsPresent;
 use blobstore::KeyedBlobstore;
 use blobstore::Loadable;
+use blobstore::LoadableError;
+use blobstore::OverwriteStatus;
+use blobstore::PutBehaviour;
 use blobstore::Storable;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use cacheblob::MemWritesKeyedBlobstore;
 use context::CoreContext;
 use derived_data_manager::BonsaiDerivable;
+use derived_data_manager::DerivationStagePayload;
+use derived_data_manager::ManifestStagePayload;
 use fbinit::FacebookInit;
 use futures::FutureExt;
 use futures::stream::TryStreamExt;
 use justknobs::test_helpers::JustKnobsInMemory;
 use justknobs::test_helpers::KnobVal;
-use justknobs::test_helpers::override_just_knobs;
 use justknobs::test_helpers::with_just_knobs_async;
 use manifest::Entry;
 use manifest::ManifestOps;
+use memblob::Memblob;
 use mercurial_derivation::DeriveHgChangeset;
 use mercurial_derivation::MappedHgChangesetId;
 use mercurial_derivation::RootHgAugmentedManifestId;
@@ -76,8 +86,11 @@ use repo_derived_data::RepoDerivedDataRef;
 use restricted_paths::ManifestType;
 use restricted_paths::RestrictedPathManifestIdEntry;
 use restricted_paths::RestrictedPathsRef;
+use test_repo_factory::TestRepoFactory;
 use tests_utils::CreateCommitContext;
 use tests_utils::drawdag::extend_from_dag_with_actions;
+use tokio::sync::Barrier;
+use tokio::time::timeout;
 
 use crate::Repo;
 
@@ -110,6 +123,8 @@ struct DenyGetKeyedBlobstore<B> {
     inner: B,
     denied: DeniedGet,
     result: DeniedGetResult,
+    denied_gets: Arc<AtomicUsize>,
+    misses: usize,
 }
 
 impl<B> DenyGetKeyedBlobstore<B> {
@@ -118,6 +133,8 @@ impl<B> DenyGetKeyedBlobstore<B> {
             inner,
             denied: DeniedGet::Keys(HashSet::from([denied_key])),
             result: DeniedGetResult::Error,
+            denied_gets: Arc::new(AtomicUsize::new(0)),
+            misses: usize::MAX,
         }
     }
 
@@ -126,6 +143,8 @@ impl<B> DenyGetKeyedBlobstore<B> {
             inner,
             denied: DeniedGet::Prefix(denied_prefix.to_string()),
             result: DeniedGetResult::Error,
+            denied_gets: Arc::new(AtomicUsize::new(0)),
+            misses: usize::MAX,
         }
     }
 
@@ -134,6 +153,8 @@ impl<B> DenyGetKeyedBlobstore<B> {
             inner,
             denied: DeniedGet::Keys(denied_keys.into_iter().collect()),
             result: DeniedGetResult::Missing,
+            denied_gets: Arc::new(AtomicUsize::new(0)),
+            misses: usize::MAX,
         }
     }
 
@@ -142,6 +163,8 @@ impl<B> DenyGetKeyedBlobstore<B> {
             inner,
             denied: DeniedGet::Keys(denied_keys.into_iter().collect()),
             result: DeniedGetResult::Error,
+            denied_gets: Arc::new(AtomicUsize::new(0)),
+            misses: usize::MAX,
         }
     }
 }
@@ -159,7 +182,9 @@ impl<B: KeyedBlobstore + Clone> KeyedBlobstore for DenyGetKeyedBlobstore<B> {
         ctx: &'a CoreContext,
         key: &'a str,
     ) -> Result<Option<BlobstoreGetData>> {
-        if self.denied.matches(key) {
+        if self.denied.matches(key)
+            && self.denied_gets.fetch_add(1, Ordering::Relaxed) < self.misses
+        {
             return match self.result {
                 DeniedGetResult::Error => {
                     Err(anyhow!("unexpected load of denied blobstore key {key}"))
@@ -222,9 +247,7 @@ async fn test_augmented_manifest_hg_blobs_loadable(fb: FacebookInit) -> Result<(
     let manager = repo.repo_derived_data().manager();
 
     // Pre-derive HgChangesets for the old HgManifest-based augmented path.
-    manager
-        .derive_exactly_batch::<MappedHgChangesetId>(&ctx, vec![root, child], None)
-        .await?;
+    fixtures::store_hg_changesets_as_uploaded(&ctx, &repo, vec![root, child]).await?;
 
     // Pre-derive RootAclManifestId (batch dependency of RootHgAugmentedManifestId)
     manager
@@ -469,9 +492,7 @@ async fn test_augmented_manifest_multi_batch(fb: FacebookInit) -> Result<()> {
     let manager = repo.repo_derived_data().manager();
 
     // Pre-derive dependencies of RootHgAugmentedManifestId.
-    manager
-        .derive_exactly_batch::<MappedHgChangesetId>(&ctx, csids.clone(), None)
-        .await?;
+    fixtures::store_hg_changesets_as_uploaded(&ctx, &repo, csids.clone()).await?;
     manager
         .derive_exactly_batch::<RootAclManifestId>(&ctx, csids.clone(), None)
         .await?;
@@ -562,83 +583,6 @@ async fn test_augmented_manifest_derive_heads(fb: FacebookInit) -> Result<()> {
             .load(&ctx, repo.repo_blobstore())
             .await?
             .manifestid();
-
-        compare_manifests(&ctx, &repo, hg_manifest_id, aug.hg_augmented_manifest_id()).await?;
-    }
-
-    Ok(())
-}
-
-/// Test that the old HgManifest-based augmented-manifest path remains
-/// compatible when `hgmanifest_skip_writes=true`.
-#[mononoke::fbinit_test]
-async fn test_augmented_manifest_skip_writes(fb: FacebookInit) -> Result<()> {
-    override_just_knobs(JustKnobsInMemory::new(HashMap::from([(
-        "scm/mononoke:hgmanifest_skip_writes".to_string(),
-        KnobVal::Bool(true),
-    )])));
-
-    let ctx = CoreContext::test_mock(fb);
-    let repo: Repo = test_repo_factory::build_empty(fb).await?;
-
-    let root = CreateCommitContext::new_root(&ctx, &repo)
-        .add_file("dir/file_a", "content_a")
-        .add_file("dir/file_b", "content_b")
-        .add_file("other/file_c", "content_c")
-        .commit()
-        .await?;
-
-    let child = CreateCommitContext::new(&ctx, &repo, vec![root])
-        .add_file("dir/file_a", "updated_a")
-        .add_file("new/file_d", "content_d")
-        .commit()
-        .await?;
-
-    let grandchild = CreateCommitContext::new(&ctx, &repo, vec![child])
-        .add_file("other/file_c", "updated_c")
-        .commit()
-        .await?;
-
-    let manager = repo.repo_derived_data().manager();
-
-    // Prederive the static manager dependency retained in this stack.
-    manager
-        .derive_exactly_batch::<MappedHgChangesetId>(&ctx, vec![root, child, grandchild], None)
-        .await?;
-
-    // Pre-derive RootAclManifestId (batch dependency of RootHgAugmentedManifestId)
-    manager
-        .derive_exactly_batch::<RootAclManifestId>(&ctx, vec![root, child, grandchild], None)
-        .await?;
-
-    manager
-        .derive_exactly_batch::<RootHgAugmentedManifestId>(
-            &ctx,
-            vec![root, child, grandchild],
-            None,
-        )
-        .await?;
-
-    for cs_id in [root, child, grandchild] {
-        let aug = manager
-            .fetch_derived::<RootHgAugmentedManifestId>(&ctx, cs_id, None)
-            .await?
-            .unwrap_or_else(|| panic!("Missing RootHgAugmentedManifestId for {cs_id}"));
-
-        let hg_cs_id = repo.derive_hg_changeset(&ctx, cs_id).await?;
-        let hg_manifest_id = hg_cs_id
-            .load(&ctx, repo.repo_blobstore())
-            .await?
-            .manifestid();
-
-        // HgManifest blobs are loadable via the reconstruction layer.
-        let _root_mf = hg_manifest_id.load(&ctx, repo.repo_blobstore()).await?;
-
-        let entries: Vec<_> = hg_manifest_id
-            .list_all_entries(ctx.clone(), repo.repo_blobstore().clone())
-            .try_collect()
-            .await?;
-        assert!(!entries.is_empty());
 
         compare_manifests(&ctx, &repo, hg_manifest_id, aug.hg_augmented_manifest_id()).await?;
     }
@@ -842,9 +786,7 @@ async fn test_resolve_copy_from_filenodes(fb: FacebookInit) -> Result<()> {
     let manager = repo.repo_derived_data().manager();
 
     // Pre-derive HgChangesets for the old HgManifest-based augmented path.
-    manager
-        .derive_exactly_batch::<MappedHgChangesetId>(&ctx, vec![root], None)
-        .await?;
+    fixtures::store_hg_changesets_as_uploaded(&ctx, &repo, vec![root]).await?;
     manager
         .derive_exactly_batch::<RootAclManifestId>(&ctx, vec![root], None)
         .await?;
@@ -875,15 +817,28 @@ async fn test_resolve_copy_from_filenodes(fb: FacebookInit) -> Result<()> {
         })
         .collect();
 
+    let error = derive_hg_augmented_manifest::resolve_copy_from_filenodes(
+        &ctx,
+        repo.repo_blobstore(),
+        &derived_data_manager::StageId::Manifest(MPath::new("copied_file")?),
+        &file_changes,
+        (Some(root), None),
+        &[],
+        |csid| std::future::ready(Ok((csid == root).then_some(root_aug))),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("missing augmented stage output"));
+
     // Resolve copy-from filenodes
     let result = derive_hg_augmented_manifest::resolve_copy_from_filenodes(
         &ctx,
         repo.repo_blobstore(),
-        &MPath::new("copied_file")?,
+        &derived_data_manager::StageId::Manifest(MPath::new("copied_file")?),
         &file_changes,
         (Some(root), None),
-        &[],
-        &HashMap::from([(root, root_aug)]),
+        &[derived_data_manager::ManifestStageOutput::Entry(None)],
+        |csid| std::future::ready(Ok((csid == root).then_some(root_aug))),
     )
     .await?;
 
@@ -954,9 +909,7 @@ async fn test_resolve_copy_from_filenodes_missing_source(fb: FacebookInit) -> Re
 
     let manager = repo.repo_derived_data().manager();
 
-    manager
-        .derive_exactly_batch::<MappedHgChangesetId>(&ctx, vec![root, child], None)
-        .await?;
+    fixtures::store_hg_changesets_as_uploaded(&ctx, &repo, vec![root, child]).await?;
     manager
         .derive_exactly_batch::<RootAclManifestId>(&ctx, vec![root, child], None)
         .await?;
@@ -988,11 +941,11 @@ async fn test_resolve_copy_from_filenodes_missing_source(fb: FacebookInit) -> Re
     let result = derive_hg_augmented_manifest::resolve_copy_from_filenodes(
         &ctx,
         repo.repo_blobstore(),
-        &MPath::new("new_file")?,
+        &derived_data_manager::StageId::Manifest(MPath::new("new_file")?),
         &file_changes,
         (Some(child), None),
-        &[],
-        &HashMap::from([(child, child_aug)]),
+        &[derived_data_manager::ManifestStageOutput::Entry(None)],
+        |csid| std::future::ready(Ok((csid == child).then_some(child_aug))),
     )
     .await?;
 
@@ -1037,9 +990,7 @@ async fn test_compute_hg_node_id_matches_materialised(fb: FacebookInit) -> Resul
         .await?;
 
     let manager = repo.repo_derived_data().manager();
-    manager
-        .derive_exactly_batch::<MappedHgChangesetId>(&ctx, vec![cs_id], None)
-        .await?;
+    fixtures::store_hg_changesets_as_uploaded(&ctx, &repo, vec![cs_id]).await?;
     manager
         .derive_exactly_batch::<RootAclManifestId>(&ctx, vec![cs_id], None)
         .await?;
@@ -1111,9 +1062,7 @@ async fn derive_augmented_manifests(
     cs_ids: Vec<ChangesetId>,
 ) -> Result<Vec<(HgAugmentedManifestId, HgAugmentedManifestEnvelope)>> {
     let manager = repo.repo_derived_data().manager();
-    manager
-        .derive_exactly_batch::<MappedHgChangesetId>(ctx, cs_ids.clone(), None)
-        .await?;
+    fixtures::store_hg_changesets_as_uploaded(ctx, repo, cs_ids.clone()).await?;
     manager
         .derive_exactly_batch::<RootAclManifestId>(ctx, cs_ids.clone(), None)
         .await?;
@@ -4963,9 +4912,7 @@ async fn test_augmented_manifest_batch_handles_repeated_merge_acl_root(
         .await?;
     let csids = vec![base, left1, right1, merge1, left2, right2, merge2];
     let manager = repo.repo_derived_data().manager();
-    manager
-        .derive_exactly_batch::<MappedHgChangesetId>(&ctx, csids.clone(), None)
-        .await?;
+    fixtures::store_hg_changesets_as_uploaded(&ctx, &repo, csids.clone()).await?;
     manager
         .derive_exactly_batch::<RootAclManifestId>(&ctx, csids.clone(), None)
         .await?;
@@ -5133,7 +5080,7 @@ async fn test_cached_acl_overlay_map_none_does_not_mutate_cache(fb: FacebookInit
 }
 
 #[mononoke::fbinit_test]
-async fn test_augmented_manifest_skip_writes_uses_mapped_hg_roots(fb: FacebookInit) -> Result<()> {
+async fn test_augmented_manifest_uses_mapped_hg_roots(fb: FacebookInit) -> Result<()> {
     let repo: Repo = test_repo_factory::build_empty(fb).await?;
     let ctx = CoreContext::test_mock(fb);
 
@@ -5154,9 +5101,7 @@ async fn test_augmented_manifest_skip_writes_uses_mapped_hg_roots(fb: FacebookIn
 
     let csids = vec![root, child, grandchild];
     let manager = repo.repo_derived_data().manager();
-    manager
-        .derive_exactly_batch::<MappedHgChangesetId>(&ctx, csids.clone(), None)
-        .await?;
+    fixtures::store_hg_changesets_as_uploaded(&ctx, &repo, csids.clone()).await?;
     manager
         .derive_exactly_batch::<RootAclManifestId>(&ctx, csids.clone(), None)
         .await?;
@@ -5176,20 +5121,10 @@ async fn test_augmented_manifest_skip_writes_uses_mapped_hg_roots(fb: FacebookIn
         expected_roots.insert(*cs_id, expected_root);
     }
 
-    // When: deriving v1 augmented manifests with Hg manifest skip-writes enabled.
-    with_just_knobs_async(
-        JustKnobsInMemory::new(HashMap::from([(
-            "scm/mononoke:hgmanifest_skip_writes".to_string(),
-            KnobVal::Bool(true),
-        )])),
-        async {
-            manager
-                .derive_exactly_batch::<RootHgAugmentedManifestId>(&ctx, csids.clone(), None)
-                .await
-        }
-        .boxed(),
-    )
-    .await?;
+    // When: deriving v1 augmented manifests.
+    manager
+        .derive_exactly_batch::<RootHgAugmentedManifestId>(&ctx, csids.clone(), None)
+        .await?;
 
     // Then: the derived augmented manifests use the existing mapped Hg roots
     // and keep the manager dependency mapping intact.
@@ -5868,6 +5803,165 @@ async fn test_upload_path_builds_a_leaf_directory_alone(fb: FacebookInit) -> Res
     assert_upload_path_matches_derivation(&ctx, &repo, parent, child, &["src/deep"]).await
 }
 
+async fn assert_upload_dependency_visibility(
+    ctx: &CoreContext,
+    repo: &Repo,
+    tree: HgManifestId,
+    dependency_key: String,
+) -> Result<()> {
+    let tree_key = HgAugmentedManifestId::new(tree.into_nodehash()).blobstore_key();
+    let expected = repo
+        .repo_blobstore()
+        .get(ctx, &tree_key)
+        .await?
+        .context("the fixture must have a canonical augmented envelope")?
+        .into_raw_bytes();
+
+    for misses in [0, 1, 2, usize::MAX] {
+        let denied = DenyGetKeyedBlobstore {
+            misses,
+            ..DenyGetKeyedBlobstore::missing(
+                DenyGetKeyedBlobstore::missing(repo.repo_blobstore().clone(), [tree_key.clone()]),
+                [dependency_key.clone()],
+            )
+        };
+        let reads = denied.denied_gets.clone();
+        let overlay: Arc<dyn KeyedBlobstore> = Arc::new(MemWritesKeyedBlobstore::new(denied));
+        let result = build_one_uploaded_tree(ctx, repo, &overlay, tree).await;
+        if misses <= 2 {
+            result?;
+            let actual = overlay
+                .get(ctx, &tree_key)
+                .await?
+                .context("the successful build must store its envelope")?
+                .into_raw_bytes();
+            assert_eq!(actual, expected);
+        } else {
+            let err = result.expect_err("permanently missing dependencies must still fail");
+            assert!(err.chain().any(|cause| {
+                cause.downcast_ref::<UploadTreeBuildError>().is_some()
+                    || matches!(
+                        cause.downcast_ref::<LoadableError>(),
+                        Some(LoadableError::Missing(_))
+                    )
+            }));
+            assert!(overlay.get(ctx, &tree_key).await?.is_none());
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), misses.min(2) + 1);
+    }
+
+    let denied = DenyGetKeyedBlobstore::new(
+        DenyGetKeyedBlobstore::missing(repo.repo_blobstore().clone(), [tree_key.clone()]),
+        dependency_key,
+    );
+    let reads = denied.denied_gets.clone();
+    let overlay: Arc<dyn KeyedBlobstore> = Arc::new(MemWritesKeyedBlobstore::new(denied));
+    build_one_uploaded_tree(ctx, repo, &overlay, tree)
+        .await
+        .expect_err("read errors must propagate without retry");
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_upload_path_external_child_visibility(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let commit = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("src/deep/file", "content")
+        .commit()
+        .await?;
+    let manifest = hg_manifest_id_of(&ctx, &repo, commit).await?;
+    derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents(
+        &ctx,
+        repo.repo_blobstore(),
+        manifest,
+        vec![],
+        &Default::default(),
+        repo.restricted_paths().config_based(),
+        derive_acl_overlay(&ctx, &repo, commit).await?,
+    )
+    .await?;
+    let src = tree_id_at_path(&ctx, &repo, manifest, "src").await?;
+    let deep = tree_id_at_path(&ctx, &repo, manifest, "src/deep").await?;
+    assert_upload_dependency_visibility(
+        &ctx,
+        &repo,
+        src,
+        HgAugmentedManifestId::new(deep.into_nodehash()).blobstore_key(),
+    )
+    .await
+}
+
+#[mononoke::fbinit_test]
+async fn test_upload_path_parent_shard_visibility(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let files = (0..WIDE_DIRECTORY_FILES)
+        .map(|i| Ok((NonRootMPath::new(format!("f{i:05}"))?, format!("v{i}"))))
+        .collect::<Result<Vec<_>>>()?;
+    let parent = CreateCommitContext::new_root(&ctx, &repo)
+        .add_files(files)
+        .commit()
+        .await?;
+    let child = CreateCommitContext::new(&ctx, &repo, vec![parent])
+        .add_file("f00000", "changed")
+        .commit()
+        .await?;
+    let parent_manifest = hg_manifest_id_of(&ctx, &repo, parent).await?;
+    let child_manifest = hg_manifest_id_of(&ctx, &repo, child).await?;
+    let parent_root = derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents(
+        &ctx,
+        repo.repo_blobstore(),
+        parent_manifest,
+        vec![],
+        &Default::default(),
+        repo.restricted_paths().config_based(),
+        derive_acl_overlay(&ctx, &repo, parent).await?,
+    )
+    .await?;
+    derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents(
+        &ctx,
+        repo.repo_blobstore(),
+        child_manifest,
+        vec![parent_root],
+        &Default::default(),
+        repo.restricted_paths().config_based(),
+        derive_acl_overlay(&ctx, &repo, child).await?,
+    )
+    .await?;
+
+    let parent_envelope = HgAugmentedManifestEnvelope::load(
+        &ctx,
+        repo.repo_blobstore(),
+        HgAugmentedManifestId::new(parent_manifest.into_nodehash()),
+    )
+    .await?
+    .context("the parent envelope must exist")?;
+    let probe = DenyGetKeyedBlobstore {
+        result: DeniedGetResult::Missing,
+        ..DenyGetKeyedBlobstore::new_denying_prefix(
+            repo.repo_blobstore().clone(),
+            "hgaugmentedmanifest.map2node.",
+        )
+    };
+    let err = parent_envelope
+        .augmented_manifest
+        .subentries
+        .into_entries(&ctx, &probe)
+        .try_collect::<Vec<_>>()
+        .await
+        .expect_err("the wide parent must read a stored shard");
+    let shard_key = err
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<LoadableError>() {
+            Some(LoadableError::Missing(key)) => Some(key.clone()),
+            _ => None,
+        })
+        .context("the missing shard must retain its typed error")?;
+    assert_upload_dependency_visibility(&ctx, &repo, child_manifest, shard_key).await
+}
+
 /// What it tests: a tree whose child directory has not been derived yet fails,
 /// and leaves nothing behind.
 ///
@@ -5901,6 +5995,7 @@ async fn test_upload_path_fails_when_a_child_is_not_derived(fb: FacebookInit) ->
                 .await?;
 
             let parent_manifest = hg_manifest_id_of(&ctx, &repo, parent).await?;
+            fixtures::store_hg_changesets_as_uploaded(&ctx, &repo, vec![child]).await?;
             let child_manifest = hg_manifest_id_of(&ctx, &repo, child).await?;
             derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents(
                 &ctx,
@@ -6570,4 +6665,115 @@ async fn test_upload_fails_when_transitive_child_is_missing(fb: FacebookInit) ->
         child,
     )
     .await
+}
+
+#[derive(Debug)]
+struct ConcurrentAclReads {
+    inner: Memblob,
+    gated: AtomicBool,
+    readers: Barrier,
+    reads: AtomicUsize,
+}
+
+impl fmt::Display for ConcurrentAclReads {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ConcurrentAclReads")
+    }
+}
+
+#[async_trait]
+impl Blobstore for ConcurrentAclReads {
+    async fn get<'a>(
+        &'a self,
+        ctx: &'a CoreContext,
+        key: &'a str,
+    ) -> Result<Option<BlobstoreGetData>> {
+        if self.gated.load(Ordering::Relaxed) && key.contains(".derived_root_aclmf.") {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            timeout(Duration::from_secs(5), self.readers.wait())
+                .await
+                .context("both ACL roots must be read before either read finishes")?;
+        }
+        self.inner.get(ctx, key).await
+    }
+
+    async fn put_explicit<'a>(
+        &'a self,
+        ctx: &'a CoreContext,
+        key: String,
+        value: BlobstoreBytes,
+        behaviour: PutBehaviour,
+    ) -> Result<OverwriteStatus> {
+        self.inner.put_explicit(ctx, key, value, behaviour).await
+    }
+
+    async fn put_with_status<'a>(
+        &'a self,
+        ctx: &'a CoreContext,
+        key: String,
+        value: BlobstoreBytes,
+    ) -> Result<OverwriteStatus> {
+        self.inner.put_with_status(ctx, key, value).await
+    }
+
+    async fn unlink<'a>(&'a self, ctx: &'a CoreContext, key: &'a str) -> Result<()> {
+        Blobstore::unlink(&self.inner, ctx, key).await
+    }
+}
+
+#[mononoke::fbinit_test]
+async fn augmented_batch_prefetches_acl_roots_concurrently(fb: FacebookInit) -> Result<()> {
+    for canonical in [false, true] {
+        async {
+            let ctx = CoreContext::test_mock(fb);
+            let store = Arc::new(ConcurrentAclReads {
+                inner: Memblob::default(),
+                gated: AtomicBool::new(false),
+                readers: Barrier::new(2),
+                reads: AtomicUsize::new(0),
+            });
+            let repo: Repo = TestRepoFactory::new(fb)?
+                .with_blobstore(store.clone())
+                .build()
+                .await?;
+            let first = CreateCommitContext::new_root(&ctx, &repo)
+                .add_file("file", "first")
+                .commit()
+                .await?;
+            let second = CreateCommitContext::new(&ctx, &repo, vec![first])
+                .add_file("file", "second")
+                .commit()
+                .await?;
+            let csids = vec![first, second];
+            let payload = DerivationStagePayload::Manifest(ManifestStagePayload {
+                path: MPath::ROOT,
+                deps: vec![].into(),
+            });
+            let manager = repo
+                .repo_derived_data()
+                .manager()
+                .with_pipeline_mode(if canonical {
+                    derived_data_manager::PipelineMode::Production
+                } else {
+                    derived_data_manager::PipelineMode::Shadow
+                });
+            let acl = manager
+                .derive_stage_batch::<RootAclManifestId>(&ctx, csids.clone(), &payload)
+                .await?;
+            let manager = manager.with_stage_inputs(derived_data_manager::StageInputs::new(
+                &acl.outputs.into_iter().collect::<Vec<_>>(),
+            )?);
+            store.gated.store(true, Ordering::Relaxed);
+            manager
+                .derive_stage_batch::<RootHgAugmentedManifestId>(&ctx, csids, &payload)
+                .await?;
+            assert_eq!(
+                store.reads.load(Ordering::Relaxed),
+                if canonical { 2 } else { 0 }
+            );
+            anyhow::Ok(())
+        }
+        .await?;
+    }
+    Ok(())
 }

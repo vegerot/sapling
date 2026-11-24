@@ -6,8 +6,10 @@
  */
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -18,6 +20,7 @@ use mononoke_types::NonRootMPath;
 pub use restricted_paths::DenyingRestriction;
 use restricted_paths::PathRestrictionInfo;
 use restricted_paths::PermissionRequestGroup;
+use source_control::PartialOptions;
 
 /// Access check result for a restricted path.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -236,33 +239,142 @@ pub enum RestrictedPathsPolicy {
 }
 
 /// Shared omission state for `SkipAndCollect`: the total omitted count plus
-/// per-restriction counts keyed by the denying restriction.
+/// per-restriction counts keyed by the denying restriction. Paths are
+/// retained per group only when a handler opts in, so unbounded streams
+/// never accumulate them.
 #[derive(Debug, Default)]
 pub struct OmissionCollector {
     omitted: AtomicUsize,
-    groups: Mutex<BTreeMap<DenyingRestriction, usize>>,
+    omitted_entries: AtomicUsize,
+    groups: Mutex<BTreeMap<DenyingRestriction, OmissionGroup>>,
+    max_omitted: Mutex<Option<MPath>>,
+    retain_paths: AtomicBool,
+}
+
+/// One group's denial count plus its retained paths, if any:
+/// fully-omitted entries and visible-but-downgraded entries separately.
+#[derive(Debug, Default)]
+struct OmissionGroup {
+    count: usize,
+    omitted_paths: BTreeSet<MPath>,
+    downgraded_paths: BTreeSet<MPath>,
 }
 
 impl OmissionCollector {
-    /// Total omitted paths recorded so far.
+    /// Total denied sides recorded so far: fully-omitted and
+    /// downgraded alike. Unlike the entry count, one entry counts once
+    /// per side that denied it.
     pub fn omitted_count(&self) -> usize {
         self.omitted.load(Ordering::Relaxed)
     }
 
-    /// Omitted-path counts grouped by denying restriction.
-    pub fn omitted_groups(&self) -> BTreeMap<DenyingRestriction, usize> {
-        self.groups.lock().expect("lock poisoned").clone()
+    /// Total fully-omitted entries noted so far. Unlike the side-based
+    /// count, one entry counts once however many sides denied it.
+    pub fn omitted_entry_count(&self) -> usize {
+        self.omitted_entries.load(Ordering::Relaxed)
     }
 
-    /// Record one omitted path, attributed to its denying restriction.
-    pub fn record(&self, restriction: &DenyingRestriction) {
-        self.omitted.fetch_add(1, Ordering::Relaxed);
-        *self
-            .groups
+    /// Whether omitted paths are being retained (and counted toward page
+    /// budgets) for this request.
+    pub fn omitted_path_retention(&self) -> bool {
+        self.retain_paths.load(Ordering::Relaxed)
+    }
+
+    /// Retain omitted paths per group from now on. The constructor turns
+    /// this on for requests whose block asks for omitted paths (bounded
+    /// unary pages); streams leave it off and emit paths inline instead.
+    fn set_path_retention(&self, retain: bool) {
+        self.retain_paths.store(retain, Ordering::Relaxed);
+    }
+
+    /// Omitted-path counts grouped by denying restriction.
+    pub fn omitted_groups(&self) -> BTreeMap<DenyingRestriction, usize> {
+        self.groups
             .lock()
             .expect("lock poisoned")
-            .entry(restriction.clone())
-            .or_default() += 1;
+            .iter()
+            .map(|(restriction, group)| (restriction.clone(), group.count))
+            .collect()
+    }
+
+    /// Retained paths of fully-omitted entries, grouped by denying
+    /// restriction, in path order. Empty unless retention was enabled;
+    /// manifest denials carry no path.
+    pub fn omitted_paths(&self) -> BTreeMap<DenyingRestriction, Vec<MPath>> {
+        self.groups
+            .lock()
+            .expect("lock poisoned")
+            .iter()
+            .map(|(restriction, group)| {
+                (
+                    restriction.clone(),
+                    group.omitted_paths.iter().cloned().collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Retained entry paths of visible-but-downgraded entries, grouped by
+    /// denying restriction, in path order. Empty unless retention was
+    /// enabled.
+    pub fn downgraded_paths(&self) -> BTreeMap<DenyingRestriction, Vec<MPath>> {
+        self.groups
+            .lock()
+            .expect("lock poisoned")
+            .iter()
+            .map(|(restriction, group)| {
+                (
+                    restriction.clone(),
+                    group.downgraded_paths.iter().cloned().collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Record one denied side of a fully-omitted entry, attributed to its
+    /// denying restriction. `path` is `None` for manifest denials, which
+    /// name no path. Callers pass the entry path; hidden copy/subtree
+    /// sources stay server-side.
+    pub fn record_omission(&self, restriction: &DenyingRestriction, path: Option<&MPath>) {
+        self.omitted.fetch_add(1, Ordering::Relaxed);
+        let mut groups = self.groups.lock().expect("lock poisoned");
+        let group = groups.entry(restriction.clone()).or_default();
+        group.count += 1;
+        if self.retain_paths.load(Ordering::Relaxed)
+            && let Some(path) = path
+        {
+            group.omitted_paths.insert(path.clone());
+        }
+    }
+
+    /// Record the denied side of a visible-but-downgraded entry: the
+    /// count plus the entry path, never the hidden side's own path.
+    pub fn record_downgrade(&self, restriction: &DenyingRestriction, path: &MPath) {
+        self.omitted.fetch_add(1, Ordering::Relaxed);
+        let mut groups = self.groups.lock().expect("lock poisoned");
+        let group = groups.entry(restriction.clone()).or_default();
+        group.count += 1;
+        if self.retain_paths.load(Ordering::Relaxed) {
+            group.downgraded_paths.insert(path.clone());
+        }
+    }
+
+    /// Note one fully-omitted entry. Call downstream of the page take so
+    /// lookahead past the budget never counts. `path` feeds the maximum
+    /// omitted path; `None` (unparseable) still counts the entry.
+    pub fn note_omitted_entry(&self, path: Option<&MPath>) {
+        self.omitted_entries.fetch_add(1, Ordering::Relaxed);
+        if let Some(path) = path {
+            let mut max = self.max_omitted.lock().expect("lock poisoned");
+            if max.as_ref().is_none_or(|current| *current < *path) {
+                *max = Some(path.clone());
+            }
+        }
+    }
+
+    /// Maximum omitted path noted so far, if any.
+    pub fn max_omitted_mpath(&self) -> Option<MPath> {
+        self.max_omitted.lock().expect("lock poisoned").clone()
     }
 }
 
@@ -279,31 +391,111 @@ pub const SCS_ENABLE_PARTIAL_RESPONSES_JK: &str = "scm/mononoke:scs_enable_parti
 
 impl RestrictedPathsPolicy {
     /// Build the policy for the current SCS (or diff-service) request.
-    /// Skipping is allowed when the killswitch is on for the repo or the
-    /// client opted in via the request header, unless the client opted out:
-    /// an opted-out client gets `Strict` even when the killswitch is on.
-    /// Evaluate ONCE per request
-    /// and share the result across every call, so the knob decision cannot
-    /// disagree with itself. A missing knob is an error; the knob exists
-    /// with default off, and integration tests enable it via
-    /// `merge_just_knobs`.
-    pub fn for_scs_request(ctx: &CoreContext, repo_name: &str) -> Self {
+    /// Skipping is allowed when the killswitch is on for the repo, the
+    /// client opted in via the request header, or the request set
+    /// `partial_options`, unless the client opted out: an opted-out
+    /// client gets `Strict` even when the killswitch is on. A present
+    /// block also turns on path retention when it asks for omitted
+    /// paths; `Strict` ignores the block entirely. Evaluate ONCE per
+    /// request and share the result across every call, so the knob
+    /// decision cannot disagree with itself. A missing knob is an error;
+    /// the knob exists with default off, and integration tests enable it
+    /// via `merge_just_knobs`.
+    pub fn for_scs_request(
+        ctx: &CoreContext,
+        repo_name: &str,
+        partial_options: Option<&PartialOptions>,
+    ) -> Self {
         if ctx.metadata().partial_responses_opt_out() {
             return Self::Strict;
         }
         let client_opt_in = ctx.metadata().partial_responses_opt_in();
         let knob_on = justknobs::eval(SCS_ENABLE_PARTIAL_RESPONSES_JK, None, Some(repo_name));
-        if client_opt_in || knob_on {
-            Self::SkipAndCollect(Arc::new(OmissionCollector::default()))
+        if client_opt_in || knob_on || partial_options.is_some() {
+            let collector = OmissionCollector::default();
+            if Self::paths_requested(partial_options) {
+                collector.set_path_retention(true);
+            }
+            Self::SkipAndCollect(Arc::new(collector))
         } else {
             Self::Strict
         }
     }
 
-    /// Record one omitted path, attributed to its denying restriction.
-    pub fn record_denial(&self, restriction: &DenyingRestriction) {
+    /// Whether a partial-options block asks for withheld paths in the
+    /// response. An absent block or an unset flag means no paths. The
+    /// constructor and the render call sites share this predicate, so
+    /// retention and rendering cannot disagree.
+    pub fn paths_requested(partial_options: Option<&PartialOptions>) -> bool {
+        partial_options.is_some_and(|options| options.include_omitted_paths.unwrap_or(false))
+    }
+
+    /// Record one denied side of a fully-omitted entry, attributed to
+    /// its denying restriction. `path` is `None` for manifest denials,
+    /// which name no path. Callers pass the entry path; hidden
+    /// copy/subtree sources stay server-side. No-op under `Strict`.
+    pub fn record_omission(&self, restriction: &DenyingRestriction, path: Option<&MPath>) {
         if let Self::SkipAndCollect(collector) = self {
-            collector.record(restriction);
+            collector.record_omission(restriction, path);
+        }
+    }
+
+    /// Record the denied side of a visible-but-downgraded entry: the
+    /// count plus the entry path, never the hidden side's own path.
+    /// No-op under `Strict`.
+    pub fn record_downgrade(&self, restriction: &DenyingRestriction, path: &MPath) {
+        if let Self::SkipAndCollect(collector) = self {
+            collector.record_downgrade(restriction, path);
+        }
+    }
+
+    /// Whether omitted paths are being retained for this request.
+    pub fn omitted_path_retention(&self) -> bool {
+        match self {
+            Self::Strict => false,
+            Self::SkipAndCollect(collector) => collector.omitted_path_retention(),
+        }
+    }
+
+    /// Note one fully-omitted entry. No-op under `Strict`.
+    pub fn note_omitted_entry(&self, path: Option<&MPath>) {
+        if let Self::SkipAndCollect(collector) = self {
+            collector.note_omitted_entry(path);
+        }
+    }
+
+    /// Fully-omitted entries noted so far, or `None` when partial
+    /// responses are not allowed.
+    pub fn omitted_entry_count(&self) -> Option<usize> {
+        match self {
+            Self::Strict => None,
+            Self::SkipAndCollect(collector) => Some(collector.omitted_entry_count()),
+        }
+    }
+
+    /// Last scanned path of the counted windows: the maximum of
+    /// `visible_last` and every noted omitted path, compared as paths.
+    /// `None` when both are absent. An unparseable visible path is
+    /// ignored, which understates rather than overstates the resume
+    /// point.
+    pub fn last_scanned_path(&self, visible_last: Option<&str>) -> Option<String> {
+        let visible = visible_last.and_then(|s| MPath::new(s).ok());
+        let omitted = match self {
+            Self::Strict => None,
+            Self::SkipAndCollect(collector) => collector.max_omitted_mpath(),
+        };
+        visible
+            .into_iter()
+            .chain(omitted)
+            .max()
+            .map(|path| path.to_string())
+    }
+
+    /// Maximum omitted path noted so far, if any.
+    pub fn max_omitted_mpath(&self) -> Option<MPath> {
+        match self {
+            Self::Strict => None,
+            Self::SkipAndCollect(collector) => collector.max_omitted_mpath(),
         }
     }
 
@@ -322,6 +514,24 @@ impl RestrictedPathsPolicy {
         match self {
             Self::Strict => None,
             Self::SkipAndCollect(collector) => Some(collector.omitted_groups()),
+        }
+    }
+
+    /// Retained omitted paths grouped by denying restriction, or `None`
+    /// when partial responses are not allowed.
+    pub fn omitted_paths(&self) -> Option<BTreeMap<DenyingRestriction, Vec<MPath>>> {
+        match self {
+            Self::Strict => None,
+            Self::SkipAndCollect(collector) => Some(collector.omitted_paths()),
+        }
+    }
+
+    /// Retained downgraded entry paths grouped by denying restriction,
+    /// or `None` when partial responses are not allowed.
+    pub fn downgraded_paths(&self) -> Option<BTreeMap<DenyingRestriction, Vec<MPath>>> {
+        match self {
+            Self::Strict => None,
+            Self::SkipAndCollect(collector) => Some(collector.downgraded_paths()),
         }
     }
 
@@ -426,7 +636,7 @@ mod tests {
             knobs(false),
             async move {
                 assert!(matches!(
-                    RestrictedPathsPolicy::for_scs_request(&ctx, "repo"),
+                    RestrictedPathsPolicy::for_scs_request(&ctx, "repo", None),
                     RestrictedPathsPolicy::Strict
                 ));
                 Ok(())
@@ -442,7 +652,7 @@ mod tests {
         with_just_knobs_async(
             knobs(false),
             async move {
-                let policy = RestrictedPathsPolicy::for_scs_request(&ctx, "repo");
+                let policy = RestrictedPathsPolicy::for_scs_request(&ctx, "repo", None);
                 assert_eq!(policy.omitted_count(), Some(0));
                 Ok(())
             }
@@ -457,7 +667,7 @@ mod tests {
         with_just_knobs_async(
             knobs(true),
             async move {
-                let policy = RestrictedPathsPolicy::for_scs_request(&ctx, "repo");
+                let policy = RestrictedPathsPolicy::for_scs_request(&ctx, "repo", None);
                 assert_eq!(policy.omitted_count(), Some(0));
                 Ok(())
             }
@@ -473,7 +683,7 @@ mod tests {
             knobs(true),
             async move {
                 assert!(matches!(
-                    RestrictedPathsPolicy::for_scs_request(&ctx, "repo"),
+                    RestrictedPathsPolicy::for_scs_request(&ctx, "repo", None),
                     RestrictedPathsPolicy::Strict
                 ));
                 Ok(())
@@ -490,7 +700,87 @@ mod tests {
             knobs(false),
             async move {
                 assert!(matches!(
-                    RestrictedPathsPolicy::for_scs_request(&ctx, "repo"),
+                    RestrictedPathsPolicy::for_scs_request(&ctx, "repo", None),
+                    RestrictedPathsPolicy::Strict
+                ));
+                Ok(())
+            }
+            .boxed(),
+        )
+        .await
+    }
+
+    #[mononoke::fbinit_test]
+    async fn block_opts_in_without_knob(fb: FacebookInit) -> Result<(), anyhow::Error> {
+        let ctx = ctx_with_opt_flags(fb, false, false);
+        let block = PartialOptions {
+            include_omitted_paths: Some(true),
+            ..Default::default()
+        };
+        with_just_knobs_async(
+            knobs(false),
+            async move {
+                let policy = RestrictedPathsPolicy::for_scs_request(&ctx, "repo", Some(&block));
+                assert_eq!(policy.omitted_count(), Some(0));
+                // The block's flag turns on retention at construction.
+                let restriction = denying_restriction("tent", "REPO_REGION:tent_acl")?;
+                policy.record_omission(&restriction, Some(&MPath::new("tent/secret")?));
+                assert_eq!(
+                    policy.omitted_paths(),
+                    Some(BTreeMap::from([(
+                        restriction,
+                        vec![MPath::new("tent/secret")?]
+                    )])),
+                );
+                Ok(())
+            }
+            .boxed(),
+        )
+        .await
+    }
+
+    #[mononoke::fbinit_test]
+    async fn block_without_flag_skips_without_retention(
+        fb: FacebookInit,
+    ) -> Result<(), anyhow::Error> {
+        let ctx = ctx_with_opt_flags(fb, false, false);
+        let block = PartialOptions {
+            include_omitted_paths: None,
+            ..Default::default()
+        };
+        with_just_knobs_async(
+            knobs(false),
+            async move {
+                let policy = RestrictedPathsPolicy::for_scs_request(&ctx, "repo", Some(&block));
+                assert_eq!(policy.omitted_count(), Some(0));
+                // Presence alone skips; without the flag, paths are dropped.
+                let restriction = denying_restriction("tent", "REPO_REGION:tent_acl")?;
+                policy.record_omission(&restriction, Some(&MPath::new("tent/secret")?));
+                assert_eq!(policy.omitted_count(), Some(1));
+                assert!(
+                    policy
+                        .omitted_paths()
+                        .is_some_and(|paths| paths.values().all(|group| group.is_empty()))
+                );
+                Ok(())
+            }
+            .boxed(),
+        )
+        .await
+    }
+
+    #[mononoke::fbinit_test]
+    async fn opt_out_beats_block(fb: FacebookInit) -> Result<(), anyhow::Error> {
+        let ctx = ctx_with_opt_flags(fb, false, true);
+        let block = PartialOptions {
+            include_omitted_paths: Some(true),
+            ..Default::default()
+        };
+        with_just_knobs_async(
+            knobs(false),
+            async move {
+                assert!(matches!(
+                    RestrictedPathsPolicy::for_scs_request(&ctx, "repo", Some(&block)),
                     RestrictedPathsPolicy::Strict
                 ));
                 Ok(())
@@ -505,9 +795,9 @@ mod tests {
         let collector = OmissionCollector::default();
         let tent_a = denying_restriction("tent_a", "REPO_REGION:a_acl")?;
         let tent_b = denying_restriction("tent_b", "REPO_REGION:b_acl")?;
-        collector.record(&tent_a);
-        collector.record(&tent_b);
-        collector.record(&tent_a);
+        collector.record_omission(&tent_a, Some(&MPath::new("tent_a/secret")?));
+        collector.record_omission(&tent_b, None);
+        collector.record_omission(&tent_a, Some(&MPath::new("tent_a/other")?));
 
         assert_eq!(collector.omitted_count(), 3);
         assert_eq!(
@@ -518,22 +808,149 @@ mod tests {
     }
 
     #[mononoke::test]
+    fn collect_retains_paths_only_when_enabled() -> Result<(), anyhow::Error> {
+        // Retention off: paths are dropped, counts still recorded.
+        let collector = OmissionCollector::default();
+        let tent = denying_restriction("tent", "REPO_REGION:tent_acl")?;
+        collector.record_omission(&tent, Some(&MPath::new("tent/b")?));
+        collector.record_omission(&tent, Some(&MPath::new("tent/a")?));
+        collector.record_omission(&tent, Some(&MPath::new("tent/a")?));
+        assert_eq!(collector.omitted_count(), 3);
+        assert!(
+            collector
+                .omitted_paths()
+                .values()
+                .all(|paths| paths.is_empty())
+        );
+
+        // Retention on: paths are kept sorted and deduplicated per group.
+        // A path recorded twice still counts twice.
+        collector.set_path_retention(true);
+        collector.record_omission(&tent, Some(&MPath::new("tent/b")?));
+        collector.record_omission(&tent, Some(&MPath::new("tent/a")?));
+        collector.record_omission(&tent, Some(&MPath::new("tent/a")?));
+        assert_eq!(collector.omitted_count(), 6);
+        assert_eq!(
+            collector.omitted_paths(),
+            BTreeMap::from([(tent, vec![MPath::new("tent/a")?, MPath::new("tent/b")?])]),
+        );
+        Ok(())
+    }
+
+    #[mononoke::test]
     fn policy_collects_groups_and_ignores_strict() -> Result<(), anyhow::Error> {
         let policy = RestrictedPathsPolicy::SkipAndCollect(Arc::new(OmissionCollector::default()));
         let restriction = denying_restriction("tent", "REPO_REGION:tent_acl")?;
-        policy.record_denial(&restriction);
-        policy.record_denial(&restriction);
+        policy.record_omission(&restriction, Some(&MPath::new("tent/secret")?));
+        policy.record_omission(&restriction, None);
+        policy.record_downgrade(&restriction, &MPath::new("tent/changed")?);
 
-        assert_eq!(policy.omitted_count(), Some(2));
+        assert_eq!(policy.omitted_count(), Some(3));
         assert_eq!(
             policy.omitted_groups(),
-            Some(BTreeMap::from([(restriction, 2)])),
+            Some(BTreeMap::from([(restriction, 3)])),
         );
 
         let strict = RestrictedPathsPolicy::Strict;
-        strict.record_denial(&denying_restriction("tent", "REPO_REGION:tent_acl")?);
+        strict.record_omission(&denying_restriction("tent", "REPO_REGION:tent_acl")?, None);
+        strict.record_downgrade(
+            &denying_restriction("tent", "REPO_REGION:tent_acl")?,
+            &MPath::new("tent/changed")?,
+        );
         assert_eq!(strict.omitted_count(), None);
         assert_eq!(strict.omitted_groups(), None);
+        assert_eq!(strict.omitted_paths(), None);
+        assert_eq!(strict.downgraded_paths(), None);
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn noted_entries_track_count_and_max_omitted() -> Result<(), anyhow::Error> {
+        let collector = OmissionCollector::default();
+        assert_eq!(collector.omitted_entry_count(), 0);
+        assert_eq!(collector.max_omitted_mpath(), None);
+
+        let first = MPath::new("tent/a")?;
+        let second = MPath::new("tent/b")?;
+        collector.note_omitted_entry(Some(&first));
+        // A pathless note still counts the entry.
+        collector.note_omitted_entry(None);
+        collector.note_omitted_entry(Some(&second));
+        // Noting out of order keeps the maximum.
+        collector.note_omitted_entry(Some(&first));
+
+        assert_eq!(collector.omitted_entry_count(), 4);
+        assert_eq!(collector.max_omitted_mpath(), Some(second));
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn last_scanned_path_maxes_visible_and_omitted() -> Result<(), anyhow::Error> {
+        let policy = RestrictedPathsPolicy::SkipAndCollect(Arc::new(OmissionCollector::default()));
+        // Neither side noted: no continuation.
+        assert_eq!(policy.last_scanned_path(None), None);
+
+        policy.note_omitted_entry(Some(&MPath::new("tent/b")?));
+        // Omitted above visible wins ...
+        assert_eq!(
+            policy.last_scanned_path(Some("tent/a")),
+            Some("tent/b".to_string())
+        );
+        // ... and visible above omitted wins.
+        assert_eq!(
+            policy.last_scanned_path(Some("tent/c")),
+            Some("tent/c".to_string())
+        );
+        // An unparseable visible path is ignored, understating the resume.
+        assert_eq!(
+            policy.last_scanned_path(Some("tent/\u{0}")),
+            Some("tent/b".to_string())
+        );
+
+        // Comparison is in path space, not string space: component-wise
+        // "a-b" sorts after "a/b", while strings order them the other way.
+        let trap = RestrictedPathsPolicy::SkipAndCollect(Arc::new(OmissionCollector::default()));
+        trap.note_omitted_entry(Some(&MPath::new("a/b")?));
+        assert_eq!(trap.last_scanned_path(Some("a-b")), Some("a-b".to_string()));
+        Ok(())
+    }
+
+    #[mononoke::test]
+    #[mononoke::test]
+    fn downgrades_count_and_list_entry_paths_separately() -> Result<(), anyhow::Error> {
+        let collector = OmissionCollector::default();
+        collector.set_path_retention(true);
+        let tent = denying_restriction("tent", "REPO_REGION:tent_acl")?;
+
+        // A downgraded entry counts its denied side and lists the entry
+        // path as downgraded, not omitted.
+        collector.record_downgrade(&tent, &MPath::new("tent/changed")?);
+        collector.record_downgrade(&tent, &MPath::new("tent/changed")?);
+        collector.record_omission(&tent, Some(&MPath::new("tent/omitted")?));
+
+        assert_eq!(collector.omitted_count(), 3);
+        assert_eq!(
+            collector.omitted_paths(),
+            BTreeMap::from([(tent.clone(), vec![MPath::new("tent/omitted")?])]),
+        );
+        assert_eq!(
+            collector.downgraded_paths(),
+            BTreeMap::from([(tent, vec![MPath::new("tent/changed")?])]),
+        );
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn strict_ignores_entry_noting() -> Result<(), anyhow::Error> {
+        let strict = RestrictedPathsPolicy::Strict;
+        strict.note_omitted_entry(Some(&MPath::new("tent/a")?));
+        assert_eq!(strict.omitted_entry_count(), None);
+        assert_eq!(strict.max_omitted_mpath(), None);
+        assert_eq!(
+            strict.last_scanned_path(Some("tent/a")),
+            Some("tent/a".to_string())
+        );
+        assert_eq!(strict.last_scanned_path(None), None);
         Ok(())
     }
 

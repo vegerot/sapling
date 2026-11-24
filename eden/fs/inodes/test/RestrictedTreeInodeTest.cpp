@@ -95,6 +95,11 @@ void setOmittedMode(EdenConfig& config) {
       RestrictedContentMode::Omitted, ConfigSourceType::CommandLine);
 }
 
+void setRestrictedMode(EdenConfig& config) {
+  config.restrictedContentMode.setValue(
+      RestrictedContentMode::Restricted, ConfigSourceType::CommandLine);
+}
+
 // Mount the given tree with acl:restricted-content-mode = omitted.
 std::unique_ptr<TestMount> makeOmittedModeTestMount(FakeTreeBuilder& builder) {
   return std::make_unique<TestMount>(
@@ -607,7 +612,13 @@ CO_TEST(
   builder.setFile("parent/normal/file.txt", "ok");
   builder.setFile("parent/restricted_child/secret.txt", "secret");
   builder.setDirIsRestricted("parent/restricted_child");
-  TestMount testMount{builder};
+  TestMount testMount{
+      builder,
+      /*startReady=*/true,
+      /*enableActivityBuffer=*/true,
+      kPathMapDefaultCaseSensitive,
+      /*errorLogger=*/nullptr,
+      setRestrictedMode};
 
   auto edenMount = testMount.getEdenMount();
   auto vi = testMount.getVirtualInode("parent"_relpath);
@@ -772,7 +783,13 @@ CO_TEST(
   builder.setFile("parent/leaf.txt", "leaf");
   builder.setFile("parent/restricted_child/secret.txt", "secret");
   builder.setDirIsRestricted("parent/restricted_child");
-  TestMount testMount{builder};
+  TestMount testMount{
+      builder,
+      /*startReady=*/true,
+      /*enableActivityBuffer=*/true,
+      kPathMapDefaultCaseSensitive,
+      /*errorLogger=*/nullptr,
+      setRestrictedMode};
 
   auto edenMount = testMount.getEdenMount();
   auto vi = testMount.getVirtualInode("parent"_relpath);
@@ -1220,11 +1237,7 @@ CO_TEST(
   testMount->getBackingStore()->putCommit(RootId{"2"}, builder2)->setReady();
 
   testMount->drainServerExecutor();
-  auto checkoutFuture =
-      testMount->getEdenMount()
-          ->checkout(testMount->getRootInode(), RootId{"2"}, context, __func__)
-          .semi()
-          .via(testMount->getServerExecutor().get());
+  auto checkoutFuture = testMount->checkout(RootId{"2"}, context, __func__);
   testMount->drainServerExecutor();
   CO_ASSERT_TRUE(checkoutFuture.isReady());
   EXPECT_EQ(0, std::move(checkoutFuture).get().conflicts.size());
@@ -1531,14 +1544,6 @@ CO_TEST(RestrictedTreeInode, asyncDigestOfRestrictedDirectory) {
       attrs, "restricted"_relpath, objectStore, checkoutTime, context);
   EXPECT_FALSE(coroResult.digestSize.has_value());
   EXPECT_FALSE(coroResult.digestHash.has_value());
-
-  auto futureResult =
-      restricted
-          .getEntryAttributes(
-              attrs, "restricted"_relpath, objectStore, checkoutTime, context)
-          .get();
-  EXPECT_FALSE(futureResult.digestSize.has_value());
-  EXPECT_FALSE(futureResult.digestHash.has_value());
 }
 
 CO_TEST(RestrictedTreeInode, asyncDigestOfRestrictedDirectoryWithoutAuxData) {

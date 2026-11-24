@@ -38,6 +38,7 @@ use mononoke_api::Repo;
 use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_app::MononokeReposManager;
+use mononoke_app::MononokeService;
 use mononoke_app::args::HooksAppExtension;
 use mononoke_app::args::McrouterAppExtension;
 use mononoke_app::args::ReadonlyArgs;
@@ -191,7 +192,6 @@ impl MononokeServerProcessExecutor {
         let config = self.repos_mgr.repo_config(repo_name).with_context(|| {
             format!("Failure in remove repo {repo_name}. The config for repo doesn't exist")
         })?;
-        self.repos_mgr.remove_stats_handle_for_repo(repo_name);
         // Check if the current repo is a deep-sharded or shallow-sharded repo. If the
         // repo is deep-sharded, then remove it since SM wants some other host to serve it.
         // If repo is shallow-sharded, then keep it since regardless of SM sharding, shallow
@@ -231,6 +231,7 @@ impl RepoShardedProcessExecutor for MononokeServerProcessExecutor {
 #[fbinit::main]
 fn main(fb: FacebookInit) -> Result<()> {
     let app = MononokeAppBuilder::new(fb)
+        .with_default_service(MononokeService::SLAPI_SERVER)
         .with_default_scuba_dataset("mononoke_test_perf")
         .with_entry_point(ClientEntryPoint::SaplingRemoteApi)
         .with_bookmarks_cache(BookmarkCacheOptions {
@@ -315,9 +316,8 @@ fn main(fb: FacebookInit) -> Result<()> {
     // service name as None while opening repos.
     let service_name = args
         .sharded_executor_args
-        .sharded_service_name
-        .as_ref()
-        .map(|_| ShardedService::SaplingRemoteApi);
+        .is_sharded()
+        .then_some(ShardedService::SaplingRemoteApi);
     app.start_monitoring(&runtime, "mononoke_server", service.clone())?;
     app.start_stats_aggregation()?;
 

@@ -31,22 +31,26 @@ use config_reconcile::ManifestEntry;
 use config_reconcile::RepoGeneration;
 use config_reconcile::RepoManager;
 use config_reconcile::RepoState;
+use config_reconcile::SharedGensSeen;
+use config_reconcile::Splay;
 use facet::AsyncBuildable;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::stream;
-use futures::stream::AbortHandle;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use itertools::Itertools;
 use metaconfig_parser::RepoConfigs;
+use metaconfig_parser::ServiceManifest;
+use metaconfig_parser::SharedGenerations;
 use metaconfig_parser::StorageConfigs;
 use metaconfig_parser::parse_repo_spec;
 use metaconfig_parser::spec_hash;
-use metaconfig_parser::storage_generation;
 use metaconfig_types::CommitIdentityScheme;
 use metaconfig_types::Redaction;
 use metaconfig_types::RepoConfig;
+use metaconfig_types::RepoConfigRef;
+use metaconfig_types::RepoConfigSource;
 use metaconfig_types::ShardedService;
 use mononoke_api::Mononoke;
 use mononoke_api::MononokeRepo;
@@ -58,7 +62,6 @@ use mononoke_repos::RepoLoader;
 use repo_factory::RepoFactory;
 use repo_factory::RepoFactoryBuilder;
 use repos::RepoSpec;
-use repos::TierManifest;
 use stats::prelude::*;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
@@ -90,9 +93,15 @@ define_stats! {
     repo_loaded_on_demand: timeseries(Rate, Sum),
     repo_load_on_demand_failed: timeseries(Rate, Sum),
     reconcile_applied: timeseries(Average, Sum, Count),
+    // Repos reconcile would have rebuilt whose new config equals the one serving.
+    reconcile_unchanged: timeseries(Average, Sum, Count),
     reconcile_dropped: timeseries(Average, Sum, Count),
     reconcile_failed_repos: timeseries(Average, Sum, Count),
     reconcile_tick_duration_ms: timeseries(Average, Sum, Count),
+    // Loaded repos waiting for their splay offset after a shared-config change.
+    // Sampled every pass, repeating the last count when a pass fails, so an
+    // alert on it staying above zero catches repos that never rebuild.
+    reconcile_deferred: timeseries(Average),
     tier_names_len: timeseries(Average),
     tier_names_manifest_len: timeseries(Average),
     // Per-task gauges, sampled on each reconcile tick: repos assigned to this
@@ -186,27 +195,42 @@ where
         let build_permits = self.build_permits.clone();
         async move {
             let _permit = build_permits.acquire_owned().await?;
-            // get_or_load_repo_config subscribes the per-repo ConfigHandle
-            // internally.
-            let mut repo_config = configs
-                .get_or_load_repo_config(&repo_name)
-                .inspect_err(|_| STATS::lazy_repo_build_failed.add_value(1))?;
-            if redaction_disabled {
-                repo_config.redaction = Redaction::Disabled;
-            }
-            let common_config = configs.repo_configs().common.clone();
             let start = Instant::now();
-            let repo = repo_factory
-                .build(repo_name.clone(), repo_config, common_config)
-                .await
-                .inspect_err(|_| STATS::lazy_repo_build_failed.add_value(1))?;
-            STATS::lazy_repo_build_duration_ms.add_value(start.elapsed().as_millis() as i64);
-            info!(
-                "Built repo on first request: {} in {:?}",
-                repo_name,
-                start.elapsed()
-            );
-            anyhow::Ok(repo)
+            let result: Result<Repo> = async {
+                // get_or_load_repo_config_and_source subscribes the per-repo
+                // ConfigHandle internally.
+                let (mut repo_config, source) =
+                    configs.get_or_load_repo_config_and_source(&repo_name)?;
+                if redaction_disabled {
+                    repo_config.redaction = Redaction::Disabled;
+                }
+                let common_config = configs.repo_configs().common.clone();
+                Ok(repo_factory
+                    .build(repo_name.clone(), repo_config, common_config, source)
+                    .await?)
+            }
+            .await;
+            let elapsed = start.elapsed();
+
+            let mut scuba = repo_factory.env.scuba_sample_builder.clone();
+            scuba
+                .add("repo", repo_name.as_str())
+                .add("duration_ms", elapsed.as_millis() as i64);
+            match &result {
+                Ok(_) => {
+                    STATS::lazy_repo_build_duration_ms.add_value(elapsed.as_millis() as i64);
+                    info!(
+                        "Built repo on first request: {} in {:?}",
+                        repo_name, elapsed
+                    );
+                    scuba.log_with_msg("Lazy repo built", None);
+                }
+                Err(e) => {
+                    STATS::lazy_repo_build_failed.add_value(1);
+                    scuba.log_with_msg("Lazy repo build failed", format!("{e:#}"));
+                }
+            }
+            result
         }
         .boxed()
     }
@@ -230,6 +254,7 @@ impl<Repo> MononokeReposManager<Repo> {
     where
         Names: IntoIterator<Item = String>,
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + RepoConfigRef
             + Send
             + Sync
             + 'static,
@@ -250,6 +275,7 @@ impl<Repo> MononokeReposManager<Repo> {
     where
         Names: IntoIterator<Item = String>,
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + RepoConfigRef
             + Send
             + Sync
             + 'static,
@@ -270,6 +296,7 @@ impl<Repo> MononokeReposManager<Repo> {
             repos: repos.clone(),
             redaction_disabled,
             reconcile_state: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            splay_state: Mutex::new(SplayState::default()),
             spec_hash_cache: Arc::new(Mutex::new(HashMap::new())),
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
         });
@@ -332,11 +359,18 @@ impl<Repo> MononokeReposManager<Repo> {
     /// Return a repo config for a named repo.  This reads from the main
     /// configuration, so doesn't need to be a currently managed repo.
     pub fn repo_config(&self, repo_name: &str) -> Result<RepoConfig> {
-        let mut repo_config = self.configs.get_or_load_repo_config(repo_name)?;
+        self.repo_config_and_source(repo_name)
+            .map(|(config, _)| config)
+    }
+
+    /// [`Self::repo_config`] with where the config came from.
+    fn repo_config_and_source(&self, repo_name: &str) -> Result<(RepoConfig, RepoConfigSource)> {
+        let (mut repo_config, source) =
+            self.configs.get_or_load_repo_config_and_source(repo_name)?;
         if self.redaction_disabled {
             repo_config.redaction = Redaction::Disabled;
         }
-        Ok(repo_config)
+        Ok((repo_config, source))
     }
 
     /// Construct and add a new repo to the managed repo collection.
@@ -344,17 +378,18 @@ impl<Repo> MononokeReposManager<Repo> {
     where
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>,
     {
-        // get_or_load_repo_config (called via repo_config) subscribes the
-        // per-repo ConfigHandle internally.
-        let repo_config = self
-            .repo_config(repo_name)
+        // get_or_load_repo_config_and_source (called via
+        // repo_config_and_source) subscribes the per-repo ConfigHandle
+        // internally.
+        let (repo_config, source) = self
+            .repo_config_and_source(repo_name)
             .inspect_err(|_| STATS::add_repo_failed.add_value(1))?;
         let repo_id = repo_config.repoid.id();
         let common_config = self.configs.repo_configs().common.clone();
         let start = Instant::now();
         let repo = self
             .repo_factory
-            .build(repo_name.to_string(), repo_config, common_config)
+            .build(repo_name.to_string(), repo_config, common_config, source)
             .await
             .inspect_err(|_| STATS::add_repo_failed.add_value(1))?;
         STATS::add_repo_build_duration_ms.add_value(start.elapsed().as_millis() as i64);
@@ -377,13 +412,9 @@ impl<Repo> MononokeReposManager<Repo> {
             .configs
             .manifest()
             .context("add_lazy_repo: no tier manifest, so split-loading is off")?;
-        let entry = manifest
-            .repos
-            .iter()
-            .find(|entry| entry.repo_name == repo_name)
-            .with_context(|| {
-                format!("add_lazy_repo: repo {repo_name} is not in the tier manifest")
-            })?;
+        let entry = manifest.repo(repo_name).with_context(|| {
+            format!("add_lazy_repo: repo {repo_name} is not in the tier manifest")
+        })?;
         self.repos.add_placeholder(repo_name, entry.repo_id);
         Ok(())
     }
@@ -392,7 +423,7 @@ impl<Repo> MononokeReposManager<Repo> {
     /// now unless its config defers the build to the repo's first request.
     ///
     /// Resolving the config here means the eager path resolves it twice, but
-    /// `get_or_load_repo_config` serves the second from its cache.
+    /// `get_or_load_repo_config_and_source` serves the second from its cache.
     pub async fn add_repo_for_service(
         &self,
         repo_name: &str,
@@ -456,6 +487,7 @@ impl<Repo> MononokeReposManager<Repo> {
     pub async fn reconcile(&self) -> Result<()>
     where
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + RepoConfigRef
             + Send
             + Sync
             + 'static,
@@ -475,14 +507,14 @@ impl<Repo> MononokeReposManager<Repo> {
             .into_iter()
             .unique()
             .map(|repo_name| {
-                self.repo_config(&repo_name)
-                    .map(|repo_config| (repo_name, repo_config))
+                self.repo_config_and_source(&repo_name)
+                    .map(|(repo_config, source)| (repo_name, repo_config, source))
             })
             .collect::<Result<Vec<_>>>()?;
         let total = repo_configs.len();
         let completed = Arc::new(AtomicUsize::new(0));
         let repos_input = stream::iter(repo_configs)
-            .map(|(repo_name, repo_config)| {
+            .map(|(repo_name, repo_config, source)| {
                 let repo_factory = self.repo_factory.clone();
                 let name = repo_name.clone();
                 let common_config = self.configs.repo_configs().common.clone();
@@ -493,7 +525,7 @@ impl<Repo> MononokeReposManager<Repo> {
                     let start = Instant::now();
                     info!("Initializing repo: {}", &repo_name);
                     let repo = repo_factory
-                        .build(name, repo_config, common_config)
+                        .build(name, repo_config, common_config, source)
                         .await
                         .with_context(|| format!("Failed to initialize repo '{repo_name}'"))?;
                     let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -516,14 +548,6 @@ impl<Repo> MononokeReposManager<Repo> {
             .await?;
         self.repos.populate(repos_input);
         Ok(())
-    }
-
-    pub fn add_stats_handle_for_repo(&self, repo_name: &str, handle: AbortHandle) {
-        self.repos.add_stats_handle_for_repo(repo_name, handle)
-    }
-
-    pub fn remove_stats_handle_for_repo(&self, repo_name: &str) {
-        self.repos.remove_stats_handle_for_repo(repo_name)
     }
 }
 
@@ -584,13 +608,10 @@ where
     }
     // Tier membership is the authorisation boundary: nothing outside the
     // manifest is read, let alone built. Misses are rare, so no cache.
-    let Some(repo_id) = configs.manifest().and_then(|manifest| {
-        manifest
-            .repos
-            .iter()
-            .find(|entry| entry.repo_name == repo_name)
-            .map(|entry| entry.repo_id)
-    }) else {
+    let Some(repo_id) = configs
+        .manifest()
+        .and_then(|manifest| manifest.repo(repo_name).map(|entry| entry.repo_id))
+    else {
         return Ok(None);
     };
     let repo_config = match configs.get_or_load_repo_config(repo_name) {
@@ -628,6 +649,8 @@ where
 /// Adapts `MononokeConfigs` to the `config_reconcile::ConfigSource` trait.
 struct ReconcileConfigSource {
     configs: Arc<MononokeConfigs>,
+    tier: String,
+    shared: Arc<SharedGenerations>,
     // Memoizes spec_hash keyed by the RepoSpec Arc identity. See ReconcileDriver.
     spec_hash_cache: Arc<Mutex<HashMap<String, (Arc<RepoSpec>, u64)>>>,
 }
@@ -635,7 +658,7 @@ struct ReconcileConfigSource {
 impl ConfigSource for ReconcileConfigSource {
     fn manifest(&self) -> Vec<ManifestEntry> {
         self.configs.manifest().map_or_else(Vec::new, |m| {
-            m.repos
+            m.repos()
                 .iter()
                 .map(|e| ManifestEntry {
                     name: e.repo_name.clone(),
@@ -657,15 +680,8 @@ impl ConfigSource for ReconcileConfigSource {
         Some(DesiredRepo {
             enabled: spec.enabled,
             spec_hash: hash,
+            shared_gen: self.shared.of_repo(&spec, &self.tier),
         })
-    }
-
-    fn storage_generation(&self) -> Result<u64> {
-        let manifest = self
-            .configs
-            .manifest()
-            .context("reconcile: no manifest for storage generation")?;
-        storage_generation(&manifest.storage)
     }
 }
 
@@ -677,28 +693,17 @@ struct ReconcileRepoManager<Repo> {
     repo_factory: Arc<RepoFactory>,
     repos: Arc<MononokeRepos<Repo>>,
     tier: String,
+    shared: Arc<SharedGenerations>,
     redaction_disabled: bool,
-}
-
-/// Whether a completed build should record a generation. A deep-sharded repo that
-/// was not already present is skipped (`reload_if_present` returned false) → `None`;
-/// every other case records the generation.
-fn apply_generation(
-    deep: bool,
-    applied: bool,
-    generation: RepoGeneration,
-) -> Option<RepoGeneration> {
-    if deep && !applied {
-        None
-    } else {
-        Some(generation)
-    }
+    /// Rebuilds skipped this pass because the config was unchanged.
+    unchanged: AtomicUsize,
 }
 
 #[async_trait]
 impl<Repo> RepoManager for ReconcileRepoManager<Repo>
 where
     Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+        + RepoConfigRef
         + Send
         + Sync
         + 'static,
@@ -707,46 +712,53 @@ where
         self.repos.iter_loaded_names().collect()
     }
 
-    async fn build_and_apply(
-        &self,
-        name: &str,
-        deep: bool,
-        storage_gen: u64,
-    ) -> Result<Option<RepoGeneration>> {
-        let spec = self
+    async fn build_and_apply(&self, name: &str, deep: bool) -> Result<Option<RepoGeneration>> {
+        let (spec, source) = self
             .configs
-            .live_repo_spec(name)
+            .live_repo_spec_with_source(name)
             .context("reconcile: no live RepoSpec (unsubscribed or unreadable)")?;
         let spec_hash = spec_hash(&spec)?;
+        let shared_gen = self.shared.of_repo(&spec, &self.tier);
         let manifest = self.configs.manifest().context("reconcile: no manifest")?;
-        let mut repo_config =
-            parse_repo_spec(Arc::unwrap_or_clone(spec), &self.tier, &manifest.storage)?;
+        let mut repo_config = parse_repo_spec(
+            Arc::unwrap_or_clone(spec),
+            &self.tier,
+            &manifest.storage,
+            manifest.presets.as_ref(),
+        )?;
         if self.redaction_disabled {
             repo_config.redaction = Redaction::Disabled;
         }
-        let repo_id = repo_config.repoid.id();
-        let common_config = self.configs.repo_configs().common.clone();
-        let repo = self
-            .repo_factory
-            .build(name.to_string(), repo_config, common_config)
-            .await?;
-        // The build (async) is done; the insert below is synchronous and takes
-        // the MononokeRepos update lock internally — no lock across an await.
-        let applied = if deep {
-            self.repos
-                .reload_if_present(repo_id, name.to_string(), repo)
-        } else {
-            self.repos.reload(vec![(repo_id, name.to_string(), repo)]);
-            true
+        let generation = RepoGeneration {
+            spec_hash,
+            shared_gen,
         };
-        Ok(apply_generation(
-            deep,
-            applied,
-            RepoGeneration {
-                spec_hash,
-                storage_gen,
-            },
-        ))
+        let unchanged = self
+            .repos
+            .get_by_name(name)
+            .is_some_and(|serving| *serving.repo_config() == repo_config);
+        let present = if unchanged {
+            self.unchanged.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            let repo_id = repo_config.repoid.id();
+            let common_config = self.configs.repo_configs().common.clone();
+            let repo = self
+                .repo_factory
+                .build(name.to_string(), repo_config, common_config, source)
+                .await?;
+            // The build (async) is done; the insert below is synchronous and takes
+            // the MononokeRepos update lock internally — no lock across an await.
+            if deep {
+                self.repos
+                    .reload_if_present(repo_id, name.to_string(), repo)
+            } else {
+                self.repos.reload(vec![(repo_id, name.to_string(), repo)]);
+                true
+            }
+        };
+        // A deep-sharded repo that left this job during the build records nothing.
+        Ok(present.then_some(generation))
     }
 
     fn drop_repo(&self, name: &str) {
@@ -767,12 +779,23 @@ struct ReconcileDriver<Repo> {
     // Per-repo reconcile state (loaded generation or last failure), keyed by
     // name. Empty until reconcile runs; driven by the config_reconcile crate.
     reconcile_state: Arc<ArcSwap<HashMap<String, RepoState>>>,
+    // Carried between passes so rebuilds after a shared-config change keep
+    // their offsets, and so the loop wakes when the next one is due.
+    splay_state: Mutex<SplayState>,
     // Memoizes spec_hash keyed by RepoSpec Arc identity so an unchanged repo is
     // not re-serialized every pass. Stores the Arc itself (not a raw pointer) to
     // pin the allocation, so Arc::ptr_eq can't false-match a reused address (ABA).
     spec_hash_cache: Arc<Mutex<HashMap<String, (Arc<RepoSpec>, u64)>>>,
     // Single-flight guard: only one pass runs at a time.
     reconcile_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// What one reconcile pass leaves for the next about a splayed shared-config change.
+#[derive(Default)]
+struct SplayState {
+    shared_gens_seen: SharedGensSeen,
+    next_due: Option<Instant>,
+    deferred: usize,
 }
 
 /// Single-flight guard: run `body` under `lock` iff it is free (`try_lock`), else
@@ -792,6 +815,7 @@ where
 impl<Repo> ReconcileDriver<Repo>
 where
     Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+        + RepoConfigRef
         + Send
         + Sync
         + 'static,
@@ -816,8 +840,18 @@ where
         // tokio Mutex is await-safe, so the guard is held across the whole pass.
         // A held lock means "skip this pass", which is a success (Ok(())).
         run_exclusive(&self.reconcile_lock, move || async move {
+            let manifest = self
+                .configs
+                .manifest()
+                .context("reconcile: no manifest for shared generations")?;
+            let shared = Arc::new(SharedGenerations::new(
+                &manifest.storage,
+                manifest.presets.as_ref(),
+            )?);
             let config = ReconcileConfigSource {
                 configs: self.configs.clone(),
+                tier: tier.clone(),
+                shared: shared.clone(),
                 spec_hash_cache: self.spec_hash_cache.clone(),
             };
             let manager = ReconcileRepoManager {
@@ -825,25 +859,75 @@ where
                 repo_factory: self.repo_factory.clone(),
                 repos: self.repos.clone(),
                 tier,
+                shared,
                 redaction_disabled: self.redaction_disabled,
+                unchanged: AtomicUsize::new(0),
             };
             let current = self.reconcile_state.load_full();
-            let outcome =
-                config_reconcile::reconcile(&config, &manager, &current, REPOS_MANAGER_CONCURRENCY)
-                    .await?;
+            let splay = Splay {
+                window: Duration::from_secs(justknobs::get_as::<u64>(RELOAD_SPLAY_KNOB, None)),
+                now: Instant::now(),
+            };
+            let shared_gens_seen = self
+                .splay_state
+                .lock()
+                .expect("splay_state poisoned")
+                .shared_gens_seen
+                .clone();
+            let outcome = match config_reconcile::reconcile(
+                &config,
+                &manager,
+                &current,
+                REPOS_MANAGER_CONCURRENCY,
+                splay,
+                shared_gens_seen,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // The splay state stays as it was for the next pass.
+                    let deferred = self
+                        .splay_state
+                        .lock()
+                        .expect("splay_state poisoned")
+                        .deferred;
+                    STATS::reconcile_deferred.add_value(deferred as i64);
+                    return Err(e);
+                }
+            };
 
-            if outcome.built + outcome.rebuilt + outcome.dropped > 0 || !outcome.failed.is_empty() {
+            // Reconcile counts a skipped rebuild as applied; it built nothing.
+            let unchanged = manager.unchanged.load(Ordering::Relaxed);
+            let rebuilt = outcome.rebuilt.saturating_sub(unchanged);
+            // A pass that applies nothing is routine: the first one after
+            // startup usually finds every repo unchanged.
+            if outcome.built + rebuilt + outcome.dropped > 0 || !outcome.failed.is_empty() {
                 info!(
-                    "reconcile: built={} rebuilt={} dropped={} failed={}",
+                    "reconcile: built={} rebuilt={} unchanged={} dropped={} failed={} deferred={}",
                     outcome.built,
-                    outcome.rebuilt,
+                    rebuilt,
+                    unchanged,
                     outcome.dropped,
                     outcome.failed.len(),
+                    outcome.deferred,
+                );
+            } else if unchanged > 0 || outcome.deferred > 0 {
+                debug!(
+                    "reconcile: no changes applied (unchanged={} deferred={})",
+                    unchanged, outcome.deferred,
                 );
             }
-            STATS::reconcile_applied.add_value((outcome.built + outcome.rebuilt) as i64);
+            STATS::reconcile_applied.add_value((outcome.built + rebuilt) as i64);
+            STATS::reconcile_unchanged.add_value(unchanged as i64);
             STATS::reconcile_dropped.add_value(outcome.dropped as i64);
             STATS::reconcile_failed_repos.add_value(outcome.failed.len() as i64);
+            STATS::reconcile_deferred.add_value(outcome.deferred as i64);
+            *self.splay_state.lock().expect("splay_state poisoned") = SplayState {
+                shared_gens_seen: outcome.shared_gens_seen,
+                next_due: outcome.next_due,
+                deferred: outcome.deferred,
+            };
             self.reconcile_state.store(Arc::new(outcome.next_state));
 
             // Evict spec-hash cache entries for repos no longer in the manifest.
@@ -851,7 +935,7 @@ where
             // hook. The std Mutex is acquired after all awaits, not across one.
             if let Some(manifest) = self.configs.manifest() {
                 let live: HashSet<&str> = manifest
-                    .repos
+                    .repos()
                     .iter()
                     .map(|e| e.repo_name.as_str())
                     .collect();
@@ -863,6 +947,18 @@ where
         .await
         .unwrap_or(Ok(()))
     }
+}
+
+/// Spreads rebuilds after a shared-config change over this many seconds.
+const RELOAD_SPLAY_KNOB: &str = "scm/mononoke:common_config_reload_splay_secs";
+
+/// Wake policy (pure): the backstop, or sooner if a splayed rebuild comes due.
+/// Floored at 1s: a failed or skipped pass leaves `next_due` as it was, so a due
+/// time already past must not spin the loop.
+fn next_wake(backstop: Duration, until_next_due: Option<Duration>) -> Duration {
+    until_next_due.map_or(backstop, |due| {
+        backstop.min(due.max(Duration::from_secs(1)))
+    })
 }
 
 /// Interval policy (pure): fixed 60s backstop when off; the tunable value floored
@@ -906,17 +1002,19 @@ async fn reconcile_loop<F, Fut>(
 
 /// Spawn the background reconcile loop. Owns an Arc to the driver (task is
 /// `'static`); aborted on Drop. Runs one pass immediately, then again on each
-/// wake — a config-change trigger or the backstop.
+/// wake — a config-change trigger, the backstop, or a splayed rebuild coming due.
 fn spawn_reconcile_loop<Repo>(
     driver: Arc<ReconcileDriver<Repo>>,
     trigger: Arc<Notify>,
 ) -> JoinHandle<()>
 where
     Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+        + RepoConfigRef
         + Send
         + Sync
         + 'static,
 {
+    let wake_driver = driver.clone();
     mononoke::spawn_task(reconcile_loop(
         move || {
             let driver = driver.clone();
@@ -933,7 +1031,17 @@ where
             }
         },
         trigger,
-        reconcile_tick_interval,
+        move || {
+            let next_due = wake_driver
+                .splay_state
+                .lock()
+                .expect("splay_state poisoned")
+                .next_due;
+            next_wake(
+                reconcile_tick_interval(),
+                next_due.map(|due| due.saturating_duration_since(Instant::now())),
+            )
+        },
     ))
 }
 
@@ -1038,9 +1146,9 @@ fn scheme_from_config_path(config_path: &str) -> CommitIdentityScheme {
 /// entry, no spec reads, no per-task state. The manifest is what the tier
 /// serves, so the map is complete by construction and cannot shrink with what
 /// this task happens to have cached.
-fn repo_names_from_manifest(manifest: &TierManifest) -> HashMap<String, CommitIdentityScheme> {
+fn repo_names_from_manifest(manifest: &ServiceManifest) -> HashMap<String, CommitIdentityScheme> {
     manifest
-        .repos
+        .repos()
         .iter()
         .map(|entry| {
             (
@@ -1078,8 +1186,7 @@ impl MononokeConfigUpdateReceiver {
     /// Rebuild the tier-wide repo names map from `repo_configs` (the full
     /// tier config, not the per-task subset) and atomically swap it in.
     fn refresh_repo_names_in_tier(&self, repo_configs: &RepoConfigs) {
-        let names =
-            build_repo_names_in_tier(repo_configs.repos.iter().map(|(k, v)| (k, v.as_ref())));
+        let names = build_repo_names_in_tier(repo_configs.iter());
         self.repo_names_in_tier.store(Arc::new(names));
     }
 
@@ -1088,7 +1195,7 @@ impl MononokeConfigUpdateReceiver {
     fn refresh_from_manifest(&self, configs: &MononokeConfigs) {
         match configs.manifest() {
             Some(manifest) => {
-                STATS::tier_names_manifest_len.add_value(manifest.repos.len() as i64);
+                STATS::tier_names_manifest_len.add_value(manifest.repos().len() as i64);
                 self.repo_names_in_tier
                     .store(Arc::new(repo_names_from_manifest(&manifest)));
             }

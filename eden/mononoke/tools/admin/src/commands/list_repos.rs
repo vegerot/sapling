@@ -34,11 +34,11 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
     // legacy entries take precedence on collision (the manifest entry would
     // be redundant for repos still in the legacy blob).
     let mut by_id: BTreeMap<i32, String> = BTreeMap::new();
-    for (repo_name, repo_config) in app.repo_configs().repos.iter() {
+    for (repo_name, repo_config) in app.repo_configs().iter() {
         by_id.insert(repo_config.repoid.id(), repo_name.clone());
     }
     if let Some(manifest) = app.configs().manifest() {
-        for entry in &manifest.repos {
+        for entry in manifest.repos() {
             by_id
                 .entry(entry.repo_id)
                 .or_insert(entry.repo_name.clone());

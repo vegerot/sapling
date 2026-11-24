@@ -18,7 +18,7 @@ anyhow = "1.0.104"
 async-trait = "0.1.92"
 blob = { version = "0.1.0", path = "../blob" }
 byteorder = "1.5"
-flume = "0.11.1"
+flume = "0.12.0"
 fn-error-context = "0.2"
 fs-err = "3.3.2"
 futures = { version = "0.3.34", features = ["async-await", "std"], default-features = false }
@@ -26,7 +26,7 @@ http = "1.5.0"
 lfs_protocol = { version = "0.1.0", path = "../../../mononoke/common/lfs_protocol" }
 manifest-augmented-tree = { version = "0.1.0", path = "../manifest-augmented-tree" }
 moka = { version = "0.12.16", features = ["future", "sync"] }
-parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard", "serde"] }
+parking_lot = { version = "0.13.0", features = ["arc_lock", "send_guard", "serde"] }
 paste = "1.0.14"
 quickcheck = "1.1"
 quickcheck_arbitrary_derive = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -65,7 +65,7 @@ serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw
 sha1 = "0.10.7"
 sha2 = "0.10.6"
 slex = { version = "0.1.0", path = "../slex" }
-smallvec = { version = "1.16.4", default-features = false }
+smallvec = { version = "1.16.5", default-features = false }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tokio-stream = { version = "0.1.19", features = ["fs", "io-util", "net", "signal", "sync", "time"] }

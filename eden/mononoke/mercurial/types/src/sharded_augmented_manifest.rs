@@ -38,6 +38,8 @@ use manifest::ManifestOps;
 use manifest::TrieMapOps;
 use manifest::bonsai_diff;
 use manifest::bonsai_diff_sharded;
+use manifest::find_intersection_of_diffs;
+use manifest::find_intersection_of_diffs_and_parents;
 use mononoke_types::Blob;
 use mononoke_types::BlobstoreKey;
 use mononoke_types::BlobstoreValue;
@@ -916,6 +918,47 @@ pub fn hg_manifest_bonsai_diff<B: KeyedBlobstore + Clone + 'static>(
         .boxed()
 }
 
+/// The entries of the manifest `mf_id`, including its root, that differ from
+/// the entry at the same path in every one of `parents`, as Hg entries.
+pub fn find_intersection_of_hg_diffs<B: KeyedBlobstore + Clone + 'static>(
+    ctx: &CoreContext,
+    blobstore: B,
+    repo_name: &str,
+    mf_id: HgManifestId,
+    parents: Vec<HgManifestId>,
+) -> BoxStream<'static, Result<(MPath, Entry<HgManifestId, (FileType, HgFileNodeId)>)>> {
+    if !hg_manifests_read_from_augmented(repo_name) {
+        return find_intersection_of_diffs(ctx.clone(), blobstore, mf_id, parents).boxed();
+    }
+    let is_null = |id: &HgManifestId| id.into_nodehash() == NULL_HASH;
+    if is_null(&mf_id) {
+        let root = (!parents.iter().any(is_null)).then(|| Ok((MPath::ROOT, Entry::Tree(mf_id))));
+        return stream::iter(root).boxed();
+    }
+    // A null parent is an empty tree, which every entry differs from.
+    let parents = parents
+        .into_iter()
+        .filter(|id| !is_null(id))
+        .map(HgAugmentedManifestId::from)
+        .collect();
+    // Augmented leaves also differ when only their content metadata does, so
+    // compare the Hg entries they describe.
+    find_intersection_of_diffs_and_parents(
+        ctx.clone(),
+        blobstore,
+        HgAugmentedManifestId::from(mf_id),
+        parents,
+    )
+    .try_filter_map(|(path, entry, parent_entries)| {
+        let entry = hg_entry_from_augmented(entry);
+        let changed = parent_entries
+            .into_iter()
+            .all(|parent_entry| hg_entry_from_augmented(parent_entry) != entry);
+        future::ok(changed.then_some((path, entry)))
+    })
+    .boxed()
+}
+
 fn list_all_augmented_entries<B: KeyedBlobstore + Clone + 'static>(
     ctx: &CoreContext,
     blobstore: B,
@@ -1079,6 +1122,26 @@ impl<Store: KeyedBlobstore> TrieMapOps<Store, Entry<HgAugmentedManifestId, HgAug
             .into_entries(ctx, blobstore)
             .map_ok(|(k, v)| (k, convert_hg_augmented_manifest_entry(v)))
             .boxed())
+    }
+
+    async fn lookup_many(
+        self,
+        ctx: &CoreContext,
+        blobstore: &Store,
+        names: Vec<SmallVec<[u8; 24]>>,
+    ) -> Result<
+        Vec<(
+            SmallVec<[u8; 24]>,
+            Entry<HgAugmentedManifestId, HgAugmentedFileLeafNode>,
+        )>,
+    > {
+        Ok(self
+            .0
+            .lookup_many(ctx, blobstore, names)
+            .await?
+            .into_iter()
+            .map(|(name, entry)| (name, convert_hg_augmented_manifest_entry(entry)))
+            .collect())
     }
 
     fn is_empty(&self) -> bool {

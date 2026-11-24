@@ -501,6 +501,7 @@ def setup_configerator_configs(fs: ShellFS, env: Env) -> int:
         "changeset_path_history_context_new",
         "hg_augmented_manifest_write",
         "hg_augmented_tree_context_new_check_exists",
+        "check_manifest_permission",
         "fsnodes_write",
         "fsnodes_new_check_exists"
       ],
@@ -770,6 +771,21 @@ def setup_acls(stderr: BinaryIO, fs: ShellFS, env: Env) -> int:
     return 0
 
 
+# `RawShardedService` in repos.thrift, by name.
+RAW_SHARDED_SERVICES = {
+    "EDEN_API": 1,
+    "SOURCE_CONTROL_SERVICE": 2,
+    "DERIVED_DATA_SERVICE": 3,
+    "LAND_SERVICE": 4,
+    "DERIVATION_WORKER": 5,
+    "LARGE_FILES_SERVICE": 6,
+    "ASYNC_REQUESTS_WORKER": 7,
+    "MONONOKE_GIT_SERVER": 15,
+    "BOOKMARK_SERVICE": 17,
+    "DIFF_SERVICE": 18,
+}
+
+
 def setup_mononoke_repo_config(
     args: List[str],
     stderr: BinaryIO,
@@ -867,6 +883,20 @@ hipster_acl="{env.getenv("ACL_NAME", "default")}"
 
     if env.getenv("READ_ONLY_REPO"):
         append_def_config("\nreadonly=true\n")
+
+    # Services, named as in `RawShardedService`, that load the repo only where
+    # ShardManager (or a local shard file) assigns it.
+    if deep_sharded_services := env.getenv("DEEP_SHARDED_SERVICES"):
+        status = []
+        for service in deep_sharded_services.split():
+            if service not in RAW_SHARDED_SERVICES:
+                stderr.write(f"Unknown sharded service {service}\n".encode())
+                return 1
+            status.append(f'"{RAW_SHARDED_SERVICES[service]}" = true')
+        # An inline table, so that later top-level keys stay top-level.
+        append_config(
+            f"deep_sharding_config = {{ status = {{ {', '.join(status)} }} }}"
+        )
 
     if env.getenv("COMMIT_IDENTITY_SCHEME"):
         append_def_config(
@@ -1000,6 +1030,10 @@ forbid_p2_root_rebases={forbid_p2_root_rebases}
     else:
         append_config("rewritedates=false")
 
+    if env.getenv("PUSHREBASE_RECURSION_LIMIT"):
+        recursion_limit = env.getenv("PUSHREBASE_RECURSION_LIMIT")
+        append_config(f"recursion_limit={recursion_limit}")
+
     if env.getenv("EMIT_OBSMARKERS"):
         append_config("emit_obsmarkers=true")
 
@@ -1052,8 +1086,6 @@ pure_push_allowed = true
 bookmark="{cache_warmup_bookmark}"
 """
         )
-        if env.getenv("CACHE_WARMUP_MICROWAVE"):
-            append_config("microwave_preload = true")
 
     append_config("[lfs]")
 
@@ -1277,6 +1309,8 @@ def urlencode(args: List[str], stderr: BinaryIO) -> Union[str, int]:
 # rendered into the manifest + per-repo RepoSpec layout production reads,
 # under $LOCAL_CONFIGERATOR_PATH.
 MONONOKE_TEST_TIER = "test"
+# Every `MononokeService` value (repos.thrift), COMMAND included.
+MONONOKE_SERVICES = list(range(1, 26))
 # repos.thrift RawCommitIdentityScheme::HG
 RAW_COMMIT_IDENTITY_SCHEME_HG = 2
 
@@ -1307,6 +1341,8 @@ def render_mononoke_config(stderr: BinaryIO, fs: ShellFS, env: Env) -> int:
     """Render $TESTTMP/mononoke-config (TOML RawRepoConfigs tree) into
     $LOCAL_CONFIGERATOR_PATH as `scm/mononoke/repos/tiers/<tier>_manifest`
     plus one `scm/mononoke/repos/<tier>/<repo>` RepoSpec per repo.
+    `common/presets.toml`, if present, becomes the deployment's `presets` (tier
+    manifests have none), and a repo definition's `preset` the RepoSpec's.
 
     The TOML keys are the thrift field names, so a repo's `server.toml`
     becomes the RepoSpec's `repo_config` as-is; `repo_definitions` supplies the
@@ -1350,6 +1386,8 @@ def render_mononoke_config(stderr: BinaryIO, fs: ShellFS, env: Env) -> int:
         }
         if "enable_git_bundle_uri" in definition:
             spec["enable_git_bundle_uri"] = bool(definition["enable_git_bundle_uri"])
+        if "preset" in definition:
+            spec["preset"] = definition["preset"]
         config_path = f"scm/mononoke/repos/{tier}/{encoded}"
         _write_json(fs, f"{dst}/{config_path}", spec)
         entries.append(
@@ -1357,7 +1395,11 @@ def render_mononoke_config(stderr: BinaryIO, fs: ShellFS, env: Env) -> int:
                 "repo_name": repo_name,
                 "repo_id": spec["repo_id"],
                 "config_path": config_path,
-                "is_deep_sharded": False,
+                "is_deep_sharded": any(
+                    repo_config.get("deep_sharding_config", {})
+                    .get("status", {})
+                    .values()
+                ),
             }
         )
 
@@ -1367,6 +1409,32 @@ def render_mononoke_config(stderr: BinaryIO, fs: ShellFS, env: Env) -> int:
         "storage": _read_toml(fs, f"{src}/common/storage.toml"),
     }
     _write_json(fs, f"{dst}/scm/mononoke/repos/tiers/{tier}_manifest", manifest)
+
+    # The same repos as a deployment, `scm/mononoke/deployments/<tier>`, in
+    # which every service sees the tier: a program run with `--deployment
+    # <tier>` loads what one run with `--config-tier <tier>` loads.
+    deployment = {
+        "common": manifest["common"],
+        "storage": manifest["storage"],
+        "services": {
+            str(service): {"legacy_tier": tier} for service in MONONOKE_SERVICES
+        },
+        "service_groups": {tier: MONONOKE_SERVICES},
+        "repos": [
+            {
+                "repo_name": entry["repo_name"],
+                "repo_id": entry["repo_id"],
+                "spec_path": entry["config_path"].removeprefix("scm/mononoke/repos/"),
+                "is_deep_sharded": entry["is_deep_sharded"],
+                "service_groups": [tier],
+            }
+            for entry in entries
+        ],
+    }
+    presets_path = f"{src}/common/presets.toml"
+    if fs.exists(presets_path):
+        deployment["presets"] = _read_toml(fs, presets_path)
+    _write_json(fs, f"{dst}/scm/mononoke/deployments/{tier}", deployment)
     return 0
 
 

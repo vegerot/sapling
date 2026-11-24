@@ -1195,8 +1195,7 @@ uint64_t FsFileContentStore::appendWalEntry(
   // below). Adding fsync to every WAL append would dominate the fast-
   // path cost and erase the latency win over a full directory rewrite.
   auto written = folly::writeFull(fd, buf.data(), totalSize);
-  if (FOLLY_UNLIKELY(
-          written < 0 || static_cast<size_t>(written) != totalSize)) {
+  if (written < 0 || static_cast<size_t>(written) != totalSize) [[unlikely]] {
     // Failed or short write (e.g. ENOSPC). Truncate the torn tail
     // so subsequent O_APPEND writes land on a valid prefix instead of
     // burying the tear mid-file. Capture errno before ftruncate clobbers it.
@@ -2094,7 +2093,7 @@ void FsFileContentStore::validateHeader(
         " expected at least ",
         kHeaderLength,
         " bytes, expected headerId hex=",
-        folly::hexlify(headerId));
+        folly::hexlify(ByteRange{headerId}));
   }
 
   IOBuf buf(IOBuf::WRAP_BUFFER, ByteRange{contents});
@@ -2112,7 +2111,7 @@ void FsFileContentStore::validateHeader(
         " at offset 0: actual hex=",
         folly::hexlify(ByteRange{identifier}),
         " expected hex=",
-        folly::hexlify(headerId));
+        folly::hexlify(ByteRange{headerId}));
   }
 
   // Validate header version

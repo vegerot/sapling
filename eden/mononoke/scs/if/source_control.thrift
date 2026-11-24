@@ -982,6 +982,10 @@ struct OrgStorageConfigPollResponse {
   1: OrgStorageConfigMutationState state;
   /// Configo's error text when FAILED or ABORTED.
   2: optional string message;
+  /// Configo's error type when FAILED, by name (`COMPILE_ERROR`,
+  /// `VALIDATION_ERROR`, ...; Configo's `ErrorType`). Unset when Configo
+  /// reports none.
+  3: optional string error_type;
 }
 
 struct OrgStorageConfigParams {
@@ -1454,6 +1458,35 @@ struct RepoRebaseStackParams {
   // 9: reserved for inferring base when absent
 }
 
+enum RepoCheckRebaseConflictsStatus {
+  /// Reserved zero value, never sent. A missing or unrecognized status
+  /// must not read as a real verdict.
+  UNKNOWN = 0,
+  /// The stack merges onto the target without conflicts.
+  CLEAN = 1,
+  /// The stack conflicts with the target; see `conflicts`.
+  CONFLICT = 2,
+  /// Every change in the stack is already contained in the target, so
+  /// landing it is a no-op.
+  ALREADY_LANDED = 3,
+}
+
+struct RepoCheckRebaseConflictsParams {
+  /// Top of the draft stack to check. Must be a draft.
+  1: CommitId head;
+
+  /// Name of the bookmark to check the merge against. Resolved
+  /// server-side so the caller needs no separate lookup; the resolved
+  /// commit is returned as `target_ids`.
+  2: string target_bookmark;
+
+  /// The set of commit identity schemes to return in the response.
+  3: set<CommitIdentityScheme> identity_schemes;
+
+  /// Whether paths changed on both sides may be content-merged.
+  4: RepoRebaseStackMergeResolution merge_resolution = RepoRebaseStackMergeResolution.DEFAULT;
+}
+
 struct RepoPrepareCommitsParams {
   /// The list of commits for which data must be derived
   1: list<CommitId> commits;
@@ -1614,12 +1647,14 @@ struct CommitCompareOrderedParams {
   // to continue diffing after a previous ordered request reached
   // its limit.
   1: optional Path after_path;
-  // Limit the number of returned paths to this many. Paths omitted by
-  // partial responses (restricted-path denials) never consume this budget:
-  // pages are filled up to the limit with visible entries. The end of
+  // Limit the number of scanned paths to this many. When the request
+  // asks for omitted paths (`partial_options.include_omitted_paths`),
+  // paths omitted by partial responses (restricted-path denials)
+  // consume this budget, so a page may hold fewer visible entries than
+  // the limit. The end of
   // pagination is signaled by the absence of `last_path` in the response
-  // (feed it back as `after_path` to continue), even if a page holds
-  // fewer entries than the limit or is empty.
+  // (feed it back as `after_path` to continue): otherwise it names the
+  // last scanned path, whether visible or omitted.
   2: i64 limit;
 }
 
@@ -1642,6 +1677,11 @@ struct CommitCompareParams {
   /// When performing a comparison against a parent, follow subtree
   /// copy sources and show only the differences against those sources.
   8: optional bool compare_with_subtree_copy_sources;
+  /// Opt into partial responses for this request: restricted-path
+  /// denials omit or downgrade entries instead of failing the request.
+  /// Omitted paths count toward the pagination limit. The opt-out
+  /// header takes precedence over this field.
+  9: optional PartialOptions partial_options;
 }
 
 struct CommitFileDiffsParamsSubtreeSource {
@@ -1686,14 +1726,21 @@ struct CommitFileDiffsParams {
   /// diff format.  For raw diffs, it is the total size in bytes of the returned diffs.
   /// For phabricator diff metadata, it is the number of entries.
   5: optional i64 diff_size_limit;
+  /// Opt into partial responses for this request: restricted-path
+  /// denials omit or downgrade entries instead of failing the request.
+  /// The opt-out header takes precedence over this field.
+  6: optional PartialOptions partial_options;
 }
 
 const i64 COMMIT_FIND_FILES_MAX_LIMIT = 100000;
 
 struct CommitFindFilesParams {
-  /// Limit to the number of tree entries listed. If the request returns
-  /// the limit, a subsequent call with 'after' set to the last path in the
-  /// response is necessary to find the remaining files.
+  /// Limit to the number of scanned tree entries. When the request asks
+  /// for omitted paths (`partial_options.include_omitted_paths`),
+  /// omitted entries consume this budget, so fewer visible files may be
+  /// returned. If an ordered request reaches the limit, `last_path`
+  /// carries the continuation (the last scanned path, whether visible or
+  /// omitted): pass it as `after` to find the remaining files.
   1: i64 limit;
 
   /// Start listing files after this path, to be used for paging.  If
@@ -1718,6 +1765,11 @@ struct CommitFindFilesParams {
   /// If the array is empty, nothing will match; however, basenames that are in
   /// the array basenames will match.
   5: optional list<string> basename_suffixes;
+  /// Opt into partial responses for this request: restricted-path
+  /// denials omit entries instead of failing the request. Omitted
+  /// paths count toward the pagination limit. The opt-out header
+  /// takes precedence over this field.
+  6: optional PartialOptions partial_options;
 }
 
 struct CommitChangedPathsApproxParams {}
@@ -1946,6 +1998,10 @@ struct CommitSubtreeChangesParams {
 struct CommitHgMutationHistoryParams {
   /// The format of the mutation history to return.
   1: MutationHistoryFormat format;
+  /// Also follow a split part to the split it came from. The response then
+  /// includes the split entry, whose successor is the final part, with the
+  /// requested commit in `split`.
+  2: bool follow_splits;
 }
 
 struct CommitGitMutationHistoryParams {
@@ -1978,6 +2034,10 @@ struct CommitMultiplePathInfoParams {
   ///
   /// Note: paths that do not exist will be omitted from the response.
   1: list<Path> paths;
+  /// Opt into partial responses for this request: restricted-path
+  /// denials omit entries instead of failing the request. The opt-out
+  /// header takes precedence over this field.
+  2: optional PartialOptions partial_options;
 }
 
 const i64 TREE_LIST_MAX_LIMIT = 10000;
@@ -2077,6 +2137,10 @@ struct CommitMultiplePathLastChangedParams {
   /// Perforce mirrors only: also return the Perforce revision each path has at
   /// the commit (`CommitPathLastChange.p4_*`).
   3: bool include_p4_revision;
+  /// Opt into partial responses for this request: restricted-path
+  /// denials omit entries instead of failing the request. The opt-out
+  /// header takes precedence over this field.
+  4: optional PartialOptions partial_options;
 }
 
 struct CommitRestrictedPathsAccessParams {
@@ -2286,6 +2350,31 @@ struct CommitLookupXRepoParams {
 
 struct CustomAclParams {
   1: string hipster_group;
+  /// Identities granted `read` and `write` on top of the standard grants,
+  /// only when this call creates the ACL (an existing ACL is left as it is).
+  /// For an automation that writes the first commit on the caller's behalf,
+  /// such as the repo portal's provisioning job; `AUTH_SET` entries are
+  /// checked to exist before the create, other identity types are validated
+  /// by Hipster.
+  2: list<AclIdentity> writers;
+  /// Make the ACL private: it gets none of the standard grants. An ACL that
+  /// already exists is accepted only if it grants nothing a private one would
+  /// not.
+  3: optional PrivateAclParams private_acl;
+}
+
+/// A private ACL lets in `hipster_group` (maintainer, `read`, `write`), the
+/// `writers` (`read`, `write`), the `readers` (`read`) and what each
+/// integration named here needs. Nobody and nothing else can read the repo
+/// until a maintainer adds them in Hipster.
+struct PrivateAclParams {
+  /// The repo has diffs: Phabricator's web controller and its import jobs get
+  /// `read`, and the land command gets `read` and `write`. Without it the repo
+  /// takes pushes only.
+  1: bool phabricator;
+  /// Identities granted `read` only. `AUTH_SET` entries are checked to exist
+  /// before the create, other identity types are validated by Hipster.
+  2: list<AclIdentity> readers;
 }
 
 /// A Hipster identity, as `<id_type>:<id_data>` spells it (e.g. AUTH_SET:scm).
@@ -2801,6 +2890,25 @@ struct RepoRebaseStackResponse {
   4: i64 merged_path_count;
 }
 
+struct RepoCheckRebaseConflictsResponse {
+  /// The merge verdict.
+  1: RepoCheckRebaseConflictsStatus status;
+
+  /// Conflicting paths. Non-empty only when `status` is CONFLICT.
+  2: list<PushrebaseConflict> conflicts;
+
+  /// The resolved target commit in the requested schemes. Reuse it for any
+  /// follow-up rebase so the verdict and the action agree on the target.
+  3: map<CommitIdentityScheme, CommitId> target_ids;
+
+  /// Paths changed both in the stack and between the merge base and the
+  /// target. Equals the number of conflicts when `status` is CONFLICT.
+  4: i64 overlapping_path_count;
+
+  /// Distinct paths the server content-merged.
+  5: i64 merged_path_count;
+}
+
 struct RepoPrepareCommitsResponse {}
 
 struct RepoUploadFileContentResponse {
@@ -2821,6 +2929,19 @@ union RepoUpdateSubmoduleExpansionResult {
   2: MegarepoAsynchronousRequestError error;
 }
 
+/// Partial-response options for this request. Setting `partial_options`
+/// on the request opts it into partial responses: restricted-path
+/// denials omit or downgrade entries instead of failing the request.
+/// The opt-out header takes precedence over this field. See
+/// `PartialResponseInfo` for the full selection rule.
+struct PartialOptions {
+  /// Emit the withheld paths in `partial_info`, grouped by denying
+  /// restriction: omitted paths everywhere, plus downgraded entry paths
+  /// for methods that downgrade. Streams emit them inline per chunk.
+  /// When unset, paths are not emitted.
+  1: optional bool include_omitted_paths;
+}
+
 /// Omitted paths grouped by the restriction that denied them. Entries are
 /// deduplicated by restriction: even thousands of omissions collapse to a
 /// handful of groups. Clients map a denied path to its group by longest
@@ -2835,6 +2956,13 @@ struct OmittedRestrictionGroup {
   3: string permission_request_group;
   /// Omitted paths denied under this restriction.
   4: i64 omitted_count;
+  /// Omitted paths denied under this restriction, sorted. Present only
+  /// when the caller asked for omitted paths; per page for paged methods.
+  5: optional list<string> omitted_paths;
+  /// Entry paths of visible-but-downgraded entries: one side was denied,
+  /// so the entry shows only the other side. Present only when the caller
+  /// asked for omitted paths.
+  6: optional list<string> downgraded_paths;
 }
 
 /// Partial-response signal: when the server omits entries due to
@@ -2846,8 +2974,9 @@ struct OmittedRestrictionGroup {
 /// denying restriction, and is absent when the server did not collect
 /// groups for this request. The field is populated when partial responses are
 /// allowed for the request: the `scs_enable_partial_responses` killswitch
-/// is on for the repo, or the client sent the opt-in request header,
-/// unless the client sent the opt-out request header. Its
+/// is on for the repo, the client sent the opt-in request header, or the
+/// request set `partial_options`, unless the client sent the opt-out
+/// request header. Its
 /// absence means the server does not support partial responses, or they
 /// are not allowed for this request. For diffs, both sides of an entry
 /// are counted separately: one omitted entry can contribute 2 to the
@@ -2869,8 +2998,9 @@ struct CommitCompareResponse {
   /// Only populated if TREES was specified.
   3: list<CommitCompareTree> diff_trees;
   /// Only set if commit compare was ordered, and the limit was reached.
-  /// This is the last path that was produced, suitable for passing into
-  /// the `after_path` parameter of a subsequent ordered request.
+  /// This is the last scanned path, whether visible or omitted, suitable
+  /// for passing into the `after_path` parameter of a subsequent ordered
+  /// request.
   4: optional Path last_path;
   /// Partial-response verdict. See PartialResponseInfo.
   5: optional PartialResponseInfo partial_info;
@@ -2927,6 +3057,10 @@ struct CommitFindFilesResponse {
   1: list<string> files;
   /// Partial-response verdict. See PartialResponseInfo.
   2: optional PartialResponseInfo partial_info;
+  /// Set when an ordered request reached its limit: the last scanned path,
+  /// whether visible or omitted, suitable for passing as `after` to
+  /// continue. Absent for unordered requests and short pages.
+  3: optional string last_path;
 }
 
 struct CommitFindFilesStreamResponse {}
@@ -2942,6 +3076,14 @@ struct CommitFindFilesStreamItem {
   /// with `after` until one returns fewer than `limit` files. See
   /// PartialResponseInfo.
   2: optional PartialResponseInfo partial_info;
+  /// Omitted paths streamed inline, grouped by denying restriction.
+  /// Present only when the caller asked for omitted paths. Each item is
+  /// self-describing (a group's count covers its paths in this chunk);
+  /// clients union the segments, and the terminal item carries the totals.
+  /// A fully-denied chunk carries an empty file list with `omitted` set,
+  /// so only `partial_info` marks the terminal item, never an empty
+  /// `files` alone.
+  3: optional list<OmittedRestrictionGroup> omitted;
 }
 
 struct CommitHistoryResponse {
@@ -4146,6 +4288,21 @@ service SourceControlService {
     2: InternalError internal_error,
     3: PushrebaseConflictsException pushrebase_conflicts,
     4: OverloadError overload_error,
+  );
+
+  /// Check whether a draft stack would merge cleanly onto a bookmark,
+  /// creating no commits and moving no bookmark. The stack base is the
+  /// merge base of the head and the target. Conflicts are reported in the
+  /// response rather than thrown, since a conflict is an expected answer
+  /// and not an error. Advisory only: the target may move between the
+  /// check and the land.
+  RepoCheckRebaseConflictsResponse repo_check_rebase_conflicts(
+    1: RepoSpecifier repo,
+    2: RepoCheckRebaseConflictsParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
   );
 
   /// Derive data for commits in a repo

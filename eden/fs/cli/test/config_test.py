@@ -11,12 +11,13 @@ import io
 import json
 import os
 import re
+import shutil
 import struct
 import sys
 import unittest
 from collections import namedtuple
 from pathlib import Path
-from typing import Dict, Union
+from typing import Any, Dict, Union
 from unittest.mock import MagicMock, Mock, patch
 
 import toml
@@ -342,6 +343,33 @@ prefetching-enable = true
 
         self.assertEqual({}, mounts)
 
+    def test_combine_mount_info_lists_types_the_daemon_no_longer_mounts(
+        self,
+    ) -> None:
+        checkouts = []
+        for scm_type in ("git", "recas"):
+            client_dir = self._state_dir / "clients" / f"{scm_type}-client"
+            client_dir.mkdir(parents=True)
+            (client_dir / "config.toml").write_text(
+                f"""
+[repository]
+path = "/backing-repo"
+type = "{scm_type}"
+"""
+            )
+            checkouts.append(
+                config_mod.EdenCheckout(
+                    self.get_config(), self.tmp_dir / f"{scm_type}-mount", client_dir
+                )
+            )
+
+        mounts = config_mod.EdenInstance._combine_mount_info([], checkouts)
+
+        self.assertEqual(
+            {self.tmp_dir / "git-mount", self.tmp_dir / "recas-mount"},
+            set(mounts.keys()),
+        )
+
     def test_combine_mount_info_preserves_invalid_config_errors(self) -> None:
         cfg = self.get_config()
         client_dir = self._state_dir / "clients" / "broken-client"
@@ -418,6 +446,29 @@ prefetching-enable = true
             {str(registered_mount): "registered", str(mount): "orphan"},
             json.loads((self._state_dir / "config.json").read_text()),
         )
+
+    def test_remove_client_dir_already_removed(self) -> None:
+        client_dir = self._state_dir / "clients" / "already-removed"
+
+        config_mod._remove_client_dir(client_dir)
+
+        self.assertFalse(client_dir.exists())
+
+    def test_remove_client_dir_concurrently_removed_entry(self) -> None:
+        client_dir = self._state_dir / "clients" / "racing"
+        (client_dir / "local" / "ff").mkdir(parents=True)
+        (client_dir / "config.toml").write_text("")
+        real_rmtree = shutil.rmtree
+
+        def concurrent_rmtree(path: Path, **kwargs: Any) -> None:
+            # Another `eden rm` deletes the entry between iterdir() and rmtree().
+            real_rmtree(path)
+            real_rmtree(path, **kwargs)
+
+        with patch("shutil.rmtree", side_effect=concurrent_rmtree):
+            config_mod._remove_client_dir(client_dir)
+
+        self.assertFalse(client_dir.exists())
 
     def test_checkout_without_protocol_defaults_to_nfs_on_macos(self) -> None:
         client_dir = self._state_dir / "clients" / "legacy-client"

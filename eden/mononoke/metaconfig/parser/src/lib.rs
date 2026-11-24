@@ -12,19 +12,36 @@
 pub mod config;
 mod config_hash;
 mod convert;
+mod deployment;
 pub mod errors;
+pub mod layering;
 
 pub use convert::Convert;
 
+pub use crate::config::RepoConfigEntry;
 pub use crate::config::RepoConfigs;
+pub use crate::config::ResolvedRepoConfig;
 pub use crate::config::StorageConfigs;
 pub use crate::config::configerator_manifest_handle;
 pub use crate::config::configerator_repo_config_handle;
 pub use crate::config::configerator_repo_spec_handle;
 pub use crate::config::load_empty_repo_configs;
 pub use crate::config::load_repo_configs_from_manifest;
+pub use crate::config::named_storage_config;
 pub use crate::config::parse_manifest_common_and_storage;
 pub use crate::config::parse_repo_spec;
+pub use crate::config::resolve_repo_config_with_provenance;
+pub use crate::config::resolve_repo_spec_with_provenance;
+pub use crate::config_hash::SharedGenerations;
 pub use crate::config_hash::spec_hash;
-pub use crate::config_hash::storage_generation;
+pub use crate::deployment::ConfigRoot;
+pub use crate::deployment::DeploymentLocation;
+pub use crate::deployment::ServiceManifest;
+pub use crate::deployment::ServiceView;
+pub use crate::deployment::deployment_config_handle;
+pub use crate::deployment::repo_services;
+pub use crate::deployment::service_view;
 pub use crate::errors::ConfigurationError;
+
+/// A deployment's presets by name.
+pub type Presets = std::collections::BTreeMap<String, repos::RawRepoConfig>;

@@ -94,6 +94,54 @@ invalid diff.unified
   abort: diff context lines count must be an integer, not 'foo'
   [255]
 
+diff.unified or -U of 2**63 or more shows the whole file, like 2**63-1
+
+  $ sl --config diff.unified=9223372036854775807 diff --nodates
+  diff -r cf9f4ba66af2 a
+  --- a/a
+  +++ b/a
+  @@ -1,9 +1,9 @@
+   c
+   c
+   a
+   a
+  -b
+  +dd
+   a
+   a
+   c
+   c
+  $ sl --config diff.unified=9223372036854775808 diff --nodates
+  diff -r cf9f4ba66af2 a
+  --- a/a
+  +++ b/a
+  @@ -1,9 +1,9 @@
+   c
+   c
+   a
+   a
+  -b
+  +dd
+   a
+   a
+   c
+   c
+  $ sl diff --nodates -U 18446744073709551616
+  diff -r cf9f4ba66af2 a
+  --- a/a
+  +++ b/a
+  @@ -1,9 +1,9 @@
+   c
+   c
+   a
+   a
+  -b
+  +dd
+   a
+   a
+   c
+   c
+
 noprefix config and option
 
   $ sl --config diff.noprefix=True diff --nodates

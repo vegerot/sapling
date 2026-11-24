@@ -36,6 +36,7 @@ bulk_derivation = { version = "0.1.0", path = "../../derived_data/bulk_derivatio
 bundle_uri = { version = "0.1.0", path = "../../git/bundle_uri" }
 bytes = { version = "1.12.1", features = ["serde"] }
 cacheblob = { version = "0.1.0", path = "../../blobstore/cacheblob" }
+cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cas_client = { version = "0.1.0", path = "../../common/cas_client/client" }
 case_conflict_skeleton_manifest = { version = "0.1.0", path = "../../derived_data/case_conflict_skeleton_manifest" }
 changeset_info = { version = "0.1.0", path = "../../derived_data/changeset_info" }
@@ -51,11 +52,13 @@ commit_graph = { version = "0.1.0", path = "../../repo_attributes/commit_graph/c
 commit_graph_types = { version = "0.1.0", path = "../../repo_attributes/commit_graph/commit_graph_types" }
 commit_id = { version = "0.1.0", path = "../../cmdlib/commit_id" }
 commit_transformation = { version = "0.1.0", path = "../../features/commit_transformation/commit_transformation" }
+config_args = { version = "0.1.0", path = "../../cmdlib/config_args" }
 content_manifest_derivation = { version = "0.1.0", path = "../../derived_data/content_manifest_derivation" }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
 cross_repo_sync = { version = "0.1.0", path = "../../features/cross_repo_sync" }
 deleted_manifest = { version = "0.1.0", path = "../../derived_data/deleted_manifest" }
 deletion_log = { version = "0.1.0", path = "../../repo_attributes/deletion_log" }
+derivation_pipeline_driver = { version = "0.1.0", path = "../../derived_data/derivation_pipeline_driver" }
 derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/repo_derivation_queues/if" }
 derive_more = { version = "2.1.1", features = ["full"] }
 derived_data_manager = { version = "0.1.0", path = "../../derived_data/manager" }
@@ -68,7 +71,7 @@ fbthrift = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git"
 fileblob = { version = "0.1.0", path = "../../blobstore/fileblob" }
 filenodes = { version = "0.1.0", path = "../../repo_attributes/filenodes" }
 filestore = { version = "0.1.0", path = "../../repo_attributes/filestore" }
-flate2 = { version = "1.1.10", features = ["rust_backend"], default-features = false }
+flate2 = { version = "1.1.11", features = ["rust_backend"], default-features = false }
 futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_ref_content_mapping = { version = "0.1.0", path = "../../repo_attributes/git_ref_content_mapping" }
@@ -77,13 +80,14 @@ git_symbolic_refs = { version = "0.1.0", path = "../../repo_attributes/git_symbo
 git_types = { version = "0.1.0", path = "../../git/git_types" }
 gix-hash = { version = "0.26.2", features = ["sha1"] }
 gix-object = "0.64.1"
+governor = "0.10.4"
 hex = { version = "0.4.3", features = ["alloc"] }
 history_manifest = { version = "0.1.0", path = "../../derived_data/history_manifest" }
 hook_manager = { version = "0.1.0", path = "../../repo_attributes/hook_manager/hook_manager" }
 hooks = { version = "0.1.0", path = "../../features/hooks" }
 hostname = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 itertools = "0.15.0"
-k8s-openapi = { version = "0.27.1", features = ["latest", "schemars"] }
+k8s-openapi = { version = "0.29.0", features = ["latest", "schemars"] }
 live_commit_sync_config = { version = "0.1.0", path = "../../features/commit_rewriting/live_commit_sync_config" }
 manifest = { version = "0.1.0", path = "../../manifest" }
 maplit = "1.0"
@@ -98,6 +102,7 @@ metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
 metadata = { version = "0.1.0", path = "../../common/metadata" }
 mononoke_api = { version = "0.1.0", path = "../../mononoke_api" }
 mononoke_app = { version = "0.1.0", path = "../../cmdlib/mononoke_app" }
+mononoke_configs = { version = "0.1.0", path = "../../common/mononoke_configs" }
 mononoke_macros = { version = "0.1.0", path = "../../common/mononoke_macros" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 movers = { version = "0.1.0", path = "../../features/commit_rewriting/movers" }
@@ -138,13 +143,13 @@ restricted_paths = { version = "0.1.0", path = "../../repo_attributes/restricted
 restricted_paths_common = { version = "0.1.0", path = "../../repo_attributes/restricted_paths_common" }
 sapling-dag = { version = "0.2.0", path = "../../../scm/lib/dag" }
 sapling-dag-types = { version = "0.2.0", path = "../../../scm/lib/dag/dag-types", features = ["for-tests"] }
-sapling-renderdag = { version = "0.2.0", path = "../../../scm/lib/renderdag" }
+sapling-renderdag = { version = "0.3.0", path = "../../../scm/lib/renderdag" }
 scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 skeleton_manifest = { version = "0.1.0", path = "../../derived_data/skeleton_manifest" }
 skeleton_manifest_v2 = { version = "0.1.0", path = "../../derived_data/skeleton_manifest_v2" }
-smallvec = { version = "1.16.4", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
+smallvec = { version = "1.16.5", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 source_control = { version = "0.1.0", path = "../../scs/if" }
 sql_commit_graph_storage = { version = "0.1.0", path = "../../repo_attributes/commit_graph/sql_commit_graph_storage" }
@@ -161,7 +166,7 @@ tokio-util = { version = "0.7.20", features = ["full"] }
 topo_sort = { version = "0.1.0", path = "../../common/topo_sort" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 unodes = { version = "0.1.0", path = "../../derived_data/unodes" }
-uuid = { version = "1.28.0", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
+uuid = { version = "1.29.1", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
 walkdir = "2.3"
 
 [dev-dependencies]

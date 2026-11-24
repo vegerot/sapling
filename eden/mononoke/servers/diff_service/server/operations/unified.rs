@@ -40,6 +40,7 @@ struct ComputedUnifiedDiff {
     inflight_guard: InflightBytesGuard,
     scuba: MononokeScubaSampleBuilder,
     policy: RestrictedPathsPolicy,
+    include_paths: bool,
 }
 
 impl DiffServiceImpl {
@@ -72,7 +73,13 @@ impl DiffServiceImpl {
         // Build the policy once: it selects the omission path in
         // `resolve_diff_inputs` and the stamped verdict, so the two cannot
         // disagree.
-        let policy = RestrictedPathsPolicy::for_scs_request(ctx, &request.repo_name);
+        let policy = RestrictedPathsPolicy::for_scs_request(
+            ctx,
+            &request.repo_name,
+            request.partial_options.as_ref(),
+        );
+        let include_paths =
+            RestrictedPathsPolicy::paths_requested(request.partial_options.as_ref());
         let resolved = self
             .resolve_diff_inputs(ctx, &request.repo_name, request.input, &policy)
             .await?;
@@ -113,6 +120,7 @@ impl DiffServiceImpl {
                 inflight_guard,
                 scuba,
                 policy,
+                include_paths,
             });
         }
 
@@ -150,6 +158,7 @@ impl DiffServiceImpl {
             inflight_guard,
             scuba,
             policy,
+            include_paths,
         })
     }
 
@@ -172,6 +181,7 @@ impl DiffServiceImpl {
             inflight_guard: _inflight_guard,
             mut scuba,
             policy,
+            include_paths,
         } = self.compute_unified_diff(&ctx, request).await?;
 
         let chunks: Vec<_> = diff
@@ -191,7 +201,7 @@ impl DiffServiceImpl {
         let response = thrift::DiffUnifiedResponse {
             is_binary: diff.is_binary,
             num_chunks: chunks.len() as i64,
-            partial_info: crate::service::partial_response_info(&policy),
+            partial_info: crate::service::partial_response_info(&policy, include_paths),
             ..Default::default()
         };
 
@@ -209,6 +219,7 @@ impl DiffServiceImpl {
             inflight_guard: _inflight_guard,
             mut scuba,
             policy,
+            include_paths,
         } = self.compute_unified_diff(&ctx, request).await?;
 
         // Distinct log_tag so Scuba can split unary vs streamed rows.
@@ -217,7 +228,7 @@ impl DiffServiceImpl {
         Ok(thrift::DiffUnifiedUnaryResponse {
             is_binary: diff.is_binary,
             content: diff.raw_diff,
-            partial_info: crate::service::partial_response_info(&policy),
+            partial_info: crate::service::partial_response_info(&policy, include_paths),
             ..Default::default()
         })
     }

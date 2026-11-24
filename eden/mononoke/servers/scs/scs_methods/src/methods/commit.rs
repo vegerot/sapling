@@ -76,6 +76,15 @@ use crate::source_control_impl::SourceControlServiceImpl;
 // Magic number used when we want to limit concurrency with buffer_unordered.
 const CONCURRENCY_LIMIT: usize = 100;
 
+fn follow_split_members(requested: bool) -> bool {
+    requested
+        && justknobs::eval(
+            "scm/mononoke:enable_split_member_mutation_lookup",
+            None,
+            None,
+        )
+}
+
 /// Convert the thrift `run_as` union into a set of Mononoke identities to run
 /// hooks as. The `encoded_authenticated_identities` variant carries a
 /// Compact-thrift-encoded `AuthenticatedIdentityList` and preserves identity
@@ -294,34 +303,89 @@ impl CommitFileDiffsResponseElement {
     }
 }
 
-/// Filter enumerated find-files paths by per-path visibility, keeping at
-/// most `limit` visible paths and recording an omission for each denied
-/// path dropped from the page.
+/// Visibility verdict for one enumerated find-files path: the kept path,
+/// or the denying restriction paired with it.
+async fn check_find_files_visibility(
+    changeset: ChangesetContext<Repo>,
+    path: MPath,
+) -> Result<(Option<String>, Option<(DenyingRestriction, MPath)>), MononokeError> {
+    match changeset.check_path_visibility(&path).await {
+        Ok(PathVisibility::Present(_)) => Ok((Some(path.to_string()), None)),
+        Ok(PathVisibility::Denied(restriction)) => Ok((None, Some((restriction, path)))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Split one streamed find-files chunk into visible files and per-group
+/// omitted segments, recording each denial against its restriction.
+/// Counts accumulate in the policy for the terminal verdict; the paths
+/// themselves ride inline, so streams never retain them.
+fn split_streamed_chunk(
+    chunk: Vec<(Option<String>, Option<(DenyingRestriction, MPath)>)>,
+    policy: &RestrictedPathsPolicy,
+) -> (Vec<String>, Vec<thrift::OmittedRestrictionGroup>) {
+    let mut files = Vec::with_capacity(chunk.len());
+    let mut omitted: BTreeMap<DenyingRestriction, BTreeSet<MPath>> = BTreeMap::new();
+    for (kept, denial) in chunk {
+        if let Some(path) = kept {
+            files.push(path);
+        }
+        if let Some((restriction, path)) = denial {
+            policy.record_omission(&restriction, Some(&path));
+            omitted.entry(restriction).or_default().insert(path);
+        }
+    }
+    let groups = super::render_omitted_groups(omitted.into_iter().map(|(restriction, paths)| {
+        let paths: Vec<String> = paths.into_iter().map(|path| path.to_string()).collect();
+        (restriction, paths.len() as u64, paths, Vec::new())
+    }));
+    (files, groups)
+}
+
+/// Filter enumerated find-files paths by per-path visibility.
 ///
-/// Recording happens downstream of the concurrency buffer, so buffered
-/// lookahead past `limit` is dropped without counting.
-fn filter_visible_paths<S, F, Fut>(
+/// When the caller asked for omitted paths, `limit` covers scanned
+/// paths, so denials consume it; otherwise pages fill with visible
+/// paths. Recording and entry noting happen downstream of the
+/// concurrency buffer, so buffered lookahead past `limit` is dropped
+/// without counting.
+fn filter_visible_paths<'a, S, F, Fut>(
     paths: S,
     limit: usize,
-    policy: &RestrictedPathsPolicy,
+    policy: &'a RestrictedPathsPolicy,
     check: F,
-) -> impl Stream<Item = Result<String, MononokeError>> + Send
+) -> BoxStream<'a, Result<String, MononokeError>>
 where
-    S: Stream<Item = Result<MPath, MononokeError>> + Send,
-    F: FnMut(MPath) -> Fut + Send,
-    Fut:
-        Future<Output = Result<(Option<String>, Option<DenyingRestriction>), MononokeError>> + Send,
+    S: Stream<Item = Result<MPath, MononokeError>> + Send + 'a,
+    F: FnMut(MPath) -> Fut + Send + 'a,
+    Fut: Future<
+            Output = Result<(Option<String>, Option<(DenyingRestriction, MPath)>), MononokeError>,
+        > + Send
+        + 'a,
 {
-    paths
-        .map_ok(check)
-        .try_buffered(50)
-        .try_filter_map(move |(kept, denial)| {
-            if let Some(restriction) = denial {
-                policy.record_denial(&restriction);
-            }
-            futures::future::ready(Ok(kept))
-        })
-        .take(limit)
+    let checked = paths.map_ok(check).try_buffered(50);
+    if policy.omitted_path_retention() {
+        checked
+            .take(limit)
+            .try_filter_map(move |(kept, denial)| {
+                if let Some((restriction, path)) = denial {
+                    policy.record_omission(&restriction, Some(&path));
+                    policy.note_omitted_entry(Some(&path));
+                }
+                futures::future::ready(Ok(kept))
+            })
+            .boxed()
+    } else {
+        checked
+            .try_filter_map(move |(kept, denial)| {
+                if let Some((restriction, path)) = denial {
+                    policy.record_omission(&restriction, Some(&path));
+                }
+                futures::future::ready(Ok(kept))
+            })
+            .take(limit)
+            .boxed()
+    }
 }
 
 impl SourceControlServiceImpl {
@@ -570,7 +634,12 @@ impl SourceControlServiceImpl {
         // One policy for the whole request: all three resolutions share its
         // omission counter. Under Strict, denials fail the whole request and
         // the assembly below never sees a denied side.
-        let policy = RestrictedPathsPolicy::for_scs_request(&ctx, repo_name);
+        let policy = RestrictedPathsPolicy::for_scs_request(
+            &ctx,
+            repo_name,
+            params.partial_options.as_ref(),
+        );
+        let include_paths = RestrictedPathsPolicy::paths_requested(params.partial_options.as_ref());
         // The subtree branch moves its policy into a coroutine; the other
         // branches only borrow.
         let subtree_policy = policy.clone();
@@ -848,7 +917,7 @@ impl SourceControlServiceImpl {
         Ok(thrift::CommitFileDiffsResponse {
             path_diffs,
             stopped_at_pair,
-            partial_info: super::partial_response_info(&policy),
+            partial_info: super::partial_response_info(&policy, include_paths),
             ..Default::default()
         })
     }
@@ -1001,11 +1070,12 @@ impl SourceControlServiceImpl {
         let remote_diff_config = self
             .configs
             .repo_configs()
-            .repos
             .get(repo_name)
             .and_then(|config| config.remote_diff_config.clone());
         let diff_router = self.diff_router(remote_diff_config.as_ref());
         if diff_router.should_use_remote_commit_compare(repo_name) {
+            // Authorize the caller here, as the local route does in `repo_changeset`.
+            self.repo(ctx.clone(), &commit.repo).await?;
             return diff_router
                 .remote_commit_compare(&ctx, repo_name, commit.id.clone(), params)
                 .await;
@@ -1026,7 +1096,12 @@ impl SourceControlServiceImpl {
         // Under Strict, denials fail the whole request; under SkipAndCollect,
         // entries denied by restricted-path enforcement are omitted or
         // downgraded, and recorded against their denying restriction.
-        let policy = RestrictedPathsPolicy::for_scs_request(&ctx, repo.name());
+        let policy = RestrictedPathsPolicy::for_scs_request(
+            &ctx,
+            repo.name(),
+            params.partial_options.as_ref(),
+        );
+        let include_paths = RestrictedPathsPolicy::paths_requested(params.partial_options.as_ref());
         let result = commit_compare::operations::commit_compare(
             &ctx,
             &repo,
@@ -1047,7 +1122,7 @@ impl SourceControlServiceImpl {
         // context flag. Remote path returns early above with diff_service's
         // own verdict untouched.
         let mut response = result.response;
-        response.partial_info = super::partial_response_info(&policy);
+        response.partial_info = super::partial_response_info(&policy, include_paths);
         Ok(response)
     }
 
@@ -1086,8 +1161,14 @@ impl SourceControlServiceImpl {
             }
             None => ChangesetFileOrdering::Unordered,
         };
+        let ordered = params.after.is_some();
 
-        let policy = RestrictedPathsPolicy::for_scs_request(&ctx, repo.name());
+        let policy = RestrictedPathsPolicy::for_scs_request(
+            &ctx,
+            repo.name(),
+            params.partial_options.as_ref(),
+        );
+        let include_paths = RestrictedPathsPolicy::paths_requested(params.partial_options.as_ref());
         let partial = !matches!(policy, RestrictedPathsPolicy::Strict);
 
         let path_stream = changeset
@@ -1100,14 +1181,7 @@ impl SourceControlServiceImpl {
             .await?;
         let files: Vec<String> = if partial {
             filter_visible_paths(path_stream, limit, &policy, |path| {
-                let changeset = changeset.clone();
-                async move {
-                    match changeset.check_path_visibility(&path).await {
-                        Ok(PathVisibility::Present(_)) => Ok((Some(path.to_string()), None)),
-                        Ok(PathVisibility::Denied(restriction)) => Ok((None, Some(restriction))),
-                        Err(e) => Err(e),
-                    }
-                }
+                check_find_files_visibility(changeset.clone(), path)
             })
             .try_collect()
             .await?
@@ -1120,9 +1194,20 @@ impl SourceControlServiceImpl {
         };
         policy.set_partial_if_omitted(&ctx);
 
+        // Ordered requests that reached the limit carry the continuation:
+        // the last scanned path, whether visible or omitted. Unordered
+        // requests and short pages leave it unset.
+        let scanned = files.len() + policy.omitted_entry_count().unwrap_or(0);
+        let last_path = if ordered && scanned >= limit {
+            policy.last_scanned_path(files.last().map(String::as_str))
+        } else {
+            None
+        };
+
         Ok(thrift::CommitFindFilesResponse {
             files,
-            partial_info: super::partial_response_info(&policy),
+            partial_info: super::partial_response_info(&policy, include_paths),
+            last_path,
             ..Default::default()
         })
     }
@@ -1170,11 +1255,19 @@ impl SourceControlServiceImpl {
         // (counting omissions) and the exact verdict is reported on a
         // terminal item; up front we can only set `nocache`,
         // pessimistically, since items are produced lazily.
-        let policy = RestrictedPathsPolicy::for_scs_request(&ctx, repo.name());
+        let policy = RestrictedPathsPolicy::for_scs_request(
+            &ctx,
+            repo.name(),
+            params.partial_options.as_ref(),
+        );
         let partial = !matches!(policy, RestrictedPathsPolicy::Strict);
         if partial {
             ctx.set_potential_partial_response();
         }
+
+        // Streams never retain omitted paths: when asked, each chunk
+        // carries its own omitted groups inline instead.
+        let include_paths = RestrictedPathsPolicy::paths_requested(params.partial_options.as_ref());
 
         let files_stream = (async_stream::stream! {
             // Owned by the generator so the filter closures below can
@@ -1188,31 +1281,49 @@ impl SourceControlServiceImpl {
                 ordering,
             )
             .await?;
-            let filtered: BoxStream<'_, Result<String, MononokeError>> = if partial {
-                filter_visible_paths(path_stream, limit, &policy, |path| {
-                    let changeset = changeset.clone();
-                    async move {
-                        match changeset.check_path_visibility(&path).await {
-                            Ok(PathVisibility::Present(_)) => Ok((Some(path.to_string()), None)),
-                            Ok(PathVisibility::Denied(restriction)) => Ok((None, Some(restriction))),
-                            Err(e) => Err(e),
-                        }
-                    }
-                })
-                .boxed()
-            } else {
+            // Opted-in streams keep denials beside the files they were
+            // scanned with, so the limit covers scanned paths and the
+            // caller sees every name bucketed by fetchability. Other
+            // streams filter to visible paths as before.
+            let s: BoxStream<
+                '_,
+                Result<thrift::CommitFindFilesStreamItem, scs_errors::ServiceError>,
+            > = if partial && include_paths {
                 path_stream
-                    .map_ok(|path| path.to_string())
+                    .map_ok(|path| check_find_files_visibility(changeset.clone(), path))
+                    .try_buffered(50)
                     .take(limit)
+                    .try_chunks(1000)
+                    .map_ok(|chunk| {
+                        let (files, omitted) = split_streamed_chunk(chunk, &policy);
+                        thrift::CommitFindFilesStreamItem {
+                            files,
+                            omitted: (!omitted.is_empty()).then_some(omitted),
+                            ..Default::default()
+                        }
+                    })
+                    .map_err(|err| scs_errors::ServiceError::from(err.1))
+                    .boxed()
+            } else {
+                let filtered: BoxStream<'_, Result<String, MononokeError>> = if partial {
+                    filter_visible_paths(path_stream, limit, &policy, |path| {
+                        check_find_files_visibility(changeset.clone(), path)
+                    })
+                } else {
+                    path_stream
+                        .map_ok(|path| path.to_string())
+                        .take(limit)
+                        .boxed()
+                };
+                filtered
+                    .try_chunks(1000)
+                    .map_ok(|files| thrift::CommitFindFilesStreamItem {
+                        files,
+                        ..Default::default()
+                    })
+                    .map_err(|err| scs_errors::ServiceError::from(err.1))
                     .boxed()
             };
-            let s = filtered
-            .try_chunks(1000)
-            .map_ok(|files| thrift::CommitFindFilesStreamItem {
-                files,
-                ..Default::default()
-            })
-            .map_err(|err| scs_errors::ServiceError::from(err.1)).boxed();
             pin_mut!(s);
             while let Some(value) = s.next().await {
                 yield value;
@@ -1225,7 +1336,9 @@ impl SourceControlServiceImpl {
                 policy.set_partial_if_omitted(&ctx);
                 yield Ok(thrift::CommitFindFilesStreamItem {
                     files: vec![],
-                    partial_info: super::partial_response_info(&policy),
+                    // No paths on the terminal verdict: stream omissions go
+                    // inline per chunk.
+                    partial_info: super::partial_response_info(&policy, false),
                     ..Default::default()
                 });
             }
@@ -1741,10 +1854,21 @@ impl SourceControlServiceImpl {
             .await?
             .ok_or_else(|| scs_errors::invalid_request("commit is not a hg commit".to_string()))?;
 
-        let mutations = repo
-            .hg()
-            .fetch_mutations(HashSet::from_iter([changeset_id]))
-            .await?;
+        let follow_splits = follow_split_members(params.follow_splits);
+        if params.follow_splits {
+            let mut scuba = ctx.scuba().clone();
+            scuba.add("follow_splits_effective", follow_splits);
+            scuba.log_with_msg("Mutation history read mode", None);
+        }
+        let mutations = if follow_splits {
+            repo.hg()
+                .fetch_mutations_following_splits(changeset_id)
+                .await?
+        } else {
+            repo.hg()
+                .fetch_mutations(HashSet::from_iter([changeset_id]))
+                .await?
+        };
 
         let hg_mutation_history = match params.format {
             thrift::MutationHistoryFormat::COMMIT_ID => {
@@ -2090,6 +2214,51 @@ impl SourceControlServiceImpl {
 }
 
 #[cfg(test)]
+mod split_history_tests {
+    use std::collections::HashMap;
+
+    use justknobs::test_helpers::JustKnobsInMemory;
+    use justknobs::test_helpers::KnobVal;
+    use justknobs::test_helpers::with_just_knobs;
+    use mononoke_macros::mononoke;
+
+    use super::follow_split_members;
+
+    const KNOB: &str = "scm/mononoke:enable_split_member_mutation_lookup";
+
+    #[mononoke::test]
+    fn split_following_requires_request_and_emergency_permission() {
+        for enabled in [false, true] {
+            let knobs =
+                JustKnobsInMemory::new(HashMap::from([(KNOB.to_owned(), KnobVal::Bool(enabled))]));
+            with_just_knobs(knobs, || {
+                assert!(!follow_split_members(false));
+                assert_eq!(follow_split_members(true), enabled);
+            });
+        }
+    }
+
+    #[mononoke::test]
+    fn default_request_does_not_read_a_missing_or_invalid_knob() {
+        for values in [
+            HashMap::new(),
+            HashMap::from([(KNOB.to_owned(), KnobVal::Int(1))]),
+        ] {
+            with_just_knobs(JustKnobsInMemory::new(values), || {
+                assert!(!follow_split_members(false));
+            });
+        }
+    }
+
+    #[mononoke::test]
+    #[should_panic(expected = "JustKnobs eval failed")]
+    fn opted_in_request_does_not_hide_an_invalid_knob() {
+        let knobs = JustKnobsInMemory::new(HashMap::from([(KNOB.to_owned(), KnobVal::Int(1))]));
+        with_just_knobs(knobs, || follow_split_members(true));
+    }
+}
+
+#[cfg(test)]
 mod run_as_tests {
     use mononoke_macros::mononoke;
 
@@ -2146,11 +2315,19 @@ mod run_as_tests {
 
 #[cfg(test)]
 mod find_files_filter_tests {
+    use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Arc;
 
+    use context::CoreContext;
+    use fbinit::FacebookInit;
+    use futures::FutureExt;
     use futures::stream;
+    use justknobs::test_helpers::JustKnobsInMemory;
+    use justknobs::test_helpers::KnobVal;
+    use justknobs::test_helpers::with_just_knobs_async;
     use mononoke_api::OmissionCollector;
+    use mononoke_api::restricted_paths::SCS_ENABLE_PARTIAL_RESPONSES_JK;
     use mononoke_macros::mononoke;
     use mononoke_types::NonRootMPath;
     use restricted_paths::DenyingRestriction;
@@ -2177,6 +2354,13 @@ mod find_files_filter_tests {
             .expect("test paths are valid")
     }
 
+    fn knobs(enabled: bool) -> JustKnobsInMemory {
+        JustKnobsInMemory::new(HashMap::from([(
+            SCS_ENABLE_PARTIAL_RESPONSES_JK.to_string(),
+            KnobVal::Bool(enabled),
+        )]))
+    }
+
     #[mononoke::test]
     async fn buffered_lookahead_past_limit_is_not_counted() {
         // The visible head path resolves slowly while 60 denied paths
@@ -2196,7 +2380,7 @@ mod find_files_filter_tests {
                     }
                     Ok((Some(path.to_string()), None))
                 } else {
-                    Ok((None, Some(denying_restriction())))
+                    Ok((None, Some((denying_restriction(), path))))
                 }
             },
         )
@@ -2235,7 +2419,7 @@ mod find_files_filter_tests {
                     }
                     Ok((Some(path.to_string()), None))
                 } else {
-                    Ok((None, Some(denying_restriction())))
+                    Ok((None, Some((denying_restriction(), path))))
                 }
             },
         )
@@ -2250,6 +2434,120 @@ mod find_files_filter_tests {
                 denying_restriction(),
                 3
             )])),
+        );
+    }
+
+    #[mononoke::fbinit_test]
+    async fn retained_denials_consume_the_limit(fb: FacebookInit) -> Result<(), anyhow::Error> {
+        // Retention on: the limit covers scanned paths, so the window of
+        // file000 (denied), file001 (visible), file002 (denied) yields one
+        // visible file and notes two omitted entries ending at file002.
+        // Retention comes from the request block via the constructor.
+        let ctx = CoreContext::test_mock(fb);
+        let block = thrift::PartialOptions {
+            include_omitted_paths: Some(true),
+            ..Default::default()
+        };
+        with_just_knobs_async(
+            knobs(false),
+            async move {
+                let policy = RestrictedPathsPolicy::for_scs_request(&ctx, "repo", Some(&block));
+                let paths = numbered_paths(6);
+                let files: Vec<String> = filter_visible_paths(
+                    stream::iter(paths.into_iter().map(Ok)),
+                    3,
+                    &policy,
+                    |path| async move {
+                        let n: usize = path
+                            .to_string()
+                            .strip_prefix("file")
+                            .expect("numbered test path")
+                            .parse()
+                            .expect("numbered test path");
+                        if n % 2 == 1 {
+                            Ok((Some(path.to_string()), None))
+                        } else {
+                            Ok((None, Some((denying_restriction(), path))))
+                        }
+                    },
+                )
+                .try_collect()
+                .await?;
+                assert_eq!(files, vec!["file001".to_string()]);
+                assert_eq!(policy.omitted_count(), Some(2));
+                assert_eq!(policy.omitted_entry_count(), Some(2));
+                assert_eq!(
+                    policy.last_scanned_path(files.last().map(String::as_str)),
+                    Some("file002".to_string())
+                );
+                Ok(())
+            }
+            .boxed(),
+        )
+        .await
+    }
+
+    #[mononoke::test]
+    fn streamed_chunk_splits_files_and_omitted_groups() {
+        // Visible files ride in `files`; denials group by restriction with
+        // sorted paths and per-chunk counts. Counts accumulate for the
+        // terminal verdict; with retention off nothing is retained.
+        let policy = counting_policy();
+        let tent_a = denying_restriction();
+        let acl_b = MononokeIdentity::from_str("REPO_REGION:other_acl").expect("test ACL parses");
+        let tent_b = DenyingRestriction {
+            restriction_root: Some(NonRootMPath::new("other").expect("test root parses")),
+            repo_region_acl: acl_b.clone(),
+            permission_request_group: acl_b,
+        };
+        let (files, omitted) = split_streamed_chunk(
+            vec![
+                (Some("file001".to_string()), None),
+                (
+                    None,
+                    Some((
+                        tent_a.clone(),
+                        MPath::new("restricted/b").expect("test path parses"),
+                    )),
+                ),
+                (Some("file002".to_string()), None),
+                (
+                    None,
+                    Some((
+                        tent_b.clone(),
+                        MPath::new("other/x").expect("test path parses"),
+                    )),
+                ),
+                (
+                    None,
+                    Some((
+                        tent_a.clone(),
+                        MPath::new("restricted/a").expect("test path parses"),
+                    )),
+                ),
+            ],
+            &policy,
+        );
+        assert_eq!(files, vec!["file001".to_string(), "file002".to_string()]);
+        assert_eq!(omitted.len(), 2);
+        let group_a = omitted
+            .iter()
+            .find(|group| group.restriction_root.as_deref() == Some("restricted"))
+            .expect("tent_a group present");
+        assert_eq!(group_a.omitted_count, 2);
+        assert_eq!(
+            group_a.omitted_paths,
+            Some(vec!["restricted/a".to_string(), "restricted/b".to_string()]),
+        );
+        assert_eq!(group_a.downgraded_paths, None);
+        assert_eq!(policy.omitted_count(), Some(3));
+        assert!(
+            policy
+                .omitted_paths()
+                .expect("paths readable when allowed")
+                .values()
+                .all(|paths| paths.is_empty()),
+            "streams never retain paths",
         );
     }
 }

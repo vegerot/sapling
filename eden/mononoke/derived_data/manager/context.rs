@@ -28,8 +28,19 @@ use mononoke_types::DerivableType;
 use mononoke_types::RepositoryId;
 use restricted_paths_common::config_based::ArcRestrictedPathsConfigBased;
 
+use crate::StageInputs;
 use crate::derivable::BonsaiDerivable;
 use crate::manager::derive::Rederivation;
+
+/// Publication policy for pipeline stage requests.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PipelineMode {
+    /// Publish canonical mappings and history.
+    #[default]
+    Production,
+    /// Return terminal outputs and keep history outside canonical keys.
+    Shadow,
+}
 
 /// Context for performing derivation.
 ///
@@ -41,6 +52,9 @@ pub struct DerivationContext {
     pub(crate) bonsai_hg_mapping: Option<Arc<dyn BonsaiHgMapping>>,
     pub(crate) bonsai_git_mapping: Option<Arc<dyn BonsaiGitMapping>>,
     pub(crate) filenodes: Option<Arc<dyn Filenodes>>,
+    pub(crate) stage_inputs: Arc<StageInputs>,
+    pub(crate) prepared_inputs: Option<Arc<crate::PreparedStageInputs>>,
+    pub(crate) pipeline_mode: PipelineMode,
     config_name: String,
     config: DerivedDataTypesConfig,
     pub(crate) rederivation: Option<Arc<dyn Rederivation>>,
@@ -62,6 +76,18 @@ pub struct DerivationContext {
 }
 
 impl DerivationContext {
+    pub fn prepared_input(
+        &self,
+        stage: &crate::StageId,
+        csid: ChangesetId,
+    ) -> Result<&bytes::Bytes> {
+        self.prepared_inputs
+            .as_ref()
+            .filter(|inputs| &inputs.stage == stage)
+            .and_then(|inputs| inputs.changes.get(&csid))
+            .with_context(|| format!("missing prepared input for {stage:?}, {csid}"))
+    }
+
     pub(crate) fn new(
         bonsai_hg_mapping: Arc<dyn BonsaiHgMapping>,
         bonsai_git_mapping: Arc<dyn BonsaiGitMapping>,
@@ -84,6 +110,9 @@ impl DerivationContext {
             filenodes: Some(filenodes),
             repo_id,
             repo_name,
+            stage_inputs: Arc::default(),
+            prepared_inputs: None,
+            pipeline_mode: PipelineMode::Production,
             config_name,
             config,
             rederivation,
@@ -94,6 +123,11 @@ impl DerivationContext {
             pipeline_config,
             commit_derived_data_mapping: Some(commit_derived_data_mapping),
         }
+    }
+
+    /// Whether pipeline derivation may publish the type's canonical data.
+    pub fn publish_pipeline_outputs(&self) -> bool {
+        self.pipeline_mode == PipelineMode::Production
     }
 
     pub(crate) fn with_replaced_rederivation(
@@ -329,6 +363,10 @@ impl DerivationContext {
     }
 
     /// The blobstore that should be used for storing and retrieving blobs.
+    pub fn stage_inputs(&self) -> &Arc<StageInputs> {
+        &self.stage_inputs
+    }
+
     pub fn blobstore(&self) -> &Arc<dyn KeyedBlobstore> {
         match &self.blobstore_write_cache {
             Some((blobstore, _)) => blobstore,

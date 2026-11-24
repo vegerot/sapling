@@ -8,8 +8,11 @@
 //! Imports a Perforce depot into a repo.
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -44,6 +47,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::channel::mpsc;
 use futures::future;
+use futures::future::Either;
 use futures::stream;
 use futures_stats::TimedTryFutureExt;
 pub use import_common::BackfillDerivation;
@@ -79,7 +83,15 @@ use thiserror::Error;
 define_stats! {
     prefix = "mononoke.p4_import";
     failed_batches: dynamic_timeseries("failed_batches.{}", (stage: &'static str); Rate, Sum),
+    content_reuse_collisions: timeseries(Rate, Sum),
+    content_reuse_lookup_failures: timeseries(Rate, Sum),
+    content_reuse_digest_mismatches: timeseries(Rate, Sum),
 }
+
+mod content_reuse;
+
+pub use content_reuse::ContentReuse;
+pub use content_reuse::ContentReuseReport;
 
 /// Stores a file revision's content in the repo's filestore. `size` is the size
 /// Perforce reports for the revision: content of any other length is rejected.
@@ -160,7 +172,7 @@ fn symlink_target(size: u64, mut printed: Vec<u8>) -> Result<Bytes> {
     Ok(Bytes::from(printed))
 }
 
-/// How to import: what to derive, and how much runs at once.
+/// How to import: what to derive, how much runs at once, and where to count progress.
 #[derive(Clone, Debug)]
 pub struct ImportOptions {
     /// Derived for every imported changeset before the bookmark moves, among the types
@@ -173,6 +185,25 @@ pub struct ImportOptions {
     pub file_concurrency: usize,
     /// Changelists fetched at once, while an earlier one is built. At least 1.
     pub changelist_lookahead: usize,
+    /// How long a batch builds before it stops taking changelists. Checked between
+    /// changelists: the one the build is waiting for or building when the time runs out is
+    /// finished and is the batch's last, so a batch always has one, and the rest are left
+    /// for the next import. A batch dropped before it commits, as a job restart does, loses
+    /// about this much work plus one changelist at most.
+    pub max_build_time: Duration,
+    /// Incremented for each file stored and each changeset built, so a caller can tell that
+    /// a long batch is moving. A failed batch's steps stay counted.
+    pub progress: Arc<AtomicU64>,
+    /// How many changelist numbers after the resume point `import_next`'s first listing
+    /// covers (see `next_changes_in_windows`). `None` lists up to the server's latest in one
+    /// listing (`next_changes`), which a server may answer no faster for a few changelists
+    /// than for all of them.
+    pub listing_window: Option<NonZeroU64>,
+    /// Asks for a changelist's integration records while its contents are stored, not
+    /// after: with many copies in a changelist, the records take long enough to matter.
+    pub copy_sources_with_uploads: bool,
+    /// Whether a copy whose content is already stored, found by MD5 and size, is printed.
+    pub content_reuse: ContentReuse,
 }
 
 impl Default for ImportOptions {
@@ -181,6 +212,11 @@ impl Default for ImportOptions {
             backfill_derivation: BackfillDerivation::AllConfiguredTypes,
             file_concurrency: 16,
             changelist_lookahead: 2,
+            max_build_time: Duration::from_mins(10),
+            progress: Arc::default(),
+            listing_window: None,
+            copy_sources_with_uploads: false,
+            content_reuse: ContentReuse::Off,
         }
     }
 }
@@ -202,7 +238,7 @@ fn in_depot<'a>(
 
 /// Stores the content of every revision in `changelist` that leaves content in the depot
 /// at `depot_root`, `concurrency` at a time, keyed by depot path as
-/// `p4_transform::changeset` takes it.
+/// `p4_transform::changeset` takes it. Adds one to `progress` per file stored.
 pub async fn upload_changelist_contents(
     ctx: &CoreContext,
     repo: &(impl RepoBlobstoreRef + FilestoreConfigRef),
@@ -210,6 +246,7 @@ pub async fn upload_changelist_contents(
     depot_root: &str,
     changelist: &Changelist,
     concurrency: usize,
+    progress: &AtomicU64,
 ) -> Result<HashMap<String, ContentMetadataV2>> {
     let revisions = in_depot(depot_root, changelist, |revision| {
         revision.action.has_content()
@@ -230,6 +267,9 @@ pub async fn upload_changelist_contents(
             anyhow::Ok((revision.depot_path.clone(), metadata))
         })
         .buffer_unordered(concurrency)
+        .inspect_ok(|_| {
+            progress.fetch_add(1, Ordering::Relaxed);
+        })
         .try_collect()
         .await
 }
@@ -288,9 +328,11 @@ pub struct BuiltChangeset {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChangelistTimings {
     pub describe: Duration,
-    /// Printing and storing the content of `uploaded_files` files.
+    /// Printing and storing the content of `uploaded_files` files, and reusing stored content.
     pub upload: Duration,
+    /// Files printed and stored, not those reused.
     pub uploaded_files: usize,
+    pub content_reuse: ContentReuseReport,
     /// `filelog` of each branch and move/add.
     pub integrations: Duration,
     /// Whether each copy source is a file in the parent.
@@ -407,6 +449,8 @@ struct FetchedChangelist {
     copy_sources: HashMap<String, NonRootMPath>,
     ambiguous_copy_sources: usize,
     timings: ChangelistTimings,
+    /// The revisions whose content was reused, not printed.
+    reused: Vec<FileRevision>,
 }
 
 async fn fetch_changelist(
@@ -415,29 +459,66 @@ async fn fetch_changelist(
     source: &impl ChangeSource,
     depot_root: &str,
     change: u64,
-    concurrency: usize,
+    options: &ImportOptions,
 ) -> Result<FetchedChangelist> {
     let (describe, changelist) = source.describe(change).try_timed().await?;
-    let (upload, contents) =
-        upload_changelist_contents(ctx, repo, source, depot_root, &changelist, concurrency)
-            .try_timed()
-            .await?;
-    let (integrations, (copy_sources, ambiguous_copy_sources)) =
-        copy_sources(source, depot_root, &changelist)
-            .try_timed()
-            .await?;
+    let upload = async {
+        let concurrency = options.file_concurrency.max(1);
+        let mode = match options.content_reuse {
+            ContentReuse::Off => {
+                let contents = upload_changelist_contents(
+                    ctx,
+                    repo,
+                    source,
+                    depot_root,
+                    &changelist,
+                    concurrency,
+                    &options.progress,
+                )
+                .await?;
+                return anyhow::Ok(content_reuse::Uploaded {
+                    printed_files: contents.len(),
+                    contents,
+                    ..Default::default()
+                });
+            }
+            ContentReuse::Verify => content_reuse::Mode::Verify,
+            ContentReuse::On => content_reuse::Mode::On,
+        };
+        content_reuse::upload_changelist_contents_reusing(
+            ctx,
+            repo,
+            source,
+            depot_root,
+            &changelist,
+            concurrency,
+            &options.progress,
+            mode,
+        )
+        .await
+    }
+    .try_timed();
+    let integrations = copy_sources(source, depot_root, &changelist).try_timed();
+    let ((upload, uploaded), (integrations, (copy_sources, ambiguous_copy_sources))) =
+        if options.copy_sources_with_uploads {
+            future::try_join(upload, integrations).await?
+        } else {
+            (upload.await?, integrations.await?)
+        };
     Ok(FetchedChangelist {
         timings: ChangelistTimings {
             describe: describe.completion_time,
             upload: upload.completion_time,
-            uploaded_files: contents.len(),
+            uploaded_files: uploaded.printed_files,
+            content_reuse: uploaded.report,
             integrations: integrations.completion_time,
             ..Default::default()
         },
         changelist,
-        contents,
+        contents: uploaded.contents,
         copy_sources,
         ambiguous_copy_sources,
+        reused: uploaded.reused,
     })
 }
 
@@ -457,6 +538,7 @@ async fn build_changeset(
         mut copy_sources,
         ambiguous_copy_sources,
         mut timings,
+        reused: _,
     } = fetched;
     // Mononoke doesn't check that copy_from exists in the parent, but derived data and
     // blame would follow it anyway.
@@ -520,7 +602,8 @@ struct BuildingChangelist(u64);
 /// The changesets for `changes`, in order, each on top of the one before and the first on
 /// top of `base`, each recording the source's commit server's id (see `commit_server_id`).
 /// Their contents are stored; the changesets themselves are not. Changelists are fetched ahead while earlier ones are
-/// built, but built one at a time, in order.
+/// built, but built one at a time, in order. Once `options.max_build_time` has passed, the
+/// changesets built so far are returned, at least one, and the fetches in flight are dropped.
 pub async fn build_changesets(
     ctx: &CoreContext,
     repo: &(impl RepoBlobstoreRef + RepoDerivedDataRef + FilestoreConfigRef),
@@ -530,6 +613,8 @@ pub async fn build_changesets(
     changes: &[u64],
     options: &ImportOptions,
 ) -> Result<Vec<BuiltChangeset>> {
+    // Tokio's clock, which tests can pause.
+    let started = tokio::time::Instant::now();
     let commit_server_id = commit_server_id(source).await?;
     let commit_server_id = commit_server_id.as_str();
     let concurrency = options.file_concurrency.max(1);
@@ -539,7 +624,7 @@ pub async fn build_changesets(
         let mut fetched = pin!(
             stream::iter(changes.iter().copied())
                 .map(|change| async move {
-                    fetch_changelist(ctx, repo, source, depot_root, change, concurrency)
+                    fetch_changelist(ctx, repo, source, depot_root, change, options)
                         .await
                         .with_context(|| BuildingChangelist(change))
                 })
@@ -554,9 +639,24 @@ pub async fn build_changesets(
     };
     let build = async move {
         let mut built = Vec::with_capacity(changes.len());
-        while let Some(fetched) = receiver.next().await {
-            let fetched: FetchedChangelist = fetched?;
+        // Always the first changelist, then more for as long as `max_build_time` allows.
+        while (built.is_empty() || started.elapsed() < options.max_build_time)
+            && let Some(fetched) = receiver.next().await
+        {
+            let mut fetched: FetchedChangelist = fetched?;
             let change = fetched.changelist.number;
+            // Every earlier changelist has been fetched by now.
+            let reused = std::mem::take(&mut fetched.reused);
+            let reprinted = content_reuse::reprint_collided(ctx, repo, source, reused, concurrency)
+                .await
+                .with_context(|| BuildingChangelist(change))?;
+            for (depot_path, metadata) in reprinted {
+                let reuse = &mut fetched.timings.content_reuse;
+                reuse.reused_files -= 1;
+                reuse.reused_bytes -= metadata.total_size;
+                fetched.timings.uploaded_files += 1;
+                fetched.contents.insert(depot_path, metadata);
+            }
             let changeset = build_changeset(
                 ctx,
                 repo,
@@ -570,11 +670,17 @@ pub async fn build_changesets(
             .await
             .with_context(|| BuildingChangelist(change))?;
             built.push(changeset);
+            options.progress.fetch_add(1, Ordering::Relaxed);
         }
         anyhow::Ok(built)
     };
-    let ((), built) = future::join(fetch, build).await;
-    built
+    // The build ends first when it fails or `max_build_time` has passed: returning then
+    // drops the fetches in flight, however long they still have to run.
+    let (build, fetch) = (pin!(build), pin!(fetch));
+    match future::select(build, fetch).await {
+        Either::Left((built, _fetch)) => built,
+        Either::Right(((), build)) => build.await,
+    }
 }
 
 /// The first `limit` changelists of the depot after `after`, up to the server's latest, in one
@@ -593,6 +699,42 @@ pub async fn next_changes(
     source
         .submitted_changes(depot_root, after, latest, limit)
         .await
+}
+
+/// What `next_changes` returns, from listings that each cover a range of changelist numbers:
+/// the first covers `first_window` numbers after `after`, and each one that leaves the batch
+/// short starts where it ended and covers twice as many, up to the server's latest. A
+/// listing short of what it was asked for holds every changelist the depot has in its
+/// range, so the ranges together list what one listing up to the latest would. The latest is
+/// read once. A quiet depot on a busy server costs a few listings, the last of them wide.
+pub async fn next_changes_in_windows(
+    source: &impl ChangeSource,
+    depot_root: &str,
+    after: Option<u64>,
+    limit: usize,
+    first_window: NonZeroU64,
+) -> Result<Vec<u64>> {
+    let latest = source.latest_change().await?;
+    let mut changes = Vec::new();
+    let mut listed_upto = after;
+    let mut window = first_window.get();
+    while changes.len() < limit && listed_upto.is_none_or(|upto| upto < latest) {
+        let upto = listed_upto.unwrap_or(0).saturating_add(window).min(latest);
+        let wanted = limit - changes.len();
+        let listed = source
+            .submitted_changes(depot_root, listed_upto, upto, wanted)
+            .await?;
+        ensure!(
+            listed.len() <= wanted,
+            "listing {depot_root} after {listed_upto:?} up to {upto} returned {} changelists, \
+             {wanted} asked for",
+            listed.len()
+        );
+        changes.extend(listed);
+        listed_upto = Some(upto);
+        window = window.saturating_mul(2);
+    }
+    Ok(changes)
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -778,7 +920,8 @@ pub async fn resume_point(
 }
 
 /// Imports `changes`, in order, onto `bookmark` (created by the first import) as
-/// `options` say, and returns their changesets. The batch must start after the
+/// `options` say, and returns their changesets: of the first of them only, if
+/// `options.max_build_time` ends the batch early. The batch must start after the
 /// `resume_point`, so nothing is imported twice. `depot_root` must pass `check_depot_root`
 /// and the bookmark `check_resume_continuity`, as `import_next` makes sure. Logs a row
 /// per changelist to the context's Scuba table and, once the bookmark has moved, the
@@ -854,6 +997,23 @@ pub async fn import_changelists(
         .try_timed()
         .await
         .map_err(|error| batch.failed(ctx, Stage::Build, error))?;
+    // `max_build_time` can end the batch early: from here on it is the changelists built.
+    let (last, new) = built
+        .last()
+        .map(|built| (built.change, built.changeset.get_changeset_id()))
+        .context("built no changesets")?;
+    if built.len() < changes.len() {
+        tracing::info!(
+            "batch cut after changelist {last} ({} of {}): build took {:?}, over max_build_time {:?}; session {}",
+            built.len(),
+            changes.len(),
+            build.completion_time,
+            options.max_build_time,
+            ctx.metadata().session_id(),
+        );
+    }
+    let changes = &changes[..built.len()];
+    let batch = Batch { changes, ..batch };
     let (imported, changesets): (Vec<_>, Vec<_>) = built
         .into_iter()
         .map(|built| {
@@ -893,7 +1053,6 @@ pub async fn import_changelists(
         .with_context(|| format!("saving changelists {}..={last}", changes[0]))
         .map_err(|error| batch.failed(ctx, Stage::SaveAndDerive, error))?;
 
-    let new = imported.last().context("built no changesets")?.cs_id;
     let (commit, ()) = async {
         let mut txn = repo.bookmarks().create_transaction(ctx.clone());
         match old {
@@ -921,7 +1080,7 @@ pub async fn import_changelists(
         commit: commit.completion_time,
     };
     // Synchronous, so a stop during the update-feed await below can't skip them.
-    log_imported(ctx, &imported);
+    log_imported(ctx, &imported, options.content_reuse);
     trace_imported(ctx, depot_root, bookmark, old, new, &imported);
     log_repo_update(ctx, repo, bookmark, old, new, commit_infos).await;
     Ok(imported)
@@ -1045,7 +1204,7 @@ async fn log_repo_update(
     log_bookmark_operation(ctx, repo, &info).await;
 }
 
-fn log_imported(ctx: &CoreContext, batch: &ImportedBatch) {
+fn log_imported(ctx: &CoreContext, batch: &ImportedBatch, content_reuse: ContentReuse) {
     let micros = |duration: Duration| duration.as_micros() as u64;
     for imported in &batch.changelists {
         let timings = &imported.timings;
@@ -1064,6 +1223,16 @@ fn log_imported(ctx: &CoreContext, batch: &ImportedBatch) {
             .add("batch_build_us", micros(batch.build))
             .add("batch_save_and_derive_us", micros(batch.save_and_derive))
             .add("batch_commit_us", micros(batch.commit));
+        let reuse = &timings.content_reuse;
+        if content_reuse != ContentReuse::Off {
+            scuba
+                .add("content_reuse", format!("{content_reuse:?}").to_lowercase())
+                .add("reused_files", reuse.reused_files)
+                .add("reused_bytes", reuse.reused_bytes)
+                .add("reusable_files", reuse.reusable_files)
+                .add("reusable_bytes", reuse.reusable_bytes)
+                .add("content_reuse_lookup_us", micros(reuse.lookup));
+        }
         scuba.log_with_msg("P4 changelist imported", None);
     }
 }
@@ -1134,7 +1303,12 @@ pub async fn import_next(
         check_depot_root(source, depot_root).await?;
         check_resume_continuity(ctx, repo, source, bookmark).await?;
         let after = resume_point(ctx, repo, bookmark).await?;
-        next_changes(source, depot_root, after, limit).await
+        match options.listing_window {
+            None => next_changes(source, depot_root, after, limit).await,
+            Some(first_window) => {
+                next_changes_in_windows(source, depot_root, after, limit, first_window).await
+            }
+        }
     }
     .await
     .map_err(|error| {

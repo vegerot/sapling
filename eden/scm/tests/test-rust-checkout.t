@@ -40,6 +40,23 @@ Checking out to diff without file where file removed locally
   (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
 
+Checking out to diff that modifies a file deleted locally without sl rm
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > B  # B/file = changed
+  > |
+  > A  # A/file = foo
+  > EOS
+  $ sl go $B -qC
+  $ rm file
+  $ sl go $A
+  abort: 1 conflicting file changes:
+   file
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
+  [255]
+  $ sl status
+  ! file
+
 Respect merge marker file:
   $ newclientrepo
   $ drawdag <<'EOS'

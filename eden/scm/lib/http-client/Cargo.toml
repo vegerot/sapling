@@ -15,18 +15,18 @@ name = "http_client"
 
 [dependencies]
 anyhow = "1.0.104"
-async-compression = { version = "0.4.51", features = ["brotli", "bzip2", "deflate", "futures-io", "gzip", "tokio", "zlib", "zstd", "zstdmt"] }
+async-compression = { version = "0.4.52", features = ["brotli", "bzip2", "deflate", "futures-io", "gzip", "tokio", "zlib", "zstd", "zstdmt"] }
 auto_impl = "1.4.0"
 crossfire = "3.1.22"
 curl = { version = "0.4.51", features = ["http2", "static-ssl"] }
 curl-sys = "0.4.87"
-flume = "0.11.1"
+flume = "0.12.0"
 futures = { version = "0.3.34", features = ["async-await", "std"], default-features = false }
 http = "1.5.0"
 lru-cache = "0.1.2"
 maplit = "1.0"
 openssl = "0.10.80"
-parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard", "serde"] }
+parking_lot = { version = "0.13.0", features = ["arc_lock", "send_guard", "serde"] }
 paste = "1.0.14"
 pin-project = "1.1.13"
 regex = "1.13.1"

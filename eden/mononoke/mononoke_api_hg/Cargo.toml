@@ -17,6 +17,7 @@ bonsai_hg_mapping = { version = "0.1.0", path = "../repo_attributes/bonsai_hg_ma
 bookmarks = { version = "0.1.0", path = "../repo_attributes/bookmarks" }
 bytes = { version = "1.12.1", features = ["serde"] }
 cacheblob = { version = "0.1.0", path = "../blobstore/cacheblob" }
+changesets_creation = { version = "0.1.0", path = "../features/changesets_creation" }
 commit_graph = { version = "0.1.0", path = "../repo_attributes/commit_graph/commit_graph" }
 context = { version = "0.1.0", path = "../servers/slapi/slapi_server/context" }
 derived_data_manager = { version = "0.1.0", path = "../derived_data/manager" }
@@ -26,6 +27,7 @@ futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures-util = { version = "0.3.34", features = ["compat"] }
 getbundle_response = { version = "0.1.0", path = "../repo_client/getbundle_response" }
 justknobs_ext = { version = "0.1.0", path = "../common/rust/justknobs_ext" }
+manifest = { version = "0.1.0", path = "../manifest" }
 mercurial_derivation = { version = "0.1.0", path = "../derived_data/mercurial_derivation" }
 mercurial_mutation = { version = "0.1.0", path = "../mercurial/mutation" }
 mercurial_types = { version = "0.1.0", path = "../mercurial/types" }
@@ -43,11 +45,13 @@ restricted_paths = { version = "0.1.0", path = "../repo_attributes/restricted_pa
 sapling-dag-types = { version = "0.2.0", path = "../../scm/lib/dag/dag-types" }
 sapling-edenapi_types = { version = "0.1.0", path = "../../scm/lib/edenapi/types" }
 sapling-revisionstore_types = { version = "0.1.0", path = "../../scm/lib/revisionstore/types" }
+thiserror = "2.0.21"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 unbundle = { version = "0.1.0", path = "../repo_client/unbundle" }
 
 [dev-dependencies]
 counting_blob = { version = "0.1.0", path = "../blobstore/counting_blob" }
+derivation_queue_thrift = { version = "0.1.0", path = "../repo_attributes/repo_derivation_queues/if" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fixtures = { version = "0.1.0", path = "../tests/fixtures" }

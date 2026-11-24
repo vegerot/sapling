@@ -11,13 +11,12 @@ use std::sync::Arc;
 
 use clidispatch::ReqCtx;
 use clidispatch::TermLogger;
-use cmdutil::ConfigExt;
 use cmdutil::Result;
 use configmodel::Text;
 use repo::repo::Repo;
 use types::HgId;
 
-#[cfg(feature = "fb")]
+#[cfg(feature = "direct-removal")]
 use super::direct::run_direct_eden_remove;
 use super::resolve_target;
 use crate::WorktreeOpts;
@@ -68,7 +67,7 @@ impl<'a> EdenCheckouts<'a> {
     }
 
     pub(super) fn remove(&self, logger: &TermLogger, path: &Path) -> Result<bool> {
-        run_eden_remove(logger, self.repo, path)
+        run_direct_eden_remove(logger, self.repo, path)
     }
 
     pub(super) fn has_shelves(&self, path: &Path) -> Result<bool> {
@@ -113,21 +112,10 @@ impl PreparedAdd<'_> {
     }
 }
 
-fn run_eden_remove(logger: &TermLogger, repo: &Repo, path: &Path) -> Result<bool> {
-    if repo
-        .config()
-        .get_or("worktree", "direct-eden-removal", || cfg!(feature = "fb"))?
-    {
-        run_direct_eden_remove(logger, repo, path)
-    } else if path.exists() {
-        edenfs_client::run_eden_remove(repo.config().as_ref(), path)?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
-#[cfg(not(feature = "fb"))]
-fn run_direct_eden_remove(_logger: &TermLogger, _repo: &Repo, _path: &Path) -> Result<bool> {
-    clidispatch::abort!("worktree.direct-eden-removal is not supported in this build");
+#[cfg(not(feature = "direct-removal"))]
+fn run_direct_eden_remove(_logger: &TermLogger, _repo: &Repo, path: &Path) -> Result<bool> {
+    clidispatch::abort!(
+        "removing EdenFS worktrees is not supported in this build; run `eden rm {}` instead",
+        path.display()
+    );
 }

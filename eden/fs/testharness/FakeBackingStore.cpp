@@ -17,6 +17,7 @@
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/fs/inodes/ServerState.h"
 #include "eden/fs/model/Blob.h"
+#include "eden/fs/model/EmbeddedMetadata.h"
 #include "eden/fs/model/Hash.h"
 #include "eden/fs/model/Tree.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
@@ -31,6 +32,20 @@ using std::make_unique;
 using std::unique_ptr;
 
 namespace facebook::eden {
+
+namespace {
+// The type of the ObjectIds this store generates. See EmbeddedMetadata.h.
+constexpr uint8_t kObjectIdType = 0x3f;
+
+ObjectId makeId(
+    const Hash20& hash,
+    const std::optional<timespec>& mtime = std::nullopt) {
+  EmbeddedMetadata metadata;
+  metadata.mtime = mtime;
+  return makeObjectId(kObjectIdType, metadata, hash.getBytes());
+}
+} // namespace
+
 FakeBackingStore::FakeBackingStore(
     std::shared_ptr<ServerState> serverState,
     std::optional<std::string> blake3Key)
@@ -268,7 +283,7 @@ Blob FakeBackingStore::makeBlob(folly::StringPiece contents) {
 
 std::pair<StoredBlob*, ObjectId> FakeBackingStore::putBlob(
     StringPiece contents) {
-  ObjectId id = ObjectId::sha1(contents);
+  ObjectId id = makeId(Hash20::sha1(ByteRange{contents}));
   return {putBlob(id, contents), id};
 }
 
@@ -284,7 +299,7 @@ StoredBlob* FakeBackingStore::putBlob(
 
 std::tuple<StoredBlob*, ObjectId, bool> FakeBackingStore::maybePutBlob(
     folly::StringPiece contents) {
-  return maybePutBlob(ObjectId::sha1(contents), contents);
+  return maybePutBlob(makeId(Hash20::sha1(ByteRange{contents})), contents);
 }
 
 std::tuple<StoredBlob*, ObjectId, bool> FakeBackingStore::maybePutBlob(
@@ -400,6 +415,21 @@ std::pair<StoredTree*, bool> FakeBackingStore::maybePutTree(
   return maybePutTreeImpl(id, std::move(entries), false, hasACL);
 }
 
+std::tuple<StoredBlob*, ObjectId, bool> FakeBackingStore::maybePutBlob(
+    folly::StringPiece contents,
+    timespec mtime) {
+  return maybePutBlob(
+      makeId(Hash20::sha1(ByteRange{contents}), mtime), contents);
+}
+
+std::pair<StoredTree*, bool> FakeBackingStore::maybePutTree(
+    Tree::container entries,
+    std::optional<bool> hasACL,
+    timespec mtime) {
+  auto id = computeTreeId(entries, mtime);
+  return maybePutTreeImpl(id, std::move(entries), false, hasACL);
+}
+
 Tree::container FakeBackingStore::buildTreeEntries(
     const std::initializer_list<TreeEntryData>& entryArgs) {
   Tree::container entries{kPathMapDefaultCaseSensitive};
@@ -410,7 +440,9 @@ Tree::container FakeBackingStore::buildTreeEntries(
   return entries;
 }
 
-ObjectId FakeBackingStore::computeTreeId(const Tree::container& sortedEntries) {
+ObjectId FakeBackingStore::computeTreeId(
+    const Tree::container& sortedEntries,
+    const std::optional<timespec>& mtime) {
   // Compute a SHA-1 hash over the entry contents.
   // This doesn't match how we generate ids for either git or mercurial
   // backed stores, but that doesn't really matter.  We only need to be
@@ -430,7 +462,7 @@ ObjectId FakeBackingStore::computeTreeId(const Tree::container& sortedEntries) {
   digest.hash_final(
       folly::MutableByteRange{
           computedHashBytes.data(), computedHashBytes.size()});
-  return ObjectId{computedHashBytes};
+  return makeId(Hash20{computedHashBytes}, mtime);
 }
 
 StoredTree* FakeBackingStore::putTreeImpl(

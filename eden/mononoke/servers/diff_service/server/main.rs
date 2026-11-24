@@ -19,6 +19,7 @@ use fbinit::FacebookInit;
 use metaconfig_types::ShardedService;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_app::MononokeReposManager;
+use mononoke_app::MononokeService;
 use mononoke_app::args::RepoFilterAppExtension;
 use mononoke_app::args::ShutdownTimeoutArgs;
 use mononoke_app::monitoring::MonitoringAppExtension;
@@ -144,6 +145,7 @@ impl RepoShardedProcessExecutor for DiffServiceProcessExecutor {
 #[fbinit::main]
 fn main(fb: FacebookInit) -> Result<()> {
     let app = MononokeAppBuilder::new(fb)
+        .with_default_service(MononokeService::DIFF_SERVICE)
         .with_default_scuba_dataset("mononoke_diff_service")
         .with_app_extension(MonitoringAppExtension {})
         .with_app_extension(RepoFilterAppExtension {})
@@ -162,9 +164,8 @@ fn main(fb: FacebookInit) -> Result<()> {
 
     let service_name = args
         .sharded_executor_args
-        .sharded_service_name
-        .as_ref()
-        .map(|_| ShardedService::DiffService);
+        .is_sharded()
+        .then_some(ShardedService::DiffService);
 
     // Held until after wait_until_terminated: dropping the manager aborts the
     // config reconcile loop, which is the only thing that rebuilds repos on

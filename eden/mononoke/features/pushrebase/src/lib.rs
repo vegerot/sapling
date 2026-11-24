@@ -53,6 +53,7 @@ use std::cmp::max;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
+use std::iter;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -72,6 +73,8 @@ use bookmarks::BookmarkUpdateLogId;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
 use bytes::Bytes;
+use case_conflict_skeleton_manifest::CcsmPath;
+use case_conflict_skeleton_manifest::RootCaseConflictSkeletonManifestId;
 use commit_graph::CommitGraphRef;
 use commit_graph::CommitGraphWriterRef;
 use content_manifest_derivation::RootContentManifestId;
@@ -104,6 +107,8 @@ use metaconfig_types::MergeResolutionOverride;
 use metaconfig_types::PushrebaseFlags;
 use metaconfig_types::RepoConfigRef;
 use mononoke_types::BonsaiChangeset;
+use mononoke_types::CaseConflictSkeletonManifestId;
+use mononoke_types::CaseConflictTrie;
 use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::ContentManifestId;
@@ -115,8 +120,10 @@ use mononoke_types::GitLfs;
 use mononoke_types::MPath;
 use mononoke_types::PrefixTrie;
 use mononoke_types::Timestamp;
+use mononoke_types::case_conflict_skeleton_manifest::CcsmEntry;
 use mononoke_types::check_case_conflicts;
 use mononoke_types::find_path_conflicts;
+use pushrebase_hook::PreparationRequired;
 use pushrebase_hook::PushrebaseCommitHook;
 use pushrebase_hook::PushrebaseHook;
 use pushrebase_hook::PushrebaseTransactionHook;
@@ -125,6 +132,7 @@ use pushrebase_mutation_mapping::PushrebaseMutationMappingRef;
 use repo_blobstore::RepoBlobstoreArc;
 use repo_bookmark_attrs::RepoBookmarkAttrsRef;
 use repo_cross_repo::RepoCrossRepoRef;
+use repo_derived_data::RepoDerivedDataArc;
 use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -165,6 +173,8 @@ define_stats! {
     noop_merge_commits_rejected: dynamic_timeseries("{}.noop_merge_commits_rejected", (reponame: String); Count),
     baseline_replay: dynamic_timeseries("{}.baseline_replay.{}.{}", (reponame: String, mode: &'static str, outcome: &'static str); Count),
     baseline_resolution_source: dynamic_timeseries("{}.baseline_resolution_source.{}", (reponame: String, source: &'static str); Count),
+    far_root_manifest_check: dynamic_timeseries("{}.far_root_manifest_check.{}", (reponame: String, outcome: &'static str); Count),
+    preparations: dynamic_timeseries("{}.preparations", (reponame: String); Count),
 }
 
 const MAX_REBASE_ATTEMPTS: usize = 100;
@@ -177,6 +187,20 @@ const REPLAY_MAX_COMMITS: usize = 50;
 const REPLAY_MAX_PATHS: usize = 5_000;
 /// Range length reported for an over-cap replay; longer logs as this.
 const REPLAY_LEN_PROBE_CAP: usize = 1_000;
+
+/// Per-repo switch: a stack whose root is `recursion_limit` or more commits
+/// behind the bookmark is checked for conflicts against the root and bookmark
+/// content manifests instead of being rejected with `RootTooFarBehind`.
+const FAR_ROOT_MANIFEST_CHECK_JK: &str = "scm/mononoke:pushrebase_far_root_manifest_conflicts";
+/// Changed-path bound for the far-root manifest lookups.
+const FAR_ROOT_MAX_PATHS: usize = 10_000;
+/// How far behind the destination the far-root split point is first looked
+/// for; doubled while its manifest is missing, up to `FAR_ROOT_SPLIT_MAX`.
+const FAR_ROOT_SPLIT_START: u64 = 200;
+const FAR_ROOT_SPLIT_MAX: u64 = 6_400;
+/// Most commits the recent part may hold, as a multiple of the split's
+/// first-parent distance: a merge inside it can bring in a side branch.
+const FAR_ROOT_RECENT_RANGE_FACTOR: u64 = 4;
 
 /// Ancestry probes over a baseline's recorded successors. Normally one.
 const BASELINE_SUCCESSOR_CONCURRENCY: usize = 5;
@@ -230,6 +254,13 @@ pub enum PushrebaseError {
     RebaseOverMerge,
     #[error("Root is too far behind")]
     RootTooFarBehind,
+    /// The stack's required root is not where pushrebase would rebase it
+    /// from, or is no longer an ancestor of the bookmark.
+    #[error("bookmark '{bookmark}' moved while the push was being checked. Pull and retry")]
+    BookmarkMoved {
+        bookmark: BookmarkKey,
+        required_root: ChangesetId,
+    },
     #[error("baseline {baseline} {rejection} (onto {onto})")]
     UnplaceableBaseline {
         baseline: ChangesetId,
@@ -428,11 +459,63 @@ pub struct PushrebaseStack {
     pub head: ChangesetId,
     /// Root of the pushed stack.
     pub root: ChangesetId,
+    /// Set by `require_root`: `root` must be an ancestor of the bookmark
+    /// value that each landing attempt reads.
+    required_root: Option<ChangesetId>,
     conflict_check_base: ChangesetId,
     carried_merge_file_info: Vec<MergedFileInfo>,
 }
 
 impl PushrebaseStack {
+    /// Requires the stack to be rebased from `root`. Fails unless `root` is
+    /// the root pushrebase chose for it; every landing attempt then also
+    /// fails unless `root` is an ancestor of the bookmark value it reads, so
+    /// the bookmark's compare-and-swap only lands the stack while that holds.
+    pub fn require_root(
+        &mut self,
+        bookmark: &BookmarkKey,
+        root: ChangesetId,
+    ) -> Result<(), PushrebaseError> {
+        if self.root != root {
+            return Err(PushrebaseError::BookmarkMoved {
+                bookmark: bookmark.clone(),
+                required_root: root,
+            });
+        }
+        self.required_root = Some(root);
+        Ok(())
+    }
+
+    /// Fails unless the required root, if any, is an ancestor of
+    /// `bookmark_value`.
+    async fn check_required_root(
+        &self,
+        ctx: &CoreContext,
+        repo: &impl Repo,
+        bookmark: &BookmarkKey,
+        bookmark_value: Option<ChangesetId>,
+    ) -> Result<(), PushrebaseError> {
+        let Some(required_root) = self.required_root else {
+            return Ok(());
+        };
+        let on_bookmark = match bookmark_value {
+            Some(value) => {
+                repo.commit_graph()
+                    .is_ancestor(ctx, required_root, value)
+                    .await?
+            }
+            None => false,
+        };
+        if on_bookmark {
+            Ok(())
+        } else {
+            Err(PushrebaseError::BookmarkMoved {
+                bookmark: bookmark.clone(),
+                required_root,
+            })
+        }
+    }
+
     /// Precomputes conflict information against a bookmark snapshot.
     /// Calling this method is optional; the batch worker performs any remaining work.
     pub async fn precompute(
@@ -488,6 +571,7 @@ pub trait Repo = BookmarksRef
 
 /// Repository capabilities needed to construct hooks for queued pushrebases.
 pub trait PushrebaseQueueRepo = Repo
+    + RepoDerivedDataArc
     + BonsaiGitMappingArc
     + BonsaiGlobalrevMappingArc
     + PushrebaseMutationMappingRef
@@ -510,6 +594,9 @@ fn pushrebase_context(ctx: &CoreContext, config: &PushrebaseFlags) -> CoreContex
 /// Does a pushrebase of a list of commits `pushed` onto `onto_bookmark`
 /// The commits from the pushed set should already be committed to the blobrepo
 /// Returns updated bookmark value.
+///
+/// With `required_root`, the stack must be rebased from it (see
+/// `PushrebaseStack::require_root`).
 pub async fn do_pushrebase_bonsai(
     ctx: &CoreContext,
     repo: &impl Repo,
@@ -517,6 +604,7 @@ pub async fn do_pushrebase_bonsai(
     onto_bookmark: &BookmarkKey,
     pushed: &HashSet<BonsaiChangeset>,
     prepushrebase_hooks: &[Box<dyn PushrebaseHook>],
+    required_root: Option<ChangesetId>,
 ) -> Result<PushrebaseOutcome, PushrebaseError> {
     // Tag every Scuba sample emitted during this pushrebase with the
     // land-attribution keys from the request pushvars, so downstream
@@ -526,7 +614,10 @@ pub async fn do_pushrebase_bonsai(
     let ctx = pushrebase_context(ctx, config);
     let ctx = &ctx;
 
-    let stack = index_pushrebase_request(ctx, repo, config, onto_bookmark, pushed).await?;
+    let mut stack = index_pushrebase_request(ctx, repo, config, onto_bookmark, pushed).await?;
+    if let Some(root) = required_root {
+        stack.require_root(onto_bookmark, root)?;
+    }
     rebase_in_loop(
         ctx,
         repo,
@@ -569,6 +660,7 @@ pub async fn index_pushrebase_request(
         changesets: client_bcs,
         head,
         root,
+        required_root: None,
         conflict_check_base: root,
         carried_merge_file_info: vec![],
     })
@@ -697,6 +789,7 @@ pub async fn rebase_stack_onto_with_conflict_base(
         &client_cf,
         RangeDiffManifests::ContentManifest,
         UnchangedOverlap::TakeClient,
+        FarRoot::WalkRange,
     )
     .await?;
 
@@ -791,7 +884,12 @@ pub async fn rebase_stack_onto_with_baseline(
 /// as `sl rebase` does. Moves no bookmark, runs no hooks, writes no
 /// changesets; merged content is stored when merge resolution is on.
 /// Requires `rewritedates == false`. `max_paths` bounds the stack's changed
-/// paths, which is what the manifest lookups scale with.
+/// paths, which is what the manifest lookups scale with. When
+/// `casefolding_check` is set, the stack's own changes are checked for case
+/// conflicts, as the land path checks its client changesets; collisions
+/// with onto-side changes outside the stack's paths are not visible here
+/// (there is no server-side commit range) and are still caught when the
+/// rebased stack lands.
 pub async fn rebase_stack_onto_manifest(
     ctx: &CoreContext,
     repo: &impl Repo,
@@ -838,6 +936,13 @@ pub async fn rebase_stack_onto_manifest(
             merge.get_changeset_id()
         )));
     }
+    if config.casefolding_check {
+        if let Some(conflict) =
+            check_case_conflicts(client_bcs.iter(), &config.casefolding_check_excluded_paths)
+        {
+            return Err(PushrebaseError::PotentialCaseConflict(conflict.1));
+        }
+    }
     let client_cf = find_changed_files_with(
         ctx,
         repo,
@@ -863,50 +968,20 @@ pub async fn rebase_stack_onto_manifest(
     let server_cf = manifest_overlaps(&client_cf, &base_states, &onto_states);
     let overlaps = server_cf.clone();
 
-    let reponame = repo.repo_identity().name();
     let (overrides, conflict_files_count) = match intersect_changed_files(overlaps, client_cf) {
         Ok(()) => (None, 0),
         Err(PushrebaseError::Conflicts(conflicts)) => {
-            let merge_enabled = match config.merge_resolution_override {
-                MergeResolutionOverride::ForceOn => true,
-                MergeResolutionOverride::ForceOff => false,
-                MergeResolutionOverride::UseJk => justknobs::eval(
-                    "scm/mononoke:pushrebase_enable_merge_resolution",
-                    None,
-                    Some(reponame),
-                ),
-            };
-            if !merge_enabled {
-                return Err(PushrebaseError::Conflicts(conflicts));
-            }
-            let max_conflicts: usize = justknobs::get_as::<usize>(
-                "scm/mononoke:pushrebase_max_merge_conflicts",
-                Some(reponame),
-            );
-            let max_file_size: u64 = justknobs::get_as::<u64>(
-                "scm/mononoke:pushrebase_max_merge_file_size",
-                Some(reponame),
-            );
-            match collect_overlap_states(
-                &conflicts,
+            let conflict_files_count = conflicts.len() as u64;
+            let overrides = resolve_manifest_overlaps(
+                ctx,
+                repo,
+                config,
+                conflicts,
                 &client_bcs,
                 &base_states,
                 &onto_states,
-                max_conflicts,
-                max_file_size,
-                &config.merge_resolution_excluded_path_prefixes,
-                take_incoming_scope(config, reponame),
-            ) {
-                Ok(overrides) => (Some(overrides), conflicts.len() as u64),
-                Err(err) => {
-                    ctx.scuba()
-                        .clone()
-                        .add("repo_name", reponame)
-                        .add("merge_resolution_outcome", format!("{err}"))
-                        .log_with_msg("Pushrebase merge resolution failed", None);
-                    return Err(PushrebaseError::Conflicts(conflicts));
-                }
-            }
+            )?;
+            (Some(overrides), conflict_files_count)
         }
         Err(e) => return Err(e),
     };
@@ -1586,6 +1661,14 @@ async fn do_batched_pushrebase(
     let mut requests_iter = requests.into_iter();
     while let Some(mut request) = requests_iter.next() {
         let request_ctx = pushrebase_context(&request.ctx, flags);
+        if let Err(e) = request
+            .stack
+            .check_required_root(&request_ctx, repo, onto_bookmark, old_bookmark_value)
+            .await
+        {
+            let _ = request.response_tx.send(Err(SharedError::from(e)));
+            continue;
+        }
         let bookmark_val = old_bookmark_value.unwrap_or(request.stack.root);
         // Only scan the delta since preparation or the last attempt.
         let conflict_result = match check_pushrebase_conflicts(
@@ -1735,6 +1818,26 @@ async fn do_batched_pushrebase(
     {
         Ok(h) => h,
         Err(e) => {
+            // The bookmark was not moved: prepare outside the critical
+            // section, then requeue the whole batch as after a failed swap.
+            let e = match e.downcast::<PreparationRequired>() {
+                Ok(required) => match prepare_hooks(ctx, reponame, hooks, &required.changesets)
+                    .await
+                {
+                    Ok(()) => {
+                        return pending
+                            .into_iter()
+                            .map(|mut p| {
+                                p.request.retry_num = PushrebaseRetryNum(p.request.retry_num.0 + 1);
+                                p.request.preparation_rounds += 1;
+                                p.request
+                            })
+                            .collect();
+                    }
+                    Err(e) => e,
+                },
+                Err(e) => e,
+            };
             let shared = SharedError::from(PushrebaseError::from(e));
             for p in pending {
                 let _ = p.request.response_tx.send(Err(shared.clone()));
@@ -1785,7 +1888,7 @@ async fn do_batched_pushrebase(
                 if emit_all_bookmarks {
                     bookmarks::saturation::record_pushrebase_retries(
                         repo.repo_identity().name(),
-                        p.request.retry_num.0 as i64,
+                        contention_retries(p.request.retry_num.0, p.request.preparation_rounds),
                     );
                 }
                 let stack_pairs: Vec<PushrebaseChangesetPair> = all_rebased_pairs
@@ -1808,7 +1911,8 @@ async fn do_batched_pushrebase(
                     .add("batch_size", batch_size)
                     .add("batch_total_commits", all_rebased_pairs.len())
                     .add("rebased_changesets", stack_pairs.len())
-                    .add("retry_num", p.request.retry_num.0 as i64);
+                    .add("retry_num", p.request.retry_num.0 as i64)
+                    .add("preparation_rounds", p.request.preparation_rounds as i64);
                 p.merge_summary.clone().add_to_scuba(&mut sample);
                 sample.log_with_msg("batched_pushrebase_request_complete", None);
 
@@ -1931,6 +2035,16 @@ enum UnchangedOverlap {
     TakeClient,
 }
 
+/// What the first check of a stack does when its root is `recursion_limit`
+/// or more commits behind the destination.
+#[derive(Clone, Copy)]
+enum FarRoot {
+    /// Pushrebase: answer from the two manifests, or reject as it always has.
+    Manifests,
+    /// Callers that never had the limit keep walking the range.
+    WalkRange,
+}
+
 /// Checks for server-side conflicts against the client's pushed stack.
 /// Returns conflict check results including the number of server-side changesets
 /// and optionally merged file overrides if live merge resolution succeeds.
@@ -1955,6 +2069,7 @@ async fn check_pushrebase_conflicts(
         client_cf,
         RangeDiffManifests::FromKnob,
         UnchangedOverlap::Conflict,
+        FarRoot::Manifests,
     )
     .await
 }
@@ -1970,6 +2085,48 @@ async fn check_pushrebase_conflicts_with(
     client_cf: &[MPath],
     manifests: RangeDiffManifests,
     unchanged: UnchangedOverlap,
+    far_root: FarRoot,
+) -> Result<ConflictCheckResult, PushrebaseError> {
+    // The first check of a stack whose root is far behind the bookmark would
+    // walk the whole range; manifests answer the old part in bounded reads.
+    if matches!(far_root, FarRoot::Manifests)
+        && ancestor == root
+        && let Some(limit) = config.recursion_limit
+    {
+        let distance = generation_distance(ctx, repo, ancestor, descendant).await?;
+        if distance >= u64::try_from(limit).unwrap_or(u64::MAX) {
+            return check_far_root_conflicts(
+                ctx, repo, config, root, descendant, client_bcs, client_cf, distance, manifests,
+            )
+            .await;
+        }
+    }
+    check_range_conflicts(
+        ctx, repo, config, root, ancestor, descendant, client_bcs, client_cf, manifests, unchanged,
+        None,
+    )
+    .await
+}
+
+/// The range walk: loads every changeset in `ancestor..descendant` and
+/// checks the stack against their changes. With `case_seed`, the case check
+/// starts from what exists at `ancestor` under the stack's paths, read from
+/// that case-conflict skeleton manifest, and the range's own changes are
+/// applied to it as existing; without it the check covers the range's and
+/// the stack's changes alone, which is complete when `ancestor` is the
+/// stack's root.
+async fn check_range_conflicts(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    config: &PushrebaseFlags,
+    root: ChangesetId,
+    ancestor: ChangesetId,
+    descendant: ChangesetId,
+    client_bcs: &[BonsaiChangeset],
+    client_cf: &[MPath],
+    manifests: RangeDiffManifests,
+    unchanged: UnchangedOverlap,
+    case_seed: Option<CaseConflictSkeletonManifestId>,
 ) -> Result<ConflictCheckResult, PushrebaseError> {
     let server_bcs =
         fetch_bonsai_range_ancestor_not_included(ctx, repo, ancestor, descendant).await?;
@@ -1983,10 +2140,18 @@ async fn check_pushrebase_conflicts_with(
     // root→S1, no case conflict exists in that range. Retry only needs
     // to check S1→S2 for new case conflicts with client changesets.
     if config.casefolding_check {
-        let conflict = check_case_conflicts(
-            server_bcs.iter().chain(client_bcs.iter()),
-            &config.casefolding_check_excluded_paths,
-        );
+        let exclusions = &config.casefolding_check_excluded_paths;
+        let conflict = match case_seed {
+            Some(ccsm) => {
+                let mut trie =
+                    seed_case_trie(ctx, repo, ccsm, client_cf, &server_bcs, exclusions).await?;
+                for bcs in &server_bcs {
+                    trie.apply_existing(bcs);
+                }
+                trie.check_conflicts(client_bcs.iter())
+            }
+            None => check_case_conflicts(server_bcs.iter().chain(client_bcs.iter()), exclusions),
+        };
         if let Some(conflict) = conflict {
             return Err(PushrebaseError::PotentialCaseConflict(conflict.1));
         }
@@ -2121,6 +2286,468 @@ async fn check_pushrebase_conflicts_with(
     }
 }
 
+/// Generations from `ancestor` up to `descendant`; the commit count of a
+/// linear range.
+async fn generation_distance(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    ancestor: ChangesetId,
+    descendant: ChangesetId,
+) -> Result<u64, Error> {
+    let (ancestor_gen, descendant_gen) = try_join(
+        repo.commit_graph().changeset_generation(ctx, ancestor),
+        repo.commit_graph().changeset_generation(ctx, descendant),
+    )
+    .await?;
+    Ok(descendant_gen.value().saturating_sub(ancestor_gen.value()))
+}
+
+/// `check_pushrebase_conflicts` for a stack whose root is `distance`
+/// commits behind `onto`, too far to load the range. The range is split at
+/// a recent ancestor of `onto` whose content manifest exists: the old part,
+/// `root..split`, is answered from the root and split manifests, which only
+/// exist already for commits that old; the recent part, `split..onto`, is
+/// the usual bonsai walk with every check it carries. Case folding is one
+/// check over the whole range: the walk's trie starts from what exists at
+/// the split under the stack's paths, read from the split's case-conflict
+/// skeleton manifest. The root and split manifests are
+/// fetched, never derived. What the manifests cannot answer rejects with
+/// `RootTooFarBehind` as before: an underived root manifest, no derived
+/// split point, a recent part far longer than its first-parent distance,
+/// merges in the stack, or more than `FAR_ROOT_MAX_PATHS` paths.
+async fn check_far_root_conflicts(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    config: &PushrebaseFlags,
+    root: ChangesetId,
+    onto: ChangesetId,
+    client_bcs: &[BonsaiChangeset],
+    client_cf: &[MPath],
+    distance: u64,
+    manifests: RangeDiffManifests,
+) -> Result<ConflictCheckResult, PushrebaseError> {
+    let reponame = repo.repo_identity().name();
+    let mut scuba = ctx.scuba().clone();
+    scuba
+        .add("repo_name", reponame)
+        .add("pushrebase_distance", distance as i64)
+        .add("far_root_paths", client_cf.len() as i64);
+    let reject = |mut scuba: MononokeScubaSampleBuilder, reason: &'static str| {
+        STATS::far_root_manifest_check.add_value(1, (reponame.to_string(), reason));
+        scuba
+            .add("far_root_outcome", reason)
+            .log_with_msg("pushrebase_far_root_manifest_check", None);
+        Err(PushrebaseError::RootTooFarBehind)
+    };
+
+    if !justknobs::eval(FAR_ROOT_MANIFEST_CHECK_JK, None, Some(reponame)) {
+        return reject(scuba, "disabled");
+    }
+    if client_bcs.iter().any(BonsaiChangeset::is_merge) {
+        return reject(scuba, "merge_in_stack");
+    }
+    if client_cf.len() > FAR_ROOT_MAX_PATHS {
+        return reject(scuba, "too_many_paths");
+    }
+    if config.casefolding_check
+        && !repo
+            .repo_derived_data()
+            .config()
+            .is_enabled(DerivableType::Ccsm)
+    {
+        return reject(scuba, "ccsm_not_enabled");
+    }
+    let Some(root_mf) = fetch_root_manifest_id(ctx, repo, root).await? else {
+        return reject(scuba, "root_manifest_not_derived");
+    };
+    let (split, split_mf, split_ccsm, split_distance) =
+        match find_far_root_split(ctx, repo, root, onto, config.casefolding_check).await? {
+            FarRootSplit::Found {
+                split,
+                manifest,
+                ccsm,
+                distance,
+            } => (split, manifest, ccsm, distance),
+            FarRootSplit::NoneDerived => return reject(scuba, "no_derived_split"),
+            FarRootSplit::BelowRoot => return reject(scuba, "split_below_root"),
+        };
+    scuba.add("far_root_split_distance", split_distance as i64);
+    // The split is a first-parent distance; a merge in the recent part can
+    // bring a side branch into the range walk.
+    let recent_distance = generation_distance(ctx, repo, split, onto).await?;
+    scuba.add("far_root_recent_commits", recent_distance as i64);
+    if recent_distance > split_distance.saturating_mul(FAR_ROOT_RECENT_RANGE_FACTOR) {
+        return reject(scuba, "recent_range_too_long");
+    }
+
+    // Old part: root..split from the two manifests.
+    let (base_states, split_states) = try_join(
+        lookup_manifest_states(ctx, repo, root_mf, client_cf),
+        lookup_manifest_states(ctx, repo, split_mf, client_cf),
+    )
+    .await?;
+    let old_overlaps = manifest_overlaps(client_cf, &base_states, &split_states);
+    scuba.add("far_root_old_overlaps", old_overlaps.len() as i64);
+
+    // Recent part: split..onto, walked as any range is.
+    let recent = check_range_conflicts(
+        ctx,
+        repo,
+        config,
+        root,
+        split,
+        onto,
+        client_bcs,
+        client_cf,
+        manifests,
+        UnchangedOverlap::Conflict,
+        split_ccsm,
+    )
+    .await;
+    let recent = match recent {
+        Ok(recent) => recent,
+        Err(err) => {
+            let outcome = match &err {
+                PushrebaseError::Conflicts(_) => "recent_conflict",
+                PushrebaseError::PotentialCaseConflict(_) => "case_conflict",
+                PushrebaseError::ForceFailPushrebase(_) => "recent_force_fail",
+                _ => "recent_error",
+            };
+            STATS::far_root_manifest_check.add_value(1, (reponame.to_string(), outcome));
+            scuba
+                .add("far_root_outcome", outcome)
+                .log_with_msg("pushrebase_far_root_manifest_check", None);
+            return Err(err);
+        }
+    };
+    let server_changeset_count = usize::try_from(distance).unwrap_or(usize::MAX);
+
+    let old = match intersect_changed_files(old_overlaps, client_cf.to_vec()) {
+        Ok(()) => None,
+        Err(PushrebaseError::Conflicts(conflicts)) => {
+            // A path the recent part also merged already has the right
+            // merge: base from the root, destination from the recent range.
+            // The old part's merge for it would be against the split state.
+            let recent_paths: HashSet<&NonRootMPath> = recent
+                .merged_file_overrides
+                .iter()
+                .flatten()
+                .map(|info| &info.path)
+                .collect();
+            let conflicts: Vec<PushrebaseConflict> = conflicts
+                .into_iter()
+                .filter(|conflict| {
+                    !conflict
+                        .left
+                        .clone()
+                        .into_optional_non_root_path()
+                        .is_some_and(|path| recent_paths.contains(&path))
+                })
+                .collect();
+            if conflicts.is_empty() {
+                None
+            } else {
+                let conflict_files_count = conflicts.len() as u64;
+                STATS::conflict_rejections.add_value(1, (reponame.to_string(),));
+                STATS::conflict_files_count
+                    .add_value(conflicts.len() as i64, (reponame.to_string(),));
+                let merged = resolve_manifest_overlaps(
+                    ctx,
+                    repo,
+                    config,
+                    conflicts,
+                    client_bcs,
+                    &base_states,
+                    &split_states,
+                );
+                if merged.is_err() {
+                    STATS::far_root_manifest_check.add_value(1, (reponame.to_string(), "conflict"));
+                    scuba
+                        .add("far_root_outcome", "conflict")
+                        .log_with_msg("pushrebase_far_root_manifest_check", None);
+                }
+                Some((merged?, conflict_files_count))
+            }
+        }
+        Err(e) => return Err(e),
+    };
+
+    let outcome = match (&old, &recent.merged_file_overrides) {
+        (None, None) => "clean",
+        _ => "merged",
+    };
+    STATS::far_root_manifest_check.add_value(1, (reponame.to_string(), outcome));
+    scuba
+        .add("far_root_outcome", outcome)
+        .log_with_msg("pushrebase_far_root_manifest_check", None);
+
+    let (old_merged, old_conflicts) = old.unzip();
+    let old_summary = match (&old_merged, old_conflicts) {
+        (Some(merged), Some(conflict_files_count)) => MergeResolutionSummary::Succeeded {
+            conflict_files_count,
+            resolved_files_count: merged.len() as u64,
+            resolved_paths_sample: merged
+                .iter()
+                .take(MR_PATH_SAMPLE_CAP)
+                .map(|info| info.path.clone())
+                .collect(),
+        },
+        _ => MergeResolutionSummary::NotNeeded,
+    };
+    // Old-part merges are against the split state, which is the destination
+    // state for every path the recent part left alone.
+    let merged_file_overrides = match (old_merged, recent.merged_file_overrides) {
+        (None, None) => None,
+        (Some(old), None) => Some(old),
+        (None, Some(recent)) => Some(recent),
+        (Some(old), Some(recent)) => Some(reconcile_merge_file_info(&old, &recent)),
+    };
+    Ok(ConflictCheckResult {
+        server_changeset_count,
+        merged_file_overrides,
+        merge_summary: MergeResolutionSummary::combine(old_summary, recent.merge_summary),
+    })
+}
+
+/// What `find_far_root_split` found.
+enum FarRootSplit {
+    Found {
+        split: ChangesetId,
+        manifest: ContentManifestId,
+        /// The split's case-conflict skeleton manifest, when asked for.
+        ccsm: Option<CaseConflictSkeletonManifestId>,
+        /// First-parent commits below `onto`.
+        distance: u64,
+    },
+    /// No probed commit had a derived manifest, or the graph is shallower
+    /// than the first probe.
+    NoneDerived,
+    /// The first probe is not a descendant of the root: the root is within
+    /// the recent part by first-parent distance although far by generation
+    /// (a merge brought in the generations), so the manifests have nothing
+    /// to answer.
+    BelowRoot,
+}
+
+/// A recent first-parent ancestor of `onto` whose content manifest (and,
+/// with `need_ccsm`, case-conflict skeleton manifest) exists and which
+/// descends from `root`: `FAR_ROOT_SPLIT_START` commits back, then twice as
+/// far while a manifest is missing, up to `FAR_ROOT_SPLIT_MAX`.
+async fn find_far_root_split(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    root: ChangesetId,
+    onto: ChangesetId,
+    need_ccsm: bool,
+) -> Result<FarRootSplit, Error> {
+    let graph = repo.commit_graph();
+    let onto_depth = graph.changeset_linear_depth(ctx, onto).await?;
+    let mut back = FAR_ROOT_SPLIT_START;
+    while back <= FAR_ROOT_SPLIT_MAX {
+        let Some(target_depth) = onto_depth.checked_sub(back) else {
+            return Ok(FarRootSplit::NoneDerived);
+        };
+        let Some(node) = graph
+            .p1_linear_graph()
+            .skip_tree_level_ancestor(ctx, onto, target_depth)
+            .await?
+        else {
+            return Ok(FarRootSplit::NoneDerived);
+        };
+        let split = node.cs_id;
+        if !graph.is_ancestor(ctx, root, split).await? {
+            return Ok(FarRootSplit::BelowRoot);
+        }
+        let (manifest, ccsm) = try_join(fetch_root_manifest_id(ctx, repo, split), async {
+            if need_ccsm {
+                fetch_root_ccsm_id(ctx, repo, split).await
+            } else {
+                Ok(None)
+            }
+        })
+        .await?;
+        if let Some(manifest) = manifest
+            && (!need_ccsm || ccsm.is_some())
+        {
+            return Ok(FarRootSplit::Found {
+                split,
+                manifest,
+                ccsm,
+                distance: back,
+            });
+        }
+        back *= 2;
+    }
+    Ok(FarRootSplit::NoneDerived)
+}
+
+/// Merge resolution for overlaps found between two manifests, honouring the
+/// caller's merge-resolution setting and the knob limits. Overlaps that
+/// cannot merge are returned as the conflicts they were.
+fn resolve_manifest_overlaps(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    config: &PushrebaseFlags,
+    conflicts: Vec<PushrebaseConflict>,
+    client_bcs: &[BonsaiChangeset],
+    base_states: &HashMap<MPath, ManifestState>,
+    onto_states: &HashMap<MPath, ManifestState>,
+) -> Result<Vec<MergedFileInfo>, PushrebaseError> {
+    let reponame = repo.repo_identity().name();
+    let merge_enabled = match config.merge_resolution_override {
+        MergeResolutionOverride::ForceOn => true,
+        MergeResolutionOverride::ForceOff => false,
+        MergeResolutionOverride::UseJk => justknobs::eval(
+            "scm/mononoke:pushrebase_enable_merge_resolution",
+            None,
+            Some(reponame),
+        ),
+    };
+    if !merge_enabled {
+        return Err(PushrebaseError::Conflicts(conflicts));
+    }
+    let max_conflicts: usize = justknobs::get_as::<usize>(
+        "scm/mononoke:pushrebase_max_merge_conflicts",
+        Some(reponame),
+    );
+    let max_file_size: u64 = justknobs::get_as::<u64>(
+        "scm/mononoke:pushrebase_max_merge_file_size",
+        Some(reponame),
+    );
+    collect_overlap_states(
+        &conflicts,
+        client_bcs,
+        base_states,
+        onto_states,
+        max_conflicts,
+        max_file_size,
+        &config.merge_resolution_excluded_path_prefixes,
+        take_incoming_scope(config, reponame),
+    )
+    .map_err(|err| {
+        ctx.scuba()
+            .clone()
+            .add("repo_name", reponame)
+            .add("merge_resolution_outcome", format!("{err}"))
+            .log_with_msg("Pushrebase merge resolution failed", None);
+        PushrebaseError::Conflicts(conflicts)
+    })
+}
+
+/// A case-conflict trie holding what exists at `split` under the stack's
+/// paths, read from the split's case-conflict skeleton manifest. In that
+/// manifest every component is doubled into `lowercase/Original`, so the
+/// node `l(d1)/d1/../l(dk)/dk/l(name)` lists the casings of `name` in
+/// `d1/../dk`: one lookup per component, whatever the directory's size.
+/// Each casing found is an existing entry; a directory is marked as having
+/// unlisted children when the entries looked up under it are not all of
+/// its children, so removing them cannot empty it. Paths the recent server
+/// changesets remove are looked up too, so a directory they empty does
+/// empty. Names with several casings at the split are left out, with
+/// everything under them: that conflict predates the stack, and the walk
+/// never flags it either.
+async fn seed_case_trie<'a>(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    ccsm_id: CaseConflictSkeletonManifestId,
+    client_cf: &[MPath],
+    server_bcs: &[BonsaiChangeset],
+    exclusions: &'a PrefixTrie,
+) -> Result<CaseConflictTrie<'a>, Error> {
+    use manifest::Entry;
+
+    let blobstore = repo.repo_blobstore();
+    let ccsm = ccsm_id.load(ctx, blobstore).await?;
+    let server_removed: Vec<MPath> = server_bcs
+        .iter()
+        .flat_map(|bcs| bcs.file_changes())
+        .filter(|(_, change)| change.is_removed())
+        .map(|(path, _)| MPath::from(path.clone()))
+        .collect();
+    // Only where that stays bounded; without them a directory the server
+    // emptied is kept, which rejects what it would have allowed.
+    let server_removed = if server_removed.len() <= FAR_ROOT_MAX_PATHS {
+        server_removed
+    } else {
+        vec![]
+    };
+    // Lowercase node in the ccsm -> the directory it is in. Paths that
+    // differ only in the casing of their last component share a node.
+    let lookups: HashMap<MPath, Option<NonRootMPath>> = client_cf
+        .iter()
+        .chain(server_removed.iter())
+        .flat_map(|path| path.clone().into_ancestors())
+        .filter_map(MPath::into_optional_non_root_path)
+        .filter_map(|path| {
+            let (lowercase_node, _) = CcsmPath::transform(path.clone())?
+                .into_raw()
+                .split_dirname();
+            Some((MPath::from(lowercase_node?), path.split_dirname().0))
+        })
+        .collect();
+    // Entries at the split with the looked-up names, as cased there, with
+    // a directory's count of distinct lowercase names.
+    let found: HashMap<NonRootMPath, Option<usize>> = ccsm
+        .find_entries(ctx.clone(), blobstore.clone(), lookups.keys().cloned())
+        .try_filter_map(|(lowercase_node, entry)| {
+            let dir = lookups.get(&lowercase_node).cloned();
+            async move {
+                let (Some(dir), Entry::Tree(node)) = (dir, entry) else {
+                    return Ok(None);
+                };
+                if node.subentries.size() != 1 {
+                    return Ok(None);
+                }
+                let casing = node.into_subentries(ctx, blobstore).try_next().await?;
+                Ok(casing.map(|(casing, entry)| {
+                    let children = match entry {
+                        CcsmEntry::File => None,
+                        CcsmEntry::Directory(dir) => Some(dir.subentries.size()),
+                    };
+                    (
+                        NonRootMPath::join_opt_element(dir.as_ref(), &casing),
+                        children,
+                    )
+                }))
+            }
+        })
+        .try_collect()
+        .await?;
+
+    // Entries whose every ancestor was found: anything under a name with
+    // several casings is left out with it.
+    let mut seeds: Vec<(&NonRootMPath, Option<usize>)> = found
+        .iter()
+        .filter(|(existing, _)| {
+            iter::successors(existing.split_dirname().0, |dir| dir.split_dirname().0)
+                .all(|dir| found.contains_key(&dir))
+        })
+        .map(|(existing, children)| (existing, *children))
+        .collect();
+    seeds.sort();
+    // Entries found in each directory, by lowercase name.
+    let listed_children: HashMap<&NonRootMPath, HashSet<String>> = seeds
+        .iter()
+        .filter_map(|(existing, _)| {
+            let (dir, name) = existing.split_dirname();
+            Some((dir?, name.to_lowercase_utf8()?))
+        })
+        .fold(HashMap::new(), |mut map, (dir, lower)| {
+            if let Some((key, _)) = found.get_key_value(&dir) {
+                map.entry(key).or_insert_with(HashSet::new).insert(lower);
+            }
+            map
+        });
+    let mut trie = CaseConflictTrie::new(exclusions);
+    for (existing, children) in seeds {
+        let has_unlisted_children = children.is_some_and(|children| {
+            children > listed_children.get(existing).map_or(0, HashSet::len)
+        });
+        trie.add_existing(existing, has_unlisted_children);
+    }
+    Ok(trie)
+}
+
 async fn run_batch_hooks(
     ctx: &CoreContext,
     hooks: &[Box<dyn PushrebaseHook>],
@@ -2131,6 +2758,29 @@ async fn run_batch_hooks(
             .map_err(PushrebaseError::from)
     }))
     .await
+}
+
+/// Run every hook's `prepare` for `changesets`; only outside the critical
+/// section. Each call is one preparation round, counted once per repo for
+/// the direct and the batched path alike.
+async fn prepare_hooks(
+    ctx: &CoreContext,
+    repo_name: &str,
+    hooks: &[Box<dyn PushrebaseHook>],
+    changesets: &[ChangesetId],
+) -> Result<(), Error> {
+    STATS::preparations.add_value(1, (repo_name.to_string(),));
+    try_join_all(hooks.iter().map(|h| h.prepare(ctx, changesets))).await?;
+    Ok(())
+}
+
+/// The retries of a landing that were contention: all its retries but those
+/// spent preparing. This is what the retry stats record.
+pub(crate) fn contention_retries(retries: usize, preparation_rounds: usize) -> i64 {
+    retries
+        .saturating_sub(preparation_rounds)
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 async fn rebase_in_loop(
@@ -2150,12 +2800,18 @@ async fn rebase_in_loop(
     let mut carried_merge_file_info: Vec<MergedFileInfo> = Vec::new();
     let mut total_pushrebase_distance: usize = 0;
     let mut accumulated_merge_summary = MergeResolutionSummary::NotNeeded;
+    // Attempts that ended for preparation: they count against
+    // `MAX_REBASE_ATTEMPTS`, but not as contention in the retry stats.
+    let mut preparation_rounds: usize = 0;
     for retry_num in 0..MAX_REBASE_ATTEMPTS {
         let retry_num = PushrebaseRetryNum(retry_num);
 
         let start_critical_section = Instant::now();
         // CRITICAL SECTION START: After getting the value of the bookmark
         let old_bookmark_value = get_bookmark_value(ctx, repo, onto_bookmark).await?;
+        stack
+            .check_required_root(ctx, repo, onto_bookmark, old_bookmark_value)
+            .await?;
         let hooks = try_join_all(prepushrebase_hooks.iter().map(|h| {
             h.in_critical_section(ctx, old_bookmark_value)
                 .map_err(PushrebaseError::from)
@@ -2234,7 +2890,9 @@ async fn rebase_in_loop(
             return Err(PushrebaseInternalError::MergeResolutionLostOnRetry.into());
         }
 
-        let rebase_outcome = do_rebase(
+        // A hook that needs preparation leaves the bookmark unwritten; the
+        // attempt is retried as after a failed swap, once prepared.
+        let (rebase_outcome, preparation) = match do_rebase(
             ctx,
             repo,
             config,
@@ -2244,7 +2902,14 @@ async fn rebase_in_loop(
             hooks,
             reconciled_overrides.clone(),
         )
-        .await?;
+        .await
+        {
+            Err(PushrebaseError::Error(error)) => match error.downcast::<PreparationRequired>() {
+                Ok(required) => (None, Some(required)),
+                Err(error) => return Err(PushrebaseError::Error(error)),
+            },
+            outcome => (outcome?, None),
+        };
         // CRITICAL SECTION END: Right after writing new value of bookmark
 
         let critical_section_duration_us: i64 = start_critical_section
@@ -2253,19 +2918,19 @@ async fn rebase_in_loop(
             .try_into()
             .unwrap_or(i64::MAX);
         if let Some((head, log_id, rebased_changesets)) = rebase_outcome {
+            let retries = contention_retries(retry_num.0, preparation_rounds);
             if emit_all_bookmarks {
                 bookmarks::saturation::record_pushrebase_success(
                     repo.repo_identity().name(),
                     critical_section_duration_us,
-                    Some(retry_num.0 as i64),
+                    Some(retries),
                     rebased_changesets.len() as i64,
                 );
             }
             if should_log {
                 STATS::critical_section_success_duration_us
                     .add_value(critical_section_duration_us, repo_args.clone());
-                STATS::critical_section_retries_failed
-                    .add_value(retry_num.0 as i64, repo_args.clone());
+                STATS::critical_section_retries_failed.add_value(retries, repo_args.clone());
                 STATS::commits_rebased
                     .add_value(rebased_changesets.len() as i64, repo_args.clone());
             }
@@ -2274,6 +2939,7 @@ async fn rebase_in_loop(
             sample
                 .add("repo_name", repo.repo_identity().name())
                 .add("retry_num", retry_num.0 as i64)
+                .add("preparation_rounds", preparation_rounds as i64)
                 .add("rebased_changesets", rebased_changesets.len() as i64);
             merge_summary_for_scuba.add_to_scuba(&mut sample);
             sample.log_with_msg("pushrebase_complete", None);
@@ -2293,26 +2959,45 @@ async fn rebase_in_loop(
             // CAS failed — carry forward merge info for next attempt
             carried_merge_file_info = reconciled_overrides.unwrap_or_default();
             latest_rebase_attempt = old_bookmark_value.unwrap_or(stack.root);
-            if emit_all_bookmarks {
-                bookmarks::saturation::record_pushrebase_failure(
-                    repo.repo_identity().name(),
-                    critical_section_duration_us,
-                );
-            }
-            if should_log {
-                STATS::critical_section_failure_duration_us
-                    .add_value(critical_section_duration_us, repo_args.clone());
+            match preparation {
+                // Not contention: prepare outside the critical section and
+                // outside its duration, then retry.
+                Some(required) => {
+                    preparation_rounds += 1;
+                    prepare_hooks(
+                        ctx,
+                        repo.repo_identity().name(),
+                        prepushrebase_hooks,
+                        &required.changesets,
+                    )
+                    .await?;
+                }
+                None => {
+                    if emit_all_bookmarks {
+                        bookmarks::saturation::record_pushrebase_failure(
+                            repo.repo_identity().name(),
+                            critical_section_duration_us,
+                        );
+                    }
+                    if should_log {
+                        STATS::critical_section_failure_duration_us
+                            .add_value(critical_section_duration_us, repo_args.clone());
+                    }
+                }
             }
         }
     }
     if emit_all_bookmarks {
         bookmarks::saturation::record_pushrebase_retries(
             repo.repo_identity().name(),
-            MAX_REBASE_ATTEMPTS as i64,
+            contention_retries(MAX_REBASE_ATTEMPTS, preparation_rounds),
         );
     }
     if should_log {
-        STATS::critical_section_retries_failed.add_value(MAX_REBASE_ATTEMPTS as i64, repo_args);
+        STATS::critical_section_retries_failed.add_value(
+            contention_retries(MAX_REBASE_ATTEMPTS, preparation_rounds),
+            repo_args,
+        );
     }
 
     Err(PushrebaseInternalError::TooManyRebaseAttempts.into())
@@ -2461,17 +3146,15 @@ async fn find_closest_ancestor_root(
                 .into(),
             )
         })?;
-    let (bookmark_generation, root_generation) = futures::try_join!(
-        repo.commit_graph()
-            .changeset_generation(ctx, onto_bookmark_cs_id),
-        repo.commit_graph().changeset_generation(ctx, id),
-    )?;
-    let distance = bookmark_generation
-        .value()
-        .saturating_sub(root_generation.value());
+    let distance = generation_distance(ctx, repo, id, onto_bookmark_cs_id).await?;
     if config
         .recursion_limit
         .is_some_and(|limit| distance >= u64::try_from(limit).unwrap_or(u64::MAX))
+        && !justknobs::eval(
+            FAR_ROOT_MANIFEST_CHECK_JK,
+            None,
+            Some(repo.repo_identity().name()),
+        )
     {
         return Err(PushrebaseError::RootTooFarBehind);
     }
@@ -2603,6 +3286,20 @@ async fn fetch_root_manifest_id(
         .fetch_derived::<RootContentManifestId>(ctx, bcs_id)
         .await?
         .map(RootContentManifestId::into_content_manifest_id))
+}
+
+/// The case-conflict skeleton manifest of `bcs_id` if it is derived; never
+/// derives it.
+async fn fetch_root_ccsm_id(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    bcs_id: ChangesetId,
+) -> Result<Option<CaseConflictSkeletonManifestId>, Error> {
+    Ok(repo
+        .repo_derived_data()
+        .fetch_derived::<RootCaseConflictSkeletonManifestId>(ctx, bcs_id)
+        .await?
+        .map(RootCaseConflictSkeletonManifestId::into_inner_id))
 }
 
 // from smaller generation number to larger

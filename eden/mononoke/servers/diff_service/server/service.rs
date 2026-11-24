@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -46,42 +47,84 @@ use crate::repo::Repo;
 use crate::utils::diff_conversion::convert_diff_single_input;
 use crate::utils::diff_conversion::input_changeset_specifier;
 
+/// Kill switch for keeping responses that depend on the caller's path ACLs
+/// out of ThriftCache.
+const THRIFTCACHE_NOCACHE_FOR_PATH_ACLS_JK: &str =
+    "scm/mononoke:diff_service_thriftcache_nocache_for_path_acls";
+
 pub fn internal_error<E: Into<Error>>(e: E) -> thrift::InternalError {
     thrift::InternalError {
         reason: format!("{:?}", e.into()),
     }
 }
 
+/// Whether ThriftCache must not store this response. Its key is the direct
+/// caller (SCS) and the request, not the caller SCS acts for, so a stored
+/// response is served to every SCS caller. An error is specific to the
+/// request that produced it, a partial response would reach an entitled
+/// caller incomplete, and a response that depends on the caller would reach
+/// callers it was not computed for.
+fn should_set_nocache(succeeded: bool, ctx: &CoreContext) -> bool {
+    !succeeded
+        || ctx.partial_response()
+        || (ctx.response_depends_on_caller()
+            && justknobs::eval(THRIFTCACHE_NOCACHE_FOR_PATH_ACLS_JK, None, None))
+}
+
 /// Partial-response verdict for a diff-service method, from the request's
 /// omission policy. Same contract as SCS `methods::partial_response_info`:
 /// `Some` carrying the exact signal when partial responses are allowed for
 /// this request, `None` (field unset) when not. Group counts reconcile with
-/// the total by construction. Agrees with the context flag (and hence
-/// `nocache`) by construction.
+/// the total by construction. When `include_paths`, each group also lists
+/// its retained omitted and downgraded paths. Agrees with the context flag
+/// (and hence `nocache`) by construction.
 pub(crate) fn partial_response_info(
     policy: &RestrictedPathsPolicy,
+    include_paths: bool,
 ) -> Option<source_control_thrift::PartialResponseInfo> {
     let omitted_restricted_paths_count = policy.omitted_count()?;
-    let omitted_by_restriction = policy
-        .omitted_groups()
-        .map(|collected| {
-            collected
-                .into_iter()
-                .map(|(restriction, omitted_count)| {
-                    source_control_thrift::OmittedRestrictionGroup {
-                        restriction_root: restriction.restriction_root.map(|root| root.to_string()),
-                        repo_region_acl: restriction.repo_region_acl.to_string(),
-                        permission_request_group: restriction
-                            .permission_request_group
-                            .id_data()
-                            .to_string(),
-                        omitted_count: omitted_count as i64,
-                        ..Default::default()
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .filter(|groups| !groups.is_empty());
+    let groups = policy.omitted_groups().unwrap_or_default();
+    let (paths, downgraded) = if include_paths {
+        (
+            policy.omitted_paths().unwrap_or_default(),
+            policy.downgraded_paths().unwrap_or_default(),
+        )
+    } else {
+        (BTreeMap::new(), BTreeMap::new())
+    };
+    let omitted_by_restriction = (!groups.is_empty()).then(|| {
+        groups
+            .into_iter()
+            .map(|(restriction, omitted_count)| {
+                let omitted_paths: Vec<String> = paths
+                    .get(&restriction)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|path| path.to_string())
+                    .collect();
+                let downgraded_paths: Vec<String> = downgraded
+                    .get(&restriction)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|path| path.to_string())
+                    .collect();
+                source_control_thrift::OmittedRestrictionGroup {
+                    restriction_root: restriction.restriction_root.map(|root| root.to_string()),
+                    repo_region_acl: restriction.repo_region_acl.to_string(),
+                    permission_request_group: restriction
+                        .permission_request_group
+                        .id_data()
+                        .to_string(),
+                    omitted_count: omitted_count as i64,
+                    omitted_paths: (!omitted_paths.is_empty()).then_some(omitted_paths),
+                    downgraded_paths: (!downgraded_paths.is_empty()).then_some(downgraded_paths),
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>()
+    });
     Some(source_control_thrift::PartialResponseInfo {
         partial: omitted_restricted_paths_count > 0,
         omitted_restricted_paths_count: Some(omitted_restricted_paths_count as i64),
@@ -104,7 +147,10 @@ macro_rules! impl_thrift_methods {
                 Self: Sync + 'async_trait,
             {
                 let handler = async move {
-                    let ctx = self.create_ctx(stringify!($method_name), req_ctxt, &$( $param_name ),* ).await.map_err(|e| <$err>::from(internal_error(e)))?;
+                    let ctx = self.create_ctx(stringify!($method_name), req_ctxt, &$( $param_name ),* ).await.map_err(|e| {
+                        platform::set_nocache_header(req_ctxt);
+                        <$err>::from(internal_error(e))
+                    })?;
                     ctx.scuba().clone().log_with_msg("Request start", None);
                     let mut scuba = ctx.scuba().clone();
                     let perf_counters = ctx.perf_counters().clone();
@@ -141,6 +187,9 @@ macro_rules! impl_thrift_methods {
                     perf_counters.insert_perf_counters(&mut scuba);
                     scuba.add_future_stats(&stats);
                     scuba.add("partial_response", ctx.partial_response());
+                    let nocache = should_set_nocache(res.is_ok(), &ctx);
+                    scuba.add("thriftcache_nocache", nocache);
+                    scuba.add("response_depends_on_caller", ctx.response_depends_on_caller());
 
                     scuba.log_with_msg("Request complete", None);
 
@@ -162,10 +211,7 @@ macro_rules! impl_thrift_methods {
                         },
                     });
 
-                    // A partial response must not be served from cache to an entitled
-                    // caller (who would silently receive incomplete data); the exact
-                    // verdict travels in the typed response instead.
-                    if res.is_ok() && ctx.partial_response() {
+                    if nocache {
                         platform::set_nocache_header(req_ctxt);
                     }
 
@@ -407,6 +453,9 @@ mod tests {
     use std::sync::Arc;
 
     use arc_swap::ArcSwap;
+    use justknobs::test_helpers::JustKnobsInMemory;
+    use justknobs::test_helpers::KnobVal;
+    use justknobs::test_helpers::with_just_knobs;
     use metaconfig_types::CommitIdentityScheme;
     use mononoke_api::OmissionCollector;
     use mononoke_macros::mononoke;
@@ -421,6 +470,40 @@ mod tests {
         Mononoke {
             repos: Arc::new(MononokeRepos::new()),
             repo_names_in_tier: Arc::new(ArcSwap::from_pointee(tier)),
+        }
+    }
+
+    // What it tests: which responses ThriftCache may store, with the path-ACL
+    // kill switch on and off.
+    // Expected: only a complete successful response that does not depend on
+    // the caller is cacheable. The switch off restores caching of successful
+    // caller-dependent responses and nothing else.
+    #[mononoke::fbinit_test]
+    fn test_should_set_nocache(fb: FacebookInit) {
+        let plain = CoreContext::test_mock(fb);
+        let partial = CoreContext::test_mock(fb);
+        partial.set_partial_response();
+        let acl = CoreContext::test_mock(fb);
+        acl.set_response_depends_on_caller();
+
+        // (kill switch, succeeded, context, nocache, case)
+        let cases = [
+            (true, true, &plain, false, "complete"),
+            (true, true, &partial, true, "partial"),
+            (true, true, &acl, true, "caller-dependent"),
+            (true, false, &plain, true, "error"),
+            (false, true, &acl, false, "switch off"),
+            (false, true, &partial, true, "switch off, partial"),
+            (false, false, &acl, true, "switch off, denial"),
+        ];
+        for (enabled, succeeded, ctx, nocache, case) in cases {
+            let knob = JustKnobsInMemory::new(HashMap::from([(
+                THRIFTCACHE_NOCACHE_FOR_PATH_ACLS_JK.to_string(),
+                KnobVal::Bool(enabled),
+            )]));
+            with_just_knobs(knob, || {
+                assert_eq!(should_set_nocache(succeeded, ctx), nocache, "{case}");
+            });
         }
     }
 
@@ -461,13 +544,13 @@ mod tests {
     #[mononoke::test]
     fn test_partial_response_info() -> anyhow::Result<()> {
         // Not allowed: no field.
-        assert!(partial_response_info(&RestrictedPathsPolicy::Strict).is_none());
+        assert!(partial_response_info(&RestrictedPathsPolicy::Strict, false).is_none());
         // Allowed: always populated; `partial` iff count is positive,
         // agreeing with the `nocache` decision (set iff count positive) by
         // construction. A complete response carries no groups.
         let collecting =
             || RestrictedPathsPolicy::SkipAndCollect(Arc::new(OmissionCollector::default()));
-        let complete = partial_response_info(&collecting()).expect("populated when allowed");
+        let complete = partial_response_info(&collecting(), false).expect("populated when allowed");
         assert!(!complete.partial);
         assert_eq!(complete.omitted_restricted_paths_count, Some(0));
         assert_eq!(complete.omitted_by_restriction, None);
@@ -475,17 +558,23 @@ mod tests {
         // Denials are grouped by restriction; group counts sum to the total.
         let policy = collecting();
         let acl = MononokeIdentity::from_str("REPO_REGION:tent_acl")?;
-        policy.record_denial(&DenyingRestriction {
-            restriction_root: Some(NonRootMPath::new("tent")?),
-            repo_region_acl: acl.clone(),
-            permission_request_group: acl,
-        });
-        policy.record_denial(&DenyingRestriction {
-            restriction_root: Some(NonRootMPath::new("tent")?),
-            repo_region_acl: MononokeIdentity::from_str("REPO_REGION:tent_acl")?,
-            permission_request_group: MononokeIdentity::from_str("REPO_REGION:tent_acl")?,
-        });
-        let partial = partial_response_info(&policy).expect("populated when allowed");
+        policy.record_omission(
+            &DenyingRestriction {
+                restriction_root: Some(NonRootMPath::new("tent")?),
+                repo_region_acl: acl.clone(),
+                permission_request_group: acl,
+            },
+            None,
+        );
+        policy.record_omission(
+            &DenyingRestriction {
+                restriction_root: Some(NonRootMPath::new("tent")?),
+                repo_region_acl: MononokeIdentity::from_str("REPO_REGION:tent_acl")?,
+                permission_request_group: MononokeIdentity::from_str("REPO_REGION:tent_acl")?,
+            },
+            None,
+        );
+        let partial = partial_response_info(&policy, false).expect("populated when allowed");
         assert!(partial.partial);
         assert_eq!(partial.omitted_restricted_paths_count, Some(2));
         let groups = partial
@@ -498,6 +587,30 @@ mod tests {
             "group names its restriction root"
         );
         assert_eq!(groups[0].omitted_count, 2);
+        assert_eq!(groups[0].omitted_paths, None);
+
+        // The flag alone invents no paths: without retention the lists
+        // stay unset even when asked for. Retention plumbing is covered
+        // where it lives, in mononoke_api's constructor tests.
+        let policy = collecting();
+        let acl = MononokeIdentity::from_str("REPO_REGION:tent_acl")?;
+        policy.record_omission(
+            &DenyingRestriction {
+                restriction_root: Some(NonRootMPath::new("tent")?),
+                repo_region_acl: acl.clone(),
+                permission_request_group: acl,
+            },
+            None,
+        );
+        let asked = partial_response_info(&policy, true).expect("populated when allowed");
+        assert!(
+            asked
+                .omitted_by_restriction
+                .expect("partial response carries groups")
+                .iter()
+                .all(|group| group.omitted_paths.is_none()),
+            "unretained paths stay unset when asked for",
+        );
         Ok(())
     }
 }

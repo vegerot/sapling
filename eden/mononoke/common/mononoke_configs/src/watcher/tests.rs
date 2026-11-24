@@ -8,7 +8,9 @@
 use anyhow::anyhow;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use metaconfig_parser::parse_manifest_common_and_storage;
 use mononoke_macros::mononoke;
+use repos::TierManifest;
 use repos::TierRepoEntry;
 
 use super::*;
@@ -21,11 +23,11 @@ fn tier_entry(name: &str, is_deep_sharded: bool) -> TierRepoEntry {
     }
 }
 
-fn manifest_with(entries: Vec<TierRepoEntry>) -> TierManifest {
-    TierManifest {
+fn manifest_with(entries: Vec<TierRepoEntry>) -> ServiceManifest {
+    ServiceManifest::from(TierManifest {
         repos: entries,
         ..Default::default()
-    }
+    })
 }
 
 // Regression: deep-sharded handles inserted on-demand by ShardManager
@@ -142,8 +144,14 @@ async fn test_apply_per_repo_update_calls_receivers() {
             receiver.clone() as Arc<dyn ConfigUpdateReceiver>
         ]));
 
-    let succeeded =
-        apply_per_repo_update("foo", repo_config_with_id(42), &repo_configs, &receivers).await;
+    let succeeded = apply_per_repo_update(
+        "foo",
+        repo_config_with_id(42),
+        RepoConfigSource::default(),
+        &repo_configs,
+        &receivers,
+    )
+    .await;
     assert!(succeeded);
 
     let calls = receiver.calls.lock().await;
@@ -163,8 +171,14 @@ async fn test_apply_per_repo_update_patches_bulk_arc() {
     let receivers: Swappable<Vec<Arc<dyn ConfigUpdateReceiver>>> =
         Arc::new(ArcSwap::from_pointee(vec![]));
 
-    let succeeded =
-        apply_per_repo_update("foo", repo_config_with_id(7), &repo_configs, &receivers).await;
+    let succeeded = apply_per_repo_update(
+        "foo",
+        repo_config_with_id(7),
+        RepoConfigSource::default(),
+        &repo_configs,
+        &receivers,
+    )
+    .await;
     assert!(succeeded);
 
     let after = repo_configs.load();
@@ -172,7 +186,7 @@ async fn test_apply_per_repo_update_patches_bulk_arc() {
         .repos
         .get("foo")
         .expect("foo should be in bulk Arc after per-repo apply");
-    assert_eq!(stored.repoid.id(), 7);
+    assert_eq!(stored.config.repoid.id(), 7);
 }
 
 // Regression: a repo added via apply_per_repo_update is findable by id.
@@ -182,8 +196,14 @@ async fn test_apply_per_repo_update_maintains_id_index() {
     let receivers: Swappable<Vec<Arc<dyn ConfigUpdateReceiver>>> =
         Arc::new(ArcSwap::from_pointee(vec![]));
 
-    let succeeded =
-        apply_per_repo_update("foo", repo_config_with_id(7), &repo_configs, &receivers).await;
+    let succeeded = apply_per_repo_update(
+        "foo",
+        repo_config_with_id(7),
+        RepoConfigSource::default(),
+        &repo_configs,
+        &receivers,
+    )
+    .await;
     assert!(succeeded);
 
     let after = repo_configs.load();
@@ -209,8 +229,14 @@ async fn test_apply_per_repo_update_arc_patched_before_receiver_called() {
             receiver.clone() as Arc<dyn ConfigUpdateReceiver>
         ]));
 
-    let succeeded =
-        apply_per_repo_update("foo", repo_config_with_id(99), &repo_configs, &receivers).await;
+    let succeeded = apply_per_repo_update(
+        "foo",
+        repo_config_with_id(99),
+        RepoConfigSource::default(),
+        &repo_configs,
+        &receivers,
+    )
+    .await;
     assert!(succeeded);
 
     let calls = receiver.calls.lock().await;
@@ -220,7 +246,7 @@ async fn test_apply_per_repo_update_arc_patched_before_receiver_called() {
         .get("foo")
         .expect("bulk Arc must contain new config BEFORE receiver is called");
     assert_eq!(
-        in_snapshot.repoid.id(),
+        in_snapshot.config.repoid.id(),
         99,
         "receiver must observe the new config in the bulk Arc",
     );
@@ -244,8 +270,14 @@ async fn test_apply_per_repo_update_fans_out_to_all_receivers() {
             r2.clone() as Arc<dyn ConfigUpdateReceiver>,
         ]));
 
-    let succeeded =
-        apply_per_repo_update("bar", repo_config_with_id(11), &repo_configs, &receivers).await;
+    let succeeded = apply_per_repo_update(
+        "bar",
+        repo_config_with_id(11),
+        RepoConfigSource::default(),
+        &repo_configs,
+        &receivers,
+    )
+    .await;
     assert!(succeeded);
 
     assert_eq!(r1.calls.lock().await.len(), 1, "first receiver called");
@@ -285,8 +317,14 @@ async fn test_apply_per_repo_update_receiver_error_does_not_block_others() {
             healthy.clone() as Arc<dyn ConfigUpdateReceiver>,
         ]));
 
-    let succeeded =
-        apply_per_repo_update("baz", repo_config_with_id(3), &repo_configs, &receivers).await;
+    let succeeded = apply_per_repo_update(
+        "baz",
+        repo_config_with_id(3),
+        RepoConfigSource::default(),
+        &repo_configs,
+        &receivers,
+    )
+    .await;
     assert!(!succeeded, "must return false when any receiver fails");
 
     assert_eq!(
@@ -563,7 +601,6 @@ use futures::FutureExt;
 use justknobs::test_helpers::JustKnobsInMemory;
 use justknobs::test_helpers::KnobVal;
 use justknobs::test_helpers::with_just_knobs_async;
-use repos::RawCommonConfig;
 
 use crate::tests::TEST_STORAGE;
 use crate::tests::test_raw_common_config;
@@ -597,10 +634,10 @@ fn good_manifest(trusted_tier: &str, repos: Vec<TierRepoEntry>) -> TierManifest 
     manifest
 }
 
-/// Default `RawCommonConfig` fails conversion, so common/storage parsing fails.
+/// A common config that fails conversion, so common/storage parsing fails.
 fn unparsable_manifest(repos: Vec<TierRepoEntry>) -> TierManifest {
     let manifest = TierManifest {
-        common: RawCommonConfig::default(),
+        common: crate::tests::unparsable_raw_common_config(),
         storage: test_storage_map(),
         repos,
         ..Default::default()
@@ -637,7 +674,7 @@ impl ConfigUpdateReceiver for BulkRecordingReceiver {
 struct ReloadFixture {
     source: Arc<TestSource>,
     store: ConfigStore,
-    manifest_handle: ConfigHandle<TierManifest>,
+    manifest: Arc<ManifestSource>,
     repo_handles: Arc<RwLock<HashMap<String, ConfigHandle<RepoSpec>>>>,
     repo_configs: Swappable<RepoConfigs>,
     storage_configs: Swappable<StorageConfigs>,
@@ -649,19 +686,50 @@ struct ReloadFixture {
 }
 
 impl ReloadFixture {
+    /// A tier manifest at `MANIFEST_PATH`.
     fn new(initial_manifest: &TierManifest, seeded_repos: &[&str]) -> Self {
+        let json = serde_json::to_string(initial_manifest).expect("manifest serializes");
+        Self::with_source(&json, seeded_repos, |store| {
+            ManifestSource::tier(
+                store
+                    .get_config_handle::<TierManifest>(MANIFEST_PATH.to_string())
+                    .expect("manifest handle for inserted path"),
+            )
+        })
+    }
+
+    /// A deployment at `MANIFEST_PATH`, seen as the SCS server.
+    fn new_deployment(initial: &repos::Deployment, seeded_repos: &[&str]) -> Self {
+        let json = serde_json::to_string(initial).expect("deployment serializes");
+        Self::with_source(&json, seeded_repos, |store| {
+            ManifestSource::deployment(
+                metaconfig_parser::deployment_config_handle(MANIFEST_PATH, store)
+                    .expect("deployment handle for inserted path"),
+                metaconfig_parser::DeploymentLocation {
+                    root: metaconfig_parser::ConfigRoot::ConfigStore,
+                    name: "prod".to_owned(),
+                },
+                repos::MononokeService::SCS_SERVER,
+            )
+            .expect("the deployment has the SCS server")
+        })
+    }
+
+    fn with_source(
+        initial_json: &str,
+        seeded_repos: &[&str],
+        manifest: impl FnOnce(&ConfigStore) -> ManifestSource,
+    ) -> Self {
         let source = Arc::new(TestSource::new());
         source.insert_config(
             MANIFEST_PATH,
-            &serde_json::to_string(initial_manifest).expect("manifest serializes"),
+            initial_json,
             ModificationTime::UnixTimestamp(0),
         );
         source.insert_to_refresh(MANIFEST_PATH.to_string());
         // Poll interval is irrelevant: tests refresh via force_update_configs.
         let store = ConfigStore::new(source.clone(), Duration::from_secs(3600), None);
-        let manifest_handle = store
-            .get_config_handle::<TierManifest>(MANIFEST_PATH.to_string())
-            .expect("manifest handle for inserted path");
+        let manifest = Arc::new(manifest(&store));
         let receiver = Arc::new(BulkRecordingReceiver {
             commons: tokio::sync::Mutex::new(Vec::new()),
         });
@@ -672,7 +740,7 @@ impl ReloadFixture {
         Self {
             source,
             store,
-            manifest_handle,
+            manifest,
             repo_handles: make_repo_handles(seeded_repos),
             repo_configs: empty_repo_configs(),
             storage_configs: Arc::new(ArcSwap::from_pointee(StorageConfigs {
@@ -688,9 +756,24 @@ impl ReloadFixture {
 
     /// Replace the manifest content and propagate it to the handle.
     fn swap_manifest(&self, manifest: &TierManifest, timestamp: u64) {
+        self.swap_json(
+            &serde_json::to_string(manifest).expect("manifest serializes"),
+            timestamp,
+        );
+    }
+
+    /// Replace the deployment content and propagate it to the handle.
+    fn swap_deployment(&self, deployment: &repos::Deployment, timestamp: u64) {
+        self.swap_json(
+            &serde_json::to_string(deployment).expect("deployment serializes"),
+            timestamp,
+        );
+    }
+
+    fn swap_json(&self, json: &str, timestamp: u64) {
         self.source.insert_config(
             MANIFEST_PATH,
-            &serde_json::to_string(manifest).expect("manifest serializes"),
+            json,
             ModificationTime::UnixTimestamp(timestamp),
         );
         self.store.force_update_configs();
@@ -706,7 +789,7 @@ impl ReloadFixture {
 
     async fn run(&mut self) {
         let source = ConfigSource {
-            handle: self.manifest_handle.clone(),
+            manifest: self.manifest.clone(),
             tier: "test_tier".to_string(),
         };
         run_reload_pass(
@@ -752,7 +835,7 @@ async fn test_manifest_reload_keeps_last_known_good_on_parse_failure() {
     );
     assert_eq!(
         fx.state.prev_manifest.as_deref(),
-        Some(&v0),
+        Some(&ServiceManifest::from(v0.clone())),
         "pass 1 must record the applied manifest"
     );
 
@@ -778,7 +861,7 @@ async fn test_manifest_reload_keeps_last_known_good_on_parse_failure() {
     );
     assert_eq!(
         fx.state.prev_manifest.as_deref(),
-        Some(&v0),
+        Some(&ServiceManifest::from(v0.clone())),
         "prev_manifest must not advance on parse failure, so per-repo \
          fires keep parsing against the last applied snapshot"
     );
@@ -808,7 +891,7 @@ async fn test_manifest_reload_keeps_last_known_good_on_parse_failure() {
     );
     assert_eq!(
         fx.state.prev_manifest.as_deref(),
-        Some(&v2),
+        Some(&ServiceManifest::from(v2.clone())),
         "recovery must advance prev_manifest"
     );
     assert_eq!(
@@ -862,6 +945,7 @@ async fn test_manifest_reload_retains_served_repo_on_spec_parse_failure() {
             .repos
             .get("repo/x")
             .expect("repo/x must be served after the initial good pass")
+            .config
             .repoid
             .id(),
         1,
@@ -887,6 +971,7 @@ async fn test_manifest_reload_retains_served_repo_on_spec_parse_failure() {
             .repos
             .get("repo/x")
             .expect("repo/x must STAY served: transient spec parse failure must keep the last known good per-repo config")
+            .config
             .repoid
             .id(),
         1,
@@ -897,6 +982,7 @@ async fn test_manifest_reload_retains_served_repo_on_spec_parse_failure() {
             .repos
             .get("repo/y")
             .expect("the unrelated new repo/y must appear")
+            .config
             .repoid
             .id(),
         2,
@@ -904,7 +990,7 @@ async fn test_manifest_reload_retains_served_repo_on_spec_parse_failure() {
     );
 }
 
-fn served_config(fx: &ReloadFixture, name: &str) -> Arc<RepoConfig> {
+fn served_entry(fx: &ReloadFixture, name: &str) -> Arc<RepoConfigEntry> {
     fx.repo_configs
         .load()
         .repos
@@ -923,7 +1009,7 @@ async fn test_manifest_reload_reuses_parse_for_unchanged_spec() {
     let mut fx = ReloadFixture::new(&v0, &[]);
     fx.put_spec(X_PATH, &valid_repo_spec_json(1, "repo/x"), 0);
     fx.run().await;
-    let x_before = served_config(&fx, "repo/x");
+    let x_before = served_entry(&fx, "repo/x");
 
     fx.put_spec(Y_PATH, &valid_repo_spec_json(2, "repo/y"), 1);
     let v1 = good_manifest(
@@ -937,11 +1023,11 @@ async fn test_manifest_reload_reuses_parse_for_unchanged_spec() {
     fx.run().await;
 
     assert!(
-        Arc::ptr_eq(&x_before, &served_config(&fx, "repo/x")),
+        Arc::ptr_eq(&x_before, &served_entry(&fx, "repo/x")),
         "repo/x's spec did not change, so the pass must serve the same parsed config, not a re-parse"
     );
     assert_eq!(
-        served_config(&fx, "repo/y").repoid.id(),
+        served_entry(&fx, "repo/y").config.repoid.id(),
         2,
         "the newly added repo/y must be parsed and served"
     );
@@ -962,7 +1048,7 @@ async fn test_manifest_reload_reparses_changed_spec() {
     let mut fx = ReloadFixture::new(&v0, &[]);
     fx.put_spec(X_PATH, &valid_repo_spec_json(1, "repo/x"), 0);
     fx.run().await;
-    let x_before = served_config(&fx, "repo/x");
+    let x_before = served_entry(&fx, "repo/x");
 
     fx.put_spec(X_PATH, &valid_repo_spec_json(11, "repo/x"), 1);
     fx.put_spec(Y_PATH, &valid_repo_spec_json(2, "repo/y"), 1);
@@ -976,38 +1062,120 @@ async fn test_manifest_reload_reparses_changed_spec() {
     fx.swap_manifest(&v1, 2);
     fx.run().await;
 
-    let x_after = served_config(&fx, "repo/x");
+    let x_after = served_entry(&fx, "repo/x");
     assert!(
         !Arc::ptr_eq(&x_before, &x_after),
         "a changed spec must not be served from the previous parse"
     );
     assert_eq!(
-        x_after.repoid.id(),
+        x_after.config.repoid.id(),
         11,
         "repo/x must be served from its new spec"
     );
 }
 
-// Every parse resolves against the manifest's storage, so a storage change invalidates all reuse.
+// A parse depends on the storage config its spec names, so only a change to that one re-parses.
 #[mononoke::test]
-async fn test_manifest_reload_reparses_all_on_storage_change() {
+async fn test_manifest_reload_reparses_on_a_named_storage_change_only() {
     const X_PATH: &str = "test/repos/x";
 
     let v0 = good_manifest("tier_v0", vec![spec_entry("repo/x", 1, X_PATH)]);
     let mut fx = ReloadFixture::new(&v0, &[]);
     fx.put_spec(X_PATH, &valid_repo_spec_json(1, "repo/x"), 0);
     fx.run().await;
-    let x_before = served_config(&fx, "repo/x");
+    let x_before = served_entry(&fx, "repo/x");
 
     let mut v1 = v0.clone();
     let extra = v1.storage[TEST_STORAGE].clone();
     v1.storage.insert("other_storage".to_string(), extra);
     fx.swap_manifest(&v1, 1);
     fx.run().await;
-
+    let x_after_add = served_entry(&fx, "repo/x");
     assert!(
-        !Arc::ptr_eq(&x_before, &served_config(&fx, "repo/x")),
-        "a storage change must re-parse repo/x even though its spec is unchanged"
+        Arc::ptr_eq(&x_before, &x_after_add),
+        "adding a storage config repo/x does not name must reuse its parse"
+    );
+
+    let mut v2 = v1.clone();
+    v2.storage.insert(
+        TEST_STORAGE.to_string(),
+        repos::RawStorageConfig {
+            metadata: repos::RawMetadataConfig::local(repos::RawDbLocal {
+                local_db_path: "/tmp/other_db".to_string(),
+            }),
+            ..v1.storage[TEST_STORAGE].clone()
+        },
+    );
+    fx.swap_manifest(&v2, 2);
+    fx.run().await;
+    assert!(
+        !Arc::ptr_eq(&x_after_add, &served_entry(&fx, "repo/x")),
+        "a change to the storage config repo/x names must re-parse it"
+    );
+}
+
+// A parse depends on the presets its spec names, so only a change to one of those re-parses.
+#[mononoke::test]
+async fn test_manifest_reload_reparses_on_a_named_preset_change_only() {
+    const X_PATH: &str = "scm/mononoke/repos/x";
+
+    let manifest = good_manifest("tier_v0", vec![]);
+    let deployment = |git_preset: repos::RawRepoConfig, other: Option<&str>| repos::Deployment {
+        common: manifest.common.clone(),
+        storage: manifest.storage.clone().into_iter().collect(),
+        services: [(
+            repos::MononokeService::SCS_SERVER,
+            repos::ServiceConfig {
+                legacy_tier: "test_tier".to_owned(),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        repos: vec![repos::DeploymentRepo {
+            repo_name: "repo/x".to_owned(),
+            repo_id: 1,
+            spec_path: "x".to_owned(),
+            services: Some([(repos::MononokeService::SCS_SERVER, true)].into()),
+            ..Default::default()
+        }],
+        presets: Some(
+            std::iter::once(("git".to_string(), git_preset))
+                .chain(other.map(|name| (name.to_string(), Default::default())))
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    let v0 = deployment(Default::default(), None);
+    let mut fx = ReloadFixture::new_deployment(&v0, &[]);
+    let mut spec: repos::RepoSpec =
+        serde_json::from_str(&valid_repo_spec_json(1, "repo/x")).expect("spec parses");
+    spec.preset = Some("git".to_string());
+    fx.put_spec(
+        X_PATH,
+        &serde_json::to_string(&spec).expect("spec serializes"),
+        0,
+    );
+    fx.run().await;
+    let x_before = served_entry(&fx, "repo/x");
+
+    fx.swap_deployment(&deployment(Default::default(), Some("other")), 1);
+    fx.run().await;
+    let x_after_add = served_entry(&fx, "repo/x");
+    assert!(
+        Arc::ptr_eq(&x_before, &x_after_add),
+        "adding a preset repo/x does not name must reuse its parse"
+    );
+
+    let changed = repos::RawRepoConfig {
+        hook_max_file_size: Some(1),
+        ..Default::default()
+    };
+    fx.swap_deployment(&deployment(changed, Some("other")), 2);
+    fx.run().await;
+    assert!(
+        !Arc::ptr_eq(&x_after_add, &served_entry(&fx, "repo/x")),
+        "a change to the preset repo/x names must re-parse it"
     );
 }
 
@@ -1053,7 +1221,7 @@ async fn test_manifest_reload_keeps_parses_on_failed_pass() {
     let mut fx = ReloadFixture::new(&v0, &[]);
     fx.put_spec(X_PATH, &valid_repo_spec_json(1, "repo/x"), 0);
     fx.run().await;
-    let x_before = served_config(&fx, "repo/x");
+    let x_before = served_entry(&fx, "repo/x");
 
     fx.swap_manifest(&unparsable_manifest(vec![]), 1);
     fx.run().await;
@@ -1066,7 +1234,7 @@ async fn test_manifest_reload_keeps_parses_on_failed_pass() {
     fx.swap_manifest(&v2, 2);
     fx.run().await;
     assert!(
-        Arc::ptr_eq(&x_before, &served_config(&fx, "repo/x")),
+        Arc::ptr_eq(&x_before, &served_entry(&fx, "repo/x")),
         "the recovering pass must reuse repo/x's parse"
     );
 }
@@ -1082,14 +1250,14 @@ async fn test_manifest_reload_reparses_when_served_config_replaced() {
     let mut fx = ReloadFixture::new(&v0, &[]);
     fx.put_spec(X_PATH, &valid_repo_spec_json(1, "repo/x"), 0);
     fx.run().await;
-    let cached = served_config(&fx, "repo/x");
+    let cached = served_entry(&fx, "repo/x");
 
     fx.repo_configs.rcu(|current| {
         let mut next = (**current).clone();
         next.insert_repo("repo/x".to_string(), repo_config_with_id(1));
         next
     });
-    let replaced = served_config(&fx, "repo/x");
+    let replaced = served_entry(&fx, "repo/x");
 
     fx.put_spec(Y_PATH, &valid_repo_spec_json(2, "repo/y"), 1);
     let v1 = good_manifest(
@@ -1102,7 +1270,7 @@ async fn test_manifest_reload_reparses_when_served_config_replaced() {
     fx.swap_manifest(&v1, 2);
     fx.run().await;
 
-    let x_after = served_config(&fx, "repo/x");
+    let x_after = served_entry(&fx, "repo/x");
     assert!(
         !Arc::ptr_eq(&cached, &x_after),
         "the cached parse is no longer what is served, so it must not be reused"
@@ -1124,7 +1292,7 @@ async fn test_manifest_reload_carries_parse_across_spec_failure() {
     let mut fx = ReloadFixture::new(&v0, &[]);
     fx.put_spec(X_PATH, &valid_repo_spec_json(1, "repo/x"), 0);
     fx.run().await;
-    let x_good = served_config(&fx, "repo/x");
+    let x_good = served_entry(&fx, "repo/x");
 
     // X's spec goes bad; adding Y triggers a bulk pass.
     fx.put_spec(X_PATH, "{}", 1);
@@ -1139,14 +1307,14 @@ async fn test_manifest_reload_carries_parse_across_spec_failure() {
     fx.swap_manifest(&v1, 2);
     fx.run().await;
     assert!(
-        Arc::ptr_eq(&x_good, &served_config(&fx, "repo/x")),
+        Arc::ptr_eq(&x_good, &served_entry(&fx, "repo/x")),
         "a failed spec parse must keep serving the last good config"
     );
     assert!(
         fx.state
             .parsed_specs
             .get("repo/x")
-            .is_some_and(|parsed| Arc::ptr_eq(&parsed.config, &x_good)),
+            .is_some_and(|parsed| Arc::ptr_eq(&parsed.entry, &x_good)),
         "the last good parse must be carried into the next pass"
     );
 
@@ -1164,7 +1332,7 @@ async fn test_manifest_reload_carries_parse_across_spec_failure() {
     fx.swap_manifest(&v2, 4);
     fx.run().await;
     assert!(
-        Arc::ptr_eq(&x_good, &served_config(&fx, "repo/x")),
+        Arc::ptr_eq(&x_good, &served_entry(&fx, "repo/x")),
         "a spec restored to its last good content must reuse the carried parse"
     );
 }
@@ -1178,7 +1346,7 @@ async fn test_manifest_reload_reparses_all_when_knob_off() {
     let mut fx = ReloadFixture::new(&v0, &[]);
     fx.put_spec(X_PATH, &valid_repo_spec_json(1, "repo/x"), 0);
     fx.run().await;
-    let x_before = served_config(&fx, "repo/x");
+    let x_before = served_entry(&fx, "repo/x");
 
     let v1 = good_manifest("tier_v1", vec![spec_entry("repo/x", 1, X_PATH)]);
     fx.swap_manifest(&v1, 1);
@@ -1192,7 +1360,7 @@ async fn test_manifest_reload_reparses_all_when_knob_off() {
     .await;
 
     assert!(
-        !Arc::ptr_eq(&x_before, &served_config(&fx, "repo/x")),
+        !Arc::ptr_eq(&x_before, &served_entry(&fx, "repo/x")),
         "with the kill switch off, an unchanged spec must still be re-parsed"
     );
 }

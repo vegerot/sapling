@@ -181,6 +181,52 @@ first.)
   hook call 4
   hook call 5
 
+Python fallback gets the original arguments after Python pre-hooks:
+  $ newclientrepo fallbackargv
+  $ echo a > f
+  $ sl commit -qAm A
+  $ echo b > f
+  $ sl commit -qm B
+  $ cat > count.py << 'EOF'
+  > import sys
+  > def main(io, repo, **kwargs):
+  >     sys.hook_calls = getattr(sys, "hook_calls", 0) + 1
+  >     io.write_err(b"hook call %d\n" % sys.hook_calls)
+  > EOF
+  $ cat > argv.py << 'EOF'
+  > import sys
+  > def main(io, repo, **kwargs):
+  >     io.write_err(("argv: %r\n" % sys.argv[1:]).encode())
+  >     assert sys.hook_calls == 4
+  > EOF
+  $ setconfig profiling.always-on-enabled=false 'alias.argv-goto=goto --inactive' hooks.pre-goto.first=python:count.py:main hooks.pre-goto.second=python:count.py:main hooks.update.argv=python:argv.py:main
+  >>> repo = os.path.join(os.environ["TESTTMP"], "fallbackargv")
+  >>> proc = subprocess.run([os.environ["HGEXECUTABLEPATH"], "argv-goto", ".^"], cwd=repo, capture_output=True)
+  >>> assert proc.returncode == 0, proc.stderr.decode()
+  >>> print(proc.stderr.decode(), end="")
+  hook call 1
+  hook call 2
+  hook call 3
+  hook call 4
+  argv: ['argv-goto', '.^']
+
+A nested Python command leaves its caller's arguments intact:
+  $ newclientrepo nestedargv
+  $ cat > argv.py << 'EOF'
+  > import sys, bindings
+  > def main(io, repo, **kwargs):
+  >     saved_argv = sys.argv
+  >     assert bindings.commands.run(["sl", "debuglistpythonstd", "-T", ""]) == 0
+  >     assert sys.argv is saved_argv
+  >     io.write_err(b"caller argv restored\n")
+  > EOF
+  $ setconfig profiling.always-on-enabled=false hooks.post-debugtestcommand.argv=python:argv.py:main
+  >>> repo = os.path.join(os.environ["TESTTMP"], "nestedargv")
+  >>> proc = subprocess.run([os.environ["HGEXECUTABLEPATH"], "debugtestcommand"], cwd=repo, capture_output=True)
+  >>> assert proc.returncode == 0, proc.stderr.decode()
+  >>> print(proc.stderr.decode(), end="")
+  caller argv restored
+
 
 "pre" hooks abort on error:
   $ newclientrepo

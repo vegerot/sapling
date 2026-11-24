@@ -16,11 +16,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use anyhow::bail;
 use async_trait::async_trait;
 use context::CoreContext;
 use fbinit::FacebookInit;
 use git_env::GitHost;
-use metaconfig_types::GitBundleURIConfig;
+use metaconfig_types::GitBundleUriConfig;
 #[cfg(fbcode_build)]
 use metaconfig_types::UriGeneratorType;
 use mononoke_types::RepositoryId;
@@ -63,7 +64,7 @@ pub trait GitBundleUrlGenerator {
 }
 
 #[async_trait]
-impl GitBundleUrlGenerator for LocalFSBUndleUriGenerator {
+impl GitBundleUrlGenerator for LocalFsBundleUrlGenerator {
     async fn get_url_for_bundle_handle(
         &self,
         _ctx: &CoreContext,
@@ -76,7 +77,25 @@ impl GitBundleUrlGenerator for LocalFSBUndleUriGenerator {
 }
 
 #[derive(Clone)]
-pub struct LocalFSBUndleUriGenerator {}
+pub struct LocalFsBundleUrlGenerator {}
+
+/// The URL generator of a repo with no bundle-uri config: its bundles have no
+/// URLs, so none are offered to clients.
+#[derive(Clone)]
+pub struct NoBundleUrlGenerator {}
+
+#[async_trait]
+impl GitBundleUrlGenerator for NoBundleUrlGenerator {
+    async fn get_url_for_bundle_handle(
+        &self,
+        _ctx: &CoreContext,
+        _git_host: &GitHost,
+        _ttl: i64,
+        _handle: &str,
+    ) -> Result<String> {
+        bail!("the repo has no bundle-uri config, so its bundles have no URLs")
+    }
+}
 
 #[facet::facet]
 #[async_trait]
@@ -155,13 +174,22 @@ impl<U: Send + Sync + Clone + GitBundleUrlGenerator + 'static> BundleUri<U> {
     }
 }
 
+/// The bundle-uri facet of a repo. Without a `config`, bundles are still
+/// recorded and listed, but have no URLs.
 #[cfg(fbcode_build)]
 pub fn bundle_uri_arc(
     fb: FacebookInit,
     storage: SqlGitBundleMetadataStorage,
     repo_id: RepositoryId,
-    config: &GitBundleURIConfig,
+    config: Option<&GitBundleUriConfig>,
 ) -> Arc<dyn GitBundleUri + Send + Sync + 'static> {
+    let Some(config) = config else {
+        return Arc::new(BundleUri {
+            bundle_metadata_storage: storage,
+            bundle_url_generator: NoBundleUrlGenerator {},
+            repo_id,
+        });
+    };
     match &config.uri_generator_type {
         UriGeneratorType::Cdn { bucket, api_key } => Arc::new(BundleUri {
             bundle_metadata_storage: storage,
@@ -181,26 +209,35 @@ pub fn bundle_uri_arc(
             ),
             repo_id,
         }),
-        UriGeneratorType::LocalFS => Arc::new(BundleUri {
+        UriGeneratorType::LocalFs => Arc::new(BundleUri {
             bundle_metadata_storage: storage,
-            bundle_url_generator: LocalFSBUndleUriGenerator {},
+            bundle_url_generator: LocalFsBundleUrlGenerator {},
             repo_id,
         }),
     }
 }
 
+/// The bundle-uri facet of a repo. Without a `config`, bundles are still
+/// recorded and listed, but have no URLs.
 #[cfg(not(fbcode_build))]
 pub fn bundle_uri_arc(
     _fb: FacebookInit,
     storage: SqlGitBundleMetadataStorage,
     repo_id: RepositoryId,
-    _config: &GitBundleURIConfig,
+    config: Option<&GitBundleUriConfig>,
 ) -> Arc<dyn GitBundleUri + Send + Sync + 'static> {
-    Arc::new(BundleUri {
-        bundle_metadata_storage: storage,
-        bundle_url_generator: LocalFSBUndleUriGenerator {},
-        repo_id,
-    })
+    match config {
+        Some(_) => Arc::new(BundleUri {
+            bundle_metadata_storage: storage,
+            bundle_url_generator: LocalFsBundleUrlGenerator {},
+            repo_id,
+        }),
+        None => Arc::new(BundleUri {
+            bundle_metadata_storage: storage,
+            bundle_url_generator: NoBundleUrlGenerator {},
+            repo_id,
+        }),
+    }
 }
 
 #[async_trait]

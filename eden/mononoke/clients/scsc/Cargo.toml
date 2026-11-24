@@ -20,7 +20,7 @@ chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-fea
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 commit_id_types = { version = "0.1.0", path = "../../cmdlib/commit_id_types" }
-faster-hex = "0.6.1"
+faster-hex = "2.0.0"
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures = { version = "0.3.34", features = ["async-await", "compat"] }
@@ -39,10 +39,11 @@ tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tokio-stream = { version = "0.1.19", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.20", features = ["full"] }
 topo_sort = { version = "0.1.0", path = "../../common/topo_sort" }
-unicode-truncate = "0.2"
-unicode-width = "0.2.2"
+unicode-truncate = "3.0.0"
+unicode-width = "0.2.3"
 
 [dev-dependencies]
+fbthrift = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 mononoke_macros = { version = "0.1.0", path = "../../common/mononoke_macros" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

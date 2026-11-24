@@ -17,14 +17,16 @@
 
 #include <benchmark/benchmark.h>
 #include <boost/filesystem.hpp>
+#include <fmt/format.h>
 
 #include <folly/File.h>
+#include <folly/Utility.h>
 #include <folly/container/Array.h>
 #include <folly/init/Init.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/logging/xlog.h>
-#include <folly/synchronization/test/Barrier.h>
 #include <thrift/lib/cpp2/async/HeaderClientChannel.h>
+#include <latch>
 
 #include "eden/common/utils/XAttr.h"
 #include "eden/common/utils/benchharness/Bench.h"
@@ -84,7 +86,8 @@ std::string_view xAttrTypeToString(XAttrType xtype) {
     }
     default:
       throw std::invalid_argument(
-          fmt::format("invalid xattr type selected: {}", xtype));
+          fmt::format(
+              "invalid xattr type selected: {}", fmt::underlying(xtype)));
   }
 }
 
@@ -110,7 +113,8 @@ size_t getXAttrTypeSize(XAttrType xtype) {
       return 64;
     default:
       throw std::invalid_argument(
-          fmt::format("invalid xattr type selected: {}", xtype));
+          fmt::format(
+              "invalid xattr type selected: {}", fmt::underlying(xtype)));
   }
 }
 
@@ -130,10 +134,10 @@ bool isThriftResultFatal(const ThriftResultT& res) {
   //    ATTRIBUTE_UNAVAILABLE errors should be fatal
   if (res.getType() == ThriftResultT::Type::error) {
     // Always log that an error occurred
-    XLOGF(DBG3, "Thrift request failed with: {}", res.get_error().what());
+    XLOGF(DBG3, "Thrift request failed with: {}", res.error().value().what());
 
     // The error should only be fatal in some cases
-    return res.get_error().errorType().value() !=
+    return res.error()->errorType().value() !=
         EdenErrorType::ATTRIBUTE_UNAVAILABLE ||
         FLAGS_noAttrIsFatal;
   }
@@ -170,7 +174,7 @@ void recordThriftSample(
     throw std::runtime_error("No results!");
   }
   if (UNLIKELY(res.size() != 1 || isThriftResultFatal(res.at(0)))) {
-    throw res.at(0).get_error();
+    throw res.at(0).error().as_const().value();
   }
 }
 
@@ -318,7 +322,7 @@ int main(int argc, char** argv) {
   const unsigned samples_per_thread = 8192;
 
   std::vector<std::thread> threads;
-  folly::test::Barrier gate{static_cast<unsigned>(nthreads)};
+  std::latch gate{folly::to_signed(nthreads)};
   std::vector<uint64_t> thrift_samples(nthreads * samples_per_thread);
   std::vector<uint64_t> filesystem_samples(nthreads * samples_per_thread);
   // we are just going to do calculations based on the thrift_files size, so
@@ -353,7 +357,7 @@ int main(int argc, char** argv) {
         client = std::make_unique<EdenServiceAsyncClient>(std::move(channel));
       }
 
-      gate.wait();
+      gate.arrive_and_wait();
       auto xattr_type_size = getXAttrTypeSize(xAttrType);
       for (unsigned j = 0; j < samples_per_thread; ++j) {
         auto samples_index = thread_number * samples_per_thread + j;
@@ -390,7 +394,8 @@ int main(int argc, char** argv) {
             default:
               throw std::invalid_argument(
                   fmt::format(
-                      "cannot fetch unknown attr via thrift: {}", xAttrType));
+                      "cannot fetch unknown attr via thrift: {}",
+                      fmt::underlying(xAttrType)));
           }
         }
 

@@ -7,6 +7,7 @@
 
 //! Ephemeral Store
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,9 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::stream;
 use futures_lazy_shared::LazyShared;
+use governor::Quota;
+use governor::RateLimiter;
+use mercurial_types::HgChangesetId;
 use metaconfig_types::BubbleDeletionMode;
 use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
@@ -28,13 +32,23 @@ use mononoke_types::Timestamp;
 use sql_ext::SqlConnections;
 use sql_ext::mononoke_queries;
 use sql_query_config::SqlQueryConfig;
+use stats::prelude::*;
 
 use crate::bubble::Bubble;
 use crate::bubble::BubbleId;
 use crate::bubble::ExpiryStatus;
 use crate::error::EphemeralBlobstoreError;
-use crate::unlink::UnlinkPolicy;
-use crate::unlink::Unlinker;
+use crate::unlink::UnlinkRetry;
+
+mod hg_mapping;
+
+pub(crate) use hg_mapping::SqlBubbleHgMapping;
+pub(crate) use hg_mapping::leftover_ids;
+
+define_stats! {
+    prefix = "mononoke.ephemeral_blobstore.hg_mapping";
+    hg_mapping_rows_deleted: timeseries(Sum),
+}
 
 /// Outcome of extending a bubble's TTL
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +63,12 @@ pub enum ExtendBubbleTtlOutcome {
 pub struct DeleteBubbleOutcome {
     pub keys_deleted: usize,
     pub keys_already_deleted: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeleteBubblesPolicy {
+    pub max_bubbles_per_sec: Option<NonZeroU32>,
+    pub unlink_retry: Option<UnlinkRetry>,
 }
 
 /// Ephemeral Store.
@@ -143,6 +163,22 @@ mononoke_queries! {
         repo_id: RepositoryId,
         cs_id: ChangesetId,
     ) -> (BubbleId,) {
+        "SELECT M.bubble_id
+        FROM ephemeral_bubble_changeset_mapping M
+        JOIN ephemeral_bubbles B ON B.id = M.bubble_id
+        WHERE M.repo_id = {repo_id} AND M.cs_id = {cs_id}
+        ORDER BY
+            B.expired ASC,
+            EXISTS (SELECT 1 FROM ephemeral_bubble_labels L WHERE L.bubble_id = B.id) DESC,
+            B.expires_at DESC,
+            B.id DESC
+        LIMIT 1"
+    }
+
+    read SelectBubblesFromChangeset(
+        repo_id: RepositoryId,
+        cs_id: ChangesetId,
+    ) -> (BubbleId,) {
         "SELECT bubble_id
         FROM ephemeral_bubble_changeset_mapping
         WHERE repo_id = {repo_id} AND cs_id = {cs_id}"
@@ -230,6 +266,15 @@ mononoke_queries! {
         none,
         "DELETE
         FROM ephemeral_bubble_changeset_parents
+        WHERE bubble_id IN (SELECT id FROM ephemeral_bubbles WHERE id = {id} AND expired)"
+    }
+
+    write DeleteBubbleHgMapping(
+        id: BubbleId,
+    ) {
+        none,
+        "DELETE
+        FROM ephemeral_bubble_hg_mapping
         WHERE bubble_id IN (SELECT id FROM ephemeral_bubbles WHERE id = {id} AND expired)"
     }
 
@@ -374,7 +419,11 @@ impl RepoEphemeralStoreInner {
         Ok(())
     }
 
-    /// Given a changeset ID, fetch the corresponding Bubble ID.
+    /// Given a changeset ID, fetch the corresponding Bubble ID. If the
+    /// changeset is in more than one bubble, the bubble that stays alive the
+    /// longest is returned: bubbles not marked as expired first, then bubbles
+    /// with labels (which do not expire by time), then the latest expiry
+    /// time, then the highest bubble ID.
     async fn bubble_from_changeset(
         &self,
         ctx: &CoreContext,
@@ -383,14 +432,61 @@ impl RepoEphemeralStoreInner {
     ) -> Result<Option<BubbleId>> {
         ctx.perf_counters()
             .increment_counter(PerfCounterType::SqlReadsReplica);
-        let rows = SelectBubbleFromChangeset::query(
+        let mut rows = SelectBubbleFromChangeset::query(
             &self.connections.read_connection,
             ctx.sql_query_telemetry(),
             repo_id,
             cs_id,
         )
         .await?;
+        if rows.is_empty() {
+            // The snapshot may have been written so recently that the replica
+            // has not caught up yet.
+            ctx.perf_counters()
+                .increment_counter(PerfCounterType::SqlReadsMaster);
+            rows = SelectBubbleFromChangeset::query(
+                &self.connections.read_master_connection,
+                ctx.sql_query_telemetry(),
+                repo_id,
+                cs_id,
+            )
+            .await?;
+        }
         Ok(rows.into_iter().next().map(|b| b.0))
+    }
+
+    /// Given a changeset ID, fetch every bubble that contains it, in no
+    /// particular order. Reads from the master, so that a caller that acts on
+    /// the result, like a deletion, does not miss bubbles that have not yet
+    /// replicated.
+    async fn bubbles_from_changeset(
+        &self,
+        ctx: &CoreContext,
+        repo_id: &RepositoryId,
+        cs_id: &ChangesetId,
+    ) -> Result<Vec<BubbleId>> {
+        ctx.perf_counters()
+            .increment_counter(PerfCounterType::SqlReadsMaster);
+        let rows = SelectBubblesFromChangeset::query(
+            &self.connections.read_master_connection,
+            ctx.sql_query_telemetry(),
+            repo_id,
+            cs_id,
+        )
+        .await?;
+        Ok(rows.into_iter().map(|b| b.0).collect())
+    }
+
+    async fn bubble_from_hg_changeset(
+        &self,
+        ctx: &CoreContext,
+        repo_id: RepositoryId,
+        hg_cs_id: HgChangesetId,
+    ) -> Result<Option<BubbleId>> {
+        let expires_after = Timestamp::from(DateTime::now() - self.bubble_expiration_grace);
+        SqlBubbleHgMapping::new(self.connections.clone(), repo_id)
+            .live_bubble_for_hg(ctx, hg_cs_id, expires_after)
+            .await
     }
 
     /// Given a Bubble ID, fetch labels corresponding to that bubble.
@@ -410,15 +506,18 @@ impl RepoEphemeralStoreInner {
         Ok(rows.into_iter().map(|l| l.0).collect::<Vec<_>>())
     }
 
+    /// Fetch every changeset in the bubble. Reads from the master, so that
+    /// a caller that reports what a deletion of the bubble removes sees
+    /// changesets that have not yet replicated.
     async fn changesets_from_bubble(
         &self,
         ctx: &CoreContext,
         bubble_id: &BubbleId,
     ) -> Result<Vec<ChangesetId>> {
         ctx.perf_counters()
-            .increment_counter(PerfCounterType::SqlReadsReplica);
+            .increment_counter(PerfCounterType::SqlReadsMaster);
         let rows = SelectChangesetFromBubble::query(
-            &self.connections.read_connection,
+            &self.connections.read_master_connection,
             ctx.sql_query_telemetry(),
             bubble_id,
         )
@@ -486,7 +585,7 @@ impl RepoEphemeralStoreInner {
         &self,
         ctx: &CoreContext,
         bubble_id: BubbleId,
-        unlinker: &Unlinker,
+        unlink_retry: Option<UnlinkRetry>,
     ) -> Result<DeleteBubbleOutcome> {
         // Step 0: Validate if bubble deletion is enabled.
         if let BubbleDeletionMode::Disabled = self.bubble_deletion_mode {
@@ -508,7 +607,7 @@ impl RepoEphemeralStoreInner {
         }
         // Step 2: Delete the blob content within the expired bubble.
         let bubble = self.open_bubble_raw(ctx, bubble_id, false).await?;
-        let outcome = bubble.delete_blobs_in_bubble(ctx, unlinker).await?;
+        let outcome = bubble.delete_blobs_in_bubble(ctx, unlink_retry).await?;
 
         // Step 3: Delete the metadata associated with the bubble from
         // the backing SQL store.
@@ -528,6 +627,16 @@ impl RepoEphemeralStoreInner {
             &bubble_id,
         )
         .await?;
+        ctx.perf_counters()
+            .increment_counter(PerfCounterType::SqlWrites);
+        let hg_mapping_rows = DeleteBubbleHgMapping::query(
+            &self.connections.write_connection,
+            ctx.sql_query_telemetry(),
+            &bubble_id,
+        )
+        .await?
+        .affected_rows();
+        STATS::hg_mapping_rows_deleted.add_value(hg_mapping_rows as i64);
         // When invoked through processes, this will always be a no-op. This is useful for
         // manually deleting a bubble regardless of its expiry status.
         ctx.perf_counters()
@@ -785,18 +894,18 @@ impl RepoEphemeralStore {
         ctx: &CoreContext,
         bubble_id: BubbleId,
     ) -> Result<DeleteBubbleOutcome> {
-        let unlinker = Unlinker::new(UnlinkPolicy::default());
-        self.delete_bubble_with_unlinker(ctx, bubble_id, &unlinker)
-            .await
+        self.delete_bubble_with_retry(ctx, bubble_id, None).await
     }
 
-    async fn delete_bubble_with_unlinker(
+    async fn delete_bubble_with_retry(
         &self,
         ctx: &CoreContext,
         bubble_id: BubbleId,
-        unlinker: &Unlinker,
+        unlink_retry: Option<UnlinkRetry>,
     ) -> Result<DeleteBubbleOutcome> {
-        self.inner()?.delete_bubble(ctx, bubble_id, unlinker).await
+        self.inner()?
+            .delete_bubble(ctx, bubble_id, unlink_retry)
+            .await
     }
 
     /// Deletes the given bubbles, running up to `concurrency` deletions at a time,
@@ -808,19 +917,26 @@ impl RepoEphemeralStore {
         ctx: &CoreContext,
         bubble_ids: Vec<BubbleId>,
         concurrency: usize,
-        unlink_policy: UnlinkPolicy,
+        policy: DeleteBubblesPolicy,
     ) -> impl Stream<Item = (BubbleId, Result<DeleteBubbleOutcome>)> + Send + 'static {
         let store = self.clone();
         let ctx = ctx.clone();
-        let unlinker = Arc::new(Unlinker::new(unlink_policy));
+        let rate_limiter = policy.max_bubbles_per_sec.map(|rate| {
+            Arc::new(RateLimiter::direct(
+                Quota::per_second(rate).allow_burst(NonZeroU32::MIN),
+            ))
+        });
         stream::iter(bubble_ids)
             .map(move |bubble_id| {
                 let store = store.clone();
                 let ctx = ctx.clone();
-                let unlinker = unlinker.clone();
+                let rate_limiter = rate_limiter.clone();
                 async move {
+                    if let Some(rate_limiter) = rate_limiter {
+                        rate_limiter.until_ready().await;
+                    }
                     let outcome = store
-                        .delete_bubble_with_unlinker(&ctx, bubble_id, &unlinker)
+                        .delete_bubble_with_retry(&ctx, bubble_id, policy.unlink_retry)
                         .await;
                     (bubble_id, outcome)
                 }
@@ -877,6 +993,29 @@ impl RepoEphemeralStore {
     ) -> Result<Option<BubbleId>> {
         self.inner()?
             .bubble_from_changeset(ctx, &self.repo_id, cs_id)
+            .await
+    }
+
+    /// Given a changeset ID, fetch every bubble that contains it, in no
+    /// particular order. Unlike `bubble_from_changeset`, this also returns
+    /// bubbles that are marked as expired.
+    pub async fn bubbles_from_changeset(
+        &self,
+        ctx: &CoreContext,
+        cs_id: &ChangesetId,
+    ) -> Result<Vec<BubbleId>> {
+        self.inner()?
+            .bubbles_from_changeset(ctx, &self.repo_id, cs_id)
+            .await
+    }
+
+    pub async fn bubble_from_hg_changeset(
+        &self,
+        ctx: &CoreContext,
+        hg_cs_id: HgChangesetId,
+    ) -> Result<Option<BubbleId>> {
+        self.inner()?
+            .bubble_from_hg_changeset(ctx, self.repo_id, hg_cs_id)
             .await
     }
 
@@ -944,7 +1083,6 @@ impl RepoEphemeralStore {
 mod test {
     use std::collections::HashMap;
     use std::fmt;
-    use std::num::NonZeroU32;
     use std::num::NonZeroUsize;
     use std::sync::Mutex;
     use std::time::Instant;
@@ -962,13 +1100,19 @@ mod test {
     use blobstore::KeyedBlobstore;
     use blobstore::OverwriteStatus;
     use blobstore::PutBehaviour;
+    use bonsai_hg_mapping::BonsaiHgMappingEntry;
     use context::CoreContext;
     use fbinit::FacebookInit;
+    use futures::future::try_join_all;
     use maplit::hashset;
     use memblob::Memblob;
+    use mercurial_types_mocks::nodehash as hg;
     use metaconfig_types::BubbleDeletionMode;
     use metaconfig_types::PackFormat;
     use mononoke_macros::mononoke;
+    use mononoke_types_mocks::changesetid as bonsai;
+    use mononoke_types_mocks::changesetid::ONES_CSID;
+    use mononoke_types_mocks::repo::REPO_ONE;
     use mononoke_types_mocks::repo::REPO_ZERO;
     use packblob::PackBlob;
     use repo_blobstore::RepoBlobstore;
@@ -977,7 +1121,281 @@ mod test {
 
     use super::*;
     use crate::builder::RepoEphemeralStoreBuilder;
-    use crate::unlink::UnlinkRetry;
+
+    mononoke_queries! {
+        read CountBubbleHgMappingRows(bubble_id: BubbleId) -> (u64) {
+            "SELECT COUNT(*) FROM ephemeral_bubble_hg_mapping WHERE bubble_id = {bubble_id}"
+        }
+    }
+
+    async fn seed_hg_mapping(
+        ctx: &CoreContext,
+        eph: &RepoEphemeralStore,
+    ) -> Result<(BubbleId, BubbleId)> {
+        let connections = &eph.inner()?.connections;
+        let mapping = SqlBubbleHgMapping::new(connections.clone(), REPO_ZERO);
+        let a = eph.create_bubble(ctx, None, vec![]).await?.bubble_id();
+        let b = eph.create_bubble(ctx, None, vec![]).await?.bubble_id();
+        mapping
+            .add(
+                ctx,
+                a,
+                &[
+                    BonsaiHgMappingEntry {
+                        hg_cs_id: hg::ONES_CSID,
+                        bcs_id: bonsai::ONES_CSID,
+                    },
+                    BonsaiHgMappingEntry {
+                        hg_cs_id: hg::TWOS_CSID,
+                        bcs_id: bonsai::TWOS_CSID,
+                    },
+                ],
+            )
+            .await?;
+        mapping
+            .add(
+                ctx,
+                b,
+                &[BonsaiHgMappingEntry {
+                    hg_cs_id: hg::THREES_CSID,
+                    bcs_id: bonsai::THREES_CSID,
+                }],
+            )
+            .await?;
+        Ok((a, b))
+    }
+
+    async fn bubble_with_hg(
+        ctx: &CoreContext,
+        eph: &RepoEphemeralStore,
+        hg_cs_id: HgChangesetId,
+        bcs_id: ChangesetId,
+    ) -> Result<BubbleId> {
+        let bubble_id = eph.create_bubble(ctx, None, vec![]).await?.bubble_id();
+        SqlBubbleHgMapping::new(eph.inner()?.connections.clone(), REPO_ZERO)
+            .add(ctx, bubble_id, &[BonsaiHgMappingEntry { hg_cs_id, bcs_id }])
+            .await?;
+        Ok(bubble_id)
+    }
+
+    #[mononoke::fbinit_test]
+    async fn bubble_from_hg_changeset_test(fb: FacebookInit) -> Result<()> {
+        let (ctx, _, _, eph) = bootstrap(
+            fb,
+            Duration::from_hours(24),
+            Duration::from_hours(6),
+            BubbleDeletionMode::MarkAndDelete,
+        )?;
+        let (a, b) = seed_hg_mapping(&ctx, &eph).await?;
+
+        assert_eq!(
+            eph.bubble_from_hg_changeset(&ctx, hg::TWOS_CSID).await?,
+            Some(a),
+            "an hg changeset is found in the bubble that holds it"
+        );
+        assert_eq!(
+            eph.bubble_from_hg_changeset(&ctx, hg::THREES_CSID).await?,
+            Some(b),
+            "each hg changeset is found in its own bubble"
+        );
+        assert_eq!(
+            eph.bubble_from_hg_changeset(&ctx, hg::FOURS_CSID).await?,
+            None,
+            "an hg changeset that is in no bubble is not found"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn bubble_from_hg_changeset_is_scoped_by_repo_test(fb: FacebookInit) -> Result<()> {
+        let (ctx, _, _, eph) = bootstrap(
+            fb,
+            Duration::from_hours(24),
+            Duration::from_hours(6),
+            BubbleDeletionMode::MarkAndDelete,
+        )?;
+        let bubble_id = eph.create_bubble(&ctx, None, vec![]).await?.bubble_id();
+        SqlBubbleHgMapping::new(eph.inner()?.connections.clone(), REPO_ONE)
+            .add(
+                &ctx,
+                bubble_id,
+                &[BonsaiHgMappingEntry {
+                    hg_cs_id: hg::ONES_CSID,
+                    bcs_id: bonsai::ONES_CSID,
+                }],
+            )
+            .await?;
+
+        assert_eq!(
+            eph.bubble_from_hg_changeset(&ctx, hg::ONES_CSID).await?,
+            None,
+            "a row of another repo is not visible"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn bubble_from_hg_changeset_skips_expired_test(fb: FacebookInit) -> Result<()> {
+        let grace = Duration::from_hours(6);
+        let (ctx, _, _, eph) = bootstrap(
+            fb,
+            Duration::from_hours(24),
+            grace,
+            BubbleDeletionMode::MarkAndDelete,
+        )?;
+        let marked = bubble_with_hg(&ctx, &eph, hg::ONES_CSID, bonsai::ONES_CSID).await?;
+        let timed_out = bubble_with_hg(&ctx, &eph, hg::TWOS_CSID, bonsai::TWOS_CSID).await?;
+        let in_grace = bubble_with_hg(&ctx, &eph, hg::THREES_CSID, bonsai::THREES_CSID).await?;
+        let labeled = bubble_with_hg(&ctx, &eph, hg::FOURS_CSID, bonsai::FOURS_CSID).await?;
+        let labeled_marked = bubble_with_hg(&ctx, &eph, hg::FIVES_CSID, bonsai::FIVES_CSID).await?;
+        for bubble_id in [labeled, labeled_marked] {
+            eph.add_bubble_labels(&ctx, bubble_id, vec!["workspace".to_string()])
+                .await?;
+        }
+        let connections = &eph.inner()?.connections;
+        for bubble_id in [marked, labeled_marked] {
+            UpdateExpired::query(
+                &connections.write_connection,
+                ctx.sql_query_telemetry(),
+                &ExpiryStatus::Expired,
+                &bubble_id,
+            )
+            .await?;
+        }
+        let past_grace =
+            Timestamp::from(DateTime::now() - to_chrono(grace) - ChronoDuration::minutes(1));
+        for bubble_id in [timed_out, labeled, labeled_marked] {
+            UpdateBubbleExpiration::query(
+                &connections.write_connection,
+                ctx.sql_query_telemetry(),
+                &past_grace,
+                &bubble_id,
+            )
+            .await?;
+        }
+        UpdateBubbleExpiration::query(
+            &connections.write_connection,
+            ctx.sql_query_telemetry(),
+            &Timestamp::from(DateTime::now() - ChronoDuration::minutes(1)),
+            &in_grace,
+        )
+        .await?;
+
+        assert_eq!(
+            eph.bubble_from_hg_changeset(&ctx, hg::ONES_CSID).await?,
+            None,
+            "a bubble marked expired is skipped"
+        );
+        assert_eq!(
+            eph.bubble_from_hg_changeset(&ctx, hg::TWOS_CSID).await?,
+            None,
+            "a bubble past its grace period is skipped"
+        );
+        assert_eq!(
+            eph.bubble_from_hg_changeset(&ctx, hg::THREES_CSID).await?,
+            Some(in_grace),
+            "a bubble within its grace period is still found"
+        );
+        assert_eq!(
+            eph.bubble_from_hg_changeset(&ctx, hg::FOURS_CSID).await?,
+            Some(labeled),
+            "a labeled bubble past its expiry is still alive"
+        );
+        assert_eq!(
+            eph.bubble_from_hg_changeset(&ctx, hg::FIVES_CSID).await?,
+            None,
+            "a labeled bubble that is marked expired is skipped"
+        );
+        Ok(())
+    }
+
+    async fn count_hg_mapping_rows(
+        ctx: &CoreContext,
+        eph: &RepoEphemeralStore,
+        bubble_id: BubbleId,
+    ) -> Result<u64> {
+        let rows = CountBubbleHgMappingRows::query(
+            &eph.inner()?.connections.read_master_connection,
+            ctx.sql_query_telemetry(),
+            &bubble_id,
+        )
+        .await?;
+        Ok(rows.first().map_or(0, |row| row.0))
+    }
+
+    #[mononoke::fbinit_test]
+    async fn delete_bubble_clears_hg_mapping_test(fb: FacebookInit) -> Result<()> {
+        let (ctx, _, _, eph) = bootstrap(
+            fb,
+            Duration::from_hours(24),
+            Duration::from_hours(6),
+            BubbleDeletionMode::MarkAndDelete,
+        )?;
+        let (a, b) = seed_hg_mapping(&ctx, &eph).await?;
+        assert_eq!(count_hg_mapping_rows(&ctx, &eph, a).await?, 2);
+
+        eph.delete_bubble(&ctx, a).await?;
+
+        assert_eq!(
+            count_hg_mapping_rows(&ctx, &eph, a).await?,
+            0,
+            "both rows of the deleted bubble are gone"
+        );
+        assert_eq!(
+            count_hg_mapping_rows(&ctx, &eph, b).await?,
+            1,
+            "another bubble keeps its rows"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn mark_only_keeps_hg_mapping_test(fb: FacebookInit) -> Result<()> {
+        let (ctx, _, _, eph) = bootstrap(
+            fb,
+            Duration::from_hours(24),
+            Duration::from_hours(6),
+            BubbleDeletionMode::MarkOnly,
+        )?;
+        let (a, _) = seed_hg_mapping(&ctx, &eph).await?;
+
+        eph.delete_bubble(&ctx, a).await?;
+
+        assert_eq!(
+            count_hg_mapping_rows(&ctx, &eph, a).await?,
+            2,
+            "MarkOnly keeps the rows"
+        );
+        assert!(
+            eph.open_bubble(&ctx, a).await.is_err(),
+            "the rows are unreachable because the bubble is marked expired"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn delete_bubble_retry_is_safe_test(fb: FacebookInit) -> Result<()> {
+        let initial = Duration::from_hours(24);
+        let grace = Duration::from_hours(6);
+        let (ctx, blobstore, _, mark_only) =
+            bootstrap(fb, initial, grace, BubbleDeletionMode::MarkOnly)?;
+        let (a, b) = seed_hg_mapping(&ctx, &mark_only).await?;
+        let mark_and_delete = RepoEphemeralStore::new(
+            REPO_ZERO,
+            mark_only.inner()?.connections.clone(),
+            blobstore,
+            initial,
+            grace,
+            BubbleDeletionMode::MarkAndDelete,
+        );
+
+        mark_only.delete_bubble(&ctx, a).await?;
+        mark_and_delete.delete_bubble(&ctx, a).await?;
+
+        assert_eq!(count_hg_mapping_rows(&ctx, &mark_and_delete, a).await?, 0);
+        assert_eq!(count_hg_mapping_rows(&ctx, &mark_and_delete, b).await?, 1);
+        Ok(())
+    }
 
     fn bootstrap(
         fb: FacebookInit,
@@ -1649,7 +2067,7 @@ mod test {
                     missing_bubble,
                 ],
                 2,
-                UnlinkPolicy::default(),
+                DeleteBubblesPolicy::default(),
             )
             .collect::<Vec<_>>()
             .await;
@@ -2087,6 +2505,8 @@ mod test {
         // Create a bubble
         let bubble = eph.create_bubble(&ctx, None, vec![]).await?;
         let bubble_id = bubble.bubble_id();
+        // `Bubble::expires_at` includes the grace period; the stored expiry does not.
+        let original_expiry = Timestamp::from(bubble.expires_at() - to_chrono(grace));
 
         // Try to extend TTL with a shorter duration (30 seconds)
         let result = eph
@@ -2096,22 +2516,9 @@ mod test {
         // Should return NotChanged since the requested duration is shorter than remaining time
         match result {
             ExtendBubbleTtlOutcome::NotChanged(timestamp) => {
-                // The timestamp should be approximately the original expiration time
-                let now = DateTime::now();
-                let expected_expiry = now + to_chrono(Duration::from_mins(2));
-                let actual_expiry: DateTime = timestamp.into();
-
-                // Allow for some time difference due to test execution time
-                let actual_chrono = actual_expiry.into_chrono();
-                let expected_chrono = expected_expiry.into_chrono();
-                let diff = if actual_chrono > expected_chrono {
-                    actual_chrono - expected_chrono
-                } else {
-                    expected_chrono - actual_chrono
-                };
-                assert!(
-                    diff < to_chrono(Duration::from_secs(5)),
-                    "Expiry time should be close to original"
+                assert_eq!(
+                    timestamp, original_expiry,
+                    "Expiry time should be the original expiry time"
                 );
             }
             ExtendBubbleTtlOutcome::Extended(_) => {
@@ -2566,10 +2973,10 @@ mod test {
         Ok(())
     }
 
-    fn retrying_unlink_policy(max_attempts: usize) -> UnlinkPolicy {
-        UnlinkPolicy {
-            max_unlinks_per_sec: None,
-            retry: Some(UnlinkRetry {
+    fn retrying_unlink_policy(max_attempts: usize) -> DeleteBubblesPolicy {
+        DeleteBubblesPolicy {
+            max_bubbles_per_sec: None,
+            unlink_retry: Some(UnlinkRetry {
                 max_attempts: NonZeroUsize::new(max_attempts)
                     .expect("max_attempts should be positive"),
                 initial_delay: Duration::from_millis(1),
@@ -2624,7 +3031,7 @@ mod test {
             bubble_with_keys_in_faulty_store(fb, UnlinkFault::UnlinkFailsOnce).await?;
 
         let results = eph
-            .delete_bubbles(&ctx, vec![bubble_id], 1, UnlinkPolicy::default())
+            .delete_bubbles(&ctx, vec![bubble_id], 1, DeleteBubblesPolicy::default())
             .collect::<Vec<_>>()
             .await;
 
@@ -2680,46 +3087,112 @@ mod test {
     }
 
     #[mononoke::fbinit_test]
-    async fn delete_bubbles_respects_unlink_rate_limit_test(fb: FacebookInit) -> Result<()> {
+    async fn delete_bubbles_respects_bubble_rate_limit_test(fb: FacebookInit) -> Result<()> {
         let initial = Duration::from_hours(30 * 24);
         let grace = Duration::from_hours(6);
         let (ctx, blobstore, repo_blobstore, eph) =
             bootstrap(fb, initial, grace, BubbleDeletionMode::MarkAndDelete)?;
-        let bubble = eph.create_bubble(&ctx, None, vec![]).await?;
-        let bubble_repo = bubble.wrap_repo_blobstore(repo_blobstore);
-        for i in 1..=6 {
-            bubble_repo
-                .put(
-                    &ctx,
-                    format!("test_key_{i}"),
-                    BlobstoreBytes::from_bytes(format!("test data {i}")),
-                )
-                .await?;
-        }
-        let policy = UnlinkPolicy {
-            max_unlinks_per_sec: NonZeroU32::new(20),
-            retry: None,
+        let bubble_ids = try_join_all((1..=5).map(|i| {
+            let eph = &eph;
+            let ctx = &ctx;
+            let repo_blobstore = repo_blobstore.clone();
+            async move {
+                let bubble = eph.create_bubble(ctx, None, vec![]).await?;
+                bubble
+                    .wrap_repo_blobstore(repo_blobstore)
+                    .put(
+                        ctx,
+                        format!("test_key_{i}"),
+                        BlobstoreBytes::from_bytes(format!("test data {i}")),
+                    )
+                    .await?;
+                anyhow::Ok(bubble.bubble_id())
+            }
+        }))
+        .await?;
+        let policy = DeleteBubblesPolicy {
+            max_bubbles_per_sec: NonZeroU32::new(20),
+            unlink_retry: None,
         };
 
         let started = Instant::now();
         let results = eph
-            .delete_bubbles(&ctx, vec![bubble.bubble_id()], 1, policy)
+            .delete_bubbles(&ctx, bubble_ids, 5, policy)
             .collect::<Vec<_>>()
             .await;
         let elapsed = started.elapsed();
 
-        assert!(
-            matches!(results.as_slice(), [(_, Ok(outcome))] if outcome.keys_deleted == 6),
-            "All 6 keys should be deleted under the rate limit, got {results:?}"
+        assert_eq!(
+            results.len(),
+            5,
+            "Every requested bubble should be reported"
         );
         assert!(
-            elapsed >= Duration::from_millis(150),
-            "At 20 unlinks/s with a burst of 2, the 4 unlinks after the burst need at least 200ms, took {elapsed:?}"
+            results
+                .iter()
+                .all(|(_, result)| matches!(result, Ok(outcome) if outcome.keys_deleted == 1)),
+            "Every bubble should be deleted with its key under the rate limit, got {results:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(190),
+            "At 20 bubbles/s with a burst of 1, the 5th bubble cannot start before 200ms even with concurrency 5 (a burst of 2 would allow 150ms), took {elapsed:?}"
         );
         let enumerated = blobstore
             .enumerate(&ctx, &BlobstoreKeyParam::from(..))
             .await?;
         assert!(enumerated.keys.is_empty(), "No bubble data should remain");
+        Ok(())
+    }
+
+    mononoke_queries! {
+        write InsertBubbleChangeset(
+            repo_id: RepositoryId,
+            cs_id: ChangesetId,
+            bubble_id: BubbleId,
+        ) {
+            none,
+            "INSERT INTO ephemeral_bubble_changeset_mapping (repo_id, cs_id, bubble_id, gen)
+             VALUES ({repo_id}, {cs_id}, {bubble_id}, 1)"
+        }
+    }
+
+    #[mononoke::fbinit_test]
+    async fn bubble_from_changeset_reads_primary_when_replica_lags(fb: FacebookInit) -> Result<()> {
+        // Given a store whose replica has not yet seen a snapshot that was
+        // just written to the primary
+        let initial = Duration::from_hours(30 * 24);
+        let grace = Duration::from_hours(6);
+        let mode = BubbleDeletionMode::MarkAndDelete;
+        let (ctx, blobstore, _, primary) = bootstrap(fb, initial, grace, mode)?;
+        let (_, _, _, replica) = bootstrap(fb, initial, grace, mode)?;
+        let primary_connections = &primary.inner()?.connections;
+        let eph = RepoEphemeralStore::new(
+            REPO_ZERO,
+            SqlConnections {
+                write_connection: primary_connections.write_connection.clone(),
+                read_master_connection: primary_connections.read_master_connection.clone(),
+                read_connection: replica.inner()?.connections.read_connection.clone(),
+            },
+            blobstore,
+            initial,
+            grace,
+            mode,
+        );
+        let bubble = eph.create_bubble(&ctx, None, vec![]).await?;
+        InsertBubbleChangeset::query(
+            &primary_connections.write_connection,
+            ctx.sql_query_telemetry(),
+            &REPO_ZERO,
+            &ONES_CSID,
+            &bubble.bubble_id(),
+        )
+        .await?;
+
+        // When the snapshot's bubble is looked up
+        let found = eph.bubble_from_changeset(&ctx, &ONES_CSID).await?;
+
+        // Then it is found on the primary
+        assert_eq!(found, Some(bubble.bubble_id()));
         Ok(())
     }
 }

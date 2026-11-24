@@ -59,7 +59,8 @@ mod defaults {
 
 #[derive(Debug, Deserialize)]
 pub struct CommitCloudConfig {
-    /// Endpoint for real-time polling of Commit Cloud Notifications
+    /// Endpoint for legacy Commit Cloud notification polling, used when a
+    /// subscribed repository's config does not enable SLAPI polling.
     #[serde(default)]
     pub polling_update_url: Option<String>,
 
@@ -89,4 +90,28 @@ pub struct CommitCloudConfig {
     /// This is a simple receiver working on tcp socket
     #[serde(default = "defaults::tcp_receiver_port")]
     pub tcp_receiver_port: u16,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subscriber::WorkspaceSubscriberService;
+
+    #[test]
+    fn service_does_not_require_legacy_endpoint() -> anyhow::Result<()> {
+        let mut config: CommitCloudConfig = toml::from_str("")?;
+        config.connected_subscribers_path = Some(PathBuf::from("unused"));
+        assert!(
+            WorkspaceSubscriberService::new(&config)?
+                .polling_update_url
+                .is_none()
+        );
+
+        config.polling_update_url = Some("https://legacy.example/poll".to_owned());
+        assert_eq!(
+            WorkspaceSubscriberService::new(&config)?.polling_update_url,
+            config.polling_update_url,
+        );
+        Ok(())
+    }
 }

@@ -11,8 +11,12 @@
 """Integration tests for the `eden du` (disk usage) command."""
 
 import json
+import os
+import shutil
 import subprocess
 from pathlib import Path
+
+from eden.fs.cli.util import mkscratch_bin
 
 from .lib import testcase
 
@@ -27,6 +31,12 @@ class DiskUsageTest(testcase.EdenRepoTest):
         self.repo.write_file("subdir/file.txt", "File in subdirectory\n")
         self.repo.write_file("original.txt", "Original content\n")
         self.repo.commit("Initial commit.")
+
+    def broken_scratch_config(self) -> str:
+        """Write a scratch config that fails to parse, so scratch paths can't resolve."""
+        path = Path(self.tmp_dir) / "broken-scratch.toml"
+        path.write_text("template = \n")
+        return str(path)
 
     # Basic functionality tests
     def test_du_basic_runs_successfully(self) -> None:
@@ -49,7 +59,7 @@ class DiskUsageTest(testcase.EdenRepoTest):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             encoding="utf-8",
-            env={"MKSCRATCH_BIN": "false"},
+            env={"SCRATCH_CONFIG_PATH": self.broken_scratch_config()},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("failed to scan for orphaned redirections", result.stderr)
@@ -124,7 +134,7 @@ class DiskUsageTest(testcase.EdenRepoTest):
         self.assertIn("WARNING", result.stdout)
 
     def test_du_clean_continues_when_orphan_scan_fails(self) -> None:
-        """Test that `eden du --clean` runs its other cleanups and fails at the end when mkscratch fails."""
+        """Test that `eden du --clean` runs its other cleanups and fails at the end when orphan scanning fails."""
         # Keep Python fallback available for the nested `eden gc` command.
         self.set_rust_rollout_config({"du": True})
         result = self.eden.run_unchecked(
@@ -135,7 +145,7 @@ class DiskUsageTest(testcase.EdenRepoTest):
             stderr=subprocess.PIPE,
             encoding="utf-8",
             env={
-                "MKSCRATCH_BIN": "false",
+                "SCRATCH_CONFIG_PATH": self.broken_scratch_config(),
                 "EDENFSCTL_CONFIG_DIR": str(self.eden.eden_dir),
                 "EDENFSCTL_ETC_EDEN_DIR": str(self.eden.etc_eden_dir),
                 "EDENFSCTL_HOME_DIR": str(self.eden.home_dir),
@@ -162,11 +172,134 @@ class DiskUsageTest(testcase.EdenRepoTest):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             encoding="utf-8",
-            env={"MKSCRATCH_BIN": "false"},
+            env={"SCRATCH_CONFIG_PATH": self.broken_scratch_config()},
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Failed to find orphaned redirections for cleanup", result.stderr)
         self.assertNotIn("Summary", result.stdout)
+
+    def test_du_clean_orphaned_with_checkout_missing_config(self) -> None:
+        """A checkout left without config.toml by an interrupted `eden rm`."""
+        self.set_rust_rollout_config({"du": True})
+        broken_mount = os.path.join(self.tmp_dir, "broken")
+        self.eden.clone(self.repo.path, broken_mount)
+        self.eden.run_cmd(
+            "redirect", "add", "--mount", broken_mount, "buck-out", "symlink"
+        )
+        redirections = json.loads(
+            self.eden.run_cmd("redirect", "list", "--json", "--mount", broken_mount)
+        )
+        broken_target = Path(
+            next(r["target"] for r in redirections if r["repo_path"] == "buck-out")
+        )
+        self.assertTrue(broken_target.is_dir())
+        healthy_orphan = Path(
+            subprocess.check_output(
+                [
+                    os.fsdecode(mkscratch_bin()),
+                    "path",
+                    self.mount,
+                    "--subdir",
+                    "edenfs/redirections/orphaned",
+                ],
+                encoding="utf-8",
+            ).strip()
+        )
+        self.assertTrue(healthy_orphan.is_dir())
+        self.eden.unmount(Path(broken_mount))
+        (self.eden.client_dir_for_mount(Path(broken_mount)) / "config.toml").unlink()
+
+        result = self.eden.run_unchecked(
+            "du",
+            "--clean-orphaned",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"Run `eden rm {broken_mount}`", result.stderr)
+        self.assertFalse(healthy_orphan.exists())
+        self.assertTrue(broken_target.exists())
+
+    def test_du_clean_orphaned_with_missing_mount(self) -> None:
+        """An interrupted removal leaves both the mount and config.toml gone."""
+        self.set_rust_rollout_config({"du": True})
+        scratch_config = Path(os.environ["SCRATCH_CONFIG_PATH"])
+        original_config = scratch_config.read_text()
+        for style in ("flat", "mirror"):
+            with self.subTest(style=style):
+                scratch_config.write_text(original_config + f'\nstyle = "{style}"\n')
+                broken_mount = Path(self.tmp_dir) / f"broken-{style}"
+                self.eden.clone(self.repo.path, str(broken_mount))
+                self.eden.run_cmd(
+                    "redirect",
+                    "add",
+                    "--mount",
+                    str(broken_mount),
+                    "buck-out",
+                    "symlink",
+                )
+                broken_target = (broken_mount / "buck-out").resolve(strict=True)
+                (broken_target / "payload").write_text("keep")
+                healthy_orphan = Path(
+                    subprocess.check_output(
+                        [
+                            os.fsdecode(mkscratch_bin()),
+                            "path",
+                            self.mount,
+                            "--subdir",
+                            "edenfs/redirections/orphaned",
+                        ],
+                        encoding="utf-8",
+                    ).strip()
+                )
+                self.eden.unmount(broken_mount)
+                client_dir = self.eden.client_dir_for_mount(broken_mount)
+                shutil.rmtree(broken_mount)
+                (client_dir / "config.toml").unlink()
+
+                result = self.eden.run_unchecked(
+                    "du",
+                    "--clean-orphaned",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    encoding="utf-8",
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"Run `eden rm {broken_mount}`", result.stderr)
+                self.assertFalse(healthy_orphan.exists())
+                self.assertEqual((broken_target / "payload").read_text(), "keep")
+                self.assertFalse(broken_mount.exists())
+
+    def test_du_clean_orphaned_for_one_mount(self) -> None:
+        """Cleaning one checkout's orphans while another checkout has a redirection."""
+        self.set_rust_rollout_config({"du": True})
+        other_mount = Path(self.tmp_dir) / "other"
+        self.eden.clone(self.repo.path, str(other_mount))
+        self.eden.run_cmd(
+            "redirect", "add", "--mount", str(other_mount), "buck-out", "symlink"
+        )
+        other_target = (other_mount / "buck-out").resolve(strict=True)
+        (other_target / "payload").write_text("keep")
+        orphan = Path(
+            subprocess.check_output(
+                [
+                    os.fsdecode(mkscratch_bin()),
+                    "path",
+                    self.mount,
+                    "--subdir",
+                    "edenfs/redirections/orphaned",
+                ],
+                encoding="utf-8",
+            ).strip()
+        )
+
+        self.eden.run_cmd("du", "--clean-orphaned", self.mount)
+
+        self.assertFalse(orphan.exists())
+        self.assertEqual((other_target / "payload").read_text(), "keep")
 
     # Materialized files tests
     def test_du_materialized_increases_after_file_modification(self) -> None:

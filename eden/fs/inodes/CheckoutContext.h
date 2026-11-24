@@ -89,14 +89,18 @@ class CheckoutContext {
       std::shared_ptr<const Tree> toTree);
 
   /**
+   * True once start() may have changed the parent or SNAPSHOT.
+   */
+  bool hasStarted() const {
+    return hasStarted_;
+  }
+
+  /**
    * Complete the checkout operation
    *
    * Returns the list of conflicts and errors that were encountered during the
    * operation.
    */
-  ImmediateFuture<std::vector<CheckoutConflict>> finish(
-      const RootId& newSnapshot);
-
   folly::coro::now_task<std::vector<CheckoutConflict>> co_finish(
       const RootId& newSnapshot);
 
@@ -105,8 +109,6 @@ class CheckoutContext {
    *
    * Return the list of conflicts and errors.
    */
-  ImmediateFuture<std::vector<CheckoutConflict>> flush();
-
   folly::coro::now_task<std::vector<CheckoutConflict>> co_flush();
 
   void addConflict(ConflictType type, RelativePathPiece path, dtype_t dtype);
@@ -179,6 +181,7 @@ class CheckoutContext {
   void finalizeBeforeFlush(const RootId& newSnapshot);
 
   CheckoutMode checkoutMode_;
+  bool hasStarted_{false};
   EdenMount* const mount_;
   RenameLock renameLock_;
   RefPtr<StatsFetchContext> fetchContext_;

@@ -12,7 +12,6 @@
 #include <folly/coro/Invoke.h>
 #include <folly/coro/Task.h>
 #include <folly/futures/Future.h>
-#include <folly/io/IOBuf.h>
 
 #include <stdexcept>
 
@@ -23,6 +22,7 @@
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
 #include "eden/fs/model/Blob.h"
+#include "eden/fs/model/EmbeddedMetadata.h"
 #include "eden/fs/model/Tree.h"
 #include "eden/fs/model/TreeAuxData.h"
 #include "eden/fs/store/BackingStore.h"
@@ -508,6 +508,10 @@ ObjectId ObjectStore::stripObjectId(const ObjectId& id) const {
   return backingStore_->stripObjectId(id);
 }
 
+std::optional<timespec> ObjectStore::getMtime(const ObjectId& id) const {
+  return EmbeddedMetadataView{id}.mtime();
+}
+
 ImmediateFuture<shared_ptr<const Blob>> ObjectStore::getBlob(
     const ObjectId& id,
     const ObjectFetchContextPtr& fetchContext) const {
@@ -779,7 +783,7 @@ ImmediateFuture<Hash20> ObjectStore::getBlobSha1(
 }
 
 Hash32 ObjectStore::computeBlake3(const Blob& blob) const {
-  const auto content = blob.getContents();
+  const auto& content = blob.getContents();
   // This should maybe be read at startup and saved in a member variable, but in
   // practice this key should never change. Hold the snapshot while hashing: a
   // reference into a temporary snapshot dangles once a reload drops it.

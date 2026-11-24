@@ -73,6 +73,21 @@ class UpdateTest(EdenHgTestCase):
         repo.write_file("foo/bar.txt", "updated in commit 3\n")
         self.commit3 = repo.commit("Update foo/.gitignore")
 
+        # Create a commit with troublesome file paths.
+        repo.run_hg(
+            "debugdrawdag",
+            "--config",
+            "ui.username=test",
+            "--no-bookmarks",
+            input=(
+                "X   # X/f/.git/config=[core]\n"
+                "|   # X/f/.sl/requires=store\n"
+                "|   # X/f/.GiT=tracked\n"
+                "|   # X/f/others=1\n"
+                ".   # bookmark X=X\n"
+            ),
+        )
+
     def test_mode_change_with_no_content_change(self) -> None:
         """Test changing the mode of a file but NOT the contents."""
         self.assert_status_empty()
@@ -915,11 +930,9 @@ class UpdateTest(EdenHgTestCase):
 
         self.assertEqual(snapshot_before, snapshot_path.read_bytes())
         self.assertEqual("updated in commit 3\n", self.read_file("foo/bar.txt"))
-        # FIXME: Status should succeed because checkout never changed the tree.
-        with self.assertRaisesRegex(hgrepo.HgError, "checkout was interrupted"):
-            self.assert_status_empty()
+        self.assert_status_empty()
 
-        self.repo.update(self.commit1)
+        self.repo.update(self.commit2)
         self.assert_status_empty()
 
     async def test_resume_interrupted_update(self) -> None:
@@ -1154,6 +1167,22 @@ class UpdateTest(EdenHgTestCase):
         # Setting the experimental.repair-eden-dirstate config option to true (the default) will fix the issue
         self.hg("config", "--local", "experimental.repair-eden-dirstate", "True")
         self.repo.status()
+
+    def test_troublesome_paths(self) -> None:
+        self.repo.update("X")
+        f_dir = self.get_path("f")
+        listing = os.listdir(f_dir)
+        self.assertIn("others", listing)
+        self.assertNotIn(".git", listing)
+        self.assertNotIn(".sl", listing)
+        # Hidden regardless of the mount's case sensitivity.
+        self.assertNotIn(".GiT", listing)
+
+        for name in (".git", ".sl"):
+            with self.subTest(name=name):
+                os.mkdir(os.path.join(f_dir, name))
+                self.write_file(f"f/{name}/local", "local content")
+                self.assertEqual("local content", self.read_file(f"f/{name}/local"))
 
 
 class PrjFsState(Enum):

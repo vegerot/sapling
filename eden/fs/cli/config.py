@@ -109,12 +109,12 @@ CONFIG_JSON_LOCK = "config.json.lock"
 # in the Rust CLI at fs/cli_rs/edenfs-client/src/checkout.rs and the list in
 # the Daemon's CheckoutConfig at fs/config/CheckoutConfig.h.
 DEFAULT_REVISION = {  # supported repo name -> default bookmark
-    # The daemon no longer mounts "git" checkouts; the CLI keeps recognising
-    # the type so existing ones can still be listed and removed.
+    # The daemon no longer mounts "git" or "recas" checkouts; the CLI keeps
+    # recognising the types so existing ones can still be listed and removed.
     "git": "refs/heads/master",
+    "recas": "",
     "hg": "first(present(master) + .)",
     "filteredhg": "first(present(master) + .)",
-    "recas": "",
     "http": "",
 }
 
@@ -226,7 +226,6 @@ class CheckoutConfig(typing.NamedTuple):
     redirection_targets: Dict[str, str]
     active_prefetch_profiles: List[str]
     use_write_back_cache: bool
-    re_use_case: str
     inode_catalog_type: Optional[str]
     off_mount_repo_dir: bool
 
@@ -297,19 +296,51 @@ class AbstractEdenInstance:
     def get_mounts(self) -> Dict[Path, ListMountInfo]: ...
 
 
+def _ignore_already_removed(
+    func: Callable[..., object], path: str, exc_info: Tuple[Any, BaseException, Any]
+) -> None:
+    if not isinstance(exc_info[1], FileNotFoundError):
+        raise exc_info[1]
+    log.debug(f"{path} was already removed")
+
+
 def _remove_client_dir(client_dir: Path) -> None:
     # EdenFS does not mount a client directory that has no SNAPSHOT.
     # edenfsctl reads config.toml to remove a partly deleted checkout.
+    # Another `eden rm` of the same checkout, or an earlier interrupted one,
+    # may already have deleted any part of the client directory.
     (client_dir / SNAPSHOT).unlink(missing_ok=True)
-    for entry in client_dir.iterdir():
+    try:
+        entries = list(client_dir.iterdir())
+    except FileNotFoundError:
+        log.warning(f"Client directory {client_dir} was already removed")
+        return
+    for entry in entries:
         if entry.name == MOUNT_CONFIG:
             continue
         if entry.is_dir() and not entry.is_symlink():
-            shutil.rmtree(entry)
+            shutil.rmtree(entry, onerror=_ignore_already_removed)
         else:
-            entry.unlink()
+            entry.unlink(missing_ok=True)
     (client_dir / MOUNT_CONFIG).unlink(missing_ok=True)
-    client_dir.rmdir()
+    try:
+        client_dir.rmdir()
+    except FileNotFoundError:
+        log.warning(f"Client directory {client_dir} was already removed")
+
+
+def path_is_missing(path: Path) -> bool:
+    """True only when nothing exists at `path`, the link itself included.
+    `Path.exists()` is also False for a dangling link or a directory that
+    cannot be reached right now, and those are not reasons to drop a checkout
+    from config.json."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 class EdenInstance(AbstractEdenInstance):
@@ -775,13 +806,64 @@ Do you want to run `eden mount %s` instead?"""
         if mount_timeout == 0:
             mount_timeout = None
 
-        with self.get_thrift_client(timeout=mount_timeout) as client:
-            client.mount(mount_info)
+        # Register the checkout before asking the daemon to mount it. Written
+        # after the mount, the directory-map entry was lost whenever the clone
+        # stopped in between (a timeout, a kill, a failed post-clone step), which
+        # left a mount that `eden list` shows as "(unconfigured)" and that the
+        # directory map could not help remove. A checkout registered but never
+        # mounted is an ordinary unmounted checkout: `eden mount` mounts it and
+        # `eden rm` removes it.
+        #
+        # The intentionally-unmounted marker goes first: unmount recovery
+        # (`mount:mount-health-check-recovery`) remounts a registered checkout
+        # the daemon does not serve, unless the marker is set, and a tick
+        # between the registration and the daemon's own mount would otherwise
+        # mount the checkout first and fail the call below as "already mounted",
+        # skipping the post-clone setup. The daemon clears the marker when it
+        # mounts. The marker is written into the client directory directly:
+        # config.json does not name it yet.
+        try:
+            self._set_intentionally_unmounted(path, Path(client_dir))
+            self._add_path_to_directory_map(Path(path), os.path.basename(client_dir))
+            with self.get_thrift_client(timeout=mount_timeout) as client:
+                client.mount(mount_info)
+        except BaseException:
+            # A failed call does not mean a failed mount: after a client-side
+            # timeout, a lost reply or Ctrl-C the daemon can still finish it.
+            # The entry is taken out only when the daemon reports that it does
+            # not serve the path; a mount that did happen, or that cannot be
+            # checked, stays registered. The marker goes last: while the entry
+            # is still there, it keeps unmount recovery from mounting the
+            # checkout under this cleanup. Whatever the clone leaves behind is
+            # then treated like any other checkout. The cleanup must not hide
+            # the error that is being raised.
+            try:
+                if self._daemon_serves(Path(path)) is False:
+                    self._remove_path_from_directory_map(Path(path))
+                self._clear_intentionally_unmounted(path, Path(client_dir))
+            except Exception as ex:
+                log.warning(
+                    f"could not clean up after the failed mount of {path}: {ex}"
+                )
+            raise
 
         self._post_clone_checkout_setup(checkout, snapshot_id, filter_paths)
 
-        # Add mapping of mount path to client directory in config.json
-        self._add_path_to_directory_map(Path(path), os.path.basename(client_dir))
+    def _daemon_serves(self, path: Path) -> Optional[bool]:
+        """Whether the running daemon lists a mount at `path`, in any state, or
+        None when it cannot be asked. The query has its own short timeout: it
+        runs after a failed mount call, and an unresponsive daemon must not
+        hang the clone a second time."""
+        path = path.resolve(strict=False)
+        try:
+            with self.get_thrift_client(timeout=3.0) as client:
+                return any(
+                    Path(os.fsdecode(mount.mountPoint)).resolve(strict=False) == path
+                    for mount in client.listMounts()
+                )
+        except Exception as ex:
+            log.warning(f"could not ask EdenFS whether it serves {path}: {ex}")
+            return None
 
     def _create_mount_point_dir(self, path: str) -> None:
         # Create the directory
@@ -946,42 +1028,7 @@ Do you want to run `eden mount %s` instead?"""
         # Exception if the config is in an invalid state.
         checkout.get_config()
 
-        # Make sure the mount path exists
-        path.mkdir(parents=True, exist_ok=True)
-
-        # Check if it is already mounted.
-        try:
-            root = path / ".eden" / "root"
-            target = os.readlink(root)
-            if Path(target) == path:
-                print_stderr(
-                    f"ERROR: Mount point in use! {path} is already mounted by EdenFS."
-                )
-                return 1
-            else:
-                # If we are here, MOUNT/.eden/root is a symlink, but it does not
-                # point to MOUNT. This suggests `path` is a subdirectory of an
-                # existing mount, though we should never reach this point
-                # because _get_client_dir_for_mount_point() above should have
-                # already thrown an exception. We return non-zero here just in
-                # case.
-                print_stderr(
-                    f"ERROR: Mount point in use! "
-                    f"{path} is already mounted by EdenFS as part of {root}."
-                )
-                return 1
-        except OSError as ex:
-            # - ENOENT is expected if the mount is not mounted.
-            # - We'll get ENOTCONN if the directory was not properly unmounted from a
-            #   previous EdenFS instance.  Remounting over this directory is okay (even
-            #   though ideally we would unmount the old stale mount point to clean it
-            #   up).
-            # - EINVAL can happen if .eden/root isn't a symlink.  This isn't expected
-            #   in most circumstances, but it does mean that the directory isn't
-            #   currently an EdenFS checkout.
-            err = ex.errno
-            if err not in (errno.ENOENT, errno.ENOTCONN, errno.EINVAL):
-                raise
+        _make_mount_point_dir(path)
 
         # Ask eden to mount the path
         mount_info = MountArgument(
@@ -1046,16 +1093,25 @@ Do you want to run `eden mount %s` instead?"""
                     f"unmounted: {ex}"
                 )
 
-    def _intentionally_unmounted_file(self, path: str) -> Path:
-        mount_path = Path(path).resolve(strict=False)
-        client_dir = self._get_client_dir_for_mount_point(mount_path)
+    def _intentionally_unmounted_file(
+        self, path: str, client_dir: Optional[Path] = None
+    ) -> Path:
+        """The marker of `path`, in `client_dir` when given, else in the
+        client directory config.json names for the mount path."""
+        if client_dir is None:
+            mount_path = Path(path).resolve(strict=False)
+            client_dir = self._get_client_dir_for_mount_point(mount_path)
         return client_dir / INTENTIONALLY_UNMOUNTED
 
-    def _set_intentionally_unmounted(self, path: str) -> None:
-        self._intentionally_unmounted_file(path).touch()
+    def _set_intentionally_unmounted(
+        self, path: str, client_dir: Optional[Path] = None
+    ) -> None:
+        self._intentionally_unmounted_file(path, client_dir).touch()
 
-    def _clear_intentionally_unmounted(self, path: str) -> None:
-        self._intentionally_unmounted_file(path).unlink(missing_ok=True)
+    def _clear_intentionally_unmounted(
+        self, path: str, client_dir: Optional[Path] = None
+    ) -> None:
+        self._intentionally_unmounted_file(path, client_dir).unlink(missing_ok=True)
 
     def destroy_mount(
         self, path: Union[Path, str], preserve_mount_point: bool = False
@@ -1284,8 +1340,8 @@ Do you want to run `eden mount %s` instead?"""
 
                 print(
                     f"""
-    At this point your EdenFS mount is destroyed, but EdenFS is having
-    trouble cleaning up leftovers. You will need to manually remove {path}.
+    EdenFS still lists this checkout. Remove {path} manually, then run
+    `eden rm {path}` again to finish removing it.
     """
                 )
 
@@ -1378,6 +1434,26 @@ Do you want to run `eden mount %s` instead?"""
                 raise Exception(f"mount path {path} already exists.")
             config_data[path] = dir_name
             self._write_directory_map(config_data)
+
+    def unregister_checkout(self, path: Path, state_dir: Path) -> bool:
+        """Remove `path` from config.json and touch nothing on disk. For a
+        checkout whose state directory `state_dir` is gone; `destroy_mount` is
+        for one whose state directory must be deleted too.
+
+        The entry goes only while it still names `state_dir` and nothing
+        exists at that path, both checked under the config.json lock: a clone
+        that registered a replacement at `path` in the meantime keeps its
+        entry, and so does a directory that merely cannot be reached right
+        now. Returns whether the entry was removed."""
+        with self._directory_map_lock():
+            config_data = self._get_directory_map()
+            if config_data.get(path) != state_dir.name or not path_is_missing(
+                state_dir
+            ):
+                return False
+            del config_data[path]
+            self._write_directory_map(config_data)
+            return True
 
     def _remove_path_from_directory_map(self, path: Path) -> None:
         with self._directory_map_lock():
@@ -1562,9 +1638,6 @@ class EdenCheckout:
             "profiles": {
                 "active": checkout_config.active_prefetch_profiles,
             },
-            "recas": {
-                "use-case": checkout_config.re_use_case,
-            },
         }
 
         util.write_file_atomically(
@@ -1688,12 +1761,6 @@ class EdenCheckout:
         if not isinstance(use_write_back_cache, bool):
             use_write_back_cache = False
 
-        re_use_case = "buck2-default"
-        recas = config.get("recas")
-        if recas is not None:
-            if recas.get("use-case") is not None:
-                re_use_case = str(recas.get("use-case"))
-
         off_mount_repo_dir = repository.get("off-mount-repo-dir")
         if not isinstance(off_mount_repo_dir, bool):
             off_mount_repo_dir = False
@@ -1738,7 +1805,6 @@ class EdenCheckout:
             ),
             active_prefetch_profiles=prefetch_profiles,
             use_write_back_cache=use_write_back_cache,
-            re_use_case=re_use_case,
             inode_catalog_type=inode_catalog_type,
             off_mount_repo_dir=off_mount_repo_dir,
         )
@@ -2218,6 +2284,20 @@ def _check_same_eden_directory(found_path: Path, path_arg: Path) -> None:
         )
 
 
+def _make_mount_point_dir(path: Path) -> None:
+    # Never stat an existing mount point: a stale mount left by an earlier
+    # EdenFS fails the stat, or the kernel answers it from cache. The
+    # privhelper detaches such a mount before mounting, and EdenFS rejects a
+    # path it already serves. The errnos match isErrnoFromHangingMount().
+    try:
+        path.mkdir(parents=True)
+    except FileExistsError:
+        pass
+    except OSError as ex:
+        if ex.errno not in (errno.ENOTCONN, errno.EIO, errno.ETIMEDOUT):
+            raise
+
+
 def _verify_mount_point(mount_point: str) -> None:
     if os.path.isdir(mount_point):
         return
@@ -2289,7 +2369,6 @@ def get_repo_info(
     case_sensitive: bool,
     overlay_type: Optional[str],
     backing_store_type: Optional[str] = None,
-    re_use_case: Optional[str] = None,
     off_mount_repo_dir: bool = False,
 ) -> Tuple[util.Repo, CheckoutConfig]:
     # Check to see if repo_arg points to an existing EdenFS mount
@@ -2321,7 +2400,6 @@ def get_repo_info(
         case_sensitive,
         overlay_type,
         backing_store_type=backing_store_type,
-        re_use_case=re_use_case,
         off_mount_repo_dir=off_mount_repo_dir,
     )
 
@@ -2335,7 +2413,6 @@ def create_checkout_config(
     case_sensitive: bool,
     overlay_type: Optional[str],
     backing_store_type: Optional[str] = None,
-    re_use_case: Optional[str] = None,
     off_mount_repo_dir: bool = False,
 ) -> CheckoutConfig:
     mount_protocol = util.get_protocol(nfs)
@@ -2381,7 +2458,6 @@ def create_checkout_config(
         redirection_targets={},
         active_prefetch_profiles=[],
         use_write_back_cache=False,
-        re_use_case=re_use_case or "buck2-default",
         inode_catalog_type=overlay_type,
         off_mount_repo_dir=off_mount_repo_dir,
     )

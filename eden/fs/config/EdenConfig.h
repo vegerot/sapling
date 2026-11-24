@@ -944,6 +944,16 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Log a slow mount health check probe (`daemon_running_mount_slow`) only
+   * when at least this many health check ticks in the last 24 hours had a slow
+   * probe. The default of 0 logs every slow probe.
+   */
+  ConfigSetting<uint32_t> mountHealthCheckSlowReportTicks{
+      "mount:mount-health-check-slow-report-ticks",
+      0,
+      this};
+
+  /**
    * The soong build system used in AOSP loves to crawls the entirety of the
    * repository, including the .eden directory. In doing so, it infinitely
    * recurse into the this-dir.
@@ -962,15 +972,6 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   // [store]
-
-  /**
-   * The minimum duration between logging occurrences of failed HgProxyHash
-   * loads.
-   */
-  ConfigSetting<std::chrono::nanoseconds> missingHgProxyHashLogInterval{
-      "store:missing-hgproxyhash-log-interval",
-      std::chrono::minutes{10},
-      this};
 
   /**
    * If the number of fetching requests of a process reaches this number,
@@ -2103,44 +2104,6 @@ class EdenConfig : private ConfigSettingManager {
       false,
       this};
 
-  // [coroutines]
-
-  /**
-   * Master switch to enable/disable all coroutine-based implementations.
-   * When false, all coroutine implementations are disabled regardless of
-   * individual feature flags. When true, individual feature flags control
-   * each endpoint.
-   * Default is true to allow individual feature flags to work.
-   */
-  ConfigSetting<bool> enableCoroutines{"coroutines:enabled", true, this};
-
-  /**
-   * Controls whether EdenFS uses phase 9 coroutine implementations
-   * (getFileInformation).
-   */
-  ConfigSetting<bool> enableCoroutinesPhase9{
-      "coroutines:enable-phase9",
-      false,
-      this};
-
-  /**
-   * Controls whether EdenFS uses phase 7 coroutine implementations
-   * (the checkOutRevision thrift endpoint).
-   */
-  ConfigSetting<bool> enableCoroutinesPhase7{
-      "coroutines:enable-phase7",
-      false,
-      this};
-
-  /**
-   * Controls whether EdenFS uses phase 10 coroutine implementations
-   * (getAttributesFromFilesV2).
-   */
-  ConfigSetting<bool> enableCoroutinesPhase10{
-      "coroutines:enable-phase10",
-      false,
-      this};
-
   // [blobcache]
 
   /**
@@ -2473,6 +2436,7 @@ class EdenConfig : private ConfigSettingManager {
    * Validate and recover overlay data on access instead of running startup
    * fsck. Requires inode reservation and the Legacy catalog. Unvisited
    * orphan subtrees are left for offline fsck. Disabled by default.
+   * See eden/fs/docs/OnlineFsck.md for recovery policy and trade-offs.
    */
   ConfigSetting<bool> overlayOnlineFsck{"overlay:online-fsck", false, this};
 
@@ -2855,7 +2819,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<std::chrono::nanoseconds> restrictedRootRefreshInterval{
       "acl:restricted-root-refresh-interval",
-      std::chrono::seconds(0),
+      std::chrono::minutes(1),
       this};
 
   /**
@@ -2868,14 +2832,14 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Controls how restricted ACL roots are presented. "restricted" (the
-   * default) shows them in directory listings with mode 000; "omitted" hides
-   * them from enumeration entirely. Read once at daemon startup; runtime
+   * Controls how restricted ACL roots are presented. "omitted" (the default)
+   * hides them from enumeration entirely; "restricted" shows them in
+   * directory listings with mode 000. Read once at daemon startup; runtime
    * config reloads do not change the running mode.
    */
   ConfigSetting<RestrictedContentMode> restrictedContentMode{
       "acl:restricted-content-mode",
-      RestrictedContentMode::Restricted,
+      RestrictedContentMode::Omitted,
       this};
 };
 

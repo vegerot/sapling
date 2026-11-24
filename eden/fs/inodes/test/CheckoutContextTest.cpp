@@ -8,6 +8,7 @@
 #include "eden/fs/inodes/CheckoutContext.h"
 
 #include <folly/ScopeGuard.h>
+#include <folly/coro/BlockingWait.h>
 #include <folly/logging/test/TestLogHandler.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -35,7 +36,7 @@ TEST(CheckoutContextTest, errorsAreReturnedAsConflicts) {
       "error.txt"_pc,
       folly::make_exception_wrapper<std::runtime_error>("checkout error"));
 
-  auto conflicts = std::move(context.flush()).get();
+  auto conflicts = folly::coro::blockingWait(context.co_flush());
   ASSERT_EQ(1, conflicts.size());
   EXPECT_EQ("error.txt", conflicts[0].path().value());
   EXPECT_EQ(ConflictType::ERROR, conflicts[0].type().value());
@@ -82,15 +83,8 @@ TEST(CheckoutContextTest, logsCheckoutErrorOnceAtBoundary) {
           "intentional checkout error"),
       1);
 
-  auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"target"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"target"}, ObjectFetchContext::getNullContext(), __func__);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutResult.isReady());
   EXPECT_THROW(std::move(checkoutResult).get(), EdenError);

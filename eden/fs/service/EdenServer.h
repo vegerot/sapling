@@ -90,6 +90,7 @@ class MountInfo;
 class ObjectStore;
 class PrivHelper;
 class ReloadableConfig;
+class SlowMountHealthCheckTicks;
 class ServerState;
 class StartupLogger;
 class StartupStatusChannel;
@@ -300,6 +301,12 @@ class EdenServer : private TakeoverHandler {
   void endRecoveryMount(const AbsolutePath& mountPath);
 
   /**
+   * Why the daemon last stopped serving a checkout, or tried to mount it and
+   * failed; empty if it has not done either since it started.
+   */
+  std::string getCheckoutStopReason(const AbsolutePath& mountPath);
+
+  /**
    * Mount and return an EdenMount.
    */
   [[nodiscard]] ImmediateFuture<std::shared_ptr<EdenMount>> mount(
@@ -366,14 +373,6 @@ class EdenServer : private TakeoverHandler {
    * mount is still initializing and is not ready for inode operations yet.
    */
   EdenMountHandle getMount(AbsolutePathPiece mountPath) const;
-
-  ImmediateFuture<CheckoutResult> checkOutRevision(
-      AbsolutePathPiece mountPath,
-      std::string& rootId,
-      std::optional<folly::StringPiece> rootHgManifest,
-      const ObjectFetchContextPtr& fetchContext,
-      folly::StringPiece callerName,
-      CheckoutMode checkoutMode);
 
   folly::coro::now_task<CheckoutResult> co_checkOutRevision(
       AbsolutePathPiece mountPath,
@@ -818,14 +817,12 @@ class EdenServer : private TakeoverHandler {
   // the checkouts the other daemon handed over.
   void recoverCheckoutsNotServedSoon();
 
-  // The last recorded stop reason of a checkout, or empty.
-  std::string getCheckoutStopReason(const AbsolutePath& mountPath);
   // Whether recovery stopped retrying a checkout because it kept flapping.
   bool isCheckoutFlapLimited(const AbsolutePath& mountPath) const;
 
   // Remounts a checkout loadCheckoutNotServed() returned. A failed attempt is
-  // retried by a later call, up to kMaxCheckoutRecoveryAttempts. The success
-  // or final failure is logged as an eden_mount_health_issue.
+  // retried by a later call, up to kMaxCheckoutRecoveryAttempts. Giving up is
+  // logged as an eden_mount_health_issue.
   // Returns false if the checkout must not be tried now.
   bool startCheckoutRecovery(
       const AbsolutePath& mountPath,
@@ -868,7 +865,8 @@ class EdenServer : private TakeoverHandler {
   void scheduleRunningMountHealthCheck(
       const AbsolutePath& mountPath,
       std::string repoSource,
-      std::weak_ptr<EdenMount> mount);
+      std::weak_ptr<EdenMount> mount,
+      std::chrono::steady_clock::time_point tick);
 
   // Rechecks restricted roots that omitted mode hides from their parent's
   // listing, so that a re-grant becomes visible without an explicit access.
@@ -1137,6 +1135,9 @@ class EdenServer : private TakeoverHandler {
       std::string,
       std::shared_ptr<const MountHealthProbeProgress>>>>
       runningMountHealthChecks_;
+
+  // The health check ticks of the last day that had a slow probe.
+  std::shared_ptr<SlowMountHealthCheckTicks> slowMountHealthCheckTicks_;
 
   static constexpr uint32_t kMaxCheckoutRecoveryAttempts = 3;
   // A recovered checkout that stops again within kCheckoutFlapWindow flaps;

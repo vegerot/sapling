@@ -11,15 +11,17 @@ import logging
 import os
 import shlex
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 from textwrap import dedent
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from eden.fs.cli import (
     config as config_mod,
     daemon,
     filesystem,
+    hg_util,
     mtab,
     prjfs,
     proc_utils as proc_utils_mod,
@@ -767,6 +769,47 @@ class CheckoutConfigUnreadable(Problem):
         )
 
 
+class CheckoutStateDirMissing(FixableProblem):
+    """config.json lists a checkout whose client directory no longer exists: a
+    removal interrupted after the directory was deleted, or a hand-deleted
+    directory. EdenFS skips it at startup, and until D129321444 `eden rm` failed on
+    it. With no state left there is nothing to lose: unregister it."""
+
+    def __init__(self, checkout_info: CheckoutInfo, state_dir: Path) -> None:
+        self._instance = checkout_info.instance
+        self._path = checkout_info.path
+        self._state_dir = state_dir
+
+    def description(self) -> str:
+        return (
+            f"{self._path} is listed in Eden's configuration file, but its state "
+            f"directory {self._state_dir} does not exist, so EdenFS cannot mount it."
+        )
+
+    def dry_run_msg(self) -> str:
+        return f"Would remove {self._path} from Eden's configuration file"
+
+    def start_msg(self) -> str:
+        return f"Removing {self._path} from Eden's configuration file"
+
+    def perform_fix(self) -> None:
+        # Only the config.json entry, and only while it still names the missing
+        # state directory: `destroy_mount` would delete a client directory that
+        # another clone created under the same name since the check ran, and a
+        # replacement clone registered at the same path keeps its entry.
+        self._instance.unregister_checkout(self._path, self._state_dir)
+
+    def check_fix(self) -> bool:
+        # Fixed when the entry is gone, or when the path's entry names a state
+        # directory that exists (the original one recreated, or a replacement
+        # clone's) and the problem no longer exists. `get_checkouts` reads the
+        # directory map without reading each checkout's config.
+        for checkout in self._instance.get_checkouts():
+            if checkout.path == self._path:
+                return checkout.state_dir.is_dir()
+        return True
+
+
 class EdenCheckoutConfigCorruption(FixableProblem):
     _checkout_info: CheckoutInfo
     _ex: Exception
@@ -794,16 +837,31 @@ class EdenCheckoutConfigCorruption(FixableProblem):
     def start_msg(self) -> str:
         return "Reinitialize checkout config...."
 
-    def get_repo_type(self, state_dir: Path) -> str:
-        hgpath = state_dir / ".hg"
-        if not hgpath.exists():
-            return "other"
-        if (hgpath / "requires").exists():
-            with open(hgpath / "requires", "r") as f:
-                for line in f:
-                    if line.startswith("edensparse"):
-                        return "filteredhg"
-        return "hg"
+    def get_repo_type(self, state_dir: Path) -> Tuple[str, bool]:
+        """Recover the checkout's scm_type and repo dir layout from its repo dir.
+
+        Both normally come from the config this fixer is rebuilding, so they
+        have to be read back from the repo dir: `hg_util.get_requires_data`
+        records the filteredhg decision in `requires`, and the off-mount
+        layout makes the repo dir a symlink into the state dir. The backing
+        repo cannot answer the first question -- its own `requires` never
+        carries `edensparse`.
+
+        Returns the scm_type, "other" if it could not be determined, and
+        whether the checkout keeps its repo dir off mount.
+        """
+        mount_path = self._checkout_info.path
+        repo_dir = mount_path / hg_util.sniff_dot_dir(mount_path)
+        try:
+            requires = (repo_dir / "requires").read_text()
+        except OSError:
+            return "other", False
+        off_mount = (
+            repo_dir.resolve() == hg_util.off_mount_repo_dir(state_dir).resolve()
+        )
+        if any(line.startswith("edensparse") for line in requires.splitlines()):
+            return "filteredhg", off_mount
+        return "hg", off_mount
 
     def get_backup_path(self, config_path: Path) -> Path:
         for i in range(1, 9):
@@ -830,10 +888,8 @@ class EdenCheckoutConfigCorruption(FixableProblem):
         else:
             raise Exception("checkout info missing state dir")
 
-        # Determine the repo type from the running mount.
-        # We can regenerate the config for hg and
-        # filteredhg repos.
-        repotype = self.get_repo_type(self._checkout_info.path)
+        # We can regenerate the config for hg and filteredhg repos.
+        repotype, off_mount_repo_dir = self.get_repo_type(state_dir)
         if repotype not in config_mod.HG_REPO_TYPES:
             raise Exception("Cannot fix config for non-hg repo")
 
@@ -858,9 +914,7 @@ class EdenCheckoutConfigCorruption(FixableProblem):
             nfs=self.is_nfs_default(),
             case_sensitive=sys.platform == "linux",
             overlay_type=None,
-            off_mount_repo_dir=self._checkout_info.instance.get_config_bool(
-                "clone.off-mount-repo-dir", False
-            ),
+            off_mount_repo_dir=off_mount_repo_dir,
         )
         checkout = config_mod.EdenCheckout(
             self._checkout_info.instance, self._checkout_info.path, state_dir
@@ -926,7 +980,15 @@ def check_mount(
     debug: bool,
     fast: bool,
 ) -> None:
-    if checkout.state is None and checkout.config_error is not None:
+    configured_state_dir = checkout.configured_state_dir
+    if (
+        checkout.state is None
+        and configured_state_dir is not None
+        and config_mod.path_is_missing(configured_state_dir)
+    ):
+        # Nothing of the checkout is left to mount or to lose.
+        tracker.add_problem(CheckoutStateDirMissing(checkout, configured_state_dir))
+    elif checkout.state is None and checkout.config_error is not None:
         # Remounting would fail the same way, so don't offer it as a fix.
         tracker.add_problem(CheckoutConfigUnreadable(checkout, checkout.config_error))
     elif checkout.state is None:
@@ -1101,8 +1163,18 @@ def check_running_mount(
     fast: bool,
 ) -> None:
     if checkout_info.configured_state_dir is None:
-        tracker.add_problem(CheckoutNotConfigured(checkout_info))
-        return
+        running_state_dir = checkout_info.running_state_dir
+        if running_state_dir is None or not instance.can_register_running_mount(
+            checkout_info.path, running_state_dir
+        ):
+            tracker.add_problem(CheckoutNotConfiguredAndStateMissing(checkout_info))
+            return
+        problem = CheckoutNotConfigured(checkout_info, running_state_dir)
+        tracker.add_problem(problem)
+        if not problem.check_fix():
+            return
+        # Registered now: the remaining checks apply as to any running mount.
+        checkout_info.configured_state_dir = running_state_dir
     elif checkout_info.configured_state_dir != checkout_info.running_state_dir:
         try:
             configured_state_dir_inode = (
@@ -1219,19 +1291,48 @@ def check_running_mount(
                 ) from ex
 
 
-class CheckoutNotConfigured(Problem):
+class CheckoutNotConfigured(FixableProblem):
+    """A mount the daemon serves but config.json does not list: an `eden clone`
+    that stopped after the mount and before the directory-map write. EdenFS
+    would not remount it after a restart. Registering it with the client
+    directory the running mount uses restores the normal state."""
+
+    def __init__(self, checkout_info: CheckoutInfo, client_dir: Path) -> None:
+        self._instance = checkout_info.instance
+        self._path = checkout_info.path
+        self._client_dir = client_dir
+
+    def description(self) -> str:
+        return (
+            f"Checkout {self._path} is running but not listed in Eden's "
+            "configuration file, so EdenFS would not remount it after a restart."
+        )
+
+    def dry_run_msg(self) -> str:
+        return f"Would register {self._path} in Eden's configuration file"
+
+    def start_msg(self) -> str:
+        return f"Registering {self._path} in Eden's configuration file"
+
+    def perform_fix(self) -> None:
+        self._instance.register_running_mount(self._path, self._client_dir)
+
+    def check_fix(self) -> bool:
+        return str(self._path) in self._instance.get_mount_paths()
+
+
+class CheckoutNotConfiguredAndStateMissing(Problem):
+    """A mount the daemon serves whose client directory is gone or is not one
+    of this instance's: it cannot be registered, only removed."""
+
     def __init__(self, checkout_info: CheckoutInfo) -> None:
         msg = (
-            f"Checkout {checkout_info.path} is running but not "
-            "listed in Eden's configuration file."
+            f"Checkout {checkout_info.path} is running but not listed in Eden's "
+            "configuration file, and its state directory "
+            f"{checkout_info.running_state_dir} cannot be registered."
         )
-        # TODO: Maybe we could use some better suggestions here, depending on
-        # common cases that might lead to this situation.  (At the moment I believe this
-        # can occur if `eden clone` fails to set up the .hg directory after mounting.)
         quoted_path = shlex.quote(str(checkout_info.path))
-        remediation = (
-            f'Running "eden unmount {quoted_path}" will unmount this checkout.'
-        )
+        remediation = f'Running "eden rm {quoted_path}" will remove this checkout.'
         super().__init__(msg, remediation)
 
 
@@ -1287,6 +1388,21 @@ class RunningMountNotVisible(FixableProblem):
         return False
 
 
+# A mount can fail because the backing store could not serve a fetch while the
+# checkout itself is intact. `sl doctor` cannot repair that, and the message it
+# produces tells the user their repo may be corrupted beyond repair, so these
+# are retried rather than treated as corruption.
+_TRANSIENT_MOUNT_ERROR_MARKERS: tuple[str, ...] = (
+    "SaplingBackingStoreError",
+    "Network Error",
+)
+
+
+def is_transient_mount_error(ex: Exception) -> bool:
+    msg = str(ex)
+    return all(marker in msg for marker in _TRANSIENT_MOUNT_ERROR_MARKERS)
+
+
 class CheckoutNotMounted(FixableProblem):
     _out: ui.Output
     _instance: EdenInstance
@@ -1318,6 +1434,34 @@ class CheckoutNotMounted(FixableProblem):
     def start_msg(self) -> str:
         return f"Remounting {self._mount_path}"
 
+    def _retry_mount(self) -> bool:
+        """Retry a mount that failed with a transient backing store error.
+
+        Returns whether a retry succeeded. Setting the retry count to 0
+        disables this and restores the previous `sl doctor` behavior.
+        """
+        retries = self._instance.get_config_int(
+            "doctor.transient-mount-error-retries", 3
+        )
+        delay_ms = self._instance.get_config_int(
+            "doctor.transient-mount-error-retry-delay-ms", 500
+        )
+        for attempt in range(1, retries + 1):
+            time.sleep(delay_ms * attempt / 1000)
+            self._out.write(
+                f"\nMount failed with a transient backing store error. "
+                f"Retrying ({attempt}/{retries})...\n",
+                flush=True,
+            )
+            try:
+                self._instance.mount(str(self._mount_path), False)
+                return True
+            except Exception as ex:
+                if not is_transient_mount_error(ex):
+                    log.info("retried mount failed with a new error: %s", ex)
+                    return False
+        return False
+
     def perform_fix(self) -> None:
         try:
             self._instance.mount(str(self._mount_path), False)
@@ -1333,6 +1477,9 @@ class CheckoutNotMounted(FixableProblem):
 This can happen if your machine was hard-rebooted.
 {get_reclone_msg(str(self._mount_path))}"""
                 )
+
+            if is_transient_mount_error(ex) and self._retry_mount():
+                return
 
             # if it is not this ^ eden corruption then it could be hg
             # corruption that hg doctor could fix. Let's try hg doctor and then

@@ -3,6 +3,7 @@ name = fbthrift
 fbsource_path = xplat/thrift
 shipit_project = fbthrift
 shipit_fbcode_builder = true
+shipit_fbcode_builder_layout = tool
 
 [git]
 repo_url = https://github.com/facebook/fbthrift.git
@@ -64,14 +65,8 @@ zlib
 # THRIFT_RPC=ON.
 [dependencies.feature_rpc=on]
 fizz
-libsodium
 wangle
 mvfst
-
-# Pulled only when benchmark executables are enabled; gated inside fbthrift's
-# CMake by THRIFT_BENCHMARKS=ON.
-[dependencies.feature_benchmark=on]
-benchmark
 
 [shipit.pathmap]
 xplat/thrift/public_tld = .

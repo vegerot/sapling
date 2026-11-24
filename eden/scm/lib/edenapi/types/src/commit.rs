@@ -30,6 +30,7 @@ use crate::CommitIdScheme;
 use crate::FileType;
 use crate::ServerError;
 use crate::UploadToken;
+use crate::UploadTreeEntry;
 
 /// Outcome of extending a bubble's TTL
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -395,8 +396,7 @@ pub enum BubbleStrategy {
         bubble_id: NonZeroU64,
         #[serde(default)]
         keep_ttl: bool,
-        #[serde(default)]
-        snapshot_id: Option<BonsaiChangesetId>,
+        snapshot_id: BonsaiChangesetId,
     },
 }
 
@@ -554,6 +554,89 @@ pub struct UploadSnapshotResponse {
     pub snapshot_content_bytes: u64,
 }
 
+/// Stores a snapshot, sent as its hg commit, trees and filenodes, in one request.
+///
+/// The request may leave out objects that belong to the snapshot's parent
+/// commit or that were sent with the superseded snapshot.
+#[auto_wire]
+#[derive(Clone, Default, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct UploadHgSnapshotRequest {
+    #[id(1)]
+    pub changeset: UploadHgChangeset,
+    #[id(2)]
+    pub trees: Vec<UploadTreeEntry>,
+    #[id(3)]
+    pub filenodes: Vec<UploadSnapshotFilenode>,
+    /// The snapshot this one replaces, named by the hg id that the server
+    /// returned for it.
+    #[id(4)]
+    pub superseded_snapshot: Option<HgId>,
+    #[id(5)]
+    pub custom_duration_secs: Option<u64>,
+}
+
+#[auto_wire]
+#[derive(Clone, Default, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct UploadSnapshotFilenode {
+    #[id(1)]
+    pub node_id: HgId,
+    #[id(2)]
+    pub parents: Parents,
+    /// The hg filelog metadata header, which records copy information, as in
+    /// `HgFilenodeData`. Empty when the file has none.
+    #[id(3)]
+    pub metadata: Vec<u8>,
+    /// The file contents, without the metadata header.
+    #[id(4)]
+    pub content: SnapshotFileContent,
+}
+
+/// Small snapshots carry file contents inline. Larger ones upload them first
+/// with `upload/file` and refer to them by upload token, which keeps the
+/// request small enough for the server to hold in memory.
+#[auto_wire]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub enum SnapshotFileContent {
+    #[id(1)]
+    Inline(Bytes),
+    #[id(2)]
+    Uploaded(UploadToken),
+}
+
+impl Default for SnapshotFileContent {
+    fn default() -> Self {
+        Self::Inline(Bytes::new())
+    }
+}
+
+#[cfg(any(test, feature = "for-tests"))]
+impl Arbitrary for SnapshotFileContent {
+    fn arbitrary(g: &mut Gen) -> Self {
+        if bool::arbitrary(g) {
+            Self::Inline(Bytes::from(Vec::<u8>::arbitrary(g)))
+        } else {
+            Self::Uploaded(UploadToken::arbitrary(g))
+        }
+    }
+}
+
+#[auto_wire]
+#[derive(Clone, Default, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct UploadHgSnapshotResponse {
+    /// The hg id the server computed from the hg commit it received, after
+    /// checking it against the client's node id.
+    #[id(1)]
+    pub hg_id: HgId,
+    /// When the snapshot expires, as a unix timestamp.
+    #[id(2)]
+    pub expiration_timestamp: Option<i64>,
+    #[id(3)]
+    pub bonsai_id: BonsaiChangesetId,
+}
+
 #[auto_wire]
 #[derive(Clone, Default, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
@@ -575,12 +658,11 @@ pub struct EphemeralPrepareResponse {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct EphemeralExtendRequest {
-    #[id(1)]
-    pub bubble_id: Option<NonZeroU64>,
     #[id(2)]
     pub custom_duration_secs: Option<u64>,
     #[id(3)]
-    pub snapshot_id: Option<BonsaiChangesetId>,
+    #[wire_option]
+    pub snapshot_id: BonsaiChangesetId,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]

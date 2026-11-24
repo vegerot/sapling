@@ -122,6 +122,8 @@ use mercurial_mutation::HgMutationStore;
 use mercurial_types::Globalrev;
 use metaconfig_types::RepoConfig;
 use metaconfig_types::RepoConfigRef;
+use metaconfig_types::RepoConfigSource;
+use metaconfig_types::RepoConfigSourceRef;
 use mononoke_repos::MononokeRepos;
 use mononoke_types::ContentId;
 use mononoke_types::ContentManifestId;
@@ -188,6 +190,7 @@ use crate::specifiers::HgChangesetId;
 use crate::tree::TreeContext;
 use crate::xrepo::CandidateSelectionHintArgs;
 
+pub mod check_rebase_conflicts;
 pub mod commit_cloud;
 pub mod commit_graph;
 pub mod create_bookmark;
@@ -285,6 +288,9 @@ pub struct Repo {
 
     #[facet]
     pub repo_config: RepoConfig,
+
+    #[facet]
+    pub repo_config_source: RepoConfigSource,
 
     #[facet]
     pub repo_ephemeral_store: RepoEphemeralStore,
@@ -755,6 +761,11 @@ impl RepoWithBubble for Repo {
         let commit_graph = Arc::new(bubble.repo_commit_graph(self));
         let commit_graph_writer = bubble.repo_commit_graph_writer(self);
         let repo_derived_data = Arc::new(self.repo_derived_data().for_bubble(bubble.clone()));
+        let bonsai_hg_mapping = bubble.bonsai_hg_mapping(
+            self.repo_identity().id(),
+            self.repo_identity().name(),
+            self.bonsai_hg_mapping.clone(),
+        );
         // RestrictedPaths holds its own ArcRepoDerivedData snapshot — rewrap it
         // so AclManifest derivation for bubble changesets routes through the
         // bubble-aware derived-data manager (and not DDS, which doesn't know
@@ -767,6 +778,7 @@ impl RepoWithBubble for Repo {
             commit_graph_writer,
             repo_derived_data,
             restricted_paths,
+            bonsai_hg_mapping,
             ..self.clone()
         }
     }
@@ -890,6 +902,13 @@ impl<R: RepoHandlerBaseRef> RepoContext<R> {
             .maybe_push_redirector_base
             .as_ref()
             .map(AsRef::as_ref)
+    }
+}
+
+impl<R: RepoConfigSourceRef> RepoContext<R> {
+    /// Where the referenced repository's configuration came from.
+    pub fn config_source(&self) -> &RepoConfigSource {
+        self.repo.repo_config_source()
     }
 }
 

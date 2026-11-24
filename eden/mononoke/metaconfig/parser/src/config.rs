@@ -12,10 +12,13 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::str;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
+use anyhow::ensure;
 use cached_config::ConfigHandle;
 use cached_config::ConfigStore;
 use im::HashMap as ImHashMap;
@@ -24,22 +27,34 @@ use metaconfig_types::BlobConfig;
 use metaconfig_types::CensoredScubaParams;
 use metaconfig_types::CommitIdentityScheme;
 use metaconfig_types::CommonConfig;
+use metaconfig_types::GitConfigs;
+use metaconfig_types::ManifestFormatKind;
 use metaconfig_types::ObjectsCountMultiplier;
 use metaconfig_types::Redaction;
 use metaconfig_types::RedactionConfig;
 use metaconfig_types::RepoConfig;
+use metaconfig_types::RepoConfigSource;
 use metaconfig_types::RepoReadOnly;
 use metaconfig_types::StorageConfig;
+use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
 use repos::RawCommonConfig;
+use repos::RawP4ServerConfig;
 use repos::RawRepoConfig;
 use repos::RawRestrictedPathsConfig;
 use repos::RawStorageConfig;
 use repos::RepoSpec;
 use repos::TierManifest;
 
+use crate::Presets;
 use crate::convert::Convert;
 use crate::errors::ConfigurationError;
+use crate::layering::ConfigSource;
+use crate::layering::Layer;
+use crate::layering::LayerMode;
+use crate::layering::Layered;
+use crate::layering::layer_repo_config;
+use crate::layering::layer_repo_config_with_provenance;
 
 const LIST_KEYS_PATTERNS_MAX_DEFAULT: u64 = 500_000;
 const HOOK_MAX_FILE_SIZE_DEFAULT: u64 = 8 * 1024 * 1024; // 8MiB
@@ -47,13 +62,34 @@ const HOOK_MAX_FILE_SIZE_DEFAULT: u64 = 8 * 1024 * 1024; // 8MiB
 /// Holds configuration for repositories.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepoConfigs {
-    /// Configs for all repos. Persistent + `Arc`-shared so a copy-on-write update
-    /// behind `ArcSwap` is O(1) clone + O(log N), not a whole-map deep clone.
-    pub repos: ImHashMap<String, Arc<RepoConfig>>,
+    /// Configs for all repos, each with where it came from. Persistent +
+    /// `Arc`-shared so a copy-on-write update behind `ArcSwap` is O(1) clone +
+    /// O(log N), not a whole-map deep clone.
+    pub repos: ImHashMap<String, Arc<RepoConfigEntry>>,
     /// Index from RepositoryId to repo name for O(1) lookup by id
     pub repos_by_id: ImHashMap<RepositoryId, String>,
     /// Common configs for all repos
     pub common: CommonConfig,
+}
+
+/// One repo's config and where it came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RepoConfigEntry {
+    /// The repo's config.
+    pub config: RepoConfig,
+    /// Where the config came from; empty for a config not loaded through a
+    /// per-repo config handle.
+    pub source: RepoConfigSource,
+}
+
+impl From<RepoConfig> for RepoConfigEntry {
+    /// A config with no recorded source.
+    fn from(config: RepoConfig) -> Self {
+        Self {
+            config,
+            source: RepoConfigSource::default(),
+        }
+    }
 }
 
 /// Creates a ConfigHandle for a TierManifest from a Configerator path.
@@ -118,7 +154,8 @@ pub fn load_repo_configs_from_manifest(
                     )
                 })?
                 .get();
-            let repo_config = parse_repo_spec((*repo_spec).clone(), tier, &manifest.storage)
+            // Tier manifests have no presets.
+            let repo_config = parse_repo_spec((*repo_spec).clone(), tier, &manifest.storage, None)
                 .with_context(|| {
                     format!("Failed to parse RepoSpec for repo {}", entry.repo_name)
                 })?;
@@ -143,15 +180,27 @@ pub fn load_repo_configs_from_manifest(
 pub fn parse_manifest_common_and_storage(
     manifest: &TierManifest,
 ) -> Result<(CommonConfig, StorageConfigs)> {
-    let common = parse_common_config(manifest.common.clone(), &manifest.storage)
-        .context("Failed to parse common config from tier manifest")?;
-    let storage = manifest
-        .storage
+    parse_common_and_storage(
+        &manifest.common,
+        &manifest.storage,
+        &manifest.p4_servers.clone().unwrap_or_default(),
+    )
+}
+
+/// Parses a manifest's common config and named storage configs.
+pub(crate) fn parse_common_and_storage(
+    common: &RawCommonConfig,
+    storage: &HashMap<String, RawStorageConfig>,
+    p4_servers: &BTreeMap<String, RawP4ServerConfig>,
+) -> Result<(CommonConfig, StorageConfigs)> {
+    let common = parse_common_config(common.clone(), storage, p4_servers.clone())
+        .context("Failed to parse common config from the manifest")?;
+    let storage = storage
         .clone()
         .into_iter()
         .map(|(name, config)| Ok((name, config.convert()?)))
         .collect::<Result<_>>()
-        .context("Failed to parse storage configs from tier manifest")?;
+        .context("Failed to parse storage configs from the manifest")?;
 
     Ok((common, StorageConfigs { storage }))
 }
@@ -182,55 +231,134 @@ pub fn configerator_repo_spec_handle(
     config_store.get_config_handle::<RepoSpec>(config_path.to_owned())
 }
 
-/// Merge a tier-specific override on top of a base RawRepoConfig.
-///
-/// For each field in the override, if it is set (not None/null), it replaces
-/// the corresponding field in the base. Unset fields in the override leave the
-/// base value unchanged.
-///
-/// Uses JSON-based merging to handle all fields generically, avoiding the need
-/// to enumerate all ~50 fields of RawRepoConfig. This matches the Python
-/// pipeline's merge semantics in repo_spec_processing.cinc.
-fn merge_raw_repo_config(
-    base: RawRepoConfig,
-    tier_override: &RawRepoConfig,
-) -> Result<RawRepoConfig> {
-    let mut base_json = serde_json::to_value(&base)?;
-    let override_json = serde_json::to_value(tier_override)?;
+/// A repo's raw config for a tier, and the shared configs it names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedRepoConfig<C> {
+    /// The repo's raw config, resolved from its layers.
+    pub config: C,
+    /// The storage config that `storage_config` names.
+    pub storage: RawStorageConfig,
+}
 
-    if let (serde_json::Value::Object(base_map), serde_json::Value::Object(override_map)) =
-        (&mut base_json, override_json)
-    {
-        for (key, value) in override_map {
-            if !value.is_null() {
-                base_map.insert(key, value);
-            }
-        }
+/// The preset named `name`. Only a deployment has presets, so a config loaded
+/// through a tier manifest cannot name one.
+fn find_preset<'a>(name: &str, presets: Option<&'a Presets>) -> Result<&'a RawRepoConfig> {
+    let Some(presets) = presets else {
+        bail!("preset '{name}' needs a deployment: tier manifests have no presets");
+    };
+    presets
+        .get(name)
+        .with_context(|| format!("preset '{name}' is not in the deployment"))
+}
+
+/// Resolves a repo's raw config for a tier from its layers
+/// ([`repo_config_layers`]), recording which layer set each value, with the
+/// storage config it names. A spec that names a preset `presets` lacks fails.
+pub fn resolve_repo_spec_with_provenance(
+    repo_spec: &RepoSpec,
+    tier_name: &str,
+    named_storage_configs: &HashMap<String, RawStorageConfig>,
+    presets: Option<&Presets>,
+) -> Result<ResolvedRepoConfig<Layered<RawRepoConfig>>> {
+    let config = resolve_repo_config_with_provenance(repo_spec, tier_name, presets)?;
+    let storage = named_storage_config(&config.value, named_storage_configs)?;
+    Ok(ResolvedRepoConfig { config, storage })
+}
+
+/// The raw config [`resolve_repo_spec_with_provenance`] resolves, without
+/// looking up the storage config it names.
+pub fn resolve_repo_config_with_provenance(
+    repo_spec: &RepoSpec,
+    tier_name: &str,
+    presets: Option<&Presets>,
+) -> Result<Layered<RawRepoConfig>> {
+    layer_repo_config_with_provenance(&repo_config_layers(repo_spec, tier_name, presets)?)
+}
+
+/// The config [`resolve_repo_spec_with_provenance`] resolves, without
+/// recording where each value came from.
+fn resolve_repo_spec(
+    repo_spec: &RepoSpec,
+    tier_name: &str,
+    named_storage_configs: &HashMap<String, RawStorageConfig>,
+    presets: Option<&Presets>,
+) -> Result<ResolvedRepoConfig<RawRepoConfig>> {
+    let config = layer_repo_config(&repo_config_layers(repo_spec, tier_name, presets)?)?;
+    let storage = named_storage_config(&config, named_storage_configs)?;
+    Ok(ResolvedRepoConfig { config, storage })
+}
+
+/// The storage config that a resolved raw repo config names.
+pub fn named_storage_config(
+    config: &RawRepoConfig,
+    named_storage_configs: &HashMap<String, RawStorageConfig>,
+) -> Result<RawStorageConfig> {
+    ensure!(
+        config.storage.is_none(),
+        "repo_config.storage is not supported: define the storage in the shared storage \
+         configs and name it in storage_config"
+    );
+    let name = config
+        .storage_config
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing storage_config from configuration"))?;
+    Ok(named_storage_configs
+        .get(name)
+        .ok_or_else(|| {
+            ConfigurationError::InvalidConfig(format!("Storage \"{name}\" not defined"))
+        })?
+        .clone())
+}
+
+/// `repo_spec`'s config layers on `tier_name`, lowest first.
+fn repo_config_layers<'a>(
+    repo_spec: &'a RepoSpec,
+    tier_name: &str,
+    presets: Option<&'a Presets>,
+) -> Result<Vec<Layer<'a>>> {
+    static NO_REPO_CONFIG: LazyLock<RawRepoConfig> = LazyLock::new(RawRepoConfig::default);
+    let mut layers = Vec::new();
+    if let Some(name) = &repo_spec.preset {
+        layers.push(Layer {
+            source: ConfigSource::Preset(name.clone()),
+            config: find_preset(name, presets)?,
+            mode: LayerMode::Merge,
+        });
     }
-
-    serde_json::from_value(base_json).context("Failed to deserialize merged RawRepoConfig")
+    layers.push(Layer {
+        source: ConfigSource::Spec,
+        config: repo_spec.repo_config.as_ref().unwrap_or(&NO_REPO_CONFIG),
+        mode: LayerMode::Merge,
+    });
+    if let Some(config) = repo_spec
+        .tier_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(tier_name))
+    {
+        layers.push(Layer {
+            source: ConfigSource::TierOverride(tier_name.to_owned()),
+            config,
+            mode: LayerMode::ReplaceTopLevel,
+        });
+    }
+    Ok(layers)
 }
 
 /// Parse a RepoSpec into a RepoConfig for a specific tier.
 ///
-/// Resolves tier_overrides by merging the tier-specific partial config on top
-/// of the base repo_config. Uses the RepoSpec's identity fields (hipster_acl,
-/// enabled, readonly, etc.) instead of hardcoded defaults.
+/// Resolves the repo's raw config and storage config as
+/// [`resolve_repo_spec_with_provenance`] does. Uses the RepoSpec's identity
+/// fields (hipster_acl, enabled, readonly, etc.) instead of hardcoded defaults.
 ///
-/// `named_storage_configs` typically comes from `TierManifest.storage`.
+/// `named_storage_configs` and `presets` come from the manifest the repo was
+/// listed in; only a deployment has presets.
 pub fn parse_repo_spec(
     repo_spec: RepoSpec,
     tier_name: &str,
     named_storage_configs: &HashMap<String, RawStorageConfig>,
+    presets: Option<&Presets>,
 ) -> Result<RepoConfig> {
-    let base_config = repo_spec.repo_config.unwrap_or_default();
-    let resolved_config = match repo_spec.tier_overrides {
-        Some(ref overrides) => match overrides.get(tier_name) {
-            Some(tier_override) => merge_raw_repo_config(base_config, tier_override)?,
-            None => base_config,
-        },
-        None => base_config,
-    };
+    let resolved = resolve_repo_spec(&repo_spec, tier_name, named_storage_configs, presets)?;
 
     let readonly = if repo_spec.readonly {
         RepoReadOnly::ReadOnly("Set by config option".to_string())
@@ -243,7 +371,7 @@ pub fn parse_repo_spec(
         .unwrap_or_default();
 
     build_repo_config(
-        resolved_config,
+        resolved,
         RepoMetadata {
             repoid: RepositoryId::new(repo_spec.repo_id),
             enabled: repo_spec.enabled,
@@ -252,23 +380,16 @@ pub fn parse_repo_spec(
             default_commit_identity_scheme,
             enable_git_bundle_uri: repo_spec.enable_git_bundle_uri.unwrap_or(false),
         },
-        named_storage_configs,
     )
 }
 
-/// Shared conversion logic: converts a `RawRepoConfig` plus pre-resolved
-/// metadata into a `RepoConfig`.
-///
-/// Both `parse_with_repo_definition` (monolithic loading path) and
-/// `parse_repo_spec` (per-repo split-loading path) delegate to this function.
+/// Converts a resolved raw repo config, its storage config and the repo's
+/// identity into a `RepoConfig`.
 fn build_repo_config(
-    raw_repo_config: RawRepoConfig,
+    resolved: ResolvedRepoConfig<RawRepoConfig>,
     metadata: RepoMetadata,
-    named_storage_configs: &HashMap<String, RawStorageConfig>,
 ) -> Result<RepoConfig> {
     let RawRepoConfig {
-        storage_config,
-        storage,
         bookmarks,
         hook_manager_params,
         hooks,
@@ -317,29 +438,11 @@ fn build_repo_config(
         commit_rate_limit_config,
         p4_source,
         ..
-    } = raw_repo_config;
-
-    let named_storage_config = storage_config;
+    } = resolved.config;
 
     let hooks: Vec<_> = hooks.unwrap_or_default().convert()?;
 
-    let get_storage = move |name: &str| -> Result<StorageConfig> {
-        let raw_storage_config = storage
-            .as_ref()
-            .and_then(|s| s.get(name))
-            .or_else(|| named_storage_configs.get(name))
-            .cloned()
-            .ok_or_else(|| {
-                ConfigurationError::InvalidConfig(format!("Storage \"{name}\" not defined"))
-            })?;
-
-        raw_storage_config.convert()
-    };
-
-    let storage_config = get_storage(
-        &named_storage_config
-            .ok_or_else(|| anyhow!("missing storage_config from configuration"))?,
-    )?;
+    let storage_config: StorageConfig = resolved.storage.convert()?;
 
     let walker_config = walker_config.convert()?;
 
@@ -404,7 +507,11 @@ fn build_repo_config(
 
     let raw_git_configs = git_configs.unwrap_or_default();
 
-    let git_configs = raw_git_configs.convert()?;
+    let git_configs: GitConfigs = raw_git_configs.convert()?;
+    ensure!(
+        !metadata.enable_git_bundle_uri || git_configs.git_bundle_uri.is_some(),
+        "enable_git_bundle_uri is set, so the repo needs git_configs.git_bundle_uri_config"
+    );
 
     let commit_cloud_config = commit_cloud_config.convert()?.unwrap_or_default();
     let mononoke_cas_sync_config = mononoke_cas_sync_config.convert()?;
@@ -484,9 +591,6 @@ fn build_repo_config(
         remote_diff_config,
         commit_rate_limit_config,
         p4_source,
-        // Populated by the versioned ConfigHandle load path, never at parse time.
-        config_version: None,
-        config_mutation_id: None,
     })
 }
 
@@ -500,6 +604,7 @@ pub struct StorageConfigs {
 fn parse_common_config(
     common: RawCommonConfig,
     common_storage_config: &HashMap<String, RawStorageConfig>,
+    p4_servers: BTreeMap<String, RawP4ServerConfig>,
 ) -> Result<CommonConfig> {
     let trusted_parties_hipster_tier = common
         .trusted_parties_hipster_tier
@@ -521,7 +626,7 @@ fn parse_common_config(
         .filter(|category| !category.is_empty());
     let scuba_censored_table = common.scuba_censored_table;
     let scuba_censored_local_path = common.scuba_local_path_censored;
-    let internal_identity = common.internal_identity.convert()?;
+    let internal_identity = common.internal_identity.map(Convert::convert).transpose()?;
     let git_memory_upper_bound = common
         .git_memory_upper_bound
         .map(|bound| bound.try_into())
@@ -546,10 +651,12 @@ fn parse_common_config(
             .mutable_blobstore)
     };
 
-    let redaction_config = common.redaction_config;
-    let redaction_config = RedactionConfig {
-        blobstore: get_mutable_blobstore(&redaction_config.blobstore)?,
-        redaction_sets_location: redaction_config.redaction_sets_location,
+    let redaction_config = match common.redaction_config {
+        Some(redaction_config) => Some(RedactionConfig {
+            blobstore: get_mutable_blobstore(&redaction_config.blobstore)?,
+            redaction_sets_location: redaction_config.redaction_sets_location,
+        }),
+        None => None,
     };
 
     let async_requests_config = match common.async_requests_config {
@@ -567,13 +674,58 @@ fn parse_common_config(
         .into_iter()
         .filter(|(marker, repo)| !marker.is_empty() && !repo.is_empty())
         .collect();
+    let multi_repo_land_manifest_formats = common
+        .multi_repo_land_manifest_formats
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(repo, format)| {
+            let kind = match format.to_ascii_lowercase().as_str() {
+                "aosp" => ManifestFormatKind::Aosp,
+                "west" => ManifestFormatKind::West,
+                other => {
+                    return Err(anyhow!(
+                        "multi_repo_land_manifest_formats[{repo}]: unknown manifest format {other:?} (expected aosp or west)"
+                    ));
+                }
+            };
+            Ok((repo, kind))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let multi_repo_land_pinned_manifest_paths: BTreeMap<String, String> = common
+        .multi_repo_land_pinned_manifest_paths
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(repo, path)| {
+            let path = path.trim_matches('/').to_string();
+            // Every land writes this path; a bad one must fail here, not then.
+            NonRootMPath::new(&path).with_context(|| {
+                format!("multi_repo_land_pinned_manifest_paths[{repo}]: not a valid repo path")
+            })?;
+            Ok((repo, path))
+        })
+        .collect::<Result<_>>()?;
+    let bookmark_events_category = common
+        .bookmark_events_category
+        .filter(|category| !category.is_empty());
+    // A bad entry leaves only its own alias unconfigured, so one server's typo cannot
+    // stop every job that loads this config.
+    let p4_servers = p4_servers
+        .into_iter()
+        .filter_map(|(alias, server)| match server.convert() {
+            Ok(server) => Some((alias, server)),
+            Err(error) => {
+                tracing::error!("Ignoring p4_servers[{alias}]: {error:#}");
+                None
+            }
+        })
+        .collect();
 
     Ok(CommonConfig {
         trusted_parties_hipster_tier,
         trusted_parties_allowlist,
         global_allowlist,
         loadlimiter_category,
-        enable_http_control_api: common.enable_http_control_api,
+        enable_http_control_api: common.enable_http_control_api.unwrap_or(false),
         censored_scuba_params,
         redaction_config,
         internal_identity,
@@ -582,6 +734,10 @@ fn parse_common_config(
         async_requests_config,
         rl_land_service_repo_prefix,
         multi_repo_land_manifest_repos,
+        multi_repo_land_manifest_formats,
+        multi_repo_land_pinned_manifest_paths,
+        bookmark_events_category,
+        p4_servers,
     })
 }
 
@@ -594,7 +750,7 @@ impl RepoConfigs {
             .collect();
         let repos = repos
             .into_iter()
-            .map(|(name, config)| (name, Arc::new(config)))
+            .map(|(name, config)| (name, Arc::new(RepoConfigEntry::from(config))))
             .collect();
         Self {
             repos,
@@ -604,10 +760,13 @@ impl RepoConfigs {
     }
 
     /// Build from an already-`Arc`-wrapped persistent map, deriving `repos_by_id`.
-    pub fn from_arc_map(repos: ImHashMap<String, Arc<RepoConfig>>, common: CommonConfig) -> Self {
+    pub fn from_arc_map(
+        repos: ImHashMap<String, Arc<RepoConfigEntry>>,
+        common: CommonConfig,
+    ) -> Self {
         let repos_by_id = repos
             .iter()
-            .map(|(name, config)| (config.repoid, name.clone()))
+            .map(|(name, entry)| (entry.config.repoid, name.clone()))
             .collect();
         Self {
             repos,
@@ -616,10 +775,27 @@ impl RepoConfigs {
         }
     }
 
+    /// Get individual `RepoConfig`, given its repo name.
+    pub fn get(&self, name: &str) -> Option<&RepoConfig> {
+        self.repos.get(name).map(|entry| &entry.config)
+    }
+
+    /// Get individual `RepoConfig` and where it came from, given its repo name.
+    pub fn get_with_source(&self, name: &str) -> Option<(&RepoConfig, &RepoConfigSource)> {
+        self.repos
+            .get(name)
+            .map(|entry| (&entry.config, &entry.source))
+    }
+
+    /// Every repo's name and `RepoConfig`.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &RepoConfig)> {
+        self.repos.iter().map(|(name, entry)| (name, &entry.config))
+    }
+
     /// Get individual `RepoConfig`, given a repo_id. O(1) via index.
     pub fn get_repo_config(&self, repo_id: RepositoryId) -> Option<(&String, &RepoConfig)> {
         let name = self.repos_by_id.get(&repo_id)?;
-        self.repos.get(name).map(|config| (name, &**config))
+        self.get(name).map(|config| (name, config))
     }
 
     /// O(1) lookup by raw repo id (i32). Constructs RepositoryId internally
@@ -630,21 +806,22 @@ impl RepoConfigs {
 
     /// Insert a repo and update the ID index.
     /// Cleans up stale index entries if the repo's ID changed.
-    pub fn insert_repo(&mut self, name: String, config: RepoConfig) {
-        if let Some(old_config) = self.repos.get(&name) {
-            if old_config.repoid != config.repoid {
-                self.repos_by_id.remove(&old_config.repoid);
+    pub fn insert_repo(&mut self, name: String, entry: impl Into<RepoConfigEntry>) {
+        let entry = entry.into();
+        if let Some(old) = self.repos.get(&name) {
+            if old.config.repoid != entry.config.repoid {
+                self.repos_by_id.remove(&old.config.repoid);
             }
         }
-        self.repos_by_id.insert(config.repoid, name.clone());
-        self.repos.insert(name, Arc::new(config));
+        self.repos_by_id.insert(entry.config.repoid, name.clone());
+        self.repos.insert(name, Arc::new(entry));
     }
 
     /// Remove a repo, keeping `repos` and `repos_by_id` consistent. Returns whether it existed.
     pub fn remove_repo(&mut self, name: &str) -> bool {
         match self.repos.remove(name) {
-            Some(config) => {
-                self.repos_by_id.remove(&config.repoid);
+            Some(entry) => {
+                self.repos_by_id.remove(&entry.config.repoid);
                 true
             }
             None => false,
@@ -704,6 +881,7 @@ mod test {
     use metaconfig_types::MetadataLoggerConfig;
     use metaconfig_types::MultiplexId;
     use metaconfig_types::MultiplexedStoreType;
+    use metaconfig_types::P4ServerConfig;
     use metaconfig_types::P4SourceConfig;
     use metaconfig_types::PushParams;
     use metaconfig_types::PushrebaseFlags;
@@ -737,6 +915,11 @@ mod test {
     use serde::Deserialize;
 
     use super::*;
+    use crate::layering::ConfigPath;
+
+    fn config_path(text: &str) -> ConfigPath {
+        text.parse().expect("valid path")
+    }
 
     /// Parse a collection of raw commit sync config into commit sync config and validate it.
     #[cfg(test)]
@@ -830,7 +1013,7 @@ mod test {
                 repo_config: Some(repo_config),
                 ..Default::default()
             };
-            let repo_config = parse_repo_spec(spec, TEST_TIER, &manifest.storage)?;
+            let repo_config = parse_repo_spec(spec, TEST_TIER, &manifest.storage, None)?;
             if !seen_repo_ids.insert(repo_config.repoid) {
                 return Err(ConfigurationError::DuplicatedRepoId(repo_config.repoid).into());
             }
@@ -1066,14 +1249,15 @@ mod test {
         let www_content = r#"
             scuba_table_hooks="scm_hooks"
             storage_config="files"
-
-            [storage.files.metadata.local]
+        "#;
+        let storage = r#"
+            [files.metadata.local]
             local_db_path = "/tmp/www"
 
-            [storage.files.blobstore.blob_files]
+            [files.blobstore.blob_files]
             path = "/tmp/www"
 
-            [storage.files.mutable_blobstore.blob_files]
+            [files.mutable_blobstore.blob_files]
             path = "/tmp/www_mutable"
         "#;
         let common_content = r#"
@@ -1099,6 +1283,7 @@ mod test {
 
         let paths = btreemap! {
             "common/common.toml" => common_content,
+            "common/storage.toml" => storage,
             "repos/www1/server.toml" => www_content,
             "repos/www2/server.toml" => www_content,
             "repo_definitions/www1/server.toml" => www1_repo_def,
@@ -1262,6 +1447,7 @@ mod test {
             trusted_parties_hipster_tier="tier1"
             git_memory_upper_bound=100
             edenapi_dumper_scuba_table="dumped_requests"
+            bookmark_events_category="bookmark_events"
 
             [internal_identity]
             identity_type = "SERVICE_IDENTITY"
@@ -1446,7 +1632,6 @@ mod test {
                 cache_warmup: Some(CacheWarmupParams {
                     bookmark: BookmarkKey::new("master").unwrap(),
                     commit_limit: 100,
-                    microwave_preload: false,
                 }),
                 hook_manager_params: Some(HookManagerParams {
                     disable_acl_checker: false,
@@ -1551,6 +1736,7 @@ mod test {
                     remote_mode: PushrebaseRemoteMode::RemoteLandService(Address::Tier(
                         "my-tier".to_string(),
                     )),
+                    source_revision_guard: None,
                 },
                 lfs: LfsParams {
                     threshold: Some(1000),
@@ -1620,6 +1806,7 @@ mod test {
                     extra_types_available_for_read: hashset! {},
                     wbc_excluded_types: hashset! {},
                     pipeline_config: None,
+                    shadow_pipeline_config: None,
                 },
                 enforce_lfs_acl_check: false,
                 repo_client_use_warm_bookmarks_cache: true,
@@ -1711,8 +1898,6 @@ mod test {
                 remote_diff_config: None,
                 commit_rate_limit_config: None,
                 p4_source: None,
-                config_version: None,
-                config_mutation_id: None,
             },
         );
 
@@ -1801,8 +1986,6 @@ mod test {
                 remote_diff_config: None,
                 commit_rate_limit_config: None,
                 p4_source: None,
-                config_version: None,
-                config_mutation_id: None,
             },
         );
         assert_eq!(
@@ -1820,14 +2003,14 @@ mod test {
                     table: Some("censored_table".to_string()),
                     local_path: Some("censored_local_path".to_string()),
                 },
-                redaction_config: RedactionConfig {
+                redaction_config: Some(RedactionConfig {
                     blobstore: main_storage_config.blobstore,
                     redaction_sets_location: "loc".to_string(),
-                },
-                internal_identity: Identity {
+                }),
+                internal_identity: Some(Identity {
                     id_type: "SERVICE_IDENTITY".to_string(),
                     id_data: "internal".to_string(),
-                },
+                }),
                 git_memory_upper_bound: Some(100),
                 edenapi_dumper_scuba_table: Some("dumped_requests".to_string()),
                 async_requests_config: AsyncRequestsConfig {
@@ -1836,13 +2019,17 @@ mod test {
                 },
                 rl_land_service_repo_prefix: None,
                 multi_repo_land_manifest_repos: BTreeMap::new(),
+                multi_repo_land_manifest_formats: BTreeMap::new(),
+                multi_repo_land_pinned_manifest_paths: BTreeMap::new(),
+                bookmark_events_category: Some("bookmark_events".to_string()),
+                p4_servers: BTreeMap::new(),
             }
         );
 
         // Wrap expected values in Arc to match the persistent map.
-        let repos: ImHashMap<String, Arc<RepoConfig>> = repos
+        let repos: ImHashMap<String, Arc<RepoConfigEntry>> = repos
             .into_iter()
-            .map(|(name, config)| (name, Arc::new(config)))
+            .map(|(name, config)| (name, Arc::new(RepoConfigEntry::from(config))))
             .collect();
         assert_eq!(
             repoconfig.repos.get("www"),
@@ -1873,14 +2060,15 @@ mod test {
     #[mononoke::test]
     fn test_broken_bypass_config() {
         // Incorrect bypass string
-        let content = r#"
-            storage_config = "sqlite"
-
-            [storage.sqlite.metadata.local]
+        let storage = r#"
+            [sqlite.metadata.local]
             local_db_path = "/tmp/fbsource"
 
-            [storage.sqlite.blobstore.blob_files]
+            [sqlite.blobstore.blob_files]
             path = "/tmp/fbsource"
+        "#;
+        let content = r#"
+            storage_config = "sqlite"
 
             [[bookmarks]]
             name="master"
@@ -1898,6 +2086,7 @@ mod test {
         "#;
 
         let paths = btreemap! {
+            "common/storage.toml" => storage,
             "repos/fbsource/server.toml" => content,
             "repo_definitions/fbsource/server.toml" => content_def,
         };
@@ -1969,7 +2158,7 @@ mod test {
         .expect("config should parse");
 
         assert_eq!(
-            configs.repos["fbsource"].hooks[0].config.bypasses,
+            configs.repos["fbsource"].config.hooks[0].config.bypasses,
             vec![HookBypassCondition::permission_group("group1").with_actor(HookBypassActor::Any)],
         );
     }
@@ -1989,7 +2178,7 @@ mod test {
         .expect("config should parse");
 
         assert_eq!(
-            configs.repos["fbsource"].hooks[0].config.bypasses,
+            configs.repos["fbsource"].config.hooks[0].config.bypasses,
             vec![
                 HookBypassCondition::pushvar("ALLOW", "true").with_permission_group("group1"),
                 HookBypassCondition::commit_message("@allow").with_permission_group("group1"),
@@ -2001,7 +2190,7 @@ mod test {
         let configs = load_configs_with_hook1(r#"bypass_commit_string="@allow""#)
             .expect("config should parse");
         assert_eq!(
-            configs.repos["fbsource"].hooks[0].config.bypasses,
+            configs.repos["fbsource"].config.hooks[0].config.bypasses,
             vec![HookBypassCondition::commit_message("@allow").with_actor(HookBypassActor::Any)],
         );
     }
@@ -2023,7 +2212,7 @@ mod test {
         .expect("config should parse");
 
         assert_eq!(
-            configs.repos["fbsource"].hooks[0].config.bypasses,
+            configs.repos["fbsource"].config.hooks[0].config.bypasses,
             vec![
                 HookBypassCondition::pushvar("ALLOW", "true").with_permission_group("group1"),
                 HookBypassCondition {
@@ -2090,7 +2279,10 @@ mod test {
         )
         .expect("config should parse");
 
-        assert_eq!(configs.repos["fbsource"].hooks[0].config.bypasses, vec![]);
+        assert_eq!(
+            configs.repos["fbsource"].config.hooks[0].config.bypasses,
+            vec![]
+        );
     }
 
     #[mononoke::test]
@@ -2098,14 +2290,15 @@ mod test {
         fn check_fails(common: &str, expect: &str) {
             let content = r#"
                 storage_config = "storage"
-
-                [storage.storage.metadata.local]
+            "#;
+            let storage = r#"
+                [storage.metadata.local]
                 local_db_path = "/tmp/fbsource"
 
-                [storage.storage.blobstore.blob_sqlite]
+                [storage.blobstore.blob_sqlite]
                 path = "/tmp/fbsource"
 
-                [storage.storage.mutable_blobstore.blob_files]
+                [storage.mutable_blobstore.blob_files]
                 path = "/tmp/foo1"
             "#;
 
@@ -2117,6 +2310,7 @@ mod test {
 
             let paths = btreemap! {
                 "common/common.toml" => common,
+                "common/storage.toml" => storage,
                 "repos/fbsource/server.toml" => content,
                 "repo_definitions/fbsource/server.toml" => content_def,
             };
@@ -2179,17 +2373,6 @@ mod test {
 
         const REPO: &str = r#"
         storage_config = "multiplex_store"
-
-        # Not overriding common store
-        [storage.some_other_store.metadata.remote]
-        production = { db_address = "other_db" }
-        commit_graph = { db_address = "other_db" }
-        bookmarks = { db_address = "other_db" }
-        bonsai_hg_mapping = { db_address = "other_db" }
-        filenodes = { sharded = { shard_map = "other-shards", shard_num = 20 } }
-
-        [storage.some_other_store.blobstore]
-        disabled = {}
         "#;
 
         const REPO_DEF: &str = r#"
@@ -2307,9 +2490,9 @@ mod test {
             }
         };
 
-        let expected: ImHashMap<String, Arc<RepoConfig>> = expected
+        let expected: ImHashMap<String, Arc<RepoConfigEntry>> = expected
             .into_iter()
-            .map(|(name, config)| (name, Arc::new(config)))
+            .map(|(name, config)| (name, Arc::new(RepoConfigEntry::from(config))))
             .collect();
         assert_eq!(
             res.repos, expected,
@@ -2319,7 +2502,7 @@ mod test {
     }
 
     #[mononoke::test]
-    fn test_common_blobstores_local_override() {
+    fn test_repo_storage_definitions_are_refused() {
         const STORAGE: &str = r#"
         [multiplex_store.metadata.remote]
         production = { db_address = "some_db" }
@@ -2364,7 +2547,6 @@ mod test {
         const REPO: &str = r#"
         storage_config = "multiplex_store"
 
-        # Override common store
         [storage.multiplex_store.metadata.remote]
         production = { db_address = "other_other_db" }
         commit_graph = { db_address = "other_other_db" }
@@ -2408,52 +2590,11 @@ mod test {
             "repos/test/server.toml" => REPO,
             "repo_definitions/test/server.toml" => REPO_DEF,
         };
-        let res = load_test_configs(&paths).expect("Read configs failed");
-
-        let expected = hashmap! {
-            "test".into() => RepoConfig {
-                enabled: true,
-                directory_branch_cluster_config: None,
-                storage_config: StorageConfig {
-                    blobstore: BlobConfig::Disabled,
-                    metadata: MetadataDatabaseConfig::Remote( RemoteMetadataDatabaseConfig {
-                        production: RemoteDatabaseConfig { db_address: "other_other_db".into(), },
-                        commit_graph: RemoteDatabaseConfig { db_address: "other_other_db".into(), },
-                        bookmarks: RemoteDatabaseConfig { db_address: "other_other_db".into(), },
-                        bonsai_hg_mapping: RemoteDatabaseConfig { db_address: "other_other_db".into(), },
-                        filenodes: ShardableRemoteDatabaseConfig::Sharded(ShardedRemoteDatabaseConfig { shard_map: "other-other-shards".into(), shard_num: NonZeroUsize::new(789).unwrap() }),
-                        mutation: RemoteDatabaseConfig { db_address: "other_other_mutation_db".into(), },
-                        sparse_profiles: RemoteDatabaseConfig { db_address: "test_db".into(), },
-                        bonsai_blob_mapping: None,
-                        deletion_log: None,
-                        git_bundle_metadata: Some(RemoteDatabaseConfig { db_address: "git_bundles".into(), }),
-                        commit_cloud: Some(RemoteDatabaseConfig { db_address: "other_other_other_mutation_db".into(), }),
-                        repo_metadata: Some(RemoteDatabaseConfig { db_address: "repo_metadata".into() }),
-                        restricted_paths: Some(RemoteDatabaseConfig { db_address: "restricted_paths".into(), }),
-                        commit_derived_data_mapping: Some(ShardableRemoteDatabaseConfig::Unsharded(RemoteDatabaseConfig { db_address: "derived_data_mapping".into() })),
-                        repo_manifest_mapping: None,
-                    }),
-
-                    ephemeral_blobstore: None,
-
-                    mutable_blobstore: BlobConfig::Disabled,
-                },
-                repoid: RepositoryId::new(123),
-                list_keys_patterns_max: LIST_KEYS_PATTERNS_MAX_DEFAULT,
-                hook_max_file_size: HOOK_MAX_FILE_SIZE_DEFAULT,
-                ..Default::default()
-            }
-        };
-
-        let expected: ImHashMap<String, Arc<RepoConfig>> = expected
-            .into_iter()
-            .map(|(name, config)| (name, Arc::new(config)))
-            .collect();
-        assert_eq!(
-            res.repos, expected,
-            "Got: {:#?}\nWant: {:#?}",
-            &res.repos, expected
-        )
+        let error = load_test_configs(&paths).expect_err("a repo cannot define storage");
+        assert!(
+            format!("{error:#}").contains("repo_config.storage is not supported"),
+            "{error:#}"
+        );
     }
 
     #[mononoke::test]
@@ -2510,7 +2651,7 @@ mod test {
         let res = load_test_configs(&paths).expect("Read configs failed");
 
         if let BlobConfig::MultiplexedWal { blobstores, .. } =
-            &res.repos["test"].storage_config.blobstore
+            &res.repos["test"].config.storage_config.blobstore
         {
             let expected_blobstores = vec![
                 (
@@ -2680,7 +2821,6 @@ mod test {
         );
 
         let repo = repo_configs
-            .repos
             .get("test/repo")
             .expect("test/repo should be present");
         assert_eq!(repo.repoid, RepositoryId::new(42));
@@ -2903,6 +3043,29 @@ mod test {
         }
     }
 
+    /// A spec's config with a tier override layered on top, checking that
+    /// layering with and without provenance agree.
+    fn merge_raw_repo_config(
+        base: RawRepoConfig,
+        tier_override: &RawRepoConfig,
+    ) -> Result<RawRepoConfig> {
+        let layers = [
+            Layer {
+                source: ConfigSource::Spec,
+                config: &base,
+                mode: LayerMode::Merge,
+            },
+            Layer {
+                source: ConfigSource::TierOverride("scs".to_owned()),
+                config: tier_override,
+                mode: LayerMode::ReplaceTopLevel,
+            },
+        ];
+        let value = layer_repo_config(&layers)?;
+        assert_eq!(layer_repo_config_with_provenance(&layers)?.value, value);
+        Ok(value)
+    }
+
     #[mononoke::test]
     fn test_merge_raw_repo_config_override_replaces_set_fields() {
         // Base config has storage_config set
@@ -2977,6 +3140,223 @@ mod test {
         assert_eq!(merged.phabricator_callsign, Some("CALLSIGN".to_string()));
     }
 
+    fn local_bundle_uri_configs() -> repos::RawGitConfigs {
+        repos::RawGitConfigs {
+            git_bundle_uri_config: Some(repos::RawGitBundleURIConfig {
+                uri_generator_type: repos::RawUriGeneratorType::local_fs(
+                    repos::RawLocalFSGitUriGenerator {},
+                ),
+                trusted_only: true,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[mononoke::test]
+    fn test_parse_repo_spec_bundle_uri_config_needed_when_enabled() {
+        let named_storage = hashmap! {
+            "test_storage".to_string() => test_raw_storage_config(),
+        };
+        let spec = |enabled: bool, git_configs: Option<repos::RawGitConfigs>| repos::RepoSpec {
+            default_commit_identity_scheme: repos::RawCommitIdentityScheme::GIT,
+            enable_git_bundle_uri: Some(enabled),
+            repo_config: Some(RawRepoConfig {
+                storage_config: Some("test_storage".to_string()),
+                git_configs,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let error = parse_repo_spec(spec(true, None), "scs", &named_storage, None)
+            .expect_err("bundle-uri on without its config must fail");
+        assert!(
+            error.to_string().contains("git_bundle_uri_config"),
+            "{error:?}"
+        );
+        let off = parse_repo_spec(spec(false, None), "scs", &named_storage, None)
+            .expect("bundle-uri off needs no config");
+        assert!(off.git_configs.git_bundle_uri.is_none());
+        let on = parse_repo_spec(
+            spec(true, Some(local_bundle_uri_configs())),
+            "scs",
+            &named_storage,
+            None,
+        )
+        .expect("bundle-uri on with its config parses");
+        assert!(on.git_configs.git_bundle_uri.is_some());
+    }
+
+    #[mononoke::test]
+    fn test_resolve_repo_spec_storage() {
+        let other = RawStorageConfig {
+            metadata: repos::RawMetadataConfig::local(repos::RawDbLocal {
+                local_db_path: "/tmp/other_db".to_string(),
+            }),
+            ..test_raw_storage_config()
+        };
+        let named_storage = hashmap! {
+            "main".to_string() => test_raw_storage_config(),
+            "other".to_string() => other.clone(),
+        };
+        let spec = repos::RepoSpec {
+            repo_config: Some(RawRepoConfig {
+                storage_config: Some("main".to_string()),
+                ..Default::default()
+            }),
+            tier_overrides: Some(hashmap! {
+                "scs".to_string() => RawRepoConfig {
+                    storage_config: Some("other".to_string()),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+
+        let resolve = |tier| resolve_repo_spec_with_provenance(&spec, tier, &named_storage, None);
+        assert_eq!(
+            resolve("gitimport")
+                .expect("resolve should succeed")
+                .storage,
+            test_raw_storage_config(),
+            "the storage config the spec names",
+        );
+        assert_eq!(
+            resolve("scs").expect("resolve should succeed").storage,
+            other,
+            "the storage config the tier override names, on its tier",
+        );
+
+        let missing = resolve_repo_spec_with_provenance(&spec, "scs", &HashMap::new(), None)
+            .expect_err("a storage config that is not defined must fail");
+        assert!(
+            missing
+                .to_string()
+                .contains("Storage \"other\" not defined"),
+            "{missing}"
+        );
+    }
+
+    #[mononoke::test]
+    fn test_resolve_repo_spec_provenance() {
+        let spec = repos::RepoSpec {
+            repo_config: Some(RawRepoConfig {
+                storage_config: Some("test_storage".to_string()),
+                phabricator_callsign: Some("SPEC".to_string()),
+                ..Default::default()
+            }),
+            tier_overrides: Some(hashmap! {
+                "scs".to_string() => RawRepoConfig {
+                    phabricator_callsign: Some("SCS".to_string()),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+
+        let named_storage = hashmap! {
+            "test_storage".to_string() => test_raw_storage_config(),
+        };
+        let scs = resolve_repo_spec_with_provenance(&spec, "scs", &named_storage, None)
+            .expect("resolve should succeed")
+            .config;
+        assert_eq!(scs.value.phabricator_callsign.as_deref(), Some("SCS"));
+        assert_eq!(
+            scs.provenance.source(&config_path("phabricator_callsign")),
+            &ConfigSource::TierOverride("scs".to_owned())
+        );
+        assert_eq!(
+            scs.provenance.source(&config_path("storage_config")),
+            &ConfigSource::Spec
+        );
+        assert_eq!(
+            scs.provenance.source(&config_path("hooks")),
+            &ConfigSource::Default
+        );
+
+        let gitimport = resolve_repo_spec_with_provenance(&spec, "gitimport", &named_storage, None)
+            .expect("resolve should succeed")
+            .config;
+        assert_eq!(
+            gitimport.value.phabricator_callsign.as_deref(),
+            Some("SPEC")
+        );
+        assert_eq!(
+            gitimport
+                .provenance
+                .source(&config_path("phabricator_callsign")),
+            &ConfigSource::Spec,
+            "another tier's override does not apply"
+        );
+    }
+
+    #[mononoke::test]
+    fn test_parse_repo_spec_with_repo_config_preset() {
+        let named_storage = hashmap! {
+            "test_storage".to_string() => test_raw_storage_config(),
+        };
+        let presets = btreemap! {
+            "git".to_string() => RawRepoConfig {
+                storage_config: Some("test_storage".to_string()),
+                phabricator_callsign: Some("PRESET".to_string()),
+                list_keys_patterns_max: Some(10),
+                ..Default::default()
+            },
+        };
+        let spec = |preset: &str| repos::RepoSpec {
+            repo_id: 42,
+            repo_name: "test/repo".to_string(),
+            hipster_acl: "acl.test.repo".to_string(),
+            enabled: true,
+            default_commit_identity_scheme: repos::RawCommitIdentityScheme::GIT,
+            tiers: vec!["scs".to_string()],
+            preset: Some(preset.to_string()),
+            repo_config: Some(RawRepoConfig {
+                list_keys_patterns_max: Some(20),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = parse_repo_spec(spec("git"), "scs", &named_storage, Some(&presets))
+            .expect("parse should succeed");
+        assert_eq!(config.phabricator_callsign.as_deref(), Some("PRESET"));
+        assert_eq!(
+            config.list_keys_patterns_max, 20,
+            "the spec overrides the preset"
+        );
+
+        let resolved =
+            resolve_repo_spec_with_provenance(&spec("git"), "scs", &named_storage, Some(&presets))
+                .expect("resolve should succeed")
+                .config;
+        assert_eq!(
+            resolved
+                .provenance
+                .source(&config_path("phabricator_callsign")),
+            &ConfigSource::Preset("git".to_owned())
+        );
+        assert_eq!(
+            resolved
+                .provenance
+                .source(&config_path("list_keys_patterns_max")),
+            &ConfigSource::Spec
+        );
+
+        let error = parse_repo_spec(spec("hg"), "scs", &named_storage, Some(&presets))
+            .expect_err("an unknown preset should fail")
+            .to_string();
+        assert!(
+            error.contains("preset 'hg' is not in the deployment"),
+            "{error}"
+        );
+
+        let error = parse_repo_spec(spec("git"), "scs", &named_storage, None)
+            .expect_err("a preset needs a deployment")
+            .to_string();
+        assert!(error.contains("preset 'git' needs a deployment"), "{error}");
+    }
+
     #[mononoke::test]
     fn test_parse_repo_spec_basic() {
         use repos::RawCommitIdentityScheme;
@@ -2997,6 +3377,7 @@ mod test {
             tiers: vec!["scs".to_string()],
             repo_config: Some(RawRepoConfig {
                 storage_config: Some("test_storage".to_string()),
+                git_configs: Some(local_bundle_uri_configs()),
                 ..Default::default()
             }),
             tier_overrides: None,
@@ -3004,7 +3385,7 @@ mod test {
         };
 
         let result =
-            parse_repo_spec(repo_spec, "scs", &named_storage).expect("parse should succeed");
+            parse_repo_spec(repo_spec, "scs", &named_storage, None).expect("parse should succeed");
 
         assert_eq!(result.repoid, RepositoryId::new(42));
         assert!(result.enabled);
@@ -3013,6 +3394,29 @@ mod test {
         assert_eq!(
             result.default_commit_identity_scheme,
             CommitIdentityScheme::GIT
+        );
+    }
+
+    #[mononoke::test]
+    fn test_common_config_optional_fields() {
+        let manifest = TierManifest {
+            storage: hashmap! {
+                "only_storage".to_string() => test_raw_storage_config(),
+            },
+            ..Default::default()
+        };
+        let (common, _) = parse_manifest_common_and_storage(&manifest)
+            .expect("an empty common config should parse");
+        assert!(!common.enable_http_control_api);
+        assert_eq!(common.internal_identity, None);
+        assert_eq!(common.redaction_config, None);
+        let error = common
+            .require_redaction_config()
+            .expect_err("the tier has no redaction config")
+            .to_string();
+        assert!(
+            error.contains("the tier has no redaction config"),
+            "{error}"
         );
     }
 
@@ -3049,12 +3453,13 @@ mod test {
         };
 
         // Parse for the "scs" tier — should get the overridden callsign
-        let scs_result = parse_repo_spec(repo_spec.clone(), "scs", &named_storage)
+        let scs_result = parse_repo_spec(repo_spec.clone(), "scs", &named_storage, None)
             .expect("parse for scs should succeed");
 
         // Parse for the "gitimport" tier — no override, should get base callsign
-        let gitimport_result = parse_repo_spec(repo_spec.clone(), "gitimport", &named_storage)
-            .expect("parse for gitimport should succeed");
+        let gitimport_result =
+            parse_repo_spec(repo_spec.clone(), "gitimport", &named_storage, None)
+                .expect("parse for gitimport should succeed");
 
         // SCS tier should use the overridden callsign
         assert_eq!(
@@ -3096,7 +3501,7 @@ mod test {
         };
 
         let result =
-            parse_repo_spec(repo_spec, "scs", &named_storage).expect("parse should succeed");
+            parse_repo_spec(repo_spec, "scs", &named_storage, None).expect("parse should succeed");
 
         assert!(!result.enabled, "enabled should come from RepoSpec");
         assert_eq!(
@@ -3104,6 +3509,28 @@ mod test {
             RepoReadOnly::ReadOnly("Set by config option".to_string()),
             "readonly=true should produce ReadOnly"
         );
+    }
+
+    #[mononoke::test]
+    fn test_common_config_missing_identity_and_control_api() {
+        let manifest = TierManifest {
+            common: RawCommonConfig {
+                redaction_config: Some(repos::RawRedactionConfig {
+                    blobstore: "only_storage".to_string(),
+                    redaction_sets_location: "redaction_sets".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            storage: hashmap! {
+                "only_storage".to_string() => test_raw_storage_config(),
+            },
+            ..Default::default()
+        };
+        let (common, _) = parse_manifest_common_and_storage(&manifest)
+            .expect("a common config without identity or control API should parse");
+        assert!(!common.enable_http_control_api);
+        assert_eq!(common.internal_identity, None);
     }
 
     #[mononoke::test]
@@ -3129,7 +3556,7 @@ mod test {
         };
 
         // This should fail because default RawRepoConfig has no storage_config
-        let result = parse_repo_spec(repo_spec, "scs", &named_storage);
+        let result = parse_repo_spec(repo_spec, "scs", &named_storage, None);
         assert!(
             result.is_err(),
             "RepoSpec with no repo_config should fail (missing storage_config)"
@@ -3154,6 +3581,7 @@ mod test {
                 p4_source: Some(RawP4SourceConfig {
                     server_alias: "test1".to_string(),
                     depot: depot.to_string(),
+                    path_charsets: Some(vec!["utf-8".to_string(), "gbk".to_string()]),
                 }),
                 ..Default::default()
             }),
@@ -3171,6 +3599,7 @@ mod test {
             p4_repo_spec("//swarm_playground/"),
             "p4_sync",
             &named_storage,
+            None,
         )
         .expect("parse should succeed");
         assert_eq!(
@@ -3178,6 +3607,7 @@ mod test {
             Some(P4SourceConfig {
                 server_alias: "test1".to_string(),
                 depot: "//swarm_playground/".to_string(),
+                path_charsets: Some(vec!["utf-8".to_string(), "gbk".to_string()]),
             })
         );
 
@@ -3185,7 +3615,7 @@ mod test {
         let mut no_p4 = p4_repo_spec("//swarm_playground/");
         no_p4.repo_config.as_mut().unwrap().p4_source = None;
         let result =
-            parse_repo_spec(no_p4, "p4_sync", &named_storage).expect("parse should succeed");
+            parse_repo_spec(no_p4, "p4_sync", &named_storage, None).expect("parse should succeed");
         assert_eq!(result.p4_source, None);
     }
 
@@ -3204,11 +3634,116 @@ mod test {
             "///",
             "",
         ] {
-            let result = parse_repo_spec(p4_repo_spec(depot), "p4_sync", &named_storage);
+            let result = parse_repo_spec(p4_repo_spec(depot), "p4_sync", &named_storage, None);
             assert!(
                 result.is_err(),
                 "depot {depot:?} is not a depot root and must be rejected"
             );
         }
+    }
+
+    fn parse_p4_servers(
+        servers: BTreeMap<String, repos::RawP4ServerConfig>,
+    ) -> Result<CommonConfig> {
+        let manifest = TierManifest {
+            p4_servers: Some(servers),
+            ..Default::default()
+        };
+        Ok(parse_manifest_common_and_storage(&manifest)?.0)
+    }
+
+    fn raw_p4_host(host: &str) -> repos::RawP4Host {
+        repos::RawP4Host {
+            host: host.to_string(),
+            fingerprint: format!("{host}-fingerprint"),
+        }
+    }
+
+    fn raw_p4_server(read_from: repos::RawP4ReadFrom) -> repos::RawP4ServerConfig {
+        repos::RawP4ServerConfig {
+            primary: Some(raw_p4_host("p4-primary.test1.perforce.metafb.cloud")),
+            standby: Some(raw_p4_host("p4-secondary.test1.perforce.metafb.cloud")),
+            mirror: repos::RawP4MirrorAccess {
+                read_from,
+                user: "svc-scm-p4mirror".to_string(),
+                ticket_secret: "SCM_P4MIRROR_P4TICKET".to_string(),
+            },
+        }
+    }
+
+    fn p4_server_error(server: repos::RawP4ServerConfig) -> String {
+        let error = server.convert().unwrap_err();
+        format!("{error:#}")
+    }
+
+    #[mononoke::test]
+    fn test_common_config_has_the_p4_servers_by_alias() {
+        let common = parse_p4_servers(btreemap! {
+            "test1".to_string() => raw_p4_server(repos::RawP4ReadFrom::STANDBY),
+        })
+        .expect("parse should succeed");
+        assert_eq!(
+            common.p4_servers,
+            btreemap! {
+                "test1".to_string() => P4ServerConfig {
+                    host: "p4-secondary.test1.perforce.metafb.cloud".to_string(),
+                    fingerprint: "p4-secondary.test1.perforce.metafb.cloud-fingerprint".to_string(),
+                    user: "svc-scm-p4mirror".to_string(),
+                    ticket_secret: "SCM_P4MIRROR_P4TICKET".to_string(),
+                },
+            }
+        );
+    }
+
+    #[mononoke::test]
+    fn test_a_p4_server_reads_from_the_host_read_from_names() {
+        let common = parse_p4_servers(btreemap! {
+            "test1".to_string() => raw_p4_server(repos::RawP4ReadFrom::PRIMARY),
+        })
+        .expect("parse should succeed");
+        let server = &common.p4_servers["test1"];
+        assert_eq!(server.host, "p4-primary.test1.perforce.metafb.cloud");
+        assert_eq!(
+            server.fingerprint,
+            "p4-primary.test1.perforce.metafb.cloud-fingerprint"
+        );
+    }
+
+    #[mononoke::test]
+    fn test_a_bad_p4_server_is_skipped_and_the_rest_load() {
+        let common = parse_p4_servers(btreemap! {
+            "test1".to_string() => raw_p4_server(repos::RawP4ReadFrom::UNKNOWN),
+            "test2".to_string() => raw_p4_server(repos::RawP4ReadFrom::STANDBY),
+        })
+        .expect("a bad p4_servers entry should not fail the load");
+        assert_eq!(
+            common.p4_servers.keys().collect::<Vec<_>>(),
+            vec!["test2"],
+            "test1 is bad so only test2 should be configured"
+        );
+    }
+
+    #[mononoke::test]
+    fn test_a_p4_server_with_read_from_unknown_is_refused() {
+        let message = p4_server_error(raw_p4_server(repos::RawP4ReadFrom::UNKNOWN));
+        assert!(message.contains("read_from"), "{message}");
+    }
+
+    #[mononoke::test]
+    fn test_a_p4_server_reading_from_an_unset_host_is_refused() {
+        let server = repos::RawP4ServerConfig {
+            standby: None,
+            ..raw_p4_server(repos::RawP4ReadFrom::STANDBY)
+        };
+        let message = p4_server_error(server);
+        assert!(message.contains("STANDBY"), "{message}");
+    }
+
+    #[mononoke::test]
+    fn test_a_p4_server_with_an_empty_field_is_refused() {
+        let mut server = raw_p4_server(repos::RawP4ReadFrom::STANDBY);
+        server.mirror.ticket_secret = String::new();
+        let message = p4_server_error(server);
+        assert!(message.contains("ticket_secret"), "{message}");
     }
 }

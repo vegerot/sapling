@@ -30,8 +30,11 @@ pub struct Changelist {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileRevision {
-    /// Strict UTF-8 is exactly the bytes p4 sent, so passing it back to p4 is lossless.
+    /// As the repo names the file: the bytes p4 sent, decoded.
     pub depot_path: String,
+    /// The depot path as p4 sent it, only when `depot_path` was decoded from another charset
+    /// than UTF-8.
+    pub depot_path_bytes: Option<Vec<u8>>,
     pub action: Action,
     pub file_type: String,
     pub revision: u32,
@@ -39,6 +42,16 @@ pub struct FileRevision {
     pub size: Option<u64>,
     /// Of the content `p4 print` sends. Never without `size`, but may be missing with it.
     pub digest: Option<Md5Digest>,
+}
+
+impl FileRevision {
+    /// The depot path to pass back to p4: never `depot_path` re-encoded, which may not give
+    /// back the bytes the server stores.
+    pub fn p4_depot_path(&self) -> &[u8] {
+        self.depot_path_bytes
+            .as_deref()
+            .unwrap_or(self.depot_path.as_bytes())
+    }
 }
 
 /// A file's head revision at some point in history, from `p4 fstat`.

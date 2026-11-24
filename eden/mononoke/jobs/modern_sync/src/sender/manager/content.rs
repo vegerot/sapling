@@ -21,7 +21,6 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
 use metaconfig_types::ModernSyncChannelConfig;
-use mononoke_macros::mononoke;
 use mononoke_types::ContentId;
 use repo_blobstore::RepoBlobstore;
 use stats::define_stats;
@@ -110,7 +109,10 @@ impl ContentRunner {
         }
     }
 
-    async fn run(&mut self, content_recv: &mut mpsc::Receiver<ContentMessage>) {
+    async fn run(
+        &mut self,
+        content_recv: &mut mpsc::Receiver<ContentMessage>,
+    ) -> anyhow::Result<()> {
         let mut flush_timer = interval(Duration::from_millis(self.config.flush_interval_ms as u64));
         while !self.cancelled() {
             let action = tokio::select! {
@@ -128,9 +130,11 @@ impl ContentRunner {
             };
             match action {
                 LoopAction::Continue => {}
-                LoopAction::Exit => return,
+                LoopAction::Exit => return Ok(()),
+                LoopAction::Fail(err) => return Err(err),
             }
         }
+        Ok(())
     }
 
     async fn handle_message(&mut self, msg: Option<ContentMessage>) -> LoopAction {
@@ -171,7 +175,7 @@ impl ContentRunner {
             let senders = std::mem::take(&mut self.pending_senders);
             if let Err(e) = self.pipeline.barrier(senders).await {
                 tracing::error!("Error processing content: {:?}", e);
-                return LoopAction::Exit;
+                return LoopAction::Fail(e);
             }
         }
         self.poll_completions()
@@ -192,7 +196,7 @@ impl ContentRunner {
         let senders = std::mem::take(&mut self.pending_senders);
         if let Err(e) = self.pipeline.barrier(senders).await {
             tracing::error!("Error processing content: {:?}", e);
-            return LoopAction::Exit;
+            return LoopAction::Fail(e);
         }
         LoopAction::Exit
     }
@@ -267,8 +271,8 @@ impl ContentRunner {
         // This channel already logged the failure; drop locally
         // queued signals so downstream winds down silently
         // instead of logging the same failure again per signal.
-        self.pipeline.abort(err);
-        LoopAction::Exit
+        self.pipeline.abort(&err);
+        LoopAction::Fail(err)
     }
 
     // Drain completions after every select event so the watermark keeps
@@ -306,37 +310,35 @@ impl ContentRunner {
 }
 
 impl Manager for ContentManager {
-    fn start(
-        self,
+    async fn run(
+        &mut self,
         ctx: CoreContext,
         reponame: String,
         content_es: Arc<dyn EdenapiSender + Send + Sync>,
         cancellation_requested: Arc<AtomicBool>,
-    ) {
-        mononoke::spawn_task(async move {
-            let Self {
-                max_blob_bytes,
-                config,
-                mut content_recv,
-                repo_blobstore,
-            } = self;
-            let pipeline = FlushPipeline::new(
-                reponame.clone(),
-                "content",
-                config.max_concurrent_flushes,
-                Some(config.max_bytes_in_flight),
-            );
-            let mut runner = ContentRunner::new(
-                ctx,
-                reponame,
-                content_es,
-                cancellation_requested,
-                max_blob_bytes,
-                config,
-                repo_blobstore,
-                pipeline,
-            );
-            runner.run(&mut content_recv).await;
-        });
+    ) -> anyhow::Result<()> {
+        let Self {
+            max_blob_bytes,
+            config,
+            content_recv,
+            repo_blobstore,
+        } = self;
+        let pipeline = FlushPipeline::new(
+            reponame.clone(),
+            "content",
+            config.max_concurrent_flushes,
+            Some(config.max_bytes_in_flight),
+        );
+        let mut runner = ContentRunner::new(
+            ctx,
+            reponame,
+            content_es,
+            cancellation_requested,
+            *max_blob_bytes,
+            config.clone(),
+            repo_blobstore.clone(),
+            pipeline,
+        );
+        runner.run(content_recv).await
     }
 }

@@ -51,7 +51,6 @@ use crate::restriction_check::PreFilteredRequest;
 pub use crate::restriction_check::RestrictionCheckResult;
 use crate::restriction_check::SharedFetchHandle;
 use crate::restriction_check::SourceRestrictionCheck;
-pub use crate::restriction_check::check_path_restriction_infos;
 pub use crate::restriction_check::has_maintainer_access_to_repo_region;
 use crate::restriction_check::is_in_optional_group;
 pub use crate::restriction_info::ManifestRestrictionInfo;
@@ -139,6 +138,15 @@ impl RestrictedPathsAuthorizationError {
     pub fn is_manifest_access(&self) -> bool {
         matches!(&self.access, RestrictedPathAccess::Manifest(_))
     }
+
+    /// The denied path, if the denial names one. Manifest denials carry a
+    /// manifest id instead of a path.
+    pub fn denied_path(&self) -> Option<&MPath> {
+        match &self.access {
+            RestrictedPathAccess::Path(path) => Some(path),
+            RestrictedPathAccess::Manifest(_) => None,
+        }
+    }
 }
 
 /// Why creation-time validation rejected a change to an ACL (`.slacl`) file.
@@ -209,10 +217,13 @@ pub struct RestrictedPaths {
     scuba: MononokeScubaSampleBuilder,
     /// Repo derived data for deriving ACL manifests.
     repo_derived_data: ArcRepoDerivedData,
+    /// Repo name, the switch value of this repo's JustKnobs.
+    repo_name: String,
 }
 
 impl RestrictedPaths {
     pub fn new(
+        repo_name: String,
         config_based: Arc<RestrictedPathsConfigBased>,
         acl_provider: Arc<dyn AclProvider>,
         scuba: MononokeScubaSampleBuilder,
@@ -232,6 +243,7 @@ impl RestrictedPaths {
             acl_provider,
             scuba,
             repo_derived_data,
+            repo_name,
         })
     }
 
@@ -244,6 +256,7 @@ impl RestrictedPaths {
             acl_provider: self.acl_provider.clone(),
             scuba: self.scuba.clone(),
             repo_derived_data: Arc::new(self.repo_derived_data.for_bubble(bubble)),
+            repo_name: self.repo_name.clone(),
         }
     }
 
@@ -253,6 +266,17 @@ impl RestrictedPaths {
     // and block_restricted_subtree_copy hooks).
     pub fn config(&self) -> &RestrictedPathsConfig {
         self.config_based.config()
+    }
+
+    /// Whether Both mode reconciles the two sources' checks per restriction
+    /// (`ReconciledAuthorization`). Gated per repo by a JustKnob: when it is
+    /// off, each source decides on its own and an access is denied if either
+    /// source denies.
+    // TODO(T291525172): once the knob has been on for every repo for a few
+    // days, delete it and the per-source Both-mode paths it keeps alive.
+    pub(crate) fn reconciles_both_mode_sources(&self) -> bool {
+        self.config().acl_manifest_mode == AclManifestMode::Both
+            && justknobs::eval(RECONCILE_BOTH_MODE_SOURCES_JK, None, Some(&self.repo_name))
     }
 
     /// Returns whether this repository may have restricted paths.
@@ -430,6 +454,17 @@ impl RestrictedPaths {
         roots: Vec<MPath>,
     ) -> Result<Vec<PathRestrictionInfo>> {
         restriction_info::find_restricted_descendants(self, ctx, cs_id, roots).await
+    }
+
+    /// Find and authorize descendant restriction roots with one lookup per
+    /// configured source.
+    pub async fn find_restricted_descendant_checks(
+        &self,
+        ctx: &CoreContext,
+        cs_id: Option<ChangesetId>,
+        roots: Vec<MPath>,
+    ) -> Result<Vec<PathRestrictionCheckResult>> {
+        restriction_check::find_restricted_descendant_checks(self, ctx, cs_id, roots).await
     }
 
     // -----------------------------------------------------------------------
@@ -918,6 +953,7 @@ pub async fn spawn_enforce_restricted_manifest_access<'a>(
 }
 
 const ACCESS_LOGGING_JK: &str = "scm/mononoke:enabled_restricted_paths_access_logging";
+const RECONCILE_BOTH_MODE_SOURCES_JK: &str = "scm/mononoke:path_acls_reconcile_both_mode_sources";
 
 struct SourceHandles<T: SourceRestrictionCheck> {
     config: Option<SharedFetchHandle<T>>,
@@ -987,6 +1023,8 @@ where
         }
     };
     let exemption_matched = pre_filter.exemption_matched;
+    let reconcile_sources =
+        effective_mode == AclManifestMode::Both && restricted_paths.reconciles_both_mode_sources();
     let fetches = source_fetches_for_access(
         source_options,
         &pre_filter.conditions,
@@ -1002,6 +1040,7 @@ where
             restricted_paths.clone(),
             access_data,
             effective_mode,
+            reconcile_sources,
             EnforcementDecision::Disabled,
             fetches
                 .logging_config
@@ -1015,9 +1054,17 @@ where
         return Ok(());
     }
 
+    if matches!(pre_filter.conditions, PreFilterResult::NoMatch) {
+        // No condition set matched this caller, so nothing is looked up and
+        // no ACL is consulted, but a caller that a set matches would be
+        // enforced on this access.
+        ctx.set_response_depends_on_caller();
+    }
+
     let enforcement_outcome = enforce_with_source_handles(
         fetches.enforcement_config,
         fetches.enforcement_acl_manifest,
+        reconcile_sources,
         &handles,
         pre_filter,
         missing_authoritative_source_error(
@@ -1034,6 +1081,7 @@ where
         restricted_paths.clone(),
         access_data,
         effective_mode,
+        reconcile_sources,
         EnforcementDecision::from_outcome(&enforcement_outcome, exemption_matched),
         fetches
             .logging_config
@@ -1214,6 +1262,7 @@ fn compares_sources_for_logging(effective_mode: AclManifestMode) -> bool {
 async fn enforce_with_source_handles<'a, T>(
     fetch_config: bool,
     fetch_acl_manifest: bool,
+    reconcile_sources: bool,
     handles: &SourceHandles<T>,
     pre_filter: PreFilteredRequest<'a>,
     missing_source_error: anyhow::Error,
@@ -1234,8 +1283,28 @@ where
         }
     };
 
-    // TODO(T289977216): Reconcile successful sources' tri-state factors before
-    // reducing each source to an independent boolean enforcement outcome.
+    // Both mode with reconciliation enabled and both reads successful: decide
+    // on the reconciled checks. A failed read falls through to the per-source
+    // outcomes below, which await the same shared handles (no second read) and
+    // fail closed: a denial still wins over the source error, except that with
+    // a matching exemption the error is returned.
+    if reconcile_sources
+        && fetch_config
+        && fetch_acl_manifest
+        && let (Some(config), Some(acl_manifest)) =
+            (handles.config.as_ref(), handles.acl_manifest.as_ref())
+        && let (Ok(config_checks), Ok(acl_manifest_checks)) =
+            futures::join!(config.await_result(), acl_manifest.await_result())
+    {
+        return Ok(restriction_check::reconciled_enforcement_outcome(
+            config_checks.as_ref(),
+            acl_manifest_checks.as_ref(),
+            &candidates,
+            &pre_filter_variant,
+        )
+        .exempt_if(exemption_matched));
+    }
+
     let selected_sources = handles.selected_for(fetch_config, fetch_acl_manifest);
     let mut source_outcomes =
         futures::future::join_all(selected_sources.handles.into_iter().map(|handle| {
@@ -1662,9 +1731,11 @@ mod tests {
         handles: &SourceHandles<PathRestrictionCheckResult>,
         exemption_matched: bool,
     ) -> Result<AccessEnforcementOutcome> {
+        let (fetch_config, fetch_acl_manifest, reconcile_sources) = (true, true, true);
         enforce_with_source_handles(
-            true,
-            true,
+            fetch_config,
+            fetch_acl_manifest,
+            reconcile_sources,
             handles,
             PreFilteredRequest {
                 conditions: PreFilterResult::DefiniteMatch { candidates: vec![] },

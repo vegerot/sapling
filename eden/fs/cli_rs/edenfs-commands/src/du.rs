@@ -35,6 +35,7 @@ use comfy_table::Table;
 use dialoguer::Confirm;
 use edenfs_client::checkout::EdenFsCheckout;
 use edenfs_client::checkout::find_checkout;
+use edenfs_client::checkout::has_missing_checkout_state;
 use edenfs_client::instance::EdenFsInstance;
 use edenfs_client::redirect;
 use edenfs_client::redirect::get_effective_redirections;
@@ -48,6 +49,7 @@ use edenfs_utils::trace_env;
 use hg_util::no_follow::NoFollowRoot;
 use serde::Serialize;
 use subprocess::Exec;
+use subprocess::Job;
 use subprocess::Redirection as SubprocessRedirection;
 
 use crate::ExitCode;
@@ -217,7 +219,7 @@ fn format_size(size: u64) -> String {
 impl fmt::Display for AggregatedUsageCounts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut table = Table::new();
-        table.load_preset(comfy_table::presets::NOTHING);
+        table.load_style(comfy_table::presets::NOTHING);
 
         let is_clean_mode = matches!(
             self.display_mode,
@@ -370,12 +372,12 @@ async fn ignored_usage_counts_for_mount(checkout: &EdenFsCheckout) -> Result<u64
 
 fn get_hg_cache_path() -> Result<PathBuf> {
     let output = Exec::cmd("hg")
-        .args(&["config", "remotefilelog.cachepath"])
+        .args(["config", "remotefilelog.cachepath"])
         .stdout(SubprocessRedirection::Pipe)
         .stderr(SubprocessRedirection::Pipe)
         .env_clear()
-        .env_extend(&get_environment_suitable_for_subprocess())
-        .env_extend(&trace_env("hg"))
+        .env_extend(get_environment_suitable_for_subprocess())
+        .env_extend(trace_env("hg"))
         .capture()?;
 
     if output.success() {
@@ -433,6 +435,37 @@ impl DiskUsageCmd {
                 .collect();
             Ok(config_paths)
         }
+    }
+
+    /// Find the redirection targets in the scratch root that no registered
+    /// checkout uses.
+    ///
+    /// The scratch root holds the redirections of every checkout, so when `du`
+    /// runs on some mounts, the redirections of all the other checkouts are
+    /// collected too.
+    fn get_orphaned_redirections(
+        &self,
+        instance: &EdenFsInstance,
+        redirect_targets: &BTreeSet<PathBuf>,
+        skipped_mounts: &[PathBuf],
+    ) -> Result<Vec<PathBuf>> {
+        if self.mounts.is_empty() {
+            return redirect::scratch::get_orphaned_redirection_targets(
+                redirect_targets,
+                skipped_mounts,
+            );
+        }
+        let mounts: Vec<PathBuf> = instance
+            .get_configured_mounts_map()
+            .context("Failed to get EdenFS mounts")?
+            .into_keys()
+            .collect();
+        let (checkouts, skipped_mounts) =
+            get_checkouts(&mounts, instance, true).context("Failed to get EdenFS checkouts")?;
+        let (redirections, _) =
+            get_redirections(&checkouts).context("Failed to get EdenFS redirections")?;
+        let redirect_targets = redirections.into_iter().map(|(_, target)| target).collect();
+        redirect::scratch::get_orphaned_redirection_targets(&redirect_targets, &skipped_mounts)
     }
 
     /// Remove all the fsck directories if --deep-clean is used.
@@ -526,14 +559,35 @@ fn get_redirections(
 }
 
 /// Get all the checkous associated with the passed in mounts.
-fn get_checkouts(mounts: &[PathBuf], instance: &EdenFsInstance) -> Result<Vec<EdenFsCheckout>> {
-    mounts
-        .iter()
-        .map(|mount| {
-            find_checkout(instance, mount)
-                .with_context(|| format!("Failed to find checkout for {}", mount.display()))
-        })
-        .collect::<Result<_, anyhow::Error>>()
+///
+/// With `skip_missing_state`, mounts whose checkout state is missing, as an
+/// interrupted or concurrent `eden rm` leaves them, are warned about and
+/// returned separately instead of failing the whole command.
+fn get_checkouts(
+    mounts: &[PathBuf],
+    instance: &EdenFsInstance,
+    skip_missing_state: bool,
+) -> Result<(Vec<EdenFsCheckout>, Vec<PathBuf>)> {
+    let mut checkouts = Vec::new();
+    let mut skipped_mounts = Vec::new();
+    for mount in mounts {
+        match find_checkout(instance, mount) {
+            Ok(checkout) => checkouts.push(checkout),
+            Err(error) if skip_missing_state && has_missing_checkout_state(&error) => {
+                eprintln!(
+                    "Warning: skipping {}: {error}. Run `eden rm {}` to remove it.",
+                    mount.display(),
+                    mount.display()
+                );
+                skipped_mounts.push(mount.clone());
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to find checkout for {}", mount.display()));
+            }
+        }
+    }
+    Ok((checkouts, skipped_mounts))
 }
 
 /// Get all the fsck directories for the passed in checkouts.
@@ -586,9 +640,10 @@ fn clean_buck_redirections(buck_redirections: HashSet<PathBuf>) -> Result<()> {
                 .stderr(SubprocessRedirection::Pipe)
                 .cwd(basename)
                 .env_clear()
-                .env_extend(&get_env_with_buck_version(basename)?)
-                .env_extend(&trace_env("buck"))
-                .capture()
+                .env_extend(get_env_with_buck_version(basename)?)
+                .env_extend(trace_env("buck"))
+                .start()
+                .and_then(Job::capture)
                 .with_context(|| format!("Failed to run buck {}", get_buck_command()))?;
 
             if output.success() {
@@ -739,8 +794,8 @@ impl crate::Subcommand for DiskUsageCmd {
         let mounts = self
             .get_mounts(instance)
             .context("Failed to get EdenFS mounts")?;
-        let checkouts =
-            get_checkouts(&mounts, instance).context("Failed to get EdenFS checkouts")?;
+        let (checkouts, skipped_mounts) = get_checkouts(&mounts, instance, self.mounts.is_empty())
+            .context("Failed to get EdenFS checkouts")?;
         let backing_repos = get_backing_repos(&checkouts);
         let (redirections, buck_redirections) =
             get_redirections(&checkouts).context("Failed to get EdenFS redirections")?;
@@ -749,7 +804,7 @@ impl crate::Subcommand for DiskUsageCmd {
         // `--clean`/`--deep-clean` still run their other cleanups and report the
         // scan failure at the end.
         let (orphaned_redirections, orphan_scan_error) =
-            match redirect::scratch::get_orphaned_redirection_targets(&redirect_targets) {
+            match self.get_orphaned_redirections(instance, &redirect_targets, &skipped_mounts) {
                 Ok(orphaned) => (orphaned, None),
                 Err(error) if self.clean_orphaned => {
                     return Err(error.context("Failed to find orphaned redirections for cleanup"));
@@ -790,8 +845,15 @@ impl crate::Subcommand for DiskUsageCmd {
             aggregated_usage_counts.materialized += usage_count;
             mount_failed_file_checks.extend(failed_file_checks);
 
-            // GET SUMMARY INFO for ignored counts
-            aggregated_usage_counts.ignored += ignored_usage_counts_for_mount(checkout).await?;
+            // GET SUMMARY INFO for ignored counts. A configured checkout that is
+            // not mounted fails status, so skip it rather than aborting cleanup.
+            match ignored_usage_counts_for_mount(checkout).await {
+                Ok(ignored) => aggregated_usage_counts.ignored += ignored,
+                Err(error) => eprintln!(
+                    "Warning: failed to measure ignored files for {}: {error}",
+                    checkout.path().display()
+                ),
+            }
         }
 
         for fsck_dir in fsck_dirs.iter() {
@@ -869,7 +931,7 @@ impl crate::Subcommand for DiskUsageCmd {
             // PRINT MOUNTS
             if !self.fast {
                 write_title("Mounts");
-                for path in &mounts {
+                for path in mounts.iter().filter(|path| !skipped_mounts.contains(path)) {
                     println!("{}", path.display());
                 }
                 write_failed_to_check_files_message(&mount_failed_file_checks);
@@ -964,7 +1026,7 @@ impl crate::Subcommand for DiskUsageCmd {
                         "Cleaning shared space used by the storage engine...".blue()
                     );
                     let output = Exec::cmd("eden")
-                        .env_extend(&trace_env("eden"))
+                        .env_extend(trace_env("eden"))
                         .arg("gc")
                         .stdout(SubprocessRedirection::Pipe)
                         .stderr(SubprocessRedirection::Pipe)

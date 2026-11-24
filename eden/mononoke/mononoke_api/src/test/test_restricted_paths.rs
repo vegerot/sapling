@@ -289,10 +289,10 @@ async fn test_batch_restriction_info_mixed_paths(fb: FacebookInit) -> Result<()>
     .await?;
 
     let paths = vec![
-        NonRootMPath::new("first/file1.txt")?,
-        NonRootMPath::new("second/subdir/file2.txt")?,
-        NonRootMPath::new("third/nested/deep/file3.txt")?,
-        NonRootMPath::new("unrestricted/file4.txt")?,
+        MPath::new("first/file1.txt")?,
+        MPath::new("second/subdir/file2.txt")?,
+        MPath::new("third/nested/deep/file3.txt")?,
+        MPath::new("unrestricted/file4.txt")?,
     ];
 
     let results = cs_ctx.paths_restriction_info(paths, true).await?;
@@ -342,9 +342,9 @@ async fn test_batch_all_restricted(fb: FacebookInit) -> Result<()> {
         create_test_changeset(fb, vec![("restricted", "GROUP:my-acl")]).await?;
 
     let paths = vec![
-        NonRootMPath::new("restricted/file1.txt")?,
-        NonRootMPath::new("restricted/file2.txt")?,
-        NonRootMPath::new("restricted/subdir/file3.txt")?,
+        MPath::new("restricted/file1.txt")?,
+        MPath::new("restricted/file2.txt")?,
+        MPath::new("restricted/subdir/file3.txt")?,
     ];
 
     let results = cs_ctx.paths_restriction_info(paths, true).await?;
@@ -391,8 +391,8 @@ async fn test_batch_all_unrestricted(fb: FacebookInit) -> Result<()> {
         create_test_changeset(fb, vec![("restricted", "GROUP:my-acl")]).await?;
 
     let paths = vec![
-        NonRootMPath::new("unrestricted/file1.txt")?,
-        NonRootMPath::new("other/file2.txt")?,
+        MPath::new("unrestricted/file1.txt")?,
+        MPath::new("other/file2.txt")?,
     ];
 
     let results = cs_ctx.paths_restriction_info(paths, true).await?;
@@ -423,6 +423,36 @@ async fn test_batch_all_unrestricted(fb: FacebookInit) -> Result<()> {
     Ok(())
 }
 
+#[mononoke::fbinit_test]
+async fn test_batch_root_is_unrestricted(fb: FacebookInit) -> Result<()> {
+    let (_repo_ctx, cs_ctx) =
+        create_test_changeset(fb, vec![("restricted", "GROUP:my-acl")]).await?;
+
+    let paths = vec![MPath::ROOT, MPath::new("restricted/file.txt")?];
+
+    let mut results = cs_ctx.paths_restriction_info(paths, true).await?;
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let expected = vec![
+        (MPath::ROOT, vec![]),
+        (
+            MPath::new("restricted/file.txt")?,
+            vec![PathAccessInfo {
+                restriction: PathRestrictionInfo {
+                    restriction_root: NonRootMPath::new("restricted")?,
+                    repo_region_acl: "GROUP:my-acl".to_string(),
+                    permission_request_group: MononokeIdentity::from_str("GROUP:my-acl")?,
+                    rollout_allowlist_group: None,
+                },
+                has_access: Some(true),
+            }],
+        ),
+    ];
+    pretty_assertions::assert_eq!(results, expected);
+
+    Ok(())
+}
+
 // What it tests: Both-mode path metadata should include config-only
 // restrictions after metadata results are unioned across sources.
 // Expected: config-only restrictions are returned.
@@ -437,7 +467,7 @@ async fn test_batch_restriction_info_both_mode_config_only_root(fb: FacebookInit
     .await?;
 
     let results = cs_ctx
-        .paths_restriction_info(vec![NonRootMPath::new("config_only/file.txt")?], false)
+        .paths_restriction_info(vec![MPath::new("config_only/file.txt")?], false)
         .await?;
 
     let infos = results
@@ -469,10 +499,7 @@ async fn test_batch_restriction_info_both_mode_acl_manifest_only_root(
     .await?;
 
     let results = cs_ctx
-        .paths_restriction_info(
-            vec![NonRootMPath::new("acl_manifest_only/file.txt")?],
-            false,
-        )
+        .paths_restriction_info(vec![MPath::new("acl_manifest_only/file.txt")?], false)
         .await?;
 
     let infos = results
@@ -507,7 +534,7 @@ async fn test_batch_restriction_info_both_mode_same_root_prefers_acl_manifest(
     .await?;
 
     let results = cs_ctx
-        .paths_restriction_info(vec![NonRootMPath::new("shared/file.txt")?], false)
+        .paths_restriction_info(vec![MPath::new("shared/file.txt")?], false)
         .await?;
 
     let infos = results
@@ -525,8 +552,8 @@ async fn test_batch_restriction_info_both_mode_same_root_prefers_acl_manifest(
 
 /// What it tests: permission-aware path lookup in Both mode when config and
 /// AclManifest disagree on the ACL for the same root.
-/// Expected: one AclManifest metadata row is returned and its allowed ACL
-/// is reported, while authorization requires both source ACLs and is denied.
+/// Expected: one AclManifest metadata row is returned, while authorization
+/// conservatively requires both source ACLs.
 #[mononoke::fbinit_test]
 async fn test_restriction_info_both_mode_same_root_requires_both_acls(
     fb: FacebookInit,
@@ -551,10 +578,7 @@ async fn test_restriction_info_both_mode_same_root_requires_both_acls(
     assert_eq!(infos.len(), 1, "same-root metadata should produce one row");
     assert_eq!(info.restriction_root(), &NonRootMPath::new("shared")?);
     assert_eq!(info.repo_region_acl(), "REPO_REGION:myusername_project");
-    // FIXME(T291525172): The current metadata lookup applies AclManifest
-    // precedence, so this temporarily asserts today's access grant. Invert the
-    // assertion when Both-mode reconciliation is used.
-    assert_eq!(info.has_access, Some(true));
+    assert_eq!(info.has_access, Some(false));
 
     Ok(())
 }
@@ -585,10 +609,7 @@ async fn test_restriction_info_both_mode_uses_config_rollout_fallback(
         .ok_or_else(|| anyhow::anyhow!("expected one same-root restriction"))?;
 
     assert_eq!(infos.len(), 1, "same-root metadata should produce one row");
-    // FIXME(T291525172): The current metadata lookup treats AclManifest's
-    // missing rollout group as denial, so this temporarily asserts today's
-    // denial. Invert the assertion with reconciliation.
-    assert_eq!(info.has_access, Some(false));
+    assert_eq!(info.has_access, Some(true));
     Ok(())
 }
 
@@ -607,7 +628,7 @@ async fn test_batch_restriction_info_both_mode_same_root_requires_both_acls(
         vec!["shared/file.txt"],
     )
     .await?;
-    let path = NonRootMPath::new("shared/file.txt")?;
+    let path = MPath::new("shared/file.txt")?;
 
     let results = cs_ctx
         .paths_restriction_info(vec![path.clone()], true)
@@ -624,10 +645,7 @@ async fn test_batch_restriction_info_both_mode_same_root_requires_both_acls(
     assert_eq!(infos.len(), 1, "same-root metadata should produce one row");
     assert_eq!(info.restriction_root(), &NonRootMPath::new("shared")?);
     assert_eq!(info.repo_region_acl(), "REPO_REGION:myusername_project");
-    // FIXME(T291525172): The current metadata lookup applies AclManifest
-    // precedence, so this temporarily asserts today's access grant. Invert the
-    // assertion when Both-mode reconciliation is used.
-    assert_eq!(info.has_access, Some(true));
+    assert_eq!(info.has_access, Some(false));
 
     Ok(())
 }
@@ -666,10 +684,7 @@ async fn test_find_descendants_both_mode_same_root_requires_both_acls(
     );
     assert_eq!(info.restriction_root(), &NonRootMPath::new("shared")?);
     assert_eq!(info.repo_region_acl(), "REPO_REGION:myusername_project");
-    // FIXME(T291525172): The current metadata lookup applies AclManifest
-    // precedence, so this temporarily asserts today's access grant. Invert the
-    // assertion when Both-mode reconciliation is used.
-    assert_eq!(info.has_access, Some(true));
+    assert_eq!(info.has_access, Some(false));
 
     Ok(())
 }
@@ -1297,6 +1312,7 @@ async fn create_test_restricted_paths_with_mode(
     let repo_derived_data = test_repo.repo_derived_data_arc();
 
     Ok(Arc::new(RestrictedPaths::new(
+        "repo".to_string(),
         config_based,
         acl_provider,
         scuba,
@@ -1408,6 +1424,7 @@ async fn create_both_mode_test_changeset_with_config_metadata(
     let repo: Repo = factory.build().await?;
     let repo_derived_data = repo.repo_derived_data_arc();
     let restricted_paths = Arc::new(RestrictedPaths::new(
+        "repo".to_string(),
         config_based,
         acl_provider,
         scuba,

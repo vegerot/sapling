@@ -15,6 +15,7 @@
 #include "eden/fs/inodes/DirEntry.h"
 #include "eden/fs/inodes/FileInode.h"
 #include "eden/fs/inodes/InodeError.h"
+#include "eden/fs/inodes/InodeTimestamps.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/model/Tree.h"
 #include "eden/fs/model/TreeAuxData.h"
@@ -297,7 +298,7 @@ folly::coro::now_task<std::optional<Hash32>> VirtualInode::co_getDigestHash(
   // real ObjectId, so dispatching below would fetch the backing store's tree
   // aux data and leak a digest of contents the server refused to serve. Report
   // "no digest" instead.
-  if (FOLLY_UNLIKELY(isRestricted())) {
+  if (isRestricted()) [[unlikely]] {
     co_return std::nullopt;
   }
 
@@ -355,36 +356,6 @@ folly::coro::now_task<Hash20> VirtualInode::co_getSHA1(
   } else {
     co_yield folly::coro::co_error(PathError(EISDIR, path));
   }
-}
-
-ImmediateFuture<std::optional<TreeEntryType>> VirtualInode::getTreeEntryType(
-    RelativePathPiece path,
-    const ObjectFetchContextPtr& fetchContext) const {
-  using R = ImmediateFuture<std::optional<TreeEntryType>>;
-  return match(
-      variant_,
-      [&](const InodePtr& inode) -> R {
-#ifdef _WIN32
-        (void)fetchContext;
-        // On Windows, users cannot modify Unix-style file permissions.
-        // As a result, the file's initial mode remains unchanged.
-        // Therefore, we can reliably use the initial mode to determine the
-        // tree entry type, and use it as the SOURCE_CONTROL_TYPE.
-        return treeEntryTypeFromMode(inode->getInitialMode());
-#else
-        (void)path;
-        return inode->stat(fetchContext).thenValue([](const struct stat&& st) {
-          return treeEntryTypeFromMode(st.st_mode);
-        });
-#endif
-      },
-      [&](const UnmaterializedUnloadedBlobDirEntry& entry) {
-        return makeImmediateFutureWith([mode = entry.getInitialMode()]() {
-          return treeEntryTypeFromMode(mode);
-        });
-      },
-      [&](const TreePtr&) -> R { return TreeEntryType::TREE; },
-      [&](const TreeEntry& entry) -> R { return entry.getType(); });
 }
 
 std::optional<TreeEntryType> VirtualInode::tryGetTreeEntryType() const {
@@ -518,18 +489,29 @@ VirtualInode::co_getTreeAuxData(
 
 namespace {
 
-struct stat makeStatFromModeAndSize(
-    mode_t mode,
-    uint64_t size,
-    struct timespec lastCheckoutTime) {
+/**
+ * The mtime of an object that has no inode: the one an inode loaded for it
+ * starts with. That is the time the object's id carries, limited to the range
+ * an inode holds (EdenTimestamp), or else the time of the last checkout.
+ */
+struct timespec mtimeWithoutInode(
+    const ObjectStore& objectStore,
+    const ObjectId& id,
+    const struct timespec& lastCheckoutTime) {
+  const auto mtime = objectStore.getMtime(id);
+  return mtime ? EdenTimestamp{*mtime}.toTimespec() : lastCheckoutTime;
+}
+
+struct stat
+makeStatFromModeAndSize(mode_t mode, uint64_t size, struct timespec mtime) {
   struct stat st = {};
 #ifndef _WIN32
   st.st_mode = static_cast<decltype(st.st_mode)>(mode);
-  stMtime(st, lastCheckoutTime);
+  stMtime(st, mtime);
 #else
   // Windows returns zero for st_mode and mtime; intentionally discard.
   (void)mode;
-  (void)lastCheckoutTime;
+  (void)mtime;
 #endif
   st.st_size = static_cast<decltype(st.st_size)>(size);
   return st;
@@ -697,9 +679,6 @@ NonFileAttributePreamble setupNonFileAttributes(
   return result;
 }
 
-/**
- * Coroutine version of getEntryAttributesForNonFile.
- */
 folly::coro::now_task<EntryAttributes> co_getEntryAttributesForNonFile(
     const VirtualInode& vi,
     EntryAttributeFlags requestedAttributes,
@@ -766,8 +745,8 @@ folly::coro::now_task<EntryAttributes> co_getEntryAttributesForNonFile(
 }
 
 /**
- * Sync version of getEntryAttributesForNonFile. Mirrors the dispatch of
- * co_getEntryAttributesForNonFile but resolves entirely from cached
+ * Sync version of co_getEntryAttributesForNonFile. Mirrors its dispatch
+ * but resolves entirely from cached
  * state. Returns nullopt if any requested attribute would need an async
  * fetch.
  */
@@ -820,58 +799,6 @@ std::optional<EntryAttributes> tryGetEntryAttributesForNonFileSync(
   return attributes;
 }
 } // namespace
-
-ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributesForNonFile(
-    EntryAttributeFlags requestedAttributes,
-    RelativePathPiece path,
-    const std::shared_ptr<ObjectStore>& objectStore,
-    timespec lastCheckoutTime,
-    const ObjectFetchContextPtr& fetchContext,
-    std::optional<TreeEntryType> entryType,
-    int errorCode,
-    std::string_view additionalErrorContext) const {
-  auto [attributes, isMat] = setupNonFileAttributes(
-      *this,
-      requestedAttributes,
-      path,
-      objectStore,
-      entryType,
-      errorCode,
-      additionalErrorContext);
-
-  auto statFuture = ImmediateFuture<struct stat>::makeEmpty();
-  if (shouldRequestStatForEntry(requestedAttributes)) {
-    statFuture = stat(lastCheckoutTime, objectStore, fetchContext);
-  }
-
-  auto treeAuxFuture = ImmediateFuture<std::optional<TreeAuxData>>::makeEmpty();
-  auto shouldRequestTreeAux =
-      shouldRequestTreeAuxDataForEntry(entryType, requestedAttributes, isMat);
-  // The entry is a tree, and therefore we can attempt to compute tree
-  // aux data for it. However, we can only compute the additional attributes
-  // of trees that have ObjectIds. In other words, the tree must be
-  // unmaterialized.
-  if (shouldRequestTreeAux) {
-    treeAuxFuture = getTreeAuxData(objectStore, fetchContext);
-  } // We return empty tree aux data attributes for materialized directories
-  return collectAllValid(std::move(statFuture), std::move(treeAuxFuture))
-      .thenValue([entryAttributes = std::move(attributes), requestedAttributes](
-                     const std::tuple<
-                         std::optional<folly::Try<struct stat>>,
-                         std::optional<folly::Try<std::optional<TreeAuxData>>>>&
-                         rawAttributeData) mutable {
-        auto& [statData, treeAuxTry] = rawAttributeData;
-        if (statData.has_value()) {
-          populateStatAttributes(
-              entryAttributes, requestedAttributes, statData.value());
-        }
-        if (treeAuxTry.has_value()) {
-          populateTreeAuxAttributes(
-              entryAttributes, requestedAttributes, treeAuxTry.value());
-        }
-        return entryAttributes;
-      });
-}
 
 namespace {
 void populateBlobAuxAttributes(
@@ -991,85 +918,6 @@ EntryAttributes assembleRegularFileAttributes(
   return attributes;
 }
 } // namespace
-
-ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
-    EntryAttributeFlags requestedAttributes,
-    RelativePathPiece path,
-    const std::shared_ptr<ObjectStore>& objectStore,
-    timespec lastCheckoutTime,
-    const ObjectFetchContextPtr& fetchContext) const {
-  // For non regular files we return errors for hashes and sizes.
-  // We intentionally want to refuse to compute the SHA1 of symlinks.
-  if (auto dispatch = getNonRegularDtypeDispatch(getDtype())) {
-    return getEntryAttributesForNonFile(
-        requestedAttributes,
-        path,
-        objectStore,
-        lastCheckoutTime,
-        fetchContext,
-        dispatch->entryType,
-        dispatch->errorCode,
-        dispatch->errorContext);
-  }
-
-  // getNonRegularDtypeDispatch returned nullopt, so this is a regular file.
-  auto entryTypeFuture =
-      ImmediateFuture<std::optional<TreeEntryType>>::makeEmpty();
-  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE)) {
-    entryTypeFuture = getTreeEntryType(path, fetchContext);
-  }
-
-  auto blobAuxdataFuture = ImmediateFuture<BlobAuxData>::makeEmpty();
-  auto shouldRequestBlobAux =
-      shouldRequestBlobAuxDataForEntry(requestedAttributes);
-  if (shouldRequestBlobAux) {
-    blobAuxdataFuture = getBlobAuxData(
-        path,
-        objectStore,
-        fetchContext,
-        requestedAttributes.containsAnyOf(
-            ENTRY_ATTRIBUTE_BLAKE3 | ENTRY_ATTRIBUTE_DIGEST_HASH));
-  }
-
-  auto statFuture = ImmediateFuture<struct stat>::makeEmpty();
-  auto shouldRequestStat = shouldRequestStatForEntry(requestedAttributes);
-  if (shouldRequestStat) {
-    statFuture = stat(lastCheckoutTime, objectStore, fetchContext);
-  }
-
-  std::optional<ObjectId> objectId;
-  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_OBJECT_ID)) {
-    objectId = getObjectId();
-  }
-
-  return collectAllValid(
-             std::move(entryTypeFuture),
-             std::move(blobAuxdataFuture),
-             std::move(statFuture))
-      .thenValue(
-          [requestedAttributes,
-           entryObjectId = std::move(objectId),
-           underAcl = isUnderAcl(),
-           enableLocalUnderAclComputation =
-               shouldPopulateLocalAclAttributes(objectStore)](
-              std::tuple<
-                  std::optional<folly::Try<std::optional<TreeEntryType>>>,
-                  std::optional<folly::Try<BlobAuxData>>,
-                  std::optional<folly::Try<struct stat>>>
-                  rawAttributeData) mutable -> EntryAttributes {
-            auto& [entryTypeTry, blobAuxTry, statTry] = rawAttributeData;
-            return assembleRegularFileAttributes(
-                requestedAttributes,
-                entryTypeTry.has_value()
-                    ? std::move(*entryTypeTry)
-                    : folly::Try<std::optional<TreeEntryType>>{std::nullopt},
-                folly::Try<std::optional<ObjectId>>{std::move(entryObjectId)},
-                std::move(blobAuxTry),
-                std::move(statTry),
-                underAcl,
-                enableLocalUnderAclComputation);
-          });
-}
 
 folly::coro::now_task<EntryAttributes> VirtualInode::co_getEntryAttributes(
     EntryAttributeFlags requestedAttributes,
@@ -1214,65 +1062,6 @@ std::optional<EntryAttributes> VirtualInode::tryGetEntryAttributesSync(
       shouldPopulateLocalAclAttributes(objectStore));
 }
 
-// Returns a subset of `struct stat` required by
-// EdenServiceHandler::semifuture_getFileInformation()
-ImmediateFuture<struct stat> VirtualInode::stat(
-    // TODO: can lastCheckoutTime be fetched from some global edenMount()?
-    //
-    // VirtualInode is used to traverse the tree. However, the global
-    // renameLock is NOT held during these traversals, so we're not protected
-    // from nodes/trees being moved around during the traversal.
-    //
-    // It's inconvenient to pass the lastCheckoutTime in from the caller, but we
-    // got to this particular location in the mount by starting at a particular
-    // root node with that checkout time. Because we don't hold the rename lock,
-    // it's not clear if the current global edenMount object's lastCheckoutTime
-    // is any more or less correct than the passed in lastCheckoutTime. It's
-    // _probably_ safer to use the older one, as that represents what the state
-    // of the repository WAS when the traversal started. If we queried the
-    // global eden mount here for the lastCheckoutTime, we may get a time in the
-    // future when one of our parents changed, and we may be mis-reporting the
-    // state of the tree.
-    //
-    // In short: there's a potential race condition here that may cause
-    // mis-reporting.
-    const struct timespec& lastCheckoutTime,
-    const std::shared_ptr<ObjectStore>& objectStore,
-    const ObjectFetchContextPtr& fetchContext) const {
-  return std::visit(
-      [&](auto&& arg) -> ImmediateFuture<struct stat> {
-        using T = std::decay_t<decltype(arg)>;
-        ObjectId objectId;
-        mode_t mode;
-        if constexpr (std::is_same_v<T, InodePtr>) {
-          // Note: there's no need to modify the return value of stat here, as
-          // the inode implementations are what all the other cases are trying
-          // to emulate.
-          return arg->stat(fetchContext);
-        } else if constexpr (std::is_same_v<
-                                 T,
-                                 UnmaterializedUnloadedBlobDirEntry>) {
-          objectId = arg.getObjectId();
-          mode = arg.getInitialMode();
-          // fallthrough
-        } else if constexpr (std::is_same_v<T, TreePtr>) {
-          return makeStatFromModeAndSize(treeMode_, 0U, lastCheckoutTime);
-        } else if constexpr (std::is_same_v<T, TreeEntry>) {
-          objectId = arg.getObjectId();
-          mode = modeFromTreeEntryType(arg.getType());
-          // fallthrough
-        } else {
-          static_assert(always_false_v<T>, "non-exhaustive visitor!");
-        }
-        return objectStore->getBlobAuxData(objectId, fetchContext)
-            .thenValue([mode, lastCheckoutTime](const BlobAuxData& auxData) {
-              return makeStatFromModeAndSize(
-                  mode, auxData.size, lastCheckoutTime);
-            });
-      },
-      variant_);
-}
-
 folly::coro::now_task<struct stat> VirtualInode::co_stat(
     const struct timespec& lastCheckoutTime,
     const std::shared_ptr<ObjectStore>& objectStore,
@@ -1296,7 +1085,10 @@ folly::coro::now_task<struct stat> VirtualInode::co_stat(
   }
   auto auxData =
       co_await objectStore->co_getBlobAuxData(info->id, fetchContext);
-  co_return makeStatFromModeAndSize(info->mode, auxData.size, lastCheckoutTime);
+  co_return makeStatFromModeAndSize(
+      info->mode,
+      auxData.size,
+      mtimeWithoutInode(*objectStore, info->id, lastCheckoutTime));
 }
 
 std::optional<struct stat> VirtualInode::tryGetCachedStat(
@@ -1317,8 +1109,11 @@ std::optional<struct stat> VirtualInode::tryGetCachedStat(
   }
 
   if (auto* tree = std::get_if<TreePtr>(&variant_)) {
-    (void)tree;
-    return makeStatFromModeAndSize(treeMode_, 0U, lastCheckoutTime);
+    return makeStatFromModeAndSize(
+        treeMode_,
+        0U,
+        mtimeWithoutInode(
+            *objectStore, (*tree)->getObjectId(), lastCheckoutTime));
   }
 
   std::optional<BlobAuxData> blobAux = blobAuxHint;
@@ -1339,7 +1134,10 @@ std::optional<struct stat> VirtualInode::tryGetCachedStat(
   if (!info) {
     return std::nullopt;
   }
-  return makeStatFromModeAndSize(info->mode, blobAux->size, lastCheckoutTime);
+  return makeStatFromModeAndSize(
+      info->mode,
+      blobAux->size,
+      mtimeWithoutInode(*objectStore, info->id, lastCheckoutTime));
 }
 
 namespace {
@@ -1607,29 +1405,6 @@ folly::coro::now_task<VirtualInode> co_getOrFindChildHelper(
 }
 
 } // namespace
-
-ImmediateFuture<VirtualInode> VirtualInode::getOrFindChild(
-    PathComponentPiece childName,
-    RelativePathPiece path,
-    const std::shared_ptr<ObjectStore>& objectStore,
-    const ObjectFetchContextPtr& fetchContext) const {
-  // DEPRECATED: use co_getOrFindChild directly. Kept only because
-  // EdenMount::VirtualInodeLookupProcessor::next and VirtualInodeLoader
-  // still consume ImmediateFuture chains; delete once those are migrated.
-  return ImmediateFuture{
-      // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-      folly::coro::co_invoke(
-          [](auto&& self, auto&&... args) -> folly::coro::Task<VirtualInode> {
-            co_return co_await self.co_getOrFindChild(
-                std::forward<decltype(args)>(args)...);
-          },
-          *this,
-          childName.copy(),
-          path.copy(),
-          std::shared_ptr<ObjectStore>(objectStore),
-          fetchContext.copy())
-          .semi()};
-}
 
 folly::coro::now_task<VirtualInode> VirtualInode::co_getOrFindChild(
     PathComponentPiece childName,

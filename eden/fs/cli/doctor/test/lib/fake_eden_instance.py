@@ -28,6 +28,7 @@ from eden.fs.cli.config import (
     EdenInstance,
     HealthStatus,
     ListMountInfo,
+    path_is_missing,
 )
 from fb303_core.thrift_types import fb303_status
 
@@ -92,6 +93,8 @@ class FakeEdenInstance(AbstractEdenInstance):
 
         # A map from mount path --> FakeCheckout
         self._checkouts_by_path: Dict[str, FakeCheckout] = {}
+        self._unconfigured_checkouts: Dict[str, FakeCheckout] = {}
+        self.unregister_calls: List[str] = []
         self._hg_repo_by_path: Dict[Path, FakeHgRepo] = {}
         self.mount_table = FakeMountTable()
         self._next_dev_id = 10
@@ -163,7 +166,6 @@ class FakeEdenInstance(AbstractEdenInstance):
             redirection_targets={},
             active_prefetch_profiles=[],
             use_write_back_cache=False,
-            re_use_case="buck2-default",
             inode_catalog_type=None,
             off_mount_repo_dir=False,
         )
@@ -201,11 +203,43 @@ class FakeEdenInstance(AbstractEdenInstance):
             typing.cast(EdenInstance, self), Path(full_path), Path(state_dir)
         )
 
-    def remove_checkout_configuration(self, mount_path: str) -> None:
+    def remove_checkout_configuration(
+        self, mount_path: str, keep_state_dir: bool = False
+    ) -> None:
         """Update the state to make it look like the specified mount path is still
-        actively mounted but not configured on disk."""
+        actively mounted but not configured on disk. With keep_state_dir the
+        client directory stays, as after an `eden clone` that stopped between
+        the mount and the directory-map write."""
         checkout = self._checkouts_by_path.pop(mount_path)
-        shutil.rmtree(checkout.state_dir)
+        self._unconfigured_checkouts[mount_path] = checkout
+        if not keep_state_dir:
+            shutil.rmtree(checkout.state_dir)
+
+    def unregister_checkout(self, path: Path, state_dir: Path) -> bool:
+        self.unregister_calls.append(str(path))
+        checkout = self._checkouts_by_path.get(str(path))
+        if (
+            checkout is None
+            or checkout.state_dir != state_dir
+            or not path_is_missing(state_dir)
+        ):
+            return False
+        self._checkouts_by_path.pop(str(path))
+        return True
+
+    def can_register_running_mount(self, path: Path, client_dir: Path) -> bool:
+        checkout = self._unconfigured_checkouts.get(str(path))
+        return (
+            checkout is not None
+            and checkout.state_dir == client_dir
+            and (client_dir / "config.toml").is_file()
+            and str(path) not in self._checkouts_by_path
+        )
+
+    def register_running_mount(self, path: Path, client_dir: Path) -> None:
+        if not self.can_register_running_mount(path, client_dir):
+            raise Exception(f"cannot register {path}")
+        self._checkouts_by_path[str(path)] = self._unconfigured_checkouts.pop(str(path))
 
     def _setup_hg_path(
         self,

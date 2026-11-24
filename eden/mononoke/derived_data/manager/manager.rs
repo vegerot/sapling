@@ -27,6 +27,7 @@ use restricted_paths_common::config_based::ArcRestrictedPathsConfigBased;
 use scuba_ext::MononokeScubaSampleBuilder;
 
 use crate::DerivationContext;
+use crate::StageInputs;
 
 pub mod bubble;
 pub mod derive;
@@ -129,6 +130,32 @@ impl DerivedDataManager {
                 derivation_service_client,
                 derivation_context,
             }),
+        }
+    }
+
+    /// Set whether stage requests publish canonical data or return shadow outputs.
+    pub fn with_pipeline_mode(&self, mode: crate::PipelineMode) -> Self {
+        let mut inner = self.inner.as_ref().clone();
+        inner.derivation_context.pipeline_mode = mode;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Supply immutable outputs from parent and dependency stages.
+    pub fn with_stage_inputs(&self, inputs: Arc<StageInputs>) -> Self {
+        let mut inner = self.inner.as_ref().clone();
+        inner.derivation_context.stage_inputs = inputs;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    pub fn with_prepared_inputs(&self, inputs: Arc<crate::PreparedStageInputs>) -> Self {
+        let mut inner = self.inner.as_ref().clone();
+        inner.derivation_context.prepared_inputs = Some(inputs);
+        Self {
+            inner: Arc::new(inner),
         }
     }
 

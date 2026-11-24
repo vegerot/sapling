@@ -42,6 +42,8 @@ pub use crate::commit::WireHgMutationEntryContent;
 pub use crate::commit::WireUploadBonsaiChangesetRequest;
 pub use crate::commit::WireUploadHgChangeset;
 pub use crate::commit::WireUploadHgChangesetsRequest;
+pub use crate::commit::WireUploadHgSnapshotRequest;
+pub use crate::commit::WireUploadHgSnapshotResponse;
 use crate::wire::ToApi;
 use crate::wire::ToWire;
 use crate::wire::WireFileType;
@@ -653,6 +655,7 @@ impl Arbitrary for WireEphemeralExtendResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::WireToApiConversionError;
     use crate::wire::tests::wire_json_hashes;
 
     #[test]
@@ -678,6 +681,8 @@ mod tests {
                 WireFetchSnapshotResponse,
                 WireCommitMutationsRequest,
                 WireCommitMutationsResponse,
+                WireUploadHgSnapshotRequest,
+                WireUploadHgSnapshotResponse,
             ],
             [
                 3473352940809767921,
@@ -688,7 +693,7 @@ mod tests {
                 1141721279096408187,
                 14010494320882792131,
                 9918051020421534234,
-                14735951688500724157,
+                2143453491971505427,
                 1084558840362791376,
                 18239180058534398051,
                 9408360552512158447,
@@ -698,8 +703,23 @@ mod tests {
                 13872628972001337347,
                 13532639155927051556,
                 3944835397023904073,
-                6607109132335058288
+                6607109132335058288,
+                13965057521499469606,
+                4915736226190061855
             ]
+        );
+    }
+
+    #[test]
+    fn test_ephemeral_extend_request_without_snapshot_id() {
+        let wire: WireEphemeralExtendRequest =
+            serde_json::from_str(r#"{"1": 5, "2": 3600}"#).expect("should deserialize");
+        assert!(
+            matches!(
+                wire.to_api(),
+                Err(WireToApiConversionError::MissingField("snapshot_id"))
+            ),
+            "a request that carries only a bubble id should fail to convert"
         );
     }
 }

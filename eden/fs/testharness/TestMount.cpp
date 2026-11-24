@@ -9,6 +9,7 @@
 
 #include <folly/Exception.h>
 #include <folly/FileUtil.h>
+#include <folly/coro/Invoke.h>
 #include <folly/executors/ManualExecutor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/logging/xlog.h>
@@ -550,6 +551,29 @@ bool TestMount::hasMetadata([[maybe_unused]] InodeNumber ino) const {
 #else
   NOT_IMPLEMENTED();
 #endif // !_WIN32
+}
+
+folly::Future<CheckoutResult> TestMount::checkout(
+    const RootId& snapshotId,
+    const ObjectFetchContextPtr& fetchContext,
+    folly::StringPiece thriftMethodCaller,
+    CheckoutMode checkoutMode) {
+  return folly::coro::co_invoke(
+             [mount = edenMount_,
+              rootInode = rootInode_,
+              snapshotId,
+              fetchContext = fetchContext.copy(),
+              caller = thriftMethodCaller.str(),
+              checkoutMode]() mutable -> folly::coro::Task<CheckoutResult> {
+               co_return co_await mount->co_checkout(
+                   std::move(rootInode),
+                   snapshotId,
+                   fetchContext,
+                   caller,
+                   checkoutMode);
+             })
+      .semi()
+      .via(serverExecutor_.get());
 }
 
 size_t TestMount::drainServerExecutor() {

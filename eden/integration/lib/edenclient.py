@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import signal
@@ -45,24 +46,32 @@ from fb303_core.thrift_types import fb303_status
 
 from .find_executables import FindExe
 
+if sys.platform != "win32":
+    import resource
+
 # Two minutes is very generous, but 30 seconds is not enough CI hosts
 # and many-core machines under load.
 EDENFS_START_TIMEOUT = 120
 EDENFS_STOP_TIMEOUT = 240
 
 
+FUSE_IO_URING_KERNEL_RELEASE_REGEX = r"^(7\.|6\.16\.[^_]*_fbk(9|[1-9][0-9]+)(_|$))"
+
+
 def require_io_uring_kernel() -> None:
     release = os.uname().release if sys.platform == "linux" else ""
-    # The FUSE io_uring ABI is kernel-specific; extend this allowlist
-    # when another fbk release is validated.
-    if "fbk" not in release or not release.startswith(("6.13.", "6.16.")):
-        raise unittest.SkipTest("requires an fbk 6.13 or 6.16 FUSE io_uring kernel")
+    if re.search(FUSE_IO_URING_KERNEL_RELEASE_REGEX, release) is None:
+        raise unittest.SkipTest(
+            f"requires kernel 7.x or 6.16-fbk9+ for safe FUSE io_uring (running {release!r})"
+        )
 
 
 def fuse_transport_config(use_io_uring: bool) -> list[str]:
     settings = [f"use-io-uring = {'true' if use_io_uring else 'false'}"]
     if use_io_uring:
-        settings.append('io-uring-kernel-release-regex = ".*"')
+        settings.append(
+            f"io-uring-kernel-release-regex = {json.dumps(FUSE_IO_URING_KERNEL_RELEASE_REGEX)}"
+        )
         # Allocate queues before replying to INIT to allow devfuse fallback.
         settings.append("io-uring-pre-create-queues = true")
     return settings
@@ -78,10 +87,27 @@ def assert_fuse_transport(
         f"expected {expected!r}, got {actual!r}"
     )
     if expected == "io_uring" and actual == "devfuse":
-        raise unittest.SkipTest(
-            f"{message}; io_uring unavailable, using devfuse fallback"
-        )
+        skip_message = f"{message}; io_uring unavailable, using devfuse fallback"
+        if sys.platform != "win32":
+            skip_message += f"; {_io_uring_memlock_context()}"
+        raise unittest.SkipTest(skip_message)
     raise AssertionError(message)
+
+
+def _format_rlimit(value: int) -> str:
+    if value == resource.RLIM_INFINITY:
+        return "unlimited"
+    return f"{value // 1024} KiB"
+
+
+def _io_uring_memlock_context() -> str:
+    """Return the `RLIMIT_MEMLOCK` limits of this process and the configured CPU count."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    cpus = os.sysconf("SC_NPROCESSORS_CONF")
+    return (
+        f"RLIMIT_MEMLOCK soft={_format_rlimit(soft)} hard={_format_rlimit(hard)}, "
+        f"configured CPUs={cpus}"
+    )
 
 
 def assert_fuse_transports(mounts: Iterable[MountInfo], expected: str) -> None:

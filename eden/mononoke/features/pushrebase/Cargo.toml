@@ -16,6 +16,7 @@ bonsai_git_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_g
 bonsai_globalrev_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_globalrev_mapping" }
 bookmarks = { version = "0.1.0", path = "../../repo_attributes/bookmarks" }
 bytes = { version = "1.12.1", features = ["serde"] }
+case_conflict_skeleton_manifest = { version = "0.1.0", path = "../../derived_data/case_conflict_skeleton_manifest" }
 changesets_creation = { version = "0.1.0", path = "../changesets_creation" }
 commit_graph = { version = "0.1.0", path = "../../repo_attributes/commit_graph/commit_graph" }
 content_manifest_derivation = { version = "0.1.0", path = "../../derived_data/content_manifest_derivation" }
@@ -63,6 +64,7 @@ mutable_counters = { version = "0.1.0", path = "../../repo_attributes/mutable_co
 rand = "0.10.3"
 restricted_paths = { version = "0.1.0", path = "../../repo_attributes/restricted_paths" }
 samplingblob = { version = "0.1.0", path = "../../blobstore/samplingblob" }
+source_revision_pushrebase_hook = { version = "0.1.0", path = "source_revision_pushrebase_hook" }
 sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 test_repo_factory = { version = "0.1.0", path = "../../repo_factory/test_repo_factory" }
 tests_utils = { version = "0.1.0", path = "../../tests/utils" }

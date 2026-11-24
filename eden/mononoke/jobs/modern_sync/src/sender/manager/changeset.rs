@@ -12,6 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use backsyncer::advance_bookmark_counter;
@@ -21,7 +22,6 @@ use futures::channel::oneshot;
 use itertools::Itertools;
 use mercurial_types::blobs::HgBlobChangeset;
 use metaconfig_types::ModernSyncChannelConfig;
-use mononoke_macros::mononoke;
 use mononoke_types::BonsaiChangeset;
 use mutable_counters::ArcMutableCounters;
 use mutable_counters::MutableCounters;
@@ -129,26 +129,19 @@ impl ChangesetManager {
         for (counter_names, (position, id)) in latest_checkpoints.drain() {
             tracing::info!("Setting checkpoint from entry {} to {}", id, position);
 
-            let res_entry = mc
-                .set_counter(ctx, &counter_names.current_entry, id, None)
-                .await?;
-
-            let res_checkpoint = mc
-                .set_counter(
-                    ctx,
-                    &counter_names.batch_checkpoint,
-                    position.try_into().unwrap(),
-                    None,
-                )
-                .await?;
-
-            if !(res_checkpoint && res_entry) {
-                tracing::warn!(
-                    "Failed to checkpoint entry {} at position {:?}",
-                    id,
-                    position
-                );
-            }
+            // The reader trusts `batch_checkpoint` only when `current_entry`
+            // matches, so the two must never be stored out of step.
+            let position = i64::try_from(position)
+                .with_context(|| format!("checkpoint position {position} of entry {id}"))?;
+            mc.set_counters(
+                ctx,
+                &[
+                    (&counter_names.current_entry, id),
+                    (&counter_names.batch_checkpoint, position),
+                ],
+            )
+            .await
+            .with_context(|| format!("failed to checkpoint entry {id} at position {position}"))?;
         }
 
         if !latest_bookmark_chain.is_empty() {
@@ -214,149 +207,129 @@ impl ChangesetManager {
 }
 
 impl Manager for ChangesetManager {
-    fn start(
-        mut self,
+    async fn run(
+        &mut self,
         ctx: CoreContext,
         reponame: String,
         changeset_es: Arc<dyn EdenapiSender + Send + Sync>,
         cancellation_requested: Arc<AtomicBool>,
-    ) {
-        mononoke::spawn_task(async move {
-            let changeset_recv = &mut self.changeset_recv;
-            let mc = &self.mc;
+    ) -> Result<()> {
+        let changeset_recv = &mut self.changeset_recv;
+        let mc = &self.mc;
 
-            let mut encountered_error: Option<anyhow::Error> = None;
+        let mut encountered_error: Option<anyhow::Error> = None;
 
-            let mut pending_log = VecDeque::new();
+        let mut pending_log = VecDeque::new();
 
-            let mut latest_in_entry_checkpoints = HashMap::new();
-            let mut latest_entry_ids = HashMap::new();
-            let mut latest_bookmark_chain: Vec<BookmarkInfo> = Vec::new();
-            let mut pending_notification = None;
+        let mut latest_in_entry_checkpoints = HashMap::new();
+        let mut latest_entry_ids = HashMap::new();
+        let mut latest_bookmark_chain: Vec<BookmarkInfo> = Vec::new();
+        let mut pending_notification = None;
 
-            let mut current_batch = Vec::new();
-            let mut flush_timer =
-                interval(Duration::from_millis(self.config.flush_interval_ms as u64));
+        let mut current_batch = Vec::new();
+        let mut flush_timer = interval(Duration::from_millis(self.config.flush_interval_ms as u64));
 
-            while !cancellation_requested.load(Ordering::Relaxed) {
-                tokio::select! {
+        while !cancellation_requested.load(Ordering::Relaxed) {
+            tokio::select! {
 
-                    msg = changeset_recv.recv() => {
+                msg = changeset_recv.recv() => {
 
-                        tracing::debug!(
-                            "Changeset channel capacity: {} max capacity: {} in queue: {}",
-                            changeset_recv.capacity(),
-                            self.config.channel_size,
-                            changeset_recv.len()
-                        );
-                        STATS::changesets_queue_capacity.set_value(ctx.fb, changeset_recv.capacity() as i64, (reponame.clone(),));
-                        STATS::changesets_queue_len.add_value(changeset_recv.len() as i64, (reponame.clone(),));
-                        STATS::changesets_queue_max_capacity.set_value(ctx.fb, changeset_recv.max_capacity() as i64, (reponame.clone(),));
-                        match msg {
-                            Some(ChangesetMessage::WaitForFilesAndTrees(
-                                files_receiver,
-                                trees_receiver,
-                            )) => {
-                                // Read outcome from files and trees upload
-                                let start = std::time::Instant::now();
-                                match tokio::try_join!(files_receiver, trees_receiver) {
-                                    Ok((res_files, res_trees)) => {
-                                        if res_files.is_err() || res_trees.is_err() {
-                                            tracing::error!(
-                                                "Error processing files/trees: {:?} {:?}",
-                                                res_files,
-                                                res_trees
-                                            );
-                                            encountered_error.get_or_insert(anyhow::anyhow!(
-                                                "Files/trees error received. Winding down changesets sender.",
-                                            ));
-                                        }
-                                        let elapsed = start.elapsed().as_secs();
-                                        STATS::trees_files_wait_time_s
-                                            .add_value(elapsed as i64, (reponame.clone(),));
-                                    }
-                                    Err(e) => {
+                    tracing::debug!(
+                        "Changeset channel capacity: {} max capacity: {} in queue: {}",
+                        changeset_recv.capacity(),
+                        self.config.channel_size,
+                        changeset_recv.len()
+                    );
+                    STATS::changesets_queue_capacity.set_value(ctx.fb, changeset_recv.capacity() as i64, (reponame.clone(),));
+                    STATS::changesets_queue_len.add_value(changeset_recv.len() as i64, (reponame.clone(),));
+                    STATS::changesets_queue_max_capacity.set_value(ctx.fb, changeset_recv.max_capacity() as i64, (reponame.clone(),));
+                    match msg {
+                        Some(ChangesetMessage::WaitForFilesAndTrees(
+                            files_receiver,
+                            trees_receiver,
+                        )) => {
+                            // Read outcome from files and trees upload
+                            let start = std::time::Instant::now();
+                            match tokio::try_join!(files_receiver, trees_receiver) {
+                                Ok((res_files, res_trees)) => {
+                                    if res_files.is_err() || res_trees.is_err() {
+                                        tracing::error!(
+                                            "Error processing files/trees: {:?} {:?}",
+                                            res_files,
+                                            res_trees
+                                        );
                                         encountered_error.get_or_insert(anyhow::anyhow!(
-                                            "Error waiting for files/trees error received {e:#}"
+                                            "Files/trees error received. Winding down changesets sender.",
                                         ));
                                     }
-                                }
-                            }
-
-                            Some(ChangesetMessage::Changeset((hg_cs, bcs)))
-                                if encountered_error.is_none() =>
-                            {
-                                current_batch.push((hg_cs, bcs));
-                            }
-
-                            Some(ChangesetMessage::CheckpointInEntry {
-                                position,
-                                entry_id,
-                                counter_names,
-                            })
-                                if encountered_error.is_none() =>
-                            {
-                                latest_in_entry_checkpoints
-                                    .insert(counter_names, (position, entry_id));
-                            }
-
-                            Some(ChangesetMessage::FinishEntry(bookmark))
-                                if encountered_error.is_none() =>
-                            {
-                                // Accumulate the contiguous chain of moves. The
-                                // flush replays every move to the replica so it
-                                // reuses each source log id.
-                                latest_entry_ids
-                                    .insert(bookmark.counter_names.clone(), bookmark.log_id);
-                                latest_bookmark_chain.push(bookmark);
-                            }
-
-                            Some(ChangesetMessage::NotifyCompletion(sender))
-                                if encountered_error.is_none() =>
-                            {
-                                pending_notification = Some(sender);
-                            }
-
-                            Some(ChangesetMessage::NotifyCompletion(sender)) => {
-                                let e = encountered_error.unwrap();
-                                let _ = sender.send(Err(anyhow::anyhow!(
-                                    "Error processing changesets: {e:?}"
-                                )));
-                                return Err(e);
-                            }
-
-                            Some(ChangesetMessage::Log((_, lag)))
-                                if encountered_error.is_none() =>
-                            {
-                                pending_log.push_back(lag);
-                            }
-                            None => break,
-
-                            // Ignore any other action if there's an error
-                            _ => {}
-                        }
-
-                        if current_batch.len() >= self.config.batch_size as usize {
-                            let now = std::time::Instant::now();
-                            let changeset_ids = current_batch.iter().map(|c| c.1.get_changeset_id()).collect::<Vec<_>>();
-                            stat::log_upload_changeset_start(&ctx, changeset_ids.clone());
-                            match ChangesetManager::flush_batch(reponame.clone(), &ctx, &changeset_es, mc.clone(), &mut current_batch, &mut pending_log, &mut latest_in_entry_checkpoints, &mut latest_entry_ids, &mut latest_bookmark_chain, &mut pending_notification)
-                            .await
-                            {
-                                Ok(()) => {
-                                    stat::log_upload_changeset_done(&ctx, changeset_ids, now.elapsed());
+                                    let elapsed = start.elapsed().as_secs();
+                                    STATS::trees_files_wait_time_s
+                                        .add_value(elapsed as i64, (reponame.clone(),));
                                 }
                                 Err(e) => {
-                                    stat::log_upload_changeset_error(&ctx, changeset_ids, &e, now.elapsed());
-                                    return Err(anyhow::anyhow!(
-                                        "Error processing changesets: {e:?}"
+                                    encountered_error.get_or_insert(anyhow::anyhow!(
+                                        "Error waiting for files/trees error received {e:#}"
                                     ));
                                 }
                             }
                         }
+
+                        Some(ChangesetMessage::Changeset((hg_cs, bcs)))
+                            if encountered_error.is_none() =>
+                        {
+                            current_batch.push((hg_cs, bcs));
+                        }
+
+                        Some(ChangesetMessage::CheckpointInEntry {
+                            position,
+                            entry_id,
+                            counter_names,
+                        })
+                            if encountered_error.is_none() =>
+                        {
+                            latest_in_entry_checkpoints
+                                .insert(counter_names, (position, entry_id));
+                        }
+
+                        Some(ChangesetMessage::FinishEntry(bookmark))
+                            if encountered_error.is_none() =>
+                        {
+                            // Accumulate the contiguous chain of moves. The
+                            // flush replays every move to the replica so it
+                            // reuses each source log id.
+                            latest_entry_ids
+                                .insert(bookmark.counter_names.clone(), bookmark.log_id);
+                            latest_bookmark_chain.push(bookmark);
+                        }
+
+                        Some(ChangesetMessage::NotifyCompletion(sender))
+                            if encountered_error.is_none() =>
+                        {
+                            pending_notification = Some(sender);
+                        }
+
+                        Some(ChangesetMessage::NotifyCompletion(sender)) => {
+                            let e = encountered_error.unwrap();
+                            let _ = sender.send(Err(anyhow::anyhow!(
+                                "Error processing changesets: {e:?}"
+                            )));
+                            // The failure came from an upstream manager,
+                            // which reports it.
+                            return Ok(());
+                        }
+
+                        Some(ChangesetMessage::Log((_, lag)))
+                            if encountered_error.is_none() =>
+                        {
+                            pending_log.push_back(lag);
+                        }
+                        None => break,
+
+                        // Ignore any other action if there's an error
+                        _ => {}
                     }
-                    _ = flush_timer.tick() =>
-                    {
+
+                    if current_batch.len() >= self.config.batch_size as usize {
                         let now = std::time::Instant::now();
                         let changeset_ids = current_batch.iter().map(|c| c.1.get_changeset_id()).collect::<Vec<_>>();
                         stat::log_upload_changeset_start(&ctx, changeset_ids.clone());
@@ -364,19 +337,36 @@ impl Manager for ChangesetManager {
                         .await
                         {
                             Ok(()) => {
-                                    stat::log_upload_changeset_done(&ctx, changeset_ids, now.elapsed());
+                                stat::log_upload_changeset_done(&ctx, changeset_ids, now.elapsed());
                             }
                             Err(e) => {
                                 stat::log_upload_changeset_error(&ctx, changeset_ids, &e, now.elapsed());
-                                return Err(anyhow::anyhow!("Error processing changesets: {e:?}"));
+                                return Err(e);
                             }
                         }
                     }
                 }
+                _ = flush_timer.tick() =>
+                {
+                    let now = std::time::Instant::now();
+                    let changeset_ids = current_batch.iter().map(|c| c.1.get_changeset_id()).collect::<Vec<_>>();
+                    stat::log_upload_changeset_start(&ctx, changeset_ids.clone());
+                    match ChangesetManager::flush_batch(reponame.clone(), &ctx, &changeset_es, mc.clone(), &mut current_batch, &mut pending_log, &mut latest_in_entry_checkpoints, &mut latest_entry_ids, &mut latest_bookmark_chain, &mut pending_notification)
+                    .await
+                    {
+                        Ok(()) => {
+                                stat::log_upload_changeset_done(&ctx, changeset_ids, now.elapsed());
+                        }
+                        Err(e) => {
+                            stat::log_upload_changeset_error(&ctx, changeset_ids, &e, now.elapsed());
+                            return Err(e);
+                        }
+                    }
+                }
             }
+        }
 
-            Ok(())
-        });
+        Ok(())
     }
 }
 
@@ -387,12 +377,27 @@ mod tests {
 
     use async_trait::async_trait;
     use fbinit::FacebookInit;
+    use mononoke_macros::mononoke;
 
     use super::*;
+    use crate::sender::edenapi::NoopEdenapiSender;
 
     #[derive(Default)]
     struct TestMutableCounters {
         counters: RwLock<HashMap<String, i64>>,
+        /// Writes to this counter fail, as a SQL error would.
+        fail_writes_to: Option<String>,
+    }
+
+    impl TestMutableCounters {
+        fn check_writable(&self, name: &str) -> Result<()> {
+            match &self.fail_writes_to {
+                Some(failing) if failing == name => {
+                    Err(anyhow!("injected failure writing counter {name}"))
+                }
+                _ => Ok(()),
+            }
+        }
     }
 
     #[async_trait]
@@ -421,6 +426,7 @@ mod tests {
             value: i64,
             prev_value: Option<i64>,
         ) -> Result<bool> {
+            self.check_writable(name)?;
             let mut counters = self.counters.write().expect("test counter lock poisoned");
             if let Some(prev_value) = prev_value
                 && counters.get(name).copied() != Some(prev_value)
@@ -429,6 +435,22 @@ mod tests {
             }
             counters.insert(name.to_string(), value);
             Ok(true)
+        }
+
+        async fn set_counters(&self, _ctx: &CoreContext, counters: &[(&str, i64)]) -> Result<()> {
+            // Like the SQL transaction, a failing write applies none of them.
+            counters
+                .iter()
+                .try_for_each(|(name, _)| self.check_writable(name))?;
+            self.counters
+                .write()
+                .expect("test counter lock poisoned")
+                .extend(
+                    counters
+                        .iter()
+                        .map(|(name, value)| ((*name).to_owned(), *value)),
+                );
+            Ok(())
         }
 
         async fn set_counter_if_absent(
@@ -478,6 +500,50 @@ mod tests {
             BookmarkUpdateLogId(130),
         );
         assert_eq!(counters.get_counter(&ctx, "completed").await?, Some(130));
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn failed_checkpoint_position_write(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let names = ModernSyncCounterNames::legacy();
+        // Entry 10 was checkpointed 500 commits in.
+        let counters = Arc::new(TestMutableCounters {
+            counters: RwLock::new(HashMap::from([
+                (names.current_entry.clone(), 10),
+                (names.batch_checkpoint.clone(), 500),
+            ])),
+            fail_writes_to: Some(names.batch_checkpoint.clone()),
+        });
+        let sender: Arc<dyn EdenapiSender + Send + Sync> = Arc::new(NoopEdenapiSender::default());
+
+        // Entry 11 reaches position 3, but writing the position fails.
+        let flushed = ChangesetManager::flush_batch(
+            "repo".to_owned(),
+            &ctx,
+            &sender,
+            counters.clone(),
+            &mut Vec::new(),
+            &mut VecDeque::new(),
+            &mut HashMap::from([(names.clone(), (3, 11))]),
+            &mut HashMap::new(),
+            &mut Vec::new(),
+            &mut None,
+        )
+        .await;
+        assert!(
+            flushed.is_err(),
+            "a failed checkpoint write must fail the flush"
+        );
+
+        let stored_pair = (
+            counters.get_counter(&ctx, &names.current_entry).await?,
+            counters.get_counter(&ctx, &names.batch_checkpoint).await?,
+        );
+        // Neither counter moved, so the reader still sees entry 10's
+        // checkpoint and starts entry 11 from its first commit.
+        assert_eq!(stored_pair, (Some(10), Some(500)));
 
         Ok(())
     }

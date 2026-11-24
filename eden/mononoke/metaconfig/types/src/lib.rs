@@ -151,10 +151,12 @@ pub struct CommonConfig {
     /// Whether to enable the control API over HTTP. At this time, this is only meant to be used in
     /// tests.
     pub enable_http_control_api: bool,
-    /// Configuration for redaction of blobs
-    pub redaction_config: RedactionConfig,
-    /// Service identity for internal Mononoke services.
-    pub internal_identity: Identity,
+    /// Where the tier's redaction sets are. `None` means the tier has no
+    /// redaction, so only repos with redaction disabled can be served.
+    pub redaction_config: Option<RedactionConfig>,
+    /// Service identity for internal Mononoke services. `None` means there is
+    /// none: no CAT verifies and no request counts as internal.
+    pub internal_identity: Option<Identity>,
     /// Upper bound in bytes for the RSS memory that can be utilized by Mononoke GRit
     /// server for serving packfile stream
     pub git_memory_upper_bound: Option<u64>,
@@ -167,6 +169,83 @@ pub struct CommonConfig {
     /// Repo-name marker -> manifest repo, routing diverted pushes to the
     /// manifest repo named in their submit_manifest_land request.
     pub multi_repo_land_manifest_repos: BTreeMap<String, String>,
+    /// Manifest repo name -> the manifest format it holds. A manifest repo
+    /// absent here is [`ManifestFormatKind::Aosp`].
+    pub multi_repo_land_manifest_formats: BTreeMap<String, ManifestFormatKind>,
+    /// Manifest repo name -> where its pinned manifest lives, relative to the
+    /// repo root. A manifest repo absent here uses its format's default.
+    pub multi_repo_land_pinned_manifest_paths: BTreeMap<String, String>,
+    /// Scribe category of the process-wide bookmark event fan-out reader.
+    /// `None` keeps the per-repository bookmark event listeners.
+    pub bookmark_events_category: Option<String>,
+    /// The Perforce servers p4_sync imports from, by the alias repos name in
+    /// `p4_source.server_alias`.
+    pub p4_servers: BTreeMap<String, P4ServerConfig>,
+}
+
+/// The manifest format a Multi-Repo Land manifest repo holds.
+#[derive(Eq, Clone, Copy, Debug, Default, PartialEq, Hash)]
+pub enum ManifestFormatKind {
+    /// git-repo XML: `default.xml`, pinned into `static/static.xml`.
+    #[default]
+    Aosp,
+    /// Zephyr west: `west.yml`.
+    West,
+}
+
+impl ManifestFormatKind {
+    /// The format of `manifest_repo`, from a common config's format map.
+    pub fn for_manifest_repo(
+        formats: &BTreeMap<String, ManifestFormatKind>,
+        manifest_repo: &str,
+    ) -> Self {
+        formats.get(manifest_repo).copied().unwrap_or_default()
+    }
+
+    /// The symbolic manifest every branch of a repo of this format is read from.
+    pub const fn root_manifest_path(self) -> &'static str {
+        match self {
+            ManifestFormatKind::Aosp => "default.xml",
+            ManifestFormatKind::West => "west.yml",
+        }
+    }
+
+    /// Where the pinned manifest goes unless the repo's config says otherwise.
+    pub const fn default_pinned_manifest_path(self) -> &'static str {
+        match self {
+            ManifestFormatKind::Aosp => "static/static.xml",
+            ManifestFormatKind::West => "west-release.yml",
+        }
+    }
+}
+
+impl CommonConfig {
+    /// The manifest format of `manifest_repo`.
+    pub fn manifest_format(&self, manifest_repo: &str) -> ManifestFormatKind {
+        ManifestFormatKind::for_manifest_repo(&self.multi_repo_land_manifest_formats, manifest_repo)
+    }
+
+    /// Where `manifest_repo`'s pinned manifest lives: its configured path, else
+    /// its format's default.
+    pub fn pinned_manifest_path(&self, manifest_repo: &str) -> String {
+        self.multi_repo_land_pinned_manifest_paths
+            .get(manifest_repo)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.manifest_format(manifest_repo)
+                    .default_pinned_manifest_path()
+                    .to_string()
+            })
+    }
+}
+
+impl CommonConfig {
+    /// The tier's redaction config, or an error if the tier has none.
+    pub fn require_redaction_config(&self) -> Result<&RedactionConfig> {
+        self.redaction_config
+            .as_ref()
+            .context("the tier has no redaction config")
+    }
 }
 
 /// Configuration for logging of censored blobstore accesses
@@ -305,13 +384,19 @@ pub struct RepoConfig {
     /// The Perforce depot this repo mirrors; set only on repos under
     /// `repos/p4/`.
     pub p4_source: Option<P4SourceConfig>,
-    /// Version of the per-repo config snapshot this config was parsed from
-    /// (the last content-changing parse); `None` unless loaded via a
-    /// per-repo config handle.
-    pub config_version: Option<String>,
-    /// Mutation ID of the per-repo config snapshot; always `None` until the
-    /// configerator client exposes mutationId.
-    pub config_mutation_id: Option<i64>,
+}
+
+/// The configerator snapshot of the spec a repo's config was parsed from: the
+/// last content-changing parse. Empty for a config not loaded through a
+/// per-repo config handle.
+#[facet::facet]
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct RepoConfigSource {
+    /// Version of the snapshot.
+    pub version: Option<String>,
+    /// Mutation ID of the snapshot; always `None` until the configerator
+    /// client exposes mutationId.
+    pub mutation_id: Option<i64>,
 }
 
 /// Config determining if the repo is deep sharded in the context of a service.
@@ -425,6 +510,9 @@ pub struct DerivedDataConfig {
 
     /// Repo-level pipeline configuration.
     pub pipeline_config: Option<DerivationPipelineConfig>,
+
+    /// Pipeline layout for independent shadow derivation and verification.
+    pub shadow_pipeline_config: Option<DerivationPipelineConfig>,
 }
 
 impl DerivedDataConfig {
@@ -493,8 +581,20 @@ impl DerivedDataConfig {
 /// A single stage in a derivation pipeline, keyed by its absolute path.
 #[derive(Eq, Clone, Debug, PartialEq)]
 pub struct DerivationPipelineStageConfig {
+    /// First-byte partition cut points, in strictly increasing order.
+    pub partition_cut_points: Vec<u8>,
     /// Absolute paths of stages this one directly depends on.
     pub dependencies: Vec<MPath>,
+}
+
+impl DerivationPipelineStageConfig {
+    /// Create an unpartitioned stage with the given child-stage dependencies.
+    pub fn new(dependencies: Vec<MPath>) -> Self {
+        Self {
+            dependencies,
+            partition_cut_points: Vec::new(),
+        }
+    }
 }
 
 /// Pipeline configuration. The terminal stage is the one at `MPath::ROOT`.
@@ -506,30 +606,64 @@ pub struct DerivationPipelineConfig {
     pub bookmarks: Vec<BookmarkKey>,
     /// Stage DAG keyed by absolute path.
     pub stages: HashMap<MPath, DerivationPipelineStageConfig>,
+    /// Complete layouts in each type's manifest namespace.
+    pub stages_by_type: HashMap<DerivableType, HashMap<MPath, DerivationPipelineStageConfig>>,
     /// Maximum commits per batch.
     pub batch_size: NonZeroU64,
 }
 
 impl DerivationPipelineConfig {
+    /// Return the complete layout for a type, falling back to the shared layout.
+    pub fn stages_for(&self, ty: DerivableType) -> &HashMap<MPath, DerivationPipelineStageConfig> {
+        self.stages_by_type.get(&ty).unwrap_or(&self.stages)
+    }
+
     /// Validate the pipeline configuration.
     pub fn validate(&self) -> Result<()> {
         if self.types.is_empty() {
             bail!("Derivation pipeline config must have at least one derivable type");
         }
 
-        for (stage_path, config) in &self.stages {
+        for ty in self.stages_by_type.keys() {
+            if !self.types.contains(ty) {
+                bail!("Stage override for disabled pipeline type {ty:?}");
+            }
+        }
+        for stages in std::iter::once(&self.stages).chain(self.stages_by_type.values()) {
+            Self::validate_stages(stages)?;
+        }
+        Ok(())
+    }
+
+    fn validate_stages(stages: &HashMap<MPath, DerivationPipelineStageConfig>) -> Result<()> {
+        for (stage_path, config) in stages {
+            if !config.partition_cut_points.is_empty() {
+                if !config.dependencies.is_empty() {
+                    bail!("Partitioned stage {stage_path} must not have child stages");
+                }
+                if config.partition_cut_points[0] == 0
+                    || !config
+                        .partition_cut_points
+                        .windows(2)
+                        .all(|pair| pair[0] < pair[1])
+                {
+                    bail!(
+                        "Stage {stage_path} partition cut points must be strictly increasing and exclude zero"
+                    );
+                }
+            }
             for dep in &config.dependencies {
-                if !self.stages.contains_key(dep) {
+                if !stages.contains_key(dep) {
                     bail!("Stage {stage_path:?} depends on {dep:?}, which does not exist",);
                 }
             }
         }
 
-        if !self.stages.contains_key(&MPath::ROOT) {
+        if !stages.contains_key(&MPath::ROOT) {
             bail!("Derivation pipeline config must have a stage at root");
         }
 
-        for (stage_path, stage) in &self.stages {
+        for (stage_path, stage) in stages {
             for dep_path in &stage.dependencies {
                 if !stage_path.is_prefix_of(dep_path)
                     || dep_path.num_components() != stage_path.num_components() + 1
@@ -541,8 +675,8 @@ impl DerivationPipelineConfig {
             }
         }
 
-        let mut in_degree: HashMap<&MPath, usize> = self.stages.keys().map(|p| (p, 0)).collect();
-        for config in self.stages.values() {
+        let mut in_degree: HashMap<&MPath, usize> = stages.keys().map(|p| (p, 0)).collect();
+        for config in stages.values() {
             for dep in &config.dependencies {
                 if let Some(count) = in_degree.get_mut(dep) {
                     *count += 1;
@@ -804,8 +938,6 @@ pub struct CacheWarmupParams {
     /// Max number to fetch during commit warmup. If not set in the config, then set to a default
     /// value.
     pub commit_limit: usize,
-    /// Whether to use microwave to accelerate cache warmup.
-    pub microwave_preload: bool,
 }
 
 /// Configuration for the hook manager
@@ -1313,6 +1445,24 @@ pub struct GlobalrevConfig {
     pub globalrevs_small_repo_id: Option<RepositoryId>,
 }
 
+/// Generated JSON files whose root `source_revision` must advance by exactly
+/// one with every semantic change landed onto `bookmark`: the immediate
+/// `*.json` children of `directories`, which all share one revision.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SourceRevisionGuardConfig {
+    /// The bookmark whose pushrebases are checked.
+    pub bookmark: BookmarkKey,
+    /// The authoritative directory first, then the mirrored copies that must
+    /// hold the same files with the same content and revision.
+    pub directories: Vec<NonRootMPath>,
+    /// The most entries one guarded directory may have.
+    pub max_files: usize,
+    /// The largest guarded file, in bytes, that pushrebase will read.
+    pub max_file_bytes: u64,
+    /// The most bytes pushrebase will read for one commit's guarded files.
+    pub max_total_bytes: u64,
+}
+
 /// Pushrebase configuration options
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PushrebaseParams {
@@ -1334,6 +1484,9 @@ pub struct PushrebaseParams {
     pub allow_change_xrepo_mapping_extra: bool,
     /// How to do pushrebase on Mononoke
     pub remote_mode: PushrebaseRemoteMode,
+    /// Generated files whose `source_revision` pushrebase checks before
+    /// moving the bookmark; `None` checks nothing.
+    pub source_revision_guard: Option<SourceRevisionGuardConfig>,
 }
 
 impl Default for PushrebaseParams {
@@ -1346,6 +1499,7 @@ impl Default for PushrebaseParams {
             populate_git_mapping: false,
             allow_change_xrepo_mapping_extra: false,
             remote_mode: PushrebaseRemoteMode::Local,
+            source_revision_guard: None,
         }
     }
 }
@@ -1426,7 +1580,7 @@ pub struct StorageConfig {
     /// Blobstore for ephemeral changesets and snapshots.  If omitted
     /// then this repo cannot store ephemeral changesets or snapshots.
     pub ephemeral_blobstore: Option<EphemeralBlobstoreConfig>,
-    /// Mutable blobstore, for storing mutable data like microwave
+    /// Mutable blobstore, for storing mutable data.
     pub mutable_blobstore: BlobConfig,
 }
 
@@ -2416,7 +2570,7 @@ pub enum ZelosConfig {
 
 /// Configuration for git's bundle-uri feature
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
-pub struct GitBundleURIConfig {
+pub struct GitBundleUriConfig {
     /// Specifies what flavor of uri generator should be used.
     pub uri_generator_type: UriGeneratorType,
     /// Whether to support bundle-uri for untrusted clients
@@ -2442,7 +2596,7 @@ pub enum UriGeneratorType {
     },
     /// Use local FS as the URI generator
     #[default]
-    LocalFS,
+    LocalFs,
 }
 
 /// The concurrency setting to be used during git protocol
@@ -2476,7 +2630,7 @@ pub struct GitConfigs {
     /// if the repo enables this feature through a JK.
     pub fetch_message: Option<String>,
     /// Config for the git's bundle-uri feature
-    pub git_bundle_uri: Option<GitBundleURIConfig>,
+    pub git_bundle_uri: Option<GitBundleUriConfig>,
     /// Blobstore key for the preloaded CGDM blob
     pub preloaded_cgdm_blobstore_key: Option<String>,
 }
@@ -2485,11 +2639,27 @@ pub struct GitConfigs {
 /// depot of one server.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct P4SourceConfig {
-    /// The server, as the p4_sync job names it in `--p4-server-alias`
-    /// (e.g. `test1`), not a P4PORT.
+    /// The server: a key of [`CommonConfig::p4_servers`] (e.g. `test1`), not a P4PORT.
     pub server_alias: String,
     /// The depot root as a depot path, `//name/`.
     pub depot: String,
+    /// The charsets depot paths are decoded with, as encoding_rs labels, tried in order.
+    /// `None`: UTF-8 only.
+    pub path_charsets: Option<Vec<String>>,
+}
+
+/// A Perforce server the `repos/p4/` mirrors import from. Secrets are Keychain names, never
+/// values.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct P4ServerConfig {
+    /// The host the mirrors read from: the server's primary or its standby.
+    pub host: String,
+    /// That host's SSL fingerprint as `p4 trust -l` prints it, pinned.
+    pub fingerprint: String,
+    /// The service account the mirrors import as.
+    pub user: String,
+    /// Keychain secret holding an all-hosts ticket for `user`.
+    pub ticket_secret: String,
 }
 
 /// Configuration for x repo syncs
@@ -3007,24 +3177,9 @@ mod tests {
         Ok(())
     }
 
-    #[mononoke::test]
-    fn test_repo_config_default_has_no_provenance() {
-        let config = RepoConfig::default();
-        assert_eq!(
-            config.config_version, None,
-            "a default RepoConfig must carry no config version"
-        );
-        assert_eq!(
-            config.config_mutation_id, None,
-            "a default RepoConfig must carry no config mutation id"
-        );
-    }
-
     /// Build a stage with the given dependency paths.
     fn stage(deps: Vec<&str>) -> DerivationPipelineStageConfig {
-        DerivationPipelineStageConfig {
-            dependencies: deps.into_iter().map(mp).collect(),
-        }
+        DerivationPipelineStageConfig::new(deps.into_iter().map(mp).collect())
     }
 
     /// Build a `DerivationPipelineConfig` with the given (path, stage) pairs
@@ -3033,6 +3188,7 @@ mod tests {
         stages: Vec<(&str, DerivationPipelineStageConfig)>,
     ) -> DerivationPipelineConfig {
         DerivationPipelineConfig {
+            stages_by_type: Default::default(),
             types: BTreeSet::from([DerivableType::Fsnodes]),
             bookmarks: vec![],
             stages: stages.into_iter().map(|(p, s)| (mp(p), s)).collect(),
@@ -3063,6 +3219,7 @@ mod tests {
     #[mononoke::test]
     fn test_pipeline_config_rejects_empty_types() {
         let config = DerivationPipelineConfig {
+            stages_by_type: Default::default(),
             types: BTreeSet::new(),
             ..pipeline_config(vec![("", stage(vec![]))])
         };
@@ -3112,5 +3269,22 @@ mod tests {
     #[mononoke::test]
     fn test_acl_manifest_mode_default_is_disabled() {
         assert_eq!(AclManifestMode::default(), AclManifestMode::Disabled);
+    }
+    #[mononoke::test]
+    fn partition_cut_points_must_be_ordered_and_on_leaf_stages() {
+        for cuts in [vec![0], vec![100, 100], vec![200, 100]] {
+            let mut root = stage(vec![]);
+            root.partition_cut_points = cuts;
+            assert!(pipeline_config(vec![("", root)]).validate().is_err());
+        }
+        let mut root = stage(vec![]);
+        root.partition_cut_points = vec![1, 100, 255];
+        assert!(pipeline_config(vec![("", root.clone())]).validate().is_ok());
+        root.dependencies = vec![mp("child")];
+        assert!(
+            pipeline_config(vec![("", root), ("child", stage(vec![]))])
+                .validate()
+                .is_err()
+        );
     }
 }

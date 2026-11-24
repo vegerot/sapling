@@ -12,11 +12,13 @@ use std::collections::BTreeSet;
 #[cfg(fbcode_build)]
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use acl_regions::ArcAclRegions;
 use acl_regions::build_acl_regions;
 use anyhow::Result;
 use blobstore::Blobstore;
+use blobstore::BlobstoreEnumerableWithUnlink;
 use bonsai_git_mapping::ArcBonsaiGitMapping;
 use bonsai_git_mapping::SqlBonsaiGitMappingBuilder;
 use bonsai_globalrev_mapping::ArcBonsaiGlobalrevMapping;
@@ -36,7 +38,7 @@ use bookmarks_cache::ArcBookmarksCache;
 use bookmarks_cache::WarmerRequirement;
 use bundle_uri::ArcGitBundleUri;
 use bundle_uri::BundleUri;
-use bundle_uri::LocalFSBUndleUriGenerator;
+use bundle_uri::LocalFsBundleUrlGenerator;
 use bundle_uri::SqlGitBundleMetadataStorageBuilder;
 use cacheblob::InProcessLease;
 use commit_cloud::ArcCommitCloud;
@@ -58,6 +60,7 @@ use enabled_derived_data_types::ArcEnabledDerivedDataTypes;
 use enabled_derived_data_types::SqlEnabledDerivedDataTypesBuilder;
 use ephemeral_blobstore::ArcRepoEphemeralStore;
 use ephemeral_blobstore::RepoEphemeralStore;
+use ephemeral_blobstore::RepoEphemeralStoreBuilder;
 use fbinit::FacebookInit;
 use filenodes::ArcFilenodes;
 use filestore::ArcFilestoreConfig;
@@ -86,7 +89,9 @@ use metaconfig_parser::RepoConfigs;
 #[cfg(fbcode_build)]
 use metaconfig_parser::StorageConfigs;
 use metaconfig_types::ArcRepoConfig;
+use metaconfig_types::ArcRepoConfigSource;
 use metaconfig_types::BlameVersion;
+use metaconfig_types::BubbleDeletionMode;
 #[cfg(fbcode_build)]
 use metaconfig_types::CommonConfig;
 use metaconfig_types::ComparableRegex;
@@ -99,6 +104,7 @@ use metaconfig_types::InferredCopyFromConfig;
 use metaconfig_types::InfinitepushNamespace;
 use metaconfig_types::InfinitepushParams;
 use metaconfig_types::RepoConfig;
+use metaconfig_types::RepoConfigSource;
 use metaconfig_types::SourceControlServiceParams;
 use metaconfig_types::UnodeVersion;
 #[cfg(fbcode_build)]
@@ -210,6 +216,7 @@ pub struct TestRepoFactory {
     restricted_paths: Option<ArcRestrictedPaths>,
     acl_provider: Option<Arc<dyn AclProvider>>,
     repo_derivation_queues: Option<ArcRepoDerivationQueues>,
+    ephemeral_blobstore: Option<Arc<dyn BlobstoreEnumerableWithUnlink>>,
 }
 
 /// The default derived data types configuration for test repositories.
@@ -368,6 +375,7 @@ impl TestRepoFactory {
             restricted_paths: None,
             acl_provider: None,
             repo_derivation_queues: None,
+            ephemeral_blobstore: None,
         })
     }
 
@@ -420,6 +428,12 @@ impl TestRepoFactory {
         repo_derivation_queues: ArcRepoDerivationQueues,
     ) -> &mut Self {
         self.repo_derivation_queues = Some(repo_derivation_queues);
+        self
+    }
+
+    /// Give repos built by this factory an in-memory ephemeral store.
+    pub fn with_ephemeral_store(&mut self) -> &mut Self {
+        self.ephemeral_blobstore = Some(Arc::new(Memblob::default()));
         self
     }
 
@@ -500,6 +514,11 @@ impl TestRepoFactory {
     /// Construct RepoConfig based on the config in the factory.
     pub fn repo_config(&self) -> ArcRepoConfig {
         Arc::new(self.config.clone())
+    }
+
+    /// Test repos are not loaded from configerator, so they have no source.
+    pub fn repo_config_source(&self) -> ArcRepoConfigSource {
+        Arc::new(RepoConfigSource::default())
     }
 
     /// Construct RepoIdentity based on the config and name in the factory.
@@ -625,7 +644,7 @@ impl TestRepoFactory {
             SqlGitBundleMetadataStorageBuilder::from_sql_connections(self.metadata_db.clone())
                 .build(repo_identity.id());
 
-        let generator = LocalFSBUndleUriGenerator {};
+        let generator = LocalFsBundleUrlGenerator {};
         let bundle_uri = BundleUri::new(storage, generator, repo_identity.id()).await?;
         Ok(Arc::new(bundle_uri))
     }
@@ -769,7 +788,8 @@ impl TestRepoFactory {
             self.redacted.clone(),
             repo_identity.id(),
             MononokeScubaSampleBuilder::with_discard(),
-        );
+        )
+        .with_hg_manifest_read_check(repo_identity.name());
         Arc::new(repo_blobstore)
     }
 
@@ -796,8 +816,21 @@ impl TestRepoFactory {
     }
 
     /// Disabled ephemeral repo
-    pub fn repo_ephemeral_store(&self, repo_identity: &ArcRepoIdentity) -> ArcRepoEphemeralStore {
-        Arc::new(RepoEphemeralStore::disabled(repo_identity.id()))
+    pub fn repo_ephemeral_store(
+        &self,
+        repo_identity: &ArcRepoIdentity,
+    ) -> Result<ArcRepoEphemeralStore> {
+        let Some(blobstore) = &self.ephemeral_blobstore else {
+            return Ok(Arc::new(RepoEphemeralStore::disabled(repo_identity.id())));
+        };
+        let store = RepoEphemeralStoreBuilder::with_sqlite_in_memory()?.build(
+            repo_identity.id(),
+            blobstore.clone(),
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            BubbleDeletionMode::MarkAndDelete,
+        );
+        Ok(Arc::new(store))
     }
 
     /// Mutable renames
@@ -841,6 +874,7 @@ impl TestRepoFactory {
     /// Restricted paths
     pub fn restricted_paths(
         &self,
+        repo_identity: &ArcRepoIdentity,
         restricted_paths_config_based: &ArcRestrictedPathsConfigBased,
         repo_derived_data: &ArcRepoDerivedData,
     ) -> Result<ArcRestrictedPaths> {
@@ -857,6 +891,7 @@ impl TestRepoFactory {
         let scuba_builder = MononokeScubaSampleBuilder::with_discard();
 
         Ok(Arc::new(RestrictedPaths::new(
+            repo_identity.name().to_string(),
             restricted_paths_config_based.clone(),
             acl_provider,
             scuba_builder,
@@ -1128,6 +1163,12 @@ impl TestRepoFactory {
                     repo_event_publisher.clone(),
                     WarmerRequirement::AllKinds,
                 );
+                #[cfg(fbcode_build)]
+                if let Some(metadata) = self.repo_config().metadata_cache_config.as_ref() {
+                    warm_bookmarks_cache_builder.set_event_router_configured(
+                        metadata.wbc_event_router_scribe_category().is_some(),
+                    );
+                }
                 warm_bookmarks_cache_builder.add_all_warmers(repo_derived_data, phases)?;
                 warm_bookmarks_cache_builder.wait_until_warmed();
                 Ok(Arc::new(warm_bookmarks_cache_builder.build().await?))
@@ -1170,5 +1211,55 @@ impl TestRepoFactory {
         self.repo_derivation_queues.clone().unwrap_or_else(|| {
             Arc::new(RepoDerivationQueues::new(std::collections::HashMap::new()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ephemeral_blobstore::RepoEphemeralStoreRef;
+    use mononoke_macros::mononoke;
+
+    use super::*;
+
+    #[facet::container]
+    struct EphemeralTestRepo {
+        #[facet]
+        repo_ephemeral_store: RepoEphemeralStore,
+    }
+
+    #[mononoke::fbinit_test]
+    async fn default_ephemeral_store_is_disabled(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: EphemeralTestRepo = TestRepoFactory::new(fb)?.build().await?;
+
+        assert!(
+            repo.repo_ephemeral_store()
+                .create_bubble(&ctx, None, vec![])
+                .await
+                .is_err(),
+            "the default test repo has no ephemeral store"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn with_ephemeral_store_creates_bubbles(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: EphemeralTestRepo = TestRepoFactory::new(fb)?
+            .with_ephemeral_store()
+            .build()
+            .await?;
+
+        let bubble = repo
+            .repo_ephemeral_store()
+            .create_bubble(&ctx, None, vec![])
+            .await?;
+        let reopened = repo
+            .repo_ephemeral_store()
+            .open_bubble(&ctx, bubble.bubble_id())
+            .await?;
+
+        assert_eq!(reopened.bubble_id(), bubble.bubble_id());
+        Ok(())
     }
 }

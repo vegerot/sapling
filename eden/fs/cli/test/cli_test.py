@@ -7,7 +7,9 @@
 # pyre-strict
 
 import argparse
+import contextlib
 import errno
+import io
 import json
 import os
 import unittest
@@ -15,7 +17,13 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import toml
-from eden.fs.cli import config as config_mod, main as main_mod, telemetry, util
+from eden.fs.cli import (
+    config as config_mod,
+    main as main_mod,
+    redirect as redirect_mod,
+    telemetry,
+    util,
+)
 from eden.fs.cli.config import (
     CheckoutConfig,
     DEFAULT_REVISION,
@@ -347,9 +355,7 @@ class RestartTest(unittest.TestCase):
             "Graceful restart failed, and old EdenFS process resumed",
             telemetry_sample.strings["error"],
         )
-        # FIXME: The sample should carry the old daemon's refusal, with
-        # strings["daemon_error"] equal to daemon_error.
-        self.assertNotIn("daemon_error", telemetry_sample.strings)
+        self.assertEqual(daemon_error, telemetry_sample.strings["error_reason"])
 
     def test_graceful_restart_falls_back_on_nfs_transport_mismatch(self) -> None:
         restart_cmd = self.make_restart_cmd()
@@ -551,7 +557,6 @@ class ListTest(unittest.TestCase):
                 redirection_targets={},
                 active_prefetch_profiles=[],
                 use_write_back_cache=False,
-                re_use_case="buck2-default",
                 inode_catalog_type=None,
                 off_mount_repo_dir=False,
             )
@@ -575,7 +580,6 @@ class ListTest(unittest.TestCase):
                 redirection_targets={},
                 active_prefetch_profiles=[],
                 use_write_back_cache=False,
-                re_use_case="buck2-default",
                 inode_catalog_type=None,
                 off_mount_repo_dir=False,
             )
@@ -599,7 +603,6 @@ class ListTest(unittest.TestCase):
                 redirection_targets={},
                 active_prefetch_profiles=[],
                 use_write_back_cache=False,
-                re_use_case="buck2-default",
                 inode_catalog_type=None,
                 off_mount_repo_dir=False,
             )
@@ -623,7 +626,6 @@ class ListTest(unittest.TestCase):
                 redirection_targets={},
                 active_prefetch_profiles=[],
                 use_write_back_cache=False,
-                re_use_case="buck2-default",
                 inode_catalog_type=None,
                 off_mount_repo_dir=False,
             )
@@ -647,7 +649,6 @@ class ListTest(unittest.TestCase):
                 redirection_targets={},
                 active_prefetch_profiles=[],
                 use_write_back_cache=False,
-                re_use_case="buck2-default",
                 inode_catalog_type=None,
                 off_mount_repo_dir=False,
             )
@@ -788,7 +789,6 @@ class ListTest(unittest.TestCase):
                 redirection_targets={},
                 active_prefetch_profiles=[],
                 use_write_back_cache=False,
-                re_use_case="buck2-default",
                 inode_catalog_type=None,
                 off_mount_repo_dir=False,
             )
@@ -812,7 +812,6 @@ class ListTest(unittest.TestCase):
                 redirection_targets={},
                 active_prefetch_profiles=[],
                 use_write_back_cache=False,
-                re_use_case="buck2-default",
                 inode_catalog_type=None,
                 off_mount_repo_dir=False,
             )
@@ -872,6 +871,73 @@ class ListTest(unittest.TestCase):
         )
 
 
+class LeftoverMountPointTest(unittest.TestCase, TemporaryDirectoryMixin):
+    def test_only_edenfs_leftovers_count(self) -> None:
+        tmp = Path(self.make_temporary_directory())
+        empty = tmp / "empty"
+        empty.mkdir()
+        readme_only = tmp / "readme-only"
+        readme_only.mkdir()
+        (readme_only / "README_EDEN.txt").write_text("")
+        with_content = tmp / "with-content"
+        with_content.mkdir()
+        (with_content / "README_EDEN.txt").write_text("")
+        (with_content / "notes.txt").write_text("")
+
+        self.assertTrue(main_mod._is_leftover_mount_point(str(empty)))
+        self.assertTrue(main_mod._is_leftover_mount_point(str(readme_only)))
+        self.assertFalse(main_mod._is_leftover_mount_point(str(with_content)))
+        self.assertFalse(main_mod._is_leftover_mount_point(str(tmp / "missing")))
+
+    def test_a_directory_inside_a_registered_checkout_is_not_a_leftover(self) -> None:
+        mounts = ["/data/users/me/fbsource", "/data/users/me/www/"]
+        self.assertTrue(
+            main_mod._inside_registered_checkout("/data/users/me/fbsource/sub", mounts)
+        )
+        self.assertTrue(
+            main_mod._inside_registered_checkout("/data/users/me/www/x", mounts)
+        )
+        self.assertFalse(
+            main_mod._inside_registered_checkout("/data/users/me/fbsource", mounts)
+        )
+        self.assertFalse(
+            main_mod._inside_registered_checkout("/data/users/me/fbsource2", mounts)
+        )
+
+    def test_cleanup_only_removal_never_deletes_other_content(self) -> None:
+        """The leftover check and the removal are two steps; a file written in
+        between fails the removal instead of being deleted with the directory."""
+        tmp = Path(self.make_temporary_directory())
+        leftover = tmp / "leftover"
+        leftover.mkdir()
+        (leftover / "README_EDEN.txt").write_text("")
+        result = main_mod.remove_checkout_impl(
+            MagicMock(),
+            str(leftover),
+            False,
+            TestOutput(),
+            skip_destroy=True,
+            cleanup_only=True,
+        )
+        self.assertIsNone(result.cleanup_error)
+        self.assertFalse(leftover.exists())
+
+        raced = tmp / "raced"
+        raced.mkdir()
+        (raced / "README_EDEN.txt").write_text("")
+        (raced / "notes.txt").write_text("written after the check")
+        result = main_mod.remove_checkout_impl(
+            MagicMock(),
+            str(raced),
+            False,
+            TestOutput(),
+            skip_destroy=True,
+            cleanup_only=True,
+        )
+        self.assertIsInstance(result.cleanup_error, OSError)
+        self.assertTrue((raced / "notes.txt").exists())
+
+
 class PathIsMissingTest(unittest.TestCase, TemporaryDirectoryMixin):
     def test_only_a_missing_path_is_missing(self) -> None:
         tmp = Path(self.make_temporary_directory())
@@ -884,6 +950,99 @@ class PathIsMissingTest(unittest.TestCase, TemporaryDirectoryMixin):
             "eden.fs.cli.main.os.stat", side_effect=OSError(errno.ENOTCONN, "stale")
         ):
             self.assertFalse(main_mod._path_is_missing(str(tmp / "stale-mount")))
+
+
+class RedirectionBackingLeftBehindTest(unittest.TestCase, TemporaryDirectoryMixin):
+    def test_lists_backing_outside_the_checkout(self) -> None:
+        tmp = Path(self.make_temporary_directory())
+        checkout = MagicMock(path=tmp / "checkout")
+        Redir = redirect_mod.Redirection
+        RedirType = redirect_mod.RedirectionType
+        redirs = {
+            "out": Redir(Path("out"), RedirType.BIND, None, "repo"),
+            "link": Redir(Path("link"), RedirType.SYMLINK, None, "user"),
+            "apfs": Redir(Path("apfs"), RedirType.BIND, None, "user"),
+            "odd": Redir(Path("odd"), RedirType.UNKNOWN, None, "user"),
+        }
+        targets = {
+            Path("out"): tmp / "scratch" / "out",
+            Path("link"): tmp / "scratch" / "link",
+            # macOS APFS redirections store their data in the checkout itself.
+            Path("apfs"): tmp / "checkout" / "apfs",
+        }
+
+        def expand(redir: redirect_mod.Redirection, _checkout: object) -> Path:
+            return targets[redir.repo_path]
+
+        with (
+            patch.object(
+                redirect_mod, "get_configured_redirections", return_value=redirs
+            ),
+            patch.object(Redir, "expand_target_abspath", autospec=True) as target,
+        ):
+            target.side_effect = expand
+            self.assertEqual(
+                [tmp / "scratch" / "out", tmp / "scratch" / "link"],
+                main_mod._redirection_backing_dirs(checkout),
+            )
+
+    def test_measure_dir_counts_nested_files(self) -> None:
+        tmp = Path(self.make_temporary_directory())
+        (tmp / "sub").mkdir()
+        (tmp / "sub" / "file").write_bytes(b"x" * 100_000)
+        size, complete = main_mod._measure_dir(tmp, float("inf"))
+        self.assertTrue(complete)
+        self.assertGreaterEqual(size, 100_000)
+
+    def test_measure_dir_stops_at_the_deadline(self) -> None:
+        tmp = Path(self.make_temporary_directory())
+        (tmp / "file").write_bytes(b"x")
+        self.assertEqual((0, False), main_mod._measure_dir(tmp, 0.0))
+
+    def test_describe_size_says_when_counting_stopped(self) -> None:
+        self.assertEqual("2.0 MB", main_mod._describe_size(2_000_000, True))
+        self.assertEqual("at least 2.0 MB", main_mod._describe_size(2_000_000, False))
+        self.assertEqual("size not measured", main_mod._describe_size(0, False))
+
+    def test_each_directory_gets_its_share_of_the_budget(self) -> None:
+        tmp = Path(self.make_temporary_directory())
+        dirs = [tmp / "a", tmp / "b"]
+        for d in dirs:
+            d.mkdir()
+        budgets = []
+
+        def measure(path: Path, deadline: float) -> tuple[int, bool]:
+            budgets.append(deadline - main_mod.time.monotonic())
+            return 1, True
+
+        with (
+            patch.object(main_mod, "_measure_dir", side_effect=measure),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            main_mod._print_redirection_backing_left_behind(dirs)
+        share = main_mod.REDIRECTION_BACKING_SIZE_BUDGET_SECONDS / 2
+        self.assertEqual(2, len(budgets))
+        for budget in budgets:
+            self.assertAlmostEqual(share, budget, delta=0.5)
+
+    def test_prints_existing_backing_and_how_to_delete_it(self) -> None:
+        tmp = Path(self.make_temporary_directory())
+        backing = tmp / "edenfsZredirectionsZout"
+        backing.mkdir()
+        (backing / "file").write_bytes(b"x" * 100_000)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main_mod._print_redirection_backing_left_behind([backing, tmp / "missing"])
+        self.assertIn(f"  {backing} (", out.getvalue())
+        self.assertNotIn("missing", out.getvalue())
+        self.assertIn("eden du --clean-orphaned", out.getvalue())
+
+    def test_prints_nothing_when_no_backing_is_left(self) -> None:
+        tmp = Path(self.make_temporary_directory())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main_mod._print_redirection_backing_left_behind([tmp / "missing"])
+        self.assertEqual("", out.getvalue())
 
 
 class RemoveCallerErrorTest(unittest.TestCase, TemporaryDirectoryMixin):
@@ -980,6 +1139,281 @@ class ClonePrecheckTest(unittest.TestCase, TemporaryDirectoryMixin):
             ):
                 with self.assertRaisesRegex(Exception, "already configured"):
                     instance.clone(MagicMock(), mount_path, "0" * 40)
+
+
+class CloneRegistrationTest(unittest.TestCase, TemporaryDirectoryMixin):
+    """`clone` registers the checkout in config.json before the mount, so a
+    clone that stops after the mount never leaves an unregistered mount, and a
+    failed mount leaves no entry behind."""
+
+    def make_instance(self) -> tuple[config_mod.EdenInstance, str]:
+        tmp_dir = Path(self.make_temporary_directory())
+        state_dir = tmp_dir / "state"
+        state_dir.mkdir()
+        (state_dir / "config.json").write_text(json.dumps({}))
+        instance = config_mod.EdenInstance(
+            config_dir=state_dir,
+            etc_eden_dir=tmp_dir / "etc",
+            home_dir=tmp_dir / "home",
+        )
+        return instance, str(tmp_dir / "mounts" / "repo")
+
+    def markers(self, instance: config_mod.EdenInstance) -> list[Path]:
+        """The intentionally-unmounted markers in the instance's client
+        directories."""
+        clients_dir = instance._get_clients_dir()
+        return sorted(clients_dir.glob(f"*/{util.INTENTIONALLY_UNMOUNTED}"))
+
+    def checkout_config(self) -> config_mod.CheckoutConfig:
+        return config_mod.CheckoutConfig(
+            backing_repo=Path("/repo"),
+            scm_type="hg",
+            guid="guid",
+            mount_protocol="fuse",
+            case_sensitive=True,
+            require_utf8_path=True,
+            default_revision="master",
+            redirections={},
+            redirection_targets={},
+            active_prefetch_profiles=[],
+            use_write_back_cache=False,
+            inode_catalog_type=None,
+            off_mount_repo_dir=False,
+        )
+
+    @contextlib.contextmanager
+    def thrift_client(
+        self,
+        mount_error: Exception | None,
+        list_mounts: list[MountInfo] | Exception | None = None,
+    ):
+        client = MagicMock()
+        if mount_error is not None:
+            client.mount.side_effect = mount_error
+        if isinstance(list_mounts, Exception):
+            client.listMounts.side_effect = list_mounts
+        else:
+            client.listMounts.return_value = list_mounts or []
+        yield client
+
+    def test_interrupted_post_clone_setup_leaves_a_registered_checkout(self) -> None:
+        instance, mount_path = self.make_instance()
+        with patch.object(
+            instance, "get_thrift_client", lambda timeout=None: self.thrift_client(None)
+        ):
+            with patch.object(
+                instance,
+                "_post_clone_checkout_setup",
+                side_effect=RuntimeError("killed after the mount"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "killed after the mount"):
+                    instance.clone(self.checkout_config(), mount_path, "0" * 40)
+
+        self.assertEqual([mount_path], instance.get_mount_paths())
+
+    def test_clone_marks_the_checkout_intentionally_unmounted_until_the_mount(
+        self,
+    ) -> None:
+        """The marker keeps unmount recovery from mounting the fresh entry
+        before the daemon's own mount; the daemon clears it when it mounts."""
+        instance, mount_path = self.make_instance()
+        markers: list[bool] = []
+
+        @contextlib.contextmanager
+        def thrift_client(timeout=None):
+            client = MagicMock()
+
+            def mount(mount_info) -> None:
+                client_dir = Path(os.fsdecode(mount_info.edenClientPath))
+                markers.append((client_dir / util.INTENTIONALLY_UNMOUNTED).exists())
+
+            client.mount.side_effect = mount
+            yield client
+
+        with patch.object(instance, "get_thrift_client", thrift_client):
+            with patch.object(instance, "_post_clone_checkout_setup"):
+                instance.clone(self.checkout_config(), mount_path, "0" * 40)
+
+        self.assertEqual([True], markers)
+        self.assertEqual([mount_path], instance.get_mount_paths())
+
+    def test_failed_mount_leaves_no_registration(self) -> None:
+        instance, mount_path = self.make_instance()
+        with patch.object(
+            instance,
+            "get_thrift_client",
+            lambda timeout=None: self.thrift_client(RuntimeError("mount failed")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "mount failed"):
+                instance.clone(self.checkout_config(), mount_path, "0" * 40)
+
+        self.assertEqual([], instance.get_mount_paths())
+        self.assertEqual([], self.markers(instance))
+
+    def test_failed_cleanup_does_not_hide_the_mount_error(self) -> None:
+        instance, mount_path = self.make_instance()
+        with patch.object(
+            instance,
+            "get_thrift_client",
+            lambda timeout=None: self.thrift_client(RuntimeError("mount failed")),
+        ):
+            with patch.object(
+                instance,
+                "_remove_path_from_directory_map",
+                side_effect=OSError("config.json is read-only"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "mount failed"):
+                    instance.clone(self.checkout_config(), mount_path, "0" * 40)
+
+    def test_failed_registration_leaves_no_marker(self) -> None:
+        instance, mount_path = self.make_instance()
+        with patch.object(
+            instance,
+            "_add_path_to_directory_map",
+            side_effect=OSError("config.json is read-only"),
+        ):
+            with self.assertRaisesRegex(OSError, "read-only"):
+                instance.clone(self.checkout_config(), mount_path, "0" * 40)
+
+        self.assertEqual([], instance.get_mount_paths())
+        self.assertEqual([], self.markers(instance))
+
+    def test_mount_call_failure_with_a_served_mount_keeps_the_registration(
+        self,
+    ) -> None:
+        """A client-side timeout or a lost reply does not mean the daemon did
+        not mount; the entry stays when the daemon serves the path."""
+        instance, mount_path = self.make_instance()
+        with patch.object(
+            instance,
+            "get_thrift_client",
+            lambda timeout=None: self.thrift_client(TimeoutError("timed out")),
+        ):
+            with patch.object(instance, "_daemon_serves", return_value=True):
+                with self.assertRaises(TimeoutError):
+                    instance.clone(self.checkout_config(), mount_path, "0" * 40)
+
+        self.assertEqual([mount_path], instance.get_mount_paths())
+
+    def test_mount_call_failure_with_an_unanswered_check_keeps_the_registration(
+        self,
+    ) -> None:
+        """When the daemon cannot say whether it mounted, the entry stays: a
+        registered checkout that is not mounted is the ordinary unmounted
+        state, while an unregistered mount is the state this diff prevents."""
+        instance, mount_path = self.make_instance()
+        with patch.object(
+            instance,
+            "get_thrift_client",
+            lambda timeout=None: self.thrift_client(
+                TimeoutError("timed out"), TimeoutError("timed out again")
+            ),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "^timed out$"):
+                instance.clone(self.checkout_config(), mount_path, "0" * 40)
+
+        self.assertEqual([mount_path], instance.get_mount_paths())
+        # Without the marker, the checkout is recovered or mounted like any other.
+        self.assertEqual([], self.markers(instance))
+
+    def test_daemon_serves_is_unknown_when_the_daemon_does_not_answer(self) -> None:
+        instance, mount_path = self.make_instance()
+        served = [
+            MountInfo(
+                mountPoint=os.fsencode(mount_path),
+                edenClientPath=b"/clients/repo",
+                state=MountState.INITIALIZING,
+            )
+        ]
+        # The daemon reports the resolved path; a link to the mount still matches.
+        link = Path(mount_path).parent / "link"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        Path(mount_path).mkdir(exist_ok=True)
+        link.symlink_to(mount_path)
+        cases: list[tuple[list[MountInfo] | Exception, bool | None]] = [
+            (served, True),
+            ([], False),
+            (TimeoutError("timed out"), None),
+        ]
+        with patch.object(
+            instance,
+            "get_thrift_client",
+            lambda timeout=None: self.thrift_client(None, served),
+        ):
+            self.assertIs(True, instance._daemon_serves(link))
+        for list_mounts, expected in cases:
+            with patch.object(
+                instance,
+                "get_thrift_client",
+                lambda timeout=None, mounts=list_mounts: self.thrift_client(
+                    None, mounts
+                ),
+            ):
+                self.assertIs(expected, instance._daemon_serves(Path(mount_path)))
+
+
+class UnregisterCheckoutTest(unittest.TestCase, TemporaryDirectoryMixin):
+    """`unregister_checkout` removes a config.json entry only while it still
+    names the missing state directory, so a replacement clone registered at
+    the same path in the meantime keeps its entry."""
+
+    def make_instance(self) -> tuple[config_mod.EdenInstance, Path]:
+        tmp_dir = Path(self.make_temporary_directory())
+        state_dir = tmp_dir / "state"
+        (state_dir / "clients").mkdir(parents=True)
+        instance = config_mod.EdenInstance(
+            config_dir=state_dir,
+            etc_eden_dir=tmp_dir / "etc",
+            home_dir=tmp_dir / "home",
+        )
+        mount_path = tmp_dir / "mounts" / "repo"
+        instance._add_path_to_directory_map(mount_path, "repo")
+        return instance, mount_path
+
+    def test_entry_of_a_missing_state_dir_is_removed(self) -> None:
+        instance, mount_path = self.make_instance()
+        gone = instance._get_clients_dir() / "repo"
+        self.assertTrue(instance.unregister_checkout(mount_path, gone))
+        self.assertEqual([], instance.get_mount_paths())
+
+    def test_replacement_registered_since_the_check_is_kept(self) -> None:
+        instance, mount_path = self.make_instance()
+        client_dir = instance._get_clients_dir() / "repo"
+        # The replacement clone recreated the state directory under the same name.
+        client_dir.mkdir()
+        self.assertFalse(instance.unregister_checkout(mount_path, client_dir))
+        # Or registered the path with another state directory.
+        self.assertFalse(
+            instance.unregister_checkout(
+                mount_path, instance._get_clients_dir() / "repo-1"
+            )
+        )
+        self.assertEqual([str(mount_path)], instance.get_mount_paths())
+
+    def test_a_state_dir_that_cannot_be_reached_is_kept(self) -> None:
+        """Only `FileNotFoundError` means gone: a directory that cannot be
+        reached right now may still hold the checkout's state."""
+        instance, mount_path = self.make_instance()
+        client_dir = instance._get_clients_dir() / "repo"
+        real_lstat = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            if Path(path) == client_dir:
+                raise PermissionError("not now")
+            return real_lstat(path, *args, **kwargs)
+
+        with patch.object(config_mod.os, "lstat", lstat):
+            self.assertFalse(instance.unregister_checkout(mount_path, client_dir))
+        self.assertEqual([str(mount_path)], instance.get_mount_paths())
+
+    def test_a_dangling_link_is_kept(self) -> None:
+        """A state directory that is a link to a missing target is still
+        something: doctor reports it instead of unregistering it."""
+        instance, mount_path = self.make_instance()
+        client_dir = instance._get_clients_dir() / "repo"
+        client_dir.symlink_to(instance._get_clients_dir() / "moved-away")
+        self.assertFalse(instance.unregister_checkout(mount_path, client_dir))
+        self.assertEqual([str(mount_path)], instance.get_mount_paths())
 
 
 class FsckThreadCountTest(unittest.TestCase):

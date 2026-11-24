@@ -87,30 +87,6 @@ inline void PrintTo(
 }
 } // namespace std
 
-/**
- * Parameterized fixture: runs every checkout test once with the futures
- * implementation (`useCoroutines=false`) and once with the coroutine
- * implementation (`useCoroutines=true`). Mirrors the pattern in
- * `DiffTestParam`.
- *
- * Tests opt into the coroutine variant for any `TestMount` they
- * construct by calling `applyParam(mount)` immediately after
- * construction (free helpers take a `bool useCoroutines` and call
- * `enableCoroutinesConfig(mount)` themselves — same shape as
- * `DiffTest`'s `useCoroutines_` constructor parameter).
- */
-class CheckoutTest : public ::testing::TestWithParam<bool> {
- protected:
-  /// Apply the parameterized coroutine variant config (if `GetParam()`)
-  /// to the given mount via the existing `enableCoroutinesConfig`
-  /// bundle (which includes `enable-phase7`).
-  void applyParam(TestMount& mount) const {
-    if (GetParam()) {
-      enableCoroutinesConfig(mount);
-    }
-  }
-};
-
 namespace {
 
 bool isExecutable([[maybe_unused]] int perms) {
@@ -297,15 +273,11 @@ void checkFileChangeJournalEntries(
 void testAddFile(
     folly::StringPiece newFilePath,
     LoadBehavior loadType,
-    int perms = 0644,
-    bool useCoroutines = false) {
+    int perms = 0644) {
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("src/main.c", "int main() { return 0; }\n");
   builder1.setFile("src/test/test.c", "testy tests");
   TestMount testMount{builder1};
-  if (useCoroutines) {
-    enableCoroutinesConfig(testMount);
-  }
 
   // Prepare a second tree, by starting with builder1 then adding the new file
   auto builder2 = builder1.clone();
@@ -318,15 +290,8 @@ void testAddFile(
   loadInodes(testMount, newFilePath, loadType);
   testMount.drainServerExecutor();
 
-  auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"2"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"2"}, ObjectFetchContext::getNullContext(), __func__);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutResult.isReady());
   auto result = std::move(checkoutResult).get();
@@ -344,35 +309,29 @@ void testAddFile(
   EXPECT_FILE_INODE(newInode, "this is the new file contents\n", perms);
 }
 
-void runAddFileTests(folly::StringPiece path, bool useCoroutines) {
+void runAddFileTests(folly::StringPiece path) {
   for (auto loadType : kAddLoadTypes) {
     SCOPED_TRACE(fmt::format("add {} load type {}", path, loadType));
-    testAddFile(path, loadType, /*perms=*/0644, useCoroutines);
-    testAddFile(path, loadType, 0755, useCoroutines);
+    testAddFile(path, loadType, /*perms=*/0644);
+    testAddFile(path, loadType, 0755);
   }
 }
 
-TEST_P(CheckoutTest, addFile) {
+TEST(CheckoutTest, addFile) {
   // Test with file names that will be at the beginning of the directory,
   // in the middle of the directory, and at the end of the directory.
   // (The directory entries are processed in sorted order.)
-  runAddFileTests("src/aaa.c", GetParam());
-  runAddFileTests("src/ppp.c", GetParam());
-  runAddFileTests("src/zzz.c", GetParam());
+  runAddFileTests("src/aaa.c");
+  runAddFileTests("src/ppp.c");
+  runAddFileTests("src/zzz.c");
 }
 
-void testRemoveFile(
-    folly::StringPiece filePath,
-    LoadBehavior loadType,
-    bool useCoroutines) {
+void testRemoveFile(folly::StringPiece filePath, LoadBehavior loadType) {
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("src/main.c", "int main() { return 0; }\n");
   builder1.setFile("src/test/test.c", "testy tests");
   builder1.setFile(filePath, "this file will be removed\n");
   TestMount testMount{builder1};
-  if (useCoroutines) {
-    enableCoroutinesConfig(testMount);
-  }
 
   // Prepare a second tree, by starting with builder1 then removing the desired
   // file
@@ -385,15 +344,10 @@ void testRemoveFile(
   loadInodes(testMount, filePath, loadType, "this file will be removed\n");
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"2"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor)
-                            .waitVia(executor);
+  auto checkoutResult =
+      testMount
+          .checkout(RootId{"2"}, ObjectFetchContext::getNullContext(), __func__)
+          .waitVia(executor);
   ASSERT_TRUE(checkoutResult.isReady());
   auto result = std::move(checkoutResult).get();
   EXPECT_EQ(0, result.conflicts.size());
@@ -407,11 +361,11 @@ void testRemoveFile(
   EXPECT_THROW_ERRNO(testMount.getInode(filePath), ENOENT);
 }
 
-void runRemoveFileTests(folly::StringPiece path, bool useCoroutines) {
+void runRemoveFileTests(folly::StringPiece path) {
   // Modify just the file contents, but not the permissions
   for (auto loadType : kAllLoadTypes) {
     SCOPED_TRACE(fmt::format("remove {} load type {}", path, loadType));
-    testRemoveFile(path, loadType, useCoroutines);
+    testRemoveFile(path, loadType);
   }
 }
 
@@ -419,12 +373,11 @@ void runRemoveFileTests(folly::StringPiece path, bool useCoroutines) {
 // dematerialize the directory to a tree that holds that object under the old
 // name: the directory would then claim to equal the tree, hiding the rename
 // from status and from later checkouts.
-TEST_P(CheckoutTest, renamedFileKeepsDirectoryMaterialized) {
+TEST(CheckoutTest, renamedFileKeepsDirectoryMaterialized) {
   FakeTreeBuilder builder1;
   builder1.setFile("d/keep.txt", "k\n");
   builder1.setFile("d/x.txt", "same\n");
   TestMount testMount{builder1};
-  applyParam(testMount);
 
   // Commit 2 changes the directory so checkout has to walk it.
   auto builder2 = builder1.clone();
@@ -442,14 +395,8 @@ TEST_P(CheckoutTest, renamedFileKeepsDirectoryMaterialized) {
       .get();
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"2"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"2"}, ObjectFetchContext::getNullContext(), __func__);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutResult.isReady());
   EXPECT_EQ(0, std::move(checkoutResult).get().conflicts.size());
@@ -501,12 +448,11 @@ TEST_P(CheckoutTest, renamedFileKeepsDirectoryMaterialized) {
 // Removing an unloaded, unmaterialized file during checkout only erases the
 // parent's entry. The file's inode metadata record, created when the file
 // was last loaded, has to be freed too or it outlives the inode.
-TEST_P(CheckoutTest, removingUnloadedFileFreesInodeMetadata) {
+TEST(CheckoutTest, removingUnloadedFileFreesInodeMetadata) {
   FakeTreeBuilder builder1;
   builder1.setFile("a.txt", "a\n");
   builder1.setFile("keep.txt", "k\n");
   TestMount testMount{builder1};
-  applyParam(testMount);
 
   auto builder2 = builder1.clone();
   builder2.removeFile("a.txt");
@@ -520,15 +466,8 @@ TEST_P(CheckoutTest, removingUnloadedFileFreesInodeMetadata) {
   ASSERT_TRUE(metadata->getOptional(ino).has_value());
   testMount.getRootInode()->unloadChildrenNow();
 
-  auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"2"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"2"}, ObjectFetchContext::getNullContext(), __func__);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutResult.isReady());
   EXPECT_EQ(0, std::move(checkoutResult).get().conflicts.size());
@@ -538,13 +477,13 @@ TEST_P(CheckoutTest, removingUnloadedFileFreesInodeMetadata) {
 }
 #endif
 
-TEST_P(CheckoutTest, removeFile) {
+TEST(CheckoutTest, removeFile) {
   // Test with file names that will be at the beginning of the directory,
   // in the middle of the directory, and at the end of the directory.
   // (The directory entries are processed in sorted order.)
-  runRemoveFileTests("src/aaa.c", GetParam());
-  runRemoveFileTests("src/ppp.c", GetParam());
-  runRemoveFileTests("src/zzz.c", GetParam());
+  runRemoveFileTests("src/aaa.c");
+  runRemoveFileTests("src/ppp.c");
+  runRemoveFileTests("src/zzz.c");
 }
 
 void testModifyFile(
@@ -553,8 +492,7 @@ void testModifyFile(
     folly::StringPiece contents1,
     int perms1,
     folly::StringPiece contents2,
-    int perms2,
-    bool useCoroutines) {
+    int perms2) {
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("readme.txt", "just filling out the tree\n");
   builder1.setFile("a/test.txt", "test contents\n");
@@ -562,9 +500,6 @@ void testModifyFile(
   builder1.setFile("a/b/tttt.c", "this is tttt.c\n");
   builder1.setFile(path, contents1, isExecutable(perms1));
   TestMount testMount{builder1};
-  if (useCoroutines) {
-    enableCoroutinesConfig(testMount);
-  }
   testMount.getClock().advance(9876min);
 
   // Prepare the second tree
@@ -589,15 +524,10 @@ void testModifyFile(
   testMount.getClock().advance(10min);
   [[maybe_unused]] auto checkoutStart = testMount.getClock().getTimePoint();
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"2"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor)
-                            .waitVia(executor);
+  auto checkoutResult =
+      testMount
+          .checkout(RootId{"2"}, ObjectFetchContext::getNullContext(), __func__)
+          .waitVia(executor);
   ASSERT_TRUE(checkoutResult.isReady());
   auto result = std::move(checkoutResult).get();
   EXPECT_EQ(0, result.conflicts.size());
@@ -631,7 +561,7 @@ void testModifyFile(
   EXPECT_FILE_INODE(postInode, contents2, perms2);
 }
 
-void runModifyFileTests(folly::StringPiece path, bool useCoroutines) {
+void runModifyFileTests(folly::StringPiece path) {
   // Modify just the file contents, but not the permissions
   for (auto loadType : kAllLoadTypes) {
     SCOPED_TRACE(
@@ -642,16 +572,14 @@ void runModifyFileTests(folly::StringPiece path, bool useCoroutines) {
         "contents v1",
         0644,
         "updated file contents\nextra stuff\n",
-        0644,
-        useCoroutines);
+        0644);
   }
 
   // Modify just the permissions, but not the contents
   for (auto loadType : kAllLoadTypes) {
     SCOPED_TRACE(
         fmt::format("mode change, path {} load type {}", path, loadType));
-    testModifyFile(
-        path, loadType, "unchanged", 0755, "unchanged", 0644, useCoroutines);
+    testModifyFile(path, loadType, "unchanged", 0755, "unchanged", 0644);
   }
 
   // Modify the contents and the permissions
@@ -660,36 +588,29 @@ void runModifyFileTests(folly::StringPiece path, bool useCoroutines) {
         fmt::format(
             "contents+mode change, path {} load type {}", path, loadType));
     testModifyFile(
-        path,
-        loadType,
-        "contents v1",
-        0644,
-        "executable contents",
-        0755,
-        useCoroutines);
+        path, loadType, "contents v1", 0644, "executable contents", 0755);
   }
 }
 
 // Test with file names that will be at the beginning of the directory,
 // in the middle of the directory, and at the end of the directory.
 
-TEST_P(CheckoutTest, modifyFileBeginning) {
-  runModifyFileTests("a/b/aaa.txt", GetParam());
+TEST(CheckoutTest, modifyFileBeginning) {
+  runModifyFileTests("a/b/aaa.txt");
 }
 
-TEST_P(CheckoutTest, modifyFileMiddle) {
-  runModifyFileTests("a/b/mmm.txt", GetParam());
+TEST(CheckoutTest, modifyFileMiddle) {
+  runModifyFileTests("a/b/mmm.txt");
 }
 
-TEST_P(CheckoutTest, modifyFileEnd) {
-  runModifyFileTests("a/b/zzz.txt", GetParam());
+TEST(CheckoutTest, modifyFileEnd) {
+  runModifyFileTests("a/b/zzz.txt");
 }
 
 // Test performing a checkout with a modified file where the ObjectStore data is
 // not immediately ready even though the inode is loaded.
-TEST_P(CheckoutTest, modifyLoadedButNotReadyFileWithConflict) {
+TEST(CheckoutTest, modifyLoadedButNotReadyFileWithConflict) {
   TestMount mount;
-  applyParam(mount);
   auto backingStore = mount.getBackingStore();
 
   auto builder1 = FakeTreeBuilder();
@@ -726,11 +647,8 @@ TEST_P(CheckoutTest, modifyLoadedButNotReadyFileWithConflict) {
   mount.getEdenMount()->resetParent(RootId{"3"});
 
   // Perform the checkout.
-  auto checkoutFuture = mount.getEdenMount()->checkout(
-      mount.getRootInode(),
-      RootId{"2"},
-      ObjectFetchContext::getNullContext(),
-      __func__);
+  auto checkoutFuture = mount.checkout(
+      RootId{"2"}, ObjectFetchContext::getNullContext(), __func__);
 
   // Trigger blob1 several times to allow the checkout to make forward progress
   // if it needs to access this blob, without necessarily completing all at
@@ -742,8 +660,7 @@ TEST_P(CheckoutTest, modifyLoadedButNotReadyFileWithConflict) {
   // Mark builder1 as ready and confirm that the checkout completes
   builder1.setAllReady();
   auto executor = mount.getServerExecutor().get();
-  auto waitedCheckoutFuture =
-      std::move(checkoutFuture).semi().via(executor).waitVia(executor);
+  auto waitedCheckoutFuture = std::move(checkoutFuture).waitVia(executor);
   ASSERT_TRUE(waitedCheckoutFuture.isReady());
   auto result = std::move(waitedCheckoutFuture).get();
   EXPECT_THAT(
@@ -765,8 +682,7 @@ void testModifyConflict(
     folly::StringPiece currentContents,
     int currentPerms,
     folly::StringPiece contents2,
-    int perms2,
-    bool useCoroutines) {
+    int perms2) {
   // Prepare the tree to represent the current inode state
   auto workingDirBuilder = FakeTreeBuilder();
   workingDirBuilder.setFile("readme.txt", "just filling out the tree\n");
@@ -775,9 +691,6 @@ void testModifyConflict(
   workingDirBuilder.setFile("a/b/tttt.c", "this is tttt.c\n");
   workingDirBuilder.setFile(path, currentContents, isExecutable(currentPerms));
   TestMount testMount{workingDirBuilder};
-  if (useCoroutines) {
-    enableCoroutinesConfig(testMount);
-  }
 
   // Prepare the "before" tree
   auto builder1 = workingDirBuilder.clone();
@@ -806,15 +719,12 @@ void testModifyConflict(
   loadInodes(testMount, path, loadType, currentContents, currentPerms);
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
+  auto checkoutResult = testMount
+                            .checkout(
                                 RootId{"b"},
                                 ObjectFetchContext::getNullContext(),
                                 __func__,
                                 checkoutMode)
-                            .semi()
-                            .via(executor)
                             .waitVia(executor);
   ASSERT_TRUE(checkoutResult.isReady());
   auto result = std::move(checkoutResult).get();
@@ -877,7 +787,7 @@ void testModifyConflict(
 #endif
 }
 
-void runModifyConflictTests(CheckoutMode checkoutMode, bool useCoroutines) {
+void runModifyConflictTests(CheckoutMode checkoutMode) {
   // Try with three separate path names, one that sorts first in the directory,
   // one in the middle, and one that sorts last.  This helps ensure that we
   // exercise all code paths in TreeInode::computeCheckoutActions()
@@ -898,25 +808,24 @@ void runModifyConflictTests(CheckoutMode checkoutMode, bool useCoroutines) {
           "current file contents.txt",
           0644,
           "new file contents.txt",
-          0644,
-          useCoroutines);
+          0644);
     }
   }
 }
 
-TEST_P(CheckoutTest, modifyConflictNormal) {
-  runModifyConflictTests(CheckoutMode::NORMAL, GetParam());
+TEST(CheckoutTest, modifyConflictNormal) {
+  runModifyConflictTests(CheckoutMode::NORMAL);
 }
 
-TEST_P(CheckoutTest, modifyConflictDryRun) {
-  runModifyConflictTests(CheckoutMode::DRY_RUN, GetParam());
+TEST(CheckoutTest, modifyConflictDryRun) {
+  runModifyConflictTests(CheckoutMode::DRY_RUN);
 }
 
-TEST_P(CheckoutTest, modifyConflictForce) {
-  runModifyConflictTests(CheckoutMode::FORCE, GetParam());
+TEST(CheckoutTest, modifyConflictForce) {
+  runModifyConflictTests(CheckoutMode::FORCE);
 }
 
-TEST_P(CheckoutTest, modifyThenRevert) {
+TEST(CheckoutTest, modifyThenRevert) {
   // Prepare a "before" tree
   auto srcBuilder = FakeTreeBuilder();
   srcBuilder.setFile("readme.txt", "just filling out the tree\n");
@@ -924,7 +833,6 @@ TEST_P(CheckoutTest, modifyThenRevert) {
   srcBuilder.setFile("a/test.txt", "test contents\n");
   srcBuilder.setFile("a/xyz.txt", "bar\n");
   TestMount testMount{srcBuilder};
-  applyParam(testMount);
   auto originalCommit = testMount.getEdenMount()->getCheckedOutRootId();
 
   // Modify a file.
@@ -937,15 +845,12 @@ TEST_P(CheckoutTest, modifyThenRevert) {
   // Now perform a forced checkout to the current commit,
   // which should discard our edits.
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
+  auto checkoutResult = testMount
+                            .checkout(
                                 originalCommit,
                                 ObjectFetchContext::getNullContext(),
                                 __func__,
                                 CheckoutMode::FORCE)
-                            .semi()
-                            .via(executor)
                             .waitVia(executor);
   ASSERT_TRUE(checkoutResult.isReady());
   // The checkout should report a/test.txt as a conflict
@@ -975,11 +880,10 @@ TEST_P(CheckoutTest, modifyThenRevert) {
 #endif
 }
 
-TEST_P(CheckoutTest, modifyThenCheckoutRevisionWithoutFile) {
+TEST(CheckoutTest, modifyThenCheckoutRevisionWithoutFile) {
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("src/main.c", "// Some code.\n");
   TestMount testMount{RootId{"1"}, builder1};
-  applyParam(testMount);
 
   auto builder2 = builder1.clone();
   builder2.setFile("src/test.c", "// Unit test.\n");
@@ -988,27 +892,19 @@ TEST_P(CheckoutTest, modifyThenCheckoutRevisionWithoutFile) {
   commit2->setReady();
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutTo2 = testMount.getEdenMount()
-                         ->checkout(
-                             testMount.getRootInode(),
-                             RootId("2"),
-                             ObjectFetchContext::getNullContext(),
-                             __func__)
-                         .semi()
-                         .via(executor)
-                         .waitVia(executor);
+  auto checkoutTo2 =
+      testMount
+          .checkout(RootId("2"), ObjectFetchContext::getNullContext(), __func__)
+          .waitVia(executor);
   ASSERT_TRUE(checkoutTo2.isReady());
 
   testMount.overwriteFile("src/test.c", "temporary edit\n");
-  auto checkoutTo1 = testMount.getEdenMount()
-                         ->checkout(
-                             testMount.getRootInode(),
+  auto checkoutTo1 = testMount
+                         .checkout(
                              RootId("1"),
                              ObjectFetchContext::getNullContext(),
                              __func__,
                              CheckoutMode::FORCE)
-                         .semi()
-                         .via(executor)
                          .waitVia(executor);
   ASSERT_TRUE(checkoutTo1.isReady());
 
@@ -1027,11 +923,10 @@ TEST_P(CheckoutTest, modifyThenCheckoutRevisionWithoutFile) {
   checkFileChangeJournalEntries(expected_journal, testMount);
 }
 
-TEST_P(CheckoutTest, createUntrackedFileAndCheckoutAsTrackedFile) {
+TEST(CheckoutTest, createUntrackedFileAndCheckoutAsTrackedFile) {
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("src/main.c", "// Some code.\n");
   TestMount testMount{RootId{"1"}, builder1};
-  applyParam(testMount);
 
   auto builder2 = builder1.clone();
   builder2.setFile("src/test.c", "// Unit test.\n");
@@ -1040,27 +935,17 @@ TEST_P(CheckoutTest, createUntrackedFileAndCheckoutAsTrackedFile) {
   commit2->setReady();
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutTo1 = testMount.getEdenMount()
-                         ->checkout(
-                             testMount.getRootInode(),
-                             RootId("1"),
-                             ObjectFetchContext::getNullContext(),
-                             __func__)
-                         .semi()
-                         .via(executor)
-                         .waitVia(executor);
+  auto checkoutTo1 =
+      testMount
+          .checkout(RootId("1"), ObjectFetchContext::getNullContext(), __func__)
+          .waitVia(executor);
   ASSERT_TRUE(checkoutTo1.isReady());
 
   testMount.addFile("src/test.c", "temporary edit\n");
-  auto checkoutTo2 = testMount.getEdenMount()
-                         ->checkout(
-                             testMount.getRootInode(),
-                             RootId("2"),
-                             ObjectFetchContext::getNullContext(),
-                             __func__)
-                         .semi()
-                         .via(executor)
-                         .waitVia(executor);
+  auto checkoutTo2 =
+      testMount
+          .checkout(RootId("2"), ObjectFetchContext::getNullContext(), __func__)
+          .waitVia(executor);
   ASSERT_TRUE(checkoutTo2.isReady());
 
   EXPECT_THAT(
@@ -1091,13 +976,12 @@ TEST_P(CheckoutTest, createUntrackedFileAndCheckoutAsTrackedFile) {
  * exercises the case where the code must traverse into an untracked directory
  * and mark its contents UNTRACKED_ADDED, as appropriate.
  */
-TEST_P(
+TEST(
     CheckoutTest,
     createUntrackedFileAsOnlyDirectoryEntryAndCheckoutAsTrackedFile) {
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("src/main.c", "// Some code.\n");
   TestMount testMount{RootId("1"), builder1};
-  applyParam(testMount);
 
   auto builder2 = builder1.clone();
   builder2.setFile("src/test/test.c", "// Unit test.\n");
@@ -1106,28 +990,18 @@ TEST_P(
   commit2->setReady();
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutTo1 = testMount.getEdenMount()
-                         ->checkout(
-                             testMount.getRootInode(),
-                             RootId("1"),
-                             ObjectFetchContext::getNullContext(),
-                             __func__)
-                         .semi()
-                         .via(executor)
-                         .waitVia(executor);
+  auto checkoutTo1 =
+      testMount
+          .checkout(RootId("1"), ObjectFetchContext::getNullContext(), __func__)
+          .waitVia(executor);
   ASSERT_TRUE(checkoutTo1.isReady());
 
   testMount.mkdir("src/test");
   testMount.addFile("src/test/test.c", "temporary edit\n");
-  auto checkoutTo2 = testMount.getEdenMount()
-                         ->checkout(
-                             testMount.getRootInode(),
-                             RootId("2"),
-                             ObjectFetchContext::getNullContext(),
-                             __func__)
-                         .semi()
-                         .via(executor)
-                         .waitVia(executor);
+  auto checkoutTo2 =
+      testMount
+          .checkout(RootId("2"), ObjectFetchContext::getNullContext(), __func__)
+          .waitVia(executor);
   ASSERT_TRUE(checkoutTo2.isReady());
 
   EXPECT_THAT(
@@ -1156,17 +1030,11 @@ TEST_P(
   checkFileChangeJournalEntries(expected_journal, testMount);
 }
 
-void testAddSubdirectory(
-    folly::StringPiece newDirPath,
-    LoadBehavior loadType,
-    bool useCoroutines) {
+void testAddSubdirectory(folly::StringPiece newDirPath, LoadBehavior loadType) {
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("src/main.c", "int main() { return 0; }\n");
   builder1.setFile("src/test/test.c", "testy tests");
   TestMount testMount{builder1};
-  if (useCoroutines) {
-    enableCoroutinesConfig(testMount);
-  }
 
   // Prepare a second tree, by starting with builder1 then adding
   // the new directory
@@ -1182,15 +1050,10 @@ void testAddSubdirectory(
   loadInodes(testMount, newDirPath, loadType);
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId("2"),
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor)
-                            .waitVia(executor);
+  auto checkoutResult =
+      testMount
+          .checkout(RootId("2"), ObjectFetchContext::getNullContext(), __func__)
+          .waitVia(executor);
   ASSERT_TRUE(checkoutResult.isReady());
   auto result = std::move(checkoutResult).get();
   EXPECT_EQ(0, result.conflicts.size());
@@ -1206,18 +1069,18 @@ void testAddSubdirectory(
       0644);
 }
 
-TEST_P(CheckoutTest, addSubdirectory) {
+TEST(CheckoutTest, addSubdirectory) {
   // Test with multiple paths to exercise the case where the modification is at
   // the start of the directory listing, at the end, and in the middle.
   for (const auto& path : {"src/aaa", "src/ppp", "src/zzz"}) {
     for (auto loadType : kAddLoadTypes) {
       SCOPED_TRACE(fmt::format("path {} load type {}", path, loadType));
-      testAddSubdirectory(path, loadType, GetParam());
+      testAddSubdirectory(path, loadType);
     }
   }
 }
 
-void testRemoveSubdirectory(LoadBehavior loadType, bool useCoroutines) {
+void testRemoveSubdirectory(LoadBehavior loadType) {
   // Build the destination source control tree first
   auto destBuilder = FakeTreeBuilder();
   destBuilder.setFile("src/main.c", "int main() { return 0; }\n");
@@ -1232,9 +1095,6 @@ void testRemoveSubdirectory(LoadBehavior loadType, bool useCoroutines) {
   srcBuilder.setFile(path + "include/file1.h"_relpath, "header\n");
 
   TestMount testMount{srcBuilder};
-  if (useCoroutines) {
-    enableCoroutinesConfig(testMount);
-  }
   destBuilder.finalize(testMount.getBackingStore(), true);
   auto commit2 = testMount.getBackingStore()->putCommit("2", destBuilder);
   commit2->setReady();
@@ -1242,15 +1102,10 @@ void testRemoveSubdirectory(LoadBehavior loadType, bool useCoroutines) {
   loadInodes(testMount, path, loadType);
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId("2"),
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor)
-                            .waitVia(executor);
+  auto checkoutResult =
+      testMount
+          .checkout(RootId("2"), ObjectFetchContext::getNullContext(), __func__)
+          .waitVia(executor);
   ASSERT_TRUE(checkoutResult.isReady());
   auto results = std::move(checkoutResult).get();
   EXPECT_EQ(0, results.conflicts.size());
@@ -1267,18 +1122,17 @@ void testRemoveSubdirectory(LoadBehavior loadType, bool useCoroutines) {
 }
 
 // Remove a subdirectory with no conflicts or untracked files left behind
-TEST_P(CheckoutTest, removeSubdirectorySimple) {
+TEST(CheckoutTest, removeSubdirectorySimple) {
   for (auto loadType : kAllLoadTypes) {
     SCOPED_TRACE(fmt::format(" load type {}", loadType));
-    testRemoveSubdirectory(loadType, GetParam());
+    testRemoveSubdirectory(loadType);
   }
 }
 
-TEST_P(CheckoutTest, checkoutModifiesDirectoryDuringLoad) {
+TEST(CheckoutTest, checkoutModifiesDirectoryDuringLoad) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("dir/sub/file.txt", "contents");
   TestMount testMount{builder1, false};
-  applyParam(testMount);
   builder1.setReady("");
   builder1.setReady("dir");
 
@@ -1300,11 +1154,8 @@ TEST_P(CheckoutTest, checkoutModifiesDirectoryDuringLoad) {
   EXPECT_FALSE(inodeFuture.isReady());
 
   // Checkout to a revision where the contents of "dir/sub" have changed.
-  auto checkoutResult = testMount.getEdenMount()->checkout(
-      testMount.getRootInode(),
-      RootId{"2"},
-      ObjectFetchContext::getNullContext(),
-      __func__);
+  auto checkoutResult = testMount.checkout(
+      RootId{"2"}, ObjectFetchContext::getNullContext(), __func__);
 
   // The checkout ought to wait until the load completes.
   EXPECT_FALSE(checkoutResult.isReady());
@@ -1315,8 +1166,7 @@ TEST_P(CheckoutTest, checkoutModifiesDirectoryDuringLoad) {
   EXPECT_TRUE(inodeFuture.isReady());
 
   auto executor = testMount.getServerExecutor().get();
-  auto waitedCheckoutResult =
-      std::move(checkoutResult).semi().via(executor).waitVia(executor);
+  auto waitedCheckoutResult = std::move(checkoutResult).waitVia(executor);
   ASSERT_TRUE(waitedCheckoutResult.isReady());
   auto result = std::move(waitedCheckoutResult).get();
   EXPECT_EQ(0, result.conflicts.size());
@@ -1327,11 +1177,10 @@ TEST_P(CheckoutTest, checkoutModifiesDirectoryDuringLoad) {
       1, inode->lockContentsRead()->entries.count("differentfile.txt"_pc));
 }
 
-TEST_P(CheckoutTest, checkoutCaseChanged) {
+TEST(CheckoutTest, checkoutCaseChanged) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("root", "root");
   TestMount testMount{builder1};
-  applyParam(testMount);
 
   auto lowerBuilder = builder1.clone();
   lowerBuilder.setFile("dir/file1", "lower one");
@@ -1348,26 +1197,16 @@ TEST_P(CheckoutTest, checkoutCaseChanged) {
   upperCommit->setReady();
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutToLowerResult = testMount.getEdenMount()
-                                   ->checkout(
-                                       testMount.getRootInode(),
-                                       RootId{"2"},
-                                       ObjectFetchContext::getNullContext(),
-                                       __func__)
-                                   .semi()
-                                   .via(executor)
-                                   .getVia(executor);
+  auto checkoutToLowerResult =
+      testMount
+          .checkout(RootId{"2"}, ObjectFetchContext::getNullContext(), __func__)
+          .getVia(executor);
   EXPECT_EQ(checkoutToLowerResult.conflicts.size(), 0);
 
-  auto checkoutToUpperResult = testMount.getEdenMount()
-                                   ->checkout(
-                                       testMount.getRootInode(),
-                                       RootId{"3"},
-                                       ObjectFetchContext::getNullContext(),
-                                       __func__)
-                                   .semi()
-                                   .via(executor)
-                                   .getVia(executor);
+  auto checkoutToUpperResult =
+      testMount
+          .checkout(RootId{"3"}, ObjectFetchContext::getNullContext(), __func__)
+          .getVia(executor);
   EXPECT_EQ(checkoutToUpperResult.conflicts.size(), 0);
 
   auto file1 = testMount.getFileInode("DIR/FILE1"_relpath);
@@ -1388,13 +1227,12 @@ TEST_P(CheckoutTest, checkoutCaseChanged) {
   }
 }
 
-TEST_P(CheckoutTest, checkoutCaseChangedTreeInsensitive) {
+TEST(CheckoutTest, checkoutCaseChangedTreeInsensitive) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("root", "root");
   builder1.setFile("dir/file1", "lower one");
   builder1.setFile("dir/file2", "lower two");
   TestMount testMount{builder1, true, true, CaseSensitivity::Insensitive};
-  applyParam(testMount);
 
   // Same content, directory renamed to a different case (DIR/FILE1,
   // DIR/FILE2). On a case-insensitive mount this is a case-rename of the
@@ -1408,15 +1246,10 @@ TEST_P(CheckoutTest, checkoutCaseChangedTreeInsensitive) {
   upperCommit->setReady();
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"2"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor)
-                            .getVia(executor);
+  auto checkoutResult =
+      testMount
+          .checkout(RootId{"2"}, ObjectFetchContext::getNullContext(), __func__)
+          .getVia(executor);
   EXPECT_EQ(checkoutResult.conflicts.size(), 0);
 
   EXPECT_FILE_INODE(
@@ -1431,10 +1264,9 @@ TEST_P(CheckoutTest, checkoutCaseChangedTreeInsensitive) {
       testMount.getFileInode("dir/file1"_relpath), "lower one", 0644);
 }
 
-TEST_P(CheckoutTest, checkoutRememberedChildWithDifferentCaseInsensitive) {
+TEST(CheckoutTest, checkoutRememberedChildWithDifferentCaseInsensitive) {
   FakeTreeBuilder builder;
   TestMount testMount{builder, true, true, CaseSensitivity::Insensitive};
-  applyParam(testMount);
   testMount.addFile("Foo", "local\n");
 
   auto child = testMount.getFileInode("Foo");
@@ -1461,27 +1293,23 @@ TEST_P(CheckoutTest, checkoutRememberedChildWithDifferentCaseInsensitive) {
   testMount.getBackingStore()->putCommit("2", targetBuilder)->setReady();
 
   auto executor = testMount.getServerExecutor().get();
-  auto result = testMount.getEdenMount()
-                    ->checkout(
-                        testMount.getRootInode(),
+  auto result = testMount
+                    .checkout(
                         RootId{"2"},
                         ObjectFetchContext::getNullContext(),
                         __func__,
                         CheckoutMode::FORCE)
-                    .semi()
-                    .via(executor)
                     .getVia(executor);
   ASSERT_EQ(result.conflicts.size(), 1);
   EXPECT_EQ(*result.conflicts[0].type(), ConflictType::UNTRACKED_ADDED);
   EXPECT_FILE_INODE(testMount.getFileInode("foo"), "tracked\n", 0644);
 }
 
-TEST_P(CheckoutTest, checkoutCaseChangedTreeToFileInsensitive) {
+TEST(CheckoutTest, checkoutCaseChangedTreeToFileInsensitive) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("root", "root");
   builder1.setFile("dir/file1", "lower one");
   TestMount testMount{builder1, true, true, CaseSensitivity::Insensitive};
-  applyParam(testMount);
 
   // Build a "to" commit where `dir/` is replaced by a file named `DIR`
   // (different case). On a case-insensitive mount the existing `dir/`
@@ -1494,15 +1322,10 @@ TEST_P(CheckoutTest, checkoutCaseChangedTreeToFileInsensitive) {
   toCommit->setReady();
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"2"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor)
-                            .getVia(executor);
+  auto checkoutResult =
+      testMount
+          .checkout(RootId{"2"}, ObjectFetchContext::getNullContext(), __func__)
+          .getVia(executor);
   EXPECT_EQ(checkoutResult.conflicts.size(), 0);
 
   EXPECT_FILE_INODE(testMount.getFileInode("DIR"_relpath), "now a file", 0644);
@@ -1510,12 +1333,11 @@ TEST_P(CheckoutTest, checkoutCaseChangedTreeToFileInsensitive) {
   EXPECT_FILE_INODE(testMount.getFileInode("dir"_relpath), "now a file", 0644);
 }
 
-TEST_P(CheckoutTest, checkoutCaseChangedTreeNotEmptyInsensitive) {
+TEST(CheckoutTest, checkoutCaseChangedTreeNotEmptyInsensitive) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("root", "root");
   builder1.setFile("dir/file1", "lower one");
   TestMount testMount{builder1, true, true, CaseSensitivity::Insensitive};
-  applyParam(testMount);
 
   // Materialize the directory by creating an UNTRACKED file inside it.
   // This file is not in any commit; the case-rename below must navigate
@@ -1530,15 +1352,10 @@ TEST_P(CheckoutTest, checkoutCaseChangedTreeNotEmptyInsensitive) {
   upperCommit->setReady();
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"2"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor)
-                            .getVia(executor);
+  auto checkoutResult =
+      testMount
+          .checkout(RootId{"2"}, ObjectFetchContext::getNullContext(), __func__)
+          .getVia(executor);
   // Don't assert on conflict shape — varies by platform/dispatcher.
   (void)checkoutResult;
 
@@ -1548,11 +1365,10 @@ TEST_P(CheckoutTest, checkoutCaseChangedTreeNotEmptyInsensitive) {
 }
 
 #ifndef _WIN32
-TEST_P(CheckoutTest, checkoutRemovingDirectoryDeletesOverlayFile) {
+TEST(CheckoutTest, checkoutRemovingDirectoryDeletesOverlayFile) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("dir/sub/file.txt", "contents");
   TestMount testMount{builder1};
-  applyParam(testMount);
 
   // Prepare a second commit, removing dir/sub.
   auto builder2 = FakeTreeBuilder{};
@@ -1577,15 +1393,10 @@ TEST_P(CheckoutTest, checkoutRemovingDirectoryDeletesOverlayFile) {
 
   // Checkout to a revision without "dir/sub".
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId("2"),
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor)
-                            .getVia(executor);
+  auto checkoutResult =
+      testMount
+          .checkout(RootId("2"), ObjectFetchContext::getNullContext(), __func__)
+          .getVia(executor);
   EXPECT_EQ(0, checkoutResult.conflicts.size());
 
   // The checkout kicked off an async deletion of a subtree - wait for it to
@@ -1597,7 +1408,7 @@ TEST_P(CheckoutTest, checkoutRemovingDirectoryDeletesOverlayFile) {
   EXPECT_FALSE(testMount.hasMetadata(fileInodeNumber));
 }
 
-TEST_P(CheckoutTest, checkoutUpdatesUnlinkedStatusForLoadedTrees) {
+TEST(CheckoutTest, checkoutUpdatesUnlinkedStatusForLoadedTrees) {
   // This test is designed to stress the logic in
   // TreeInode::processCheckoutEntry that decides whether it's necessary to load
   // a TreeInode in order to continue.  It tests that unlinked status is
@@ -1606,7 +1417,6 @@ TEST_P(CheckoutTest, checkoutUpdatesUnlinkedStatusForLoadedTrees) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("dir/sub/file.txt", "contents");
   TestMount testMount{builder1};
-  applyParam(testMount);
 
   // Prepare a second commit, removing dir/sub.
   auto builder2 = FakeTreeBuilder{};
@@ -1626,15 +1436,10 @@ TEST_P(CheckoutTest, checkoutUpdatesUnlinkedStatusForLoadedTrees) {
   // Checkout to a revision without "dir/sub" even though it's still referenced
   // by FUSE.
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId("2"),
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor)
-                            .getVia(executor);
+  auto checkoutResult =
+      testMount
+          .checkout(RootId("2"), ObjectFetchContext::getNullContext(), __func__)
+          .getVia(executor);
   EXPECT_EQ(0, checkoutResult.conflicts.size());
 
   // Try to load the same tree by its inode number. This will fail if the
@@ -1656,11 +1461,10 @@ TEST_P(CheckoutTest, checkoutUpdatesUnlinkedStatusForLoadedTrees) {
   EXPECT_FALSE(dirContents->isMaterialized());
 }
 
-TEST_P(CheckoutTest, checkoutRemembersInodeNumbersAfterCheckoutAndTakeover) {
+TEST(CheckoutTest, checkoutRemembersInodeNumbersAfterCheckoutAndTakeover) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("dir/sub/file1.txt", "contents1");
   TestMount testMount{builder1};
-  applyParam(testMount);
 
   // Prepare a second commit, changing dir/sub.
   auto builder2 = FakeTreeBuilder{};
@@ -1681,15 +1485,10 @@ TEST_P(CheckoutTest, checkoutRemembersInodeNumbersAfterCheckoutAndTakeover) {
   // Checkout to a revision with a new dir/sub tree.  The old data should be
   // removed from the overlay.
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId("2"),
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor)
-                            .getVia(executor);
+  auto checkoutResult =
+      testMount
+          .checkout(RootId("2"), ObjectFetchContext::getNullContext(), __func__)
+          .getVia(executor);
   EXPECT_EQ(0, checkoutResult.conflicts.size());
 
   testMount.remountGracefully();
@@ -1737,14 +1536,10 @@ std::vector<SetPathObjectIdObjectAndPath> getObjects(
 void runTestSetPathObjectId(
     folly::StringPiece file,
     folly::StringPiece pathToSet,
-    RelativePathPiece expectedFile,
-    bool useCoroutines) {
+    RelativePathPiece expectedFile) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("dir/dir2/dir3/file.txt", "contents");
   TestMount testMount{builder1, false};
-  if (useCoroutines) {
-    enableCoroutinesConfig(testMount);
-  }
   builder1.setReady("");
   builder1.setReady("dir");
   builder1.setReady("dir/dir2");
@@ -1781,51 +1576,45 @@ void runTestSetPathObjectId(
       testMount.getFileInode(expectedFile), "differentcontents", 0644);
 }
 
-TEST_P(CheckoutTest, testSetPathObjectIdSimple) {
+TEST(CheckoutTest, testSetPathObjectIdSimple) {
   runTestSetPathObjectId(
       "differentdir/differentfile.txt",
       "dir",
-      "dir/differentdir/differentfile.txt"_relpath,
-      GetParam());
+      "dir/differentdir/differentfile.txt"_relpath);
 }
 
-TEST_P(CheckoutTest, testSetPathObjectIdNewDir) {
+TEST(CheckoutTest, testSetPathObjectIdNewDir) {
   runTestSetPathObjectId(
       "differentdir/differentfile.txt",
       "dir2",
-      "dir2/differentdir/differentfile.txt"_relpath,
-      GetParam());
+      "dir2/differentdir/differentfile.txt"_relpath);
 }
 
-TEST_P(CheckoutTest, testSetPathObjectIdSetOnRoot) {
+TEST(CheckoutTest, testSetPathObjectIdSetOnRoot) {
   runTestSetPathObjectId(
       "differentdir/differentfile.txt",
       "",
-      "differentdir/differentfile.txt"_relpath,
-      GetParam());
+      "differentdir/differentfile.txt"_relpath);
 }
 
-TEST_P(CheckoutTest, testSetPathObjectIdMultipleLevelFolder) {
+TEST(CheckoutTest, testSetPathObjectIdMultipleLevelFolder) {
   runTestSetPathObjectId(
       "differentdir/differentfile.txt",
       "dir/dir2/dir3",
-      "dir/dir2/dir3/differentdir/differentfile.txt"_relpath,
-      GetParam());
+      "dir/dir2/dir3/differentdir/differentfile.txt"_relpath);
 }
 
-TEST_P(CheckoutTest, testSetPathObjectIdMultipleLevelFolderAndNewDir) {
+TEST(CheckoutTest, testSetPathObjectIdMultipleLevelFolderAndNewDir) {
   runTestSetPathObjectId(
       "differentdir/differentfile.txt",
       "dir/dir2/dir4",
-      "dir/dir2/dir4/differentdir/differentfile.txt"_relpath,
-      GetParam());
+      "dir/dir2/dir4/differentdir/differentfile.txt"_relpath);
 }
 
-TEST_P(CheckoutTest, testSetPathObjectIdConflict) {
+TEST(CheckoutTest, testSetPathObjectIdConflict) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("dir/dir2/dir3/file.txt", "contents");
   TestMount testMount{builder1, false};
-  applyParam(testMount);
   builder1.setReady("");
   builder1.setReady("dir");
   builder1.setReady("dir/dir2");
@@ -1871,9 +1660,8 @@ TEST_P(CheckoutTest, testSetPathObjectIdConflict) {
           Dtype::REGULAR)));
 }
 
-TEST_P(CheckoutTest, testSetPathObjectIdLastCheckoutTime) {
+TEST(CheckoutTest, testSetPathObjectIdLastCheckoutTime) {
   TestMount testMount;
-  applyParam(testMount);
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("dir/file.txt", "contents");
   builder1.finalize(testMount.getBackingStore(), true);
@@ -1963,11 +1751,10 @@ TEST_P(CheckoutTest, testSetPathObjectIdLastCheckoutTime) {
   EXPECT_EQ(nsec2.count(), stFile2.mtime.toTimespec().tv_nsec);
 }
 
-TEST_P(CheckoutTest, testSetPathObjectIdCheckoutSingleFile) {
+TEST(CheckoutTest, testSetPathObjectIdCheckoutSingleFile) {
   // Start with an empty mount
   auto builder1 = FakeTreeBuilder{};
   TestMount testMount{builder1, false};
-  applyParam(testMount);
 
   std::string contents = "content";
   testMount.getBackingStore()->putBlob(ObjectId{"2"}, contents)->setReady();
@@ -1998,11 +1785,10 @@ TEST_P(CheckoutTest, testSetPathObjectIdCheckoutSingleFile) {
   EXPECT_FILE_INODE(testMount.getFileInode(path), contents, 0644);
 }
 
-TEST_P(CheckoutTest, testSetPathObjectIdCheckoutMultipleFiles) {
+TEST(CheckoutTest, testSetPathObjectIdCheckoutMultipleFiles) {
   // Start with an empty mount
   auto builder1 = FakeTreeBuilder{};
   TestMount testMount{builder1, false};
-  applyParam(testMount);
 
   std::string contents = "content";
   std::string contents2 = "content";
@@ -2105,15 +1891,10 @@ TYPED_TEST(
   // Check out to a commit that changes all of these files.
   // Inode numbers for unreferenced files should be forgotten.
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"2"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor)
-                            .getVia(executor);
+  auto checkoutResult =
+      testMount
+          .checkout(RootId{"2"}, ObjectFetchContext::getNullContext(), __func__)
+          .getVia(executor);
   EXPECT_EQ(0, checkoutResult.conflicts.size());
 
   // Verify inode numbers for referenced inodes are the same.
@@ -2168,23 +1949,16 @@ TYPED_TEST(
 }
 #endif
 
-CO_TEST_P(CheckoutTest, diffFailsOnInProgressCheckout) {
+CO_TEST(CheckoutTest, diffFailsOnInProgressCheckout) {
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("src/main.c", "// Some code.\n");
   TestMount testMount{RootId{"1"}, builder1};
-  applyParam(testMount);
   testMount.getServerState()->getFaultInjector().injectBlock("checkout", ".*");
 
   // Block checkout so the checkout is "in progress"
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutTo1 = testMount.getEdenMount()
-                         ->checkout(
-                             testMount.getRootInode(),
-                             RootId{"1"},
-                             ObjectFetchContext::getNullContext(),
-                             __func__)
-                         .semi()
-                         .via(executor);
+  auto checkoutTo1 = testMount.checkout(
+      RootId{"1"}, ObjectFetchContext::getNullContext(), __func__);
   testMount.drainServerExecutor();
   CO_ASSERT_TRUE(
       testMount.getServerState()->getFaultInjector().waitUntilBlocked(
@@ -2226,23 +2000,16 @@ CO_TEST_P(CheckoutTest, diffFailsOnInProgressCheckout) {
       60s);
 }
 
-CO_TEST_P(CheckoutTest, droppedCheckoutFutureRestoresParentStateOnError) {
+CO_TEST(CheckoutTest, droppedCheckoutFutureRestoresParentStateOnError) {
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("src/main.c", "// Some code.\n");
   TestMount testMount{RootId{"1"}, builder1};
-  applyParam(testMount);
   testMount.getServerState()->getFaultInjector().injectBlock("checkout", ".*");
 
   auto executor = testMount.getServerExecutor().get();
   {
-    auto checkout = testMount.getEdenMount()
-                        ->checkout(
-                            testMount.getRootInode(),
-                            RootId{"1"},
-                            ObjectFetchContext::getNullContext(),
-                            __func__)
-                        .semi()
-                        .via(executor);
+    auto checkout = testMount.checkout(
+        RootId{"1"}, ObjectFetchContext::getNullContext(), __func__);
     testMount.drainServerExecutor();
     CO_ASSERT_TRUE(
         testMount.getServerState()->getFaultInjector().waitUntilBlocked(
@@ -2257,14 +2024,8 @@ CO_TEST_P(CheckoutTest, droppedCheckoutFutureRestoresParentStateOnError) {
   testMount.drainServerExecutor();
   testMount.getServerState()->getFaultInjector().removeFault("checkout", ".*");
 
-  auto recoveryCheckout = testMount.getEdenMount()
-                              ->checkout(
-                                  testMount.getRootInode(),
-                                  RootId{"1"},
-                                  ObjectFetchContext::getNullContext(),
-                                  __func__)
-                              .semi()
-                              .via(executor);
+  auto recoveryCheckout = testMount.checkout(
+      RootId{"1"}, ObjectFetchContext::getNullContext(), __func__);
   testMount.drainServerExecutor();
   EXPECT_NO_THROW(std::move(recoveryCheckout).getVia(executor));
 
@@ -2278,14 +2039,13 @@ CO_TEST_P(CheckoutTest, droppedCheckoutFutureRestoresParentStateOnError) {
       60s);
 }
 
-TEST_P(
+TEST(
     CheckoutTest,
     conflict_when_directory_containing_modified_file_is_removed) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("d1/sub/one.txt", "one");
   builder1.setFile("d2/two.txt", "two");
   TestMount testMount{builder1};
-  applyParam(testMount);
 
   // Prepare a second tree without one directory.
   auto builder2 = FakeTreeBuilder{};
@@ -2301,15 +2061,12 @@ TEST_P(
   auto gcToken = gcLease->getCancellationToken();
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
+  auto checkoutResult = testMount
+                            .checkout(
                                 RootId{"2"},
                                 ObjectFetchContext::getNullContext(),
                                 __func__,
                                 CheckoutMode::DRY_RUN)
-                            .semi()
-                            .via(executor)
                             .waitVia(executor);
   ASSERT_TRUE(checkoutResult.isReady());
   auto result = std::move(checkoutResult).get();
@@ -2326,11 +2083,10 @@ TEST_P(
   }
 }
 
-TEST_P(CheckoutTest, checkoutFailsOnInProgressCheckout) {
+TEST(CheckoutTest, checkoutFailsOnInProgressCheckout) {
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("src/main.c", "// Some code.\n");
   TestMount testMount{RootId("1"), builder1};
-  applyParam(testMount);
   testMount.getServerState()->getFaultInjector().injectBlock("checkout", ".*");
 
   auto builder2 = builder1.clone();
@@ -2345,14 +2101,8 @@ TEST_P(CheckoutTest, checkoutFailsOnInProgressCheckout) {
 
   // Block checkout so the checkout is "in progress"
   auto executor = testMount.getServerExecutor().get();
-  auto checkout1 = testMount.getEdenMount()
-                       ->checkout(
-                           testMount.getRootInode(),
-                           RootId{"2"},
-                           ObjectFetchContext::getNullContext(),
-                           __func__)
-                       .semi()
-                       .via(executor);
+  auto checkout1 = testMount.checkout(
+      RootId{"2"}, ObjectFetchContext::getNullContext(), __func__);
   testMount.drainServerExecutor();
   ASSERT_TRUE(testMount.getServerState()->getFaultInjector().waitUntilBlocked(
       "checkout", 5s));
@@ -2364,15 +2114,12 @@ TEST_P(CheckoutTest, checkoutFailsOnInProgressCheckout) {
 
   // Run another checkout and make sure it fails
   try {
-    testMount.getEdenMount()
-        ->checkout(
-            testMount.getRootInode(),
+    testMount
+        .checkout(
             RootId{"2"},
             ObjectFetchContext::getNullContext(),
             __func__,
             CheckoutMode::NORMAL)
-        .semi()
-        .via(executor)
         .getVia(executor);
     FAIL() << "checkout should have failed with "
               "EdenErrorType::CHECKOUT_IN_PROGRESS";
@@ -2391,15 +2138,10 @@ TEST_P(CheckoutTest, checkoutFailsOnInProgressCheckout) {
 
   // Try to checkout again just to make sure we don't block again.
   testMount.getServerState()->getFaultInjector().removeFault("checkout", ".*");
-  auto checkout2 = testMount.getEdenMount()
-                       ->checkout(
-                           testMount.getRootInode(),
-                           RootId("1"),
-                           ObjectFetchContext::getNullContext(),
-                           __func__)
-                       .semi()
-                       .via(executor)
-                       .waitVia(executor);
+  auto checkout2 =
+      testMount
+          .checkout(RootId("1"), ObjectFetchContext::getNullContext(), __func__)
+          .waitVia(executor);
   EXPECT_TRUE(checkout2.isReady());
   EXPECT_NO_THROW(std::move(checkout2).get());
   EXPECT_TRUE(gcAfterCheckoutToken.isCancellationRequested());
@@ -2408,13 +2150,12 @@ TEST_P(CheckoutTest, checkoutFailsOnInProgressCheckout) {
   EXPECT_TRUE(testMount.getEdenMount()->tryStartInodeGC());
 }
 
-TEST_P(CheckoutTest, checkoutFailureBeforeStartPreservesParentState) {
+TEST(CheckoutTest, checkoutFailureBeforeStartPreservesParentState) {
   for (bool resuming : {false, true}) {
     SCOPED_TRACE(resuming);
     FakeTreeBuilder builder1;
     builder1.setFile("src/main.c", "old contents\n");
     TestMount testMount{RootId{"1"}, builder1};
-    applyParam(testMount);
 
     auto builder2 = builder1.clone();
     builder2.replaceFile("src/main.c", "new contents\n");
@@ -2423,14 +2164,8 @@ TEST_P(CheckoutTest, checkoutFailureBeforeStartPreservesParentState) {
 
     auto checkoutTo2 = [&] {
       auto executor = testMount.getServerExecutor().get();
-      return testMount.getEdenMount()
-          ->checkout(
-              testMount.getRootInode(),
-              RootId{"2"},
-              ObjectFetchContext::getNullContext(),
-              __func__)
-          .semi()
-          .via(executor)
+      return testMount
+          .checkout(RootId{"2"}, ObjectFetchContext::getNullContext(), __func__)
           .getVia(executor);
     };
 
@@ -2455,9 +2190,7 @@ TEST_P(CheckoutTest, checkoutFailureBeforeStartPreservesParentState) {
             "checkout not started"),
         1);
     EXPECT_THROW(checkoutTo2(), EdenError);
-    // FIXME: This should equal resuming: a failure before start() must restore
-    // the prior state because the working copy has not changed.
-    EXPECT_TRUE(testMount.getEdenMount()->isCheckoutInProgress());
+    EXPECT_EQ(resuming, testMount.getEdenMount()->isCheckoutInProgress());
     EXPECT_EQ(
         parentBefore,
         testMount.getEdenMount()->getCheckoutConfig()->getParentCommit());
@@ -2472,11 +2205,10 @@ TEST_P(CheckoutTest, checkoutFailureBeforeStartPreservesParentState) {
   }
 }
 
-TEST_P(CheckoutTest, dryRunAfterInterruptedCheckoutKeepsInProgressMarker) {
+TEST(CheckoutTest, dryRunAfterInterruptedCheckoutKeepsInProgressMarker) {
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("src/main.c", "// Some code.\n");
   TestMount testMount{RootId{"1"}, builder1};
-  applyParam(testMount);
 
   auto builder2 = builder1.clone();
   builder2.replaceFile("src/main.c", "// New code.\n");
@@ -2485,15 +2217,9 @@ TEST_P(CheckoutTest, dryRunAfterInterruptedCheckoutKeepsInProgressMarker) {
 
   auto checkoutTo2 = [&](CheckoutMode mode) {
     auto executor = testMount.getServerExecutor().get();
-    return testMount.getEdenMount()
-        ->checkout(
-            testMount.getRootInode(),
-            RootId{"2"},
-            ObjectFetchContext::getNullContext(),
-            __func__,
-            mode)
-        .semi()
-        .via(executor)
+    return testMount
+        .checkout(
+            RootId{"2"}, ObjectFetchContext::getNullContext(), __func__, mode)
         .getVia(executor);
   };
 
@@ -2528,10 +2254,9 @@ TEST_P(CheckoutTest, dryRunAfterInterruptedCheckoutKeepsInProgressMarker) {
                    .isCheckoutInProgress());
 }
 
-TEST_P(CheckoutTest, overlappingCheckoutInhibitorsBlockInodeGC) {
+TEST(CheckoutTest, overlappingCheckoutInhibitorsBlockInodeGC) {
   FakeTreeBuilder builder;
   TestMount testMount{builder};
-  applyParam(testMount);
   auto mount = testMount.getEdenMount();
 
   for (bool releaseFirstInhibitorFirst : {false, true}) {
@@ -2552,11 +2277,10 @@ TEST_P(CheckoutTest, overlappingCheckoutInhibitorsBlockInodeGC) {
   }
 }
 
-TEST_P(
+TEST(
     CheckoutTest,
     changing_hash_scheme_does_not_conflict_if_contents_are_same) {
   TestMount mount;
-  applyParam(mount);
   auto backingStore = mount.getBackingStore();
 
   folly::ByteRange contents = folly::StringPiece{"test contents\n"};
@@ -2580,15 +2304,10 @@ TEST_P(
 
   // At this point, the working copy references the hash scheme used in commit1.
 
-  auto result = mount.getEdenMount()
-                    ->checkout(
-                        mount.getRootInode(),
-                        RootId{"2"},
-                        ObjectFetchContext::getNullContext(),
-                        __func__)
-                    .semi()
-                    .via(executor)
-                    .getVia(executor);
+  auto result =
+      mount
+          .checkout(RootId{"2"}, ObjectFetchContext::getNullContext(), __func__)
+          .getVia(executor);
   EXPECT_EQ(0, result.conflicts.size());
 
   // Call resetParent() to make the mount point back at commit1, even though
@@ -2596,15 +2315,10 @@ TEST_P(
   // checkout also should not produce conflicts.
   mount.getEdenMount()->resetParent(RootId{"1"});
 
-  result = mount.getEdenMount()
-               ->checkout(
-                   mount.getRootInode(),
-                   RootId{"2"},
-                   ObjectFetchContext::getNullContext(),
-                   __func__)
-               .semi()
-               .via(executor)
-               .getVia(executor);
+  result =
+      mount
+          .checkout(RootId{"2"}, ObjectFetchContext::getNullContext(), __func__)
+          .getVia(executor);
   EXPECT_EQ(0, result.conflicts.size());
 }
 
@@ -2650,9 +2364,8 @@ class FakePrjfsChannel final : public PrjfsChannel {
   ActionMap actions_;
 };
 
-TEST_P(CheckoutTest, concurrent_crawl_during_checkout) {
+TEST(CheckoutTest, concurrent_crawl_during_checkout) {
   TestMount mount;
-  applyParam(mount);
   auto backingStore = mount.getBackingStore();
 
   auto builder1 = FakeTreeBuilder();
@@ -2676,14 +2389,8 @@ TEST_P(CheckoutTest, concurrent_crawl_during_checkout) {
   FakePrjfsChannel::initializeFakePrjfsChannel(
       std::move(actions), mount.getEdenMount());
 
-  auto fut = mount.getEdenMount()
-                 ->checkout(
-                     mount.getRootInode(),
-                     RootId{"2"},
-                     ObjectFetchContext::getNullContext(),
-                     __func__)
-                 .semi()
-                 .via(mount.getServerExecutor().get());
+  auto fut = mount.checkout(
+      RootId{"2"}, ObjectFetchContext::getNullContext(), __func__);
 
   // Several executors are involved in checkout, some of which aren't the
   // server executor, thus we need to loop several times to make sure they all
@@ -2697,9 +2404,8 @@ TEST_P(CheckoutTest, concurrent_crawl_during_checkout) {
   mount.getEdenMount()->getPrjfsChannel()->unmount({}).get();
 }
 
-TEST_P(CheckoutTest, concurrent_file_to_directory_during_checkout) {
+TEST(CheckoutTest, concurrent_file_to_directory_during_checkout) {
   TestMount mount;
-  applyParam(mount);
   auto backingStore = mount.getBackingStore();
 
   auto builder1 = FakeTreeBuilder();
@@ -2729,14 +2435,8 @@ TEST_P(CheckoutTest, concurrent_file_to_directory_during_checkout) {
 
   readFile(bTxt).throwUnlessValue();
 
-  auto fut = mount.getEdenMount()
-                 ->checkout(
-                     mount.getRootInode(),
-                     RootId{"2"},
-                     ObjectFetchContext::getNullContext(),
-                     __func__)
-                 .semi()
-                 .via(mount.getServerExecutor().get());
+  auto fut = mount.checkout(
+      RootId{"2"}, ObjectFetchContext::getNullContext(), __func__);
 
   // Several executors are involved in checkout, some of which aren't the
   // server executor, thus we need to loop several times to make sure they all
@@ -2753,9 +2453,8 @@ TEST_P(CheckoutTest, concurrent_file_to_directory_during_checkout) {
   mount.getEdenMount()->getPrjfsChannel()->unmount({}).get();
 }
 
-TEST_P(CheckoutTest, concurrent_new_file_during_checkout) {
+TEST(CheckoutTest, concurrent_new_file_during_checkout) {
   TestMount mount;
-  applyParam(mount);
   auto backingStore = mount.getBackingStore();
 
   auto builder1 = FakeTreeBuilder();
@@ -2786,14 +2485,8 @@ TEST_P(CheckoutTest, concurrent_new_file_during_checkout) {
   readFile(mount.getEdenMount()->getPath() + "a/1.txt"_relpath)
       .throwUnlessValue();
 
-  auto fut = mount.getEdenMount()
-                 ->checkout(
-                     mount.getRootInode(),
-                     RootId{"2"},
-                     ObjectFetchContext::getNullContext(),
-                     __func__)
-                 .semi()
-                 .via(mount.getServerExecutor().get());
+  auto fut = mount.checkout(
+      RootId{"2"}, ObjectFetchContext::getNullContext(), __func__);
 
   // Several executors are involved in checkout, some of which aren't the
   // server executor, thus we need to loop several times to make sure they all
@@ -2810,9 +2503,8 @@ TEST_P(CheckoutTest, concurrent_new_file_during_checkout) {
   mount.getEdenMount()->getPrjfsChannel()->unmount({}).get();
 }
 
-TEST_P(CheckoutTest, concurrent_recreation_during_checkout) {
+TEST(CheckoutTest, concurrent_recreation_during_checkout) {
   TestMount mount;
-  applyParam(mount);
   auto backingStore = mount.getBackingStore();
 
   auto builder1 = FakeTreeBuilder();
@@ -2844,15 +2536,11 @@ TEST_P(CheckoutTest, concurrent_recreation_during_checkout) {
       .throwUnlessValue();
   mount.deleteFile("a/1.txt");
 
-  auto fut = mount.getEdenMount()
-                 ->checkout(
-                     mount.getRootInode(),
-                     RootId{"2"},
-                     ObjectFetchContext::getNullContext(),
-                     __func__,
-                     CheckoutMode::FORCE)
-                 .semi()
-                 .via(mount.getServerExecutor().get());
+  auto fut = mount.checkout(
+      RootId{"2"},
+      ObjectFetchContext::getNullContext(),
+      __func__,
+      CheckoutMode::FORCE);
 
   // Several executors are involved in checkout, some of which aren't the
   // server executor, thus we need to loop several times to make sure they all
@@ -2891,7 +2579,7 @@ TEST_P(CheckoutTest, concurrent_recreation_during_checkout) {
 
 #ifndef _WIN32
 
-TEST_P(CheckoutTest, overlayWritesDuringCheckout) {
+TEST(CheckoutTest, overlayWritesDuringCheckout) {
   // To trigger the N+1 overlay write problem, subdirectories must change
   // materialization state during checkout. If they stay materialized,
   // they don't trigger an overlay write for their parent.
@@ -2907,7 +2595,6 @@ TEST_P(CheckoutTest, overlayWritesDuringCheckout) {
   builder1.setFile("parent/sub4/file4.txt", "original4\n");
   builder1.setFile("parent/sub5/file5.txt", "original5\n");
   TestMount testMount{builder1};
-  applyParam(testMount);
 
   // Materialize each subdirectory by modifying its file
   testMount.overwriteFile("parent/sub1/file1.txt", "local1\n");
@@ -2936,16 +2623,11 @@ TEST_P(CheckoutTest, overlayWritesDuringCheckout) {
   auto initialWrites = data->getCounter(key);
 
   // FORCE checkout to overwrite local modifications so subs can dematerialize
-  auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"2"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__,
-                                CheckoutMode::FORCE)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"2"},
+      ObjectFetchContext::getNullContext(),
+      __func__,
+      CheckoutMode::FORCE);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutResult.isReady());
   auto result = std::move(checkoutResult).get();
@@ -2987,13 +2669,12 @@ TEST_P(CheckoutTest, overlayWritesDuringCheckout) {
       testMount.getFileInode("parent/sub5/file5.txt"), "modified5\n", 0644);
 }
 
-TEST_P(CheckoutTest, backgroundOverlayCleanupDuringCheckout) {
+TEST(CheckoutTest, backgroundOverlayCleanupDuringCheckout) {
   // Verify that overlay data for unloaded directories is cleaned up
   // asynchronously by the GC thread during checkout.
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("dir/sub/file.txt", "contents");
   TestMount testMount{builder1};
-  applyParam(testMount);
   testMount.updateEdenConfig(
       {{"experimental:background-overlay-cleanup-during-checkout", "true"}});
 
@@ -3016,15 +2697,10 @@ TEST_P(CheckoutTest, backgroundOverlayCleanupDuringCheckout) {
 
   // Checkout to the second commit.
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId("2"),
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor)
-                            .getVia(executor);
+  auto checkoutResult =
+      testMount
+          .checkout(RootId("2"), ObjectFetchContext::getNullContext(), __func__)
+          .getVia(executor);
   EXPECT_EQ(0, checkoutResult.conflicts.size());
 
   // Wait for background GC to complete.
@@ -3056,16 +2732,11 @@ TEST(Checkout, forceCheckoutRemovesLoadedRestrictedTree) {
       testMount.getBackingStore()->putCommit(RootId{"target"}, targetBuilder);
   targetCommit->setReady();
 
-  auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"target"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__,
-                                CheckoutMode::FORCE)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"target"},
+      ObjectFetchContext::getNullContext(),
+      __func__,
+      CheckoutMode::FORCE);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutResult.isReady());
   EXPECT_EQ(0, checkoutResult.value().conflicts.size());
@@ -3143,16 +2814,11 @@ TEST(Checkout, forceCheckoutReplacesLoadedRestrictedTreeWithFile) {
       testMount.getBackingStore()->putCommit(RootId{"target"}, targetBuilder);
   targetCommit->setReady();
 
-  auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"target"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__,
-                                CheckoutMode::FORCE)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"target"},
+      ObjectFetchContext::getNullContext(),
+      __func__,
+      CheckoutMode::FORCE);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutResult.isReady());
   EXPECT_EQ(0, checkoutResult.value().conflicts.size());
@@ -3172,14 +2838,13 @@ TEST(Checkout, forceCheckoutReplacesLoadedRestrictedTreeWithFile) {
   testMount.getEdenMount()->getInodeMap()->decFsRefcount(restrictedInodeNumber);
 }
 
-TEST_P(CheckoutTest, checkoutUpdatesLoadedRestrictedChildPlaceholderMetadata) {
+TEST(CheckoutTest, checkoutUpdatesLoadedRestrictedChildPlaceholderMetadata) {
   auto currentBuilder = FakeTreeBuilder{};
   currentBuilder.setFile("project/notes/readme.md", "current note\n");
   currentBuilder.setFile(
       "project/notes/restricted_child/secret.txt", "current secret\n");
   currentBuilder.setDirIsRestricted("project/notes/restricted_child");
   TestMount testMount{RootId{"current"}, currentBuilder};
-  applyParam(testMount);
 
   auto parent = testMount.getTreeInode("project/notes"_relpath);
   auto restrictedTree =
@@ -3202,16 +2867,11 @@ TEST_P(CheckoutTest, checkoutUpdatesLoadedRestrictedChildPlaceholderMetadata) {
       testMount.getBackingStore()->putCommit(RootId{"target"}, targetBuilder);
   targetCommit->setReady();
 
-  auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"target"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__,
-                                CheckoutMode::NORMAL)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"target"},
+      ObjectFetchContext::getNullContext(),
+      __func__,
+      CheckoutMode::NORMAL);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutResult.isReady());
   EXPECT_EQ(0, std::move(checkoutResult).get().conflicts.size());
@@ -3274,16 +2934,11 @@ static void runCheckoutWithNonEmptyRestrictedPlaceholder() {
       testMount.getBackingStore()->putCommit(RootId{"target"}, targetBuilder);
   targetCommit->setReady();
 
-  auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"target"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__,
-                                CheckoutMode::NORMAL)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"target"},
+      ObjectFetchContext::getNullContext(),
+      __func__,
+      CheckoutMode::NORMAL);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutResult.isReady());
   EXPECT_EQ(0, std::move(checkoutResult).get().conflicts.size());
@@ -3318,12 +2973,11 @@ TEST(Checkout, checkoutRefusesNonEmptyRestrictedPlaceholder) {
 }
 
 #ifndef _WIN32
-TEST_P(CheckoutTest, forceCheckoutKeepsRememberedRestrictedChildOpaque) {
+TEST(CheckoutTest, forceCheckoutKeepsRememberedRestrictedChildOpaque) {
   auto currentBuilder = FakeTreeBuilder{};
   currentBuilder.setFile("restricted_child/secret.txt", "current secret\n");
   currentBuilder.setDirIsRestricted("restricted_child");
   TestMount testMount{RootId{"current"}, currentBuilder};
-  applyParam(testMount);
 
   auto restrictedTree = testMount.getTreeInode("restricted_child"_relpath);
   ASSERT_TRUE(restrictedTree->isRestricted());
@@ -3350,16 +3004,11 @@ TEST_P(CheckoutTest, forceCheckoutKeepsRememberedRestrictedChildOpaque) {
   auto intermediateCommit =
       backingStore->putCommit(RootId{"intermediate"}, intermediateBuilder);
   intermediateCommit->setReady();
-  auto executor = testMount.getServerExecutor().get();
-  auto intermediateCheckout = testMount.getEdenMount()
-                                  ->checkout(
-                                      testMount.getRootInode(),
-                                      RootId{"intermediate"},
-                                      ObjectFetchContext::getNullContext(),
-                                      __func__,
-                                      CheckoutMode::FORCE)
-                                  .semi()
-                                  .via(executor);
+  auto intermediateCheckout = testMount.checkout(
+      RootId{"intermediate"},
+      ObjectFetchContext::getNullContext(),
+      __func__,
+      CheckoutMode::FORCE);
   testMount.drainServerExecutor();
   ASSERT_TRUE(intermediateCheckout.isReady());
   EXPECT_EQ(0, std::move(intermediateCheckout).get().conflicts.size());
@@ -3409,16 +3058,11 @@ TEST_P(CheckoutTest, forceCheckoutKeepsRememberedRestrictedChildOpaque) {
   auto targetCommit = backingStore->putCommit(RootId{"target"}, targetBuilder);
   targetCommit->setReady();
 
-  executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"target"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__,
-                                CheckoutMode::FORCE)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"target"},
+      ObjectFetchContext::getNullContext(),
+      __func__,
+      CheckoutMode::FORCE);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutResult.isReady());
   EXPECT_EQ(0, std::move(checkoutResult).get().conflicts.size());
@@ -3450,14 +3094,13 @@ TEST_P(CheckoutTest, forceCheckoutKeepsRememberedRestrictedChildOpaque) {
 }
 #endif
 
-TEST_P(
+TEST(
     CheckoutTest,
     checkoutUpdatesLoadedRestrictedChildWhenOnlyFetchedTreeIsRestricted) {
   auto currentBuilder = FakeTreeBuilder{};
   currentBuilder.setFile("restricted_child/secret.txt", "current secret\n");
   currentBuilder.setDirIsRestricted("restricted_child");
   TestMount testMount{RootId{"current"}, currentBuilder};
-  applyParam(testMount);
 
   auto parent = testMount.getRootInode();
   auto restrictedTree = testMount.getTreeInode("restricted_child"_relpath);
@@ -3492,16 +3135,11 @@ TEST_P(
   ASSERT_FALSE(targetEntry->second.isRestricted());
   ASSERT_TRUE(targetRestrictedTree->get().isRestricted());
 
-  auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"target"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__,
-                                CheckoutMode::NORMAL)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"target"},
+      ObjectFetchContext::getNullContext(),
+      __func__,
+      CheckoutMode::NORMAL);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutResult.isReady());
   EXPECT_EQ(0, std::move(checkoutResult).get().conflicts.size());
@@ -3528,13 +3166,12 @@ TEST_P(
 }
 
 #ifndef _WIN32
-TEST_P(
+TEST(
     CheckoutTest,
     forceCheckoutRemovesChildThatBecomesRestrictedAfterPlanning) {
   auto currentBuilder = FakeTreeBuilder{};
   currentBuilder.setFile("outer/child/file.txt", "base\n");
   TestMount testMount{RootId{"current"}, currentBuilder};
-  applyParam(testMount);
 
   auto backingStore = testMount.getBackingStore();
   auto targetBuilder = currentBuilder.clone();
@@ -3575,16 +3212,11 @@ TEST_P(
 
   // FORCE drops the newly restricted old outer tree, then selects the stale
   // child as local-only before its load discovers the restriction.
-  auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"target"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__,
-                                CheckoutMode::FORCE)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"target"},
+      ObjectFetchContext::getNullContext(),
+      __func__,
+      CheckoutMode::FORCE);
   testMount.drainServerExecutor();
   EXPECT_EQ(0, std::move(checkoutResult).get().conflicts.size());
 
@@ -3598,11 +3230,10 @@ TEST_P(
 }
 #endif
 
-TEST_P(CheckoutTest, checkoutToRestrictedTreeConflictsOnModifiedTrackedFile) {
+TEST(CheckoutTest, checkoutToRestrictedTreeConflictsOnModifiedTrackedFile) {
   auto currentBuilder = FakeTreeBuilder{};
   currentBuilder.setFile("regular/file.txt", "base\n");
   TestMount testMount{RootId{"current"}, currentBuilder};
-  applyParam(testMount);
 
   auto targetBuilder = currentBuilder.clone();
   targetBuilder.replaceFile("regular/file.txt", "target\n");
@@ -3615,15 +3246,12 @@ TEST_P(CheckoutTest, checkoutToRestrictedTreeConflictsOnModifiedTrackedFile) {
   testMount.overwriteFile("regular/file.txt", "local\n");
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
+  auto checkoutResult = testMount
+                            .checkout(
                                 RootId{"target"},
                                 ObjectFetchContext::getNullContext(),
                                 __func__,
                                 CheckoutMode::DRY_RUN)
-                            .semi()
-                            .via(executor)
                             .waitVia(executor);
   ASSERT_TRUE(checkoutResult.isReady());
 
@@ -3636,13 +3264,12 @@ TEST_P(CheckoutTest, checkoutToRestrictedTreeConflictsOnModifiedTrackedFile) {
           Dtype::REGULAR)));
 }
 
-TEST_P(
+TEST(
     CheckoutTest,
     checkoutToRestrictedTreeWithConflictDoesNotRestrictModifiedTrackedFile) {
   auto currentBuilder = FakeTreeBuilder{};
   currentBuilder.setFile("regular/file.txt", "base\n");
   TestMount testMount{RootId{"current"}, currentBuilder};
-  applyParam(testMount);
 
   auto targetBuilder = currentBuilder.clone();
   targetBuilder.replaceFile("regular/file.txt", "target\n");
@@ -3655,15 +3282,12 @@ TEST_P(
   testMount.overwriteFile("regular/file.txt", "local\n");
 
   auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
+  auto checkoutResult = testMount
+                            .checkout(
                                 RootId{"target"},
                                 ObjectFetchContext::getNullContext(),
                                 __func__,
                                 CheckoutMode::NORMAL)
-                            .semi()
-                            .via(executor)
                             .waitVia(executor);
   ASSERT_TRUE(checkoutResult.isReady());
 
@@ -3677,11 +3301,10 @@ TEST_P(
   EXPECT_FALSE(testMount.getTreeInode("regular"_relpath)->isRestricted());
 }
 
-TEST_P(CheckoutTest, checkoutToRestrictedTreeConflictsOnUntrackedFile) {
+TEST(CheckoutTest, checkoutToRestrictedTreeConflictsOnUntrackedFile) {
   auto currentBuilder = FakeTreeBuilder{};
   currentBuilder.setFile("existing/file.txt", "base\n");
   TestMount testMount{RootId{"current"}, currentBuilder};
-  applyParam(testMount);
 
   auto targetBuilder = currentBuilder.clone();
   targetBuilder.setFile("local_only_restricted/server.txt", "target\n");
@@ -3695,15 +3318,12 @@ TEST_P(CheckoutTest, checkoutToRestrictedTreeConflictsOnUntrackedFile) {
   testMount.addFile("local_only_restricted/local.txt", "local\n");
 
   auto executor = testMount.getServerExecutor().get();
-  auto dryRunResult = testMount.getEdenMount()
-                          ->checkout(
-                              testMount.getRootInode(),
+  auto dryRunResult = testMount
+                          .checkout(
                               RootId{"target"},
                               ObjectFetchContext::getNullContext(),
                               __func__,
                               CheckoutMode::DRY_RUN)
-                          .semi()
-                          .via(executor)
                           .waitVia(executor);
   ASSERT_TRUE(dryRunResult.isReady());
   EXPECT_THAT(
@@ -3716,15 +3336,12 @@ TEST_P(CheckoutTest, checkoutToRestrictedTreeConflictsOnUntrackedFile) {
   EXPECT_FALSE(
       testMount.getTreeInode("local_only_restricted"_relpath)->isRestricted());
 
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
+  auto checkoutResult = testMount
+                            .checkout(
                                 RootId{"target"},
                                 ObjectFetchContext::getNullContext(),
                                 __func__,
                                 CheckoutMode::NORMAL)
-                            .semi()
-                            .via(executor)
                             .waitVia(executor);
   ASSERT_TRUE(checkoutResult.isReady());
 
@@ -3733,6 +3350,44 @@ TEST_P(CheckoutTest, checkoutToRestrictedTreeConflictsOnUntrackedFile) {
       testMount.getTreeInode("local_only_restricted"_relpath);
   EXPECT_TRUE(restrictedInode->isRestricted());
   EXPECT_TRUE(restrictedInode->getContentsUnchecked().rlock()->entries.empty());
+}
+
+// A checkout that restricts a directory removes the untracked files in its
+// tracked subdirectories, as it does those directly in it, and leaves an empty
+// placeholder.
+TEST(CheckoutTest, checkoutToRestrictedTreeRemovesNestedUntrackedFiles) {
+  for (auto mode : {CheckoutMode::NORMAL, CheckoutMode::FORCE}) {
+    auto builder = FakeTreeBuilder{};
+    builder.setFile("dir/sub/tracked.txt", "v1\n");
+    builder.setFile("dir/sub/deep/tracked.txt", "v1\n");
+    TestMount testMount{RootId{"1"}, builder};
+    testMount.addFile("dir/sub/untracked.pyc", "local\n");
+    testMount.mkdir("dir/sub/__pycache__");
+    testMount.addFile("dir/sub/__pycache__/a.pyc", "local\n");
+    testMount.mkdir("dir/sub/deep/__pycache__");
+    testMount.addFile("dir/sub/deep/__pycache__/b.pyc", "local\n");
+
+    auto restricted = builder.clone();
+    restricted.replaceFile("dir/sub/tracked.txt", "v2\n");
+    restricted.setDirIsRestricted("dir");
+    restricted.finalize(testMount.getBackingStore(), true);
+    testMount.getBackingStore()->putCommit(RootId{"2"}, restricted)->setReady();
+
+    for (auto checkoutMode : {CheckoutMode::DRY_RUN, mode}) {
+      auto result = testMount
+                        .checkout(
+                            RootId{"2"},
+                            ObjectFetchContext::getNullContext(),
+                            __func__,
+                            checkoutMode)
+                        .waitVia(testMount.getServerExecutor().get());
+      ASSERT_TRUE(result.isReady());
+      EXPECT_TRUE(std::move(result).get().conflicts.empty());
+    }
+    auto dir = testMount.getTreeInode("dir"_relpath);
+    EXPECT_TRUE(dir->isRestricted());
+    EXPECT_TRUE(dir->getContentsUnchecked().rlock()->entries.empty());
+  }
 }
 
 #endif
@@ -3758,13 +3413,12 @@ TEST_P(CheckoutTest, checkoutToRestrictedTreeConflictsOnUntrackedFile) {
  * tracked directory, matching git's behavior of overwriting ignored files.
  */
 #ifndef _WIN32
-TEST_P(CheckoutTest, ignoredSymlinkReplacedByDirectoryInDestination) {
+TEST(CheckoutTest, ignoredSymlinkReplacedByDirectoryInDestination) {
   // Commit 1: has a .gitignore ignoring "src/link"
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("src/main.c", "// Some code.\n");
   builder1.setFile("src/.gitignore", "link\n");
   TestMount testMount{RootId{"1"}, builder1};
-  applyParam(testMount);
 
   // Commit 2: adds "src/link/" as a tracked directory with a file inside.
   // The symlink name is NOT tracked in commit 1, only as a directory in
@@ -3780,15 +3434,8 @@ TEST_P(CheckoutTest, ignoredSymlinkReplacedByDirectoryInDestination) {
   testMount.addFile("target_dir/file.txt", "stuff\n");
   testMount.addSymlink("src/link", "target_dir");
 
-  auto executor = testMount.getServerExecutor().get();
-  auto checkoutResult = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"2"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor);
+  auto checkoutResult = testMount.checkout(
+      RootId{"2"}, ObjectFetchContext::getNullContext(), __func__);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutResult.isReady());
   auto result = std::move(checkoutResult).get();
@@ -3802,12 +3449,11 @@ TEST_P(CheckoutTest, ignoredSymlinkReplacedByDirectoryInDestination) {
 }
 #endif
 
-TEST_P(CheckoutTest, directoryReplacedByFileAndRemovedIsModifiedRemoved) {
+TEST(CheckoutTest, directoryReplacedByFileAndRemovedIsModifiedRemoved) {
   auto builder1 = FakeTreeBuilder();
   builder1.setFile("readme.txt", "readme\n");
   builder1.setFile("d/x.txt", "x\n");
   TestMount mount{RootId{"1"}, builder1};
-  applyParam(mount);
   auto builder2 = FakeTreeBuilder();
   builder2.setFile("readme.txt", "readme\n");
   builder2.finalize(mount.getBackingStore(), true);
@@ -3818,15 +3464,12 @@ TEST_P(CheckoutTest, directoryReplacedByFileAndRemovedIsModifiedRemoved) {
   mount.addFile("d", "local file\n");
 
   auto executor = mount.getServerExecutor().get();
-  auto result = mount.getEdenMount()
-                    ->checkout(
-                        mount.getRootInode(),
+  auto result = mount
+                    .checkout(
                         RootId{"2"},
                         ObjectFetchContext::getNullContext(),
                         __func__,
                         CheckoutMode::NORMAL)
-                    .semi()
-                    .via(executor)
                     .getVia(executor);
   EXPECT_THAT(
       result.conflicts,
@@ -3863,15 +3506,7 @@ TEST_P(CheckoutTest, directoryReplacedByFileAndRemovedIsModifiedRemoved) {
 //   - remove file, with remove conflict
 //   - remove file, with a parent directory replaced with a file/symlink
 
-INSTANTIATE_TEST_SUITE_P(
-    CheckoutTestVariants,
-    CheckoutTest,
-    ::testing::Values(false, true),
-    [](const ::testing::TestParamInfo<bool>& info) {
-      return info.param ? "Coroutines" : "Futures";
-    });
-
-TEST_P(CheckoutTest, restrictedDirEntryInsertedOnFileToDirReplace) {
+TEST(CheckoutTest, restrictedDirEntryInsertedOnFileToDirReplace) {
   auto builder1 = FakeTreeBuilder{};
   builder1.setFile("dir/foo", "file contents");
 
@@ -3880,7 +3515,6 @@ TEST_P(CheckoutTest, restrictedDirEntryInsertedOnFileToDirReplace) {
   builder2.setDirIsRestricted("dir/foo");
 
   TestMount testMount{builder1};
-  applyParam(testMount);
 
   builder2.finalize(testMount.getBackingStore(), /*setReady=*/true);
   auto commit2 = testMount.getBackingStore()->putCommit(RootId{"2"}, builder2);
@@ -3896,15 +3530,8 @@ TEST_P(CheckoutTest, restrictedDirEntryInsertedOnFileToDirReplace) {
         << "pre-condition: builder1 entry should not be restricted";
   }
 
-  auto executor = testMount.getServerExecutor().get();
-  auto checkoutFuture = testMount.getEdenMount()
-                            ->checkout(
-                                testMount.getRootInode(),
-                                RootId{"2"},
-                                ObjectFetchContext::getNullContext(),
-                                __func__)
-                            .semi()
-                            .via(executor);
+  auto checkoutFuture = testMount.checkout(
+      RootId{"2"}, ObjectFetchContext::getNullContext(), __func__);
   testMount.drainServerExecutor();
   ASSERT_TRUE(checkoutFuture.isReady());
   auto result = std::move(checkoutFuture).get();

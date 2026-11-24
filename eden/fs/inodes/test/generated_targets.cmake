@@ -62,6 +62,7 @@ eden_add_test(eden_fs_inodes_test_checkout_context
     CheckoutContextTest.cpp
   DEPS
     ${LIBGMOCK_LIBRARIES}
+    Folly::folly_coro_blocking_wait
     Folly::folly_scope_guard
     Folly::folly_test_util
     eden_fs_inodes
@@ -97,6 +98,7 @@ eden_add_test(eden_fs_inodes_test_diff
     Folly::folly_test_test_utils
     eden_fs_config
     eden_fs_inodes
+    eden_fs_journal
     eden_fs_model_git_gitignore
     eden_fs_store
     eden_fs_testharness_fake_backing_store_and_tree_builder
@@ -104,6 +106,7 @@ eden_add_test(eden_fs_inodes_test_diff
     eden_fs_testharness_test_checks
     eden_fs_testharness_test_mount
     eden_fs_testharness_test_util
+    edencommon::edencommon_utils
 )
 
 eden_add_test(eden_fs_inodes_test_eden_dispatcher
@@ -172,6 +175,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR WIN32)
     DEPS
       ${LIBGMOCK_LIBRARIES}
       Folly::folly_chrono_conv
+      Folly::folly_coro_blocking_wait
       Folly::folly_executors_manual_executor
       Folly::folly_file
       Folly::folly_futures_core
@@ -202,6 +206,7 @@ eden_add_test(eden_fs_inodes_test_file_inode
     ${LIBGMOCK_LIBRARIES}
     Folly::folly_coro_gtest_helpers
     Folly::folly_range
+    Folly::folly_scope_guard
     Folly::folly_test_test_utils
     eden_fs_inodes
     eden_fs_journal
@@ -437,9 +442,12 @@ eden_add_test(eden_fs_inodes_test_remove
     RemoveTest.cpp
   DEPS
     ${LIBGMOCK_LIBRARIES}
+    Folly::folly_portability_unistd
+    Folly::folly_synchronization_baton
     Folly::folly_test_test_utils
     eden_fs_inodes
     eden_fs_journal
+    eden_fs_store_context
     eden_fs_testharness_fake_backing_store_and_tree_builder
     eden_fs_testharness_test_checks
     eden_fs_testharness_test_mount
@@ -522,6 +530,7 @@ eden_add_test(eden_fs_inodes_test_tree_inode
     edencommon::edencommon_utils
     fb303::fb303
     fmt::fmt
+    sigbus_memops
 )
 
 eden_add_test(eden_fs_inodes_test_virtual_inode
@@ -529,6 +538,7 @@ eden_add_test(eden_fs_inodes_test_virtual_inode
     VirtualInodeTest.cpp
   DEPS
     ${LIBGMOCK_LIBRARIES}
+    Folly::folly_coro_blocking_wait
     Folly::folly_coro_gtest_helpers
     Folly::folly_coro_invoke
     Folly::folly_exception

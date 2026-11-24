@@ -8,11 +8,13 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
+use anyhow::anyhow;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use context::CoreContext;
@@ -76,12 +78,85 @@ impl ModernSyncCounterNames {
     }
 }
 
+/// The first error that stopped one of the managers. A manager that fails
+/// exits and drops its channel, so the sync loop only sees its next send fail
+/// with "channel closed". The senders attach this error to that send failure
+/// so the error that ends the sync names the cause.
+#[derive(Clone, Default)]
+struct FirstFailure(Arc<OnceLock<String>>);
+
+impl FirstFailure {
+    fn record(&self, manager: &str, err: &anyhow::Error) {
+        let _ = self.0.set(format!("{manager} manager failed: {err:#}"));
+    }
+
+    fn get(&self) -> Option<&str> {
+        self.0.get().map(String::as_str)
+    }
+
+    fn channel_closed(&self, channel: &str) -> anyhow::Error {
+        match self.get() {
+            Some(cause) => anyhow!("{channel} channel closed: {cause}"),
+            None => anyhow!("{channel} channel closed"),
+        }
+    }
+}
+
+/// Tells the managers to stop when the last `SendManager` handle is dropped:
+/// the sync that fed them returned, failed or was aborted, so the messages
+/// still queued are abandoned rather than uploaded by a sync nobody owns.
+struct StopManagersOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopManagersOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Runs each manager as its own task, with the arguments every manager
+/// shares, and records the error a manager stops with.
+struct ManagerSpawner {
+    ctx: CoreContext,
+    reponame: String,
+    external_sender: Arc<dyn EdenapiSender + Send + Sync>,
+    cancellation_requested: Arc<AtomicBool>,
+    first_failure: FirstFailure,
+}
+
+impl ManagerSpawner {
+    fn spawn<M>(&self, name: &'static str, mut manager: M)
+    where
+        M: Manager + Send + 'static,
+    {
+        let ctx = self.ctx.clone();
+        let reponame = self.reponame.clone();
+        let external_sender = self.external_sender.clone();
+        let cancellation_requested = self.cancellation_requested.clone();
+        let first_failure = self.first_failure.clone();
+        mononoke::spawn_task(async move {
+            if let Err(err) = manager
+                .run(ctx, reponame, external_sender, cancellation_requested)
+                .await
+            {
+                first_failure.record(name, &err);
+            }
+            // `manager` owns the receiving end of its channel and is only
+            // dropped here, so the channel closes after the failure is
+            // recorded and a send that finds it closed can name the cause.
+        });
+    }
+}
+
 #[derive(Clone)]
 pub struct SendManager {
+    // Declared first so the managers see the stop request before their
+    // channels close and they would otherwise drain the queue.
+    _stop_on_drop: Arc<StopManagersOnDrop>,
     content_sender: mpsc::Sender<ContentMessage>,
     files_sender: mpsc::Sender<FileMessage>,
     trees_sender: mpsc::Sender<TreeMessage>,
     changeset_sender: mpsc::Sender<ChangesetMessage>,
+    first_failure: FirstFailure,
 }
 
 pub enum ContentMessage {
@@ -158,6 +233,15 @@ impl SendManager {
         mc: Arc<dyn MutableCounters + Send + Sync>,
         cancellation_requested: Arc<AtomicBool>,
     ) -> Self {
+        let first_failure = FirstFailure::default();
+        let managers = ManagerSpawner {
+            ctx,
+            reponame,
+            external_sender,
+            cancellation_requested: cancellation_requested.clone(),
+            first_failure: first_failure.clone(),
+        };
+
         // Create channel for receiving content
         let (content_sender, content_recv) = mpsc::channel(
             config
@@ -166,17 +250,14 @@ impl SendManager {
                 .try_into()
                 .expect("channel size is too large"),
         );
-        ContentManager::new(
-            config.max_blob_bytes as u64,
-            config.content_channel_config.clone(),
-            content_recv,
-            repo_blobstore,
-        )
-        .start(
-            ctx.clone(),
-            reponame.clone(),
-            external_sender.clone(),
-            cancellation_requested.clone(),
+        managers.spawn(
+            "content",
+            ContentManager::new(
+                config.max_blob_bytes as u64,
+                config.content_channel_config.clone(),
+                content_recv,
+                repo_blobstore,
+            ),
         );
 
         // Create channel for receiving files
@@ -187,11 +268,9 @@ impl SendManager {
                 .try_into()
                 .expect("channel size is too large"),
         );
-        FilenodeManager::new(config.filenodes_channel_config.clone(), files_recv).start(
-            ctx.clone(),
-            reponame.clone(),
-            external_sender.clone(),
-            cancellation_requested.clone(),
+        managers.spawn(
+            "filenodes",
+            FilenodeManager::new(config.filenodes_channel_config.clone(), files_recv),
         );
 
         // Create channel for receiving trees
@@ -202,11 +281,9 @@ impl SendManager {
                 .try_into()
                 .expect("channel size is too large"),
         );
-        TreeManager::new(config.trees_channel_config.clone(), trees_recv).start(
-            ctx.clone(),
-            reponame.clone(),
-            external_sender.clone(),
-            cancellation_requested.clone(),
+        managers.spawn(
+            "trees",
+            TreeManager::new(config.trees_channel_config.clone(), trees_recv),
         );
 
         // Create channel for receiving changesets
@@ -217,17 +294,19 @@ impl SendManager {
                 .try_into()
                 .expect("channel size is too large"),
         );
-        ChangesetManager::new(config.changesets_channel_config.clone(), changeset_recv, mc).start(
-            ctx.clone(),
-            reponame.clone(),
-            external_sender.clone(),
-            cancellation_requested.clone(),
+        managers.spawn(
+            "changesets",
+            ChangesetManager::new(config.changesets_channel_config.clone(), changeset_recv, mc),
         );
 
+        let stop_on_drop = Arc::new(StopManagersOnDrop(cancellation_requested.clone()));
         mononoke::spawn_task(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
+                if cancellation_requested.load(Ordering::Relaxed) {
+                    break;
+                }
                 if fs::metadata(exit_file.clone()).is_ok() {
                     tracing::warn!("Exit file detected, stopping sync");
                     cancellation_requested.store(true, Ordering::Relaxed);
@@ -237,10 +316,12 @@ impl SendManager {
         });
 
         Self {
+            _stop_on_drop: stop_on_drop,
             content_sender,
             files_sender,
             trees_sender,
             changeset_sender,
+            first_failure,
         }
     }
 
@@ -248,28 +329,28 @@ impl SendManager {
         self.content_sender
             .send(content_msg)
             .await
-            .map_err(|err| err.into())
+            .map_err(|_| self.first_failure.channel_closed("content"))
     }
 
     pub async fn send_file(&self, ft_msg: FileMessage) -> Result<()> {
         self.files_sender
             .send(ft_msg)
             .await
-            .map_err(|err| err.into())
+            .map_err(|_| self.first_failure.channel_closed("filenodes"))
     }
 
     pub async fn send_tree(&self, ft_msg: TreeMessage) -> Result<()> {
         self.trees_sender
             .send(ft_msg)
             .await
-            .map_err(|err| err.into())
+            .map_err(|_| self.first_failure.channel_closed("trees"))
     }
 
     pub async fn send_changeset(&self, cs_msg: ChangesetMessage) -> Result<()> {
         self.changeset_sender
             .send(cs_msg)
             .await
-            .map_err(|err| err.into())
+            .map_err(|_| self.first_failure.channel_closed("changesets"))
     }
 
     pub async fn send_contents(&self, content_msgs: Vec<ContentMessage>) -> Result<()> {
@@ -302,13 +383,16 @@ impl SendManager {
 }
 
 trait Manager {
-    fn start(
-        self,
+    /// Runs the manager's loop until it stops. Returns an error only when
+    /// this manager failed; winding down after an upstream manager failed,
+    /// a closed channel and cancellation all return `Ok`.
+    fn run(
+        &mut self,
         ctx: CoreContext,
         reponame: String,
         external_sender: Arc<dyn EdenapiSender + Send + Sync>,
         cancellation_requested: Arc<AtomicBool>,
-    );
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// What a manager loop should do after handling one select event.
@@ -316,6 +400,8 @@ pub(crate) enum LoopAction {
     Continue,
     /// Stop the loop and exit the runner.
     Exit,
+    /// Stop the loop and exit the runner because this manager failed.
+    Fail(anyhow::Error),
 }
 
 #[cfg(test)]
@@ -323,9 +409,175 @@ mod tests {
     use anyhow::Result;
     use bookmarks::BookmarkCategory;
     use bookmarks::BookmarkName;
+    use fbinit::FacebookInit;
     use mononoke_macros::mononoke;
 
     use super::*;
+    use crate::sender::edenapi::NoopEdenapiSender;
+
+    #[mononoke::test]
+    fn channel_closed_names_the_first_failure() {
+        let first_failure = FirstFailure::default();
+        assert_eq!(
+            first_failure.channel_closed("content").to_string(),
+            "content channel closed"
+        );
+
+        first_failure.record(
+            "content",
+            &anyhow!("server responded 504 Gateway Timeout").context("uploading contents"),
+        );
+        first_failure.record("changesets", &anyhow!("files/trees error received"));
+
+        assert_eq!(
+            first_failure.channel_closed("content").to_string(),
+            "content channel closed: content manager failed: uploading contents: \
+             server responded 504 Gateway Timeout"
+        );
+    }
+
+    /// Stops as soon as it runs, failing with `failure` if set. It holds the
+    /// receiving end of its channel like a real manager.
+    struct StoppingManager<T> {
+        _recv: mpsc::Receiver<T>,
+        failure: Option<anyhow::Error>,
+    }
+
+    impl<T: Send> Manager for StoppingManager<T> {
+        async fn run(
+            &mut self,
+            _ctx: CoreContext,
+            _reponame: String,
+            _external_sender: Arc<dyn EdenapiSender + Send + Sync>,
+            _cancellation_requested: Arc<AtomicBool>,
+        ) -> Result<()> {
+            match self.failure.take() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// Spawns a trees manager that stops with `failure`, waits for its
+    /// channel to close, and returns the error of the next tree send.
+    async fn send_tree_after_manager_stops(
+        fb: FacebookInit,
+        failure: Option<anyhow::Error>,
+    ) -> anyhow::Error {
+        let first_failure = FirstFailure::default();
+        let managers = ManagerSpawner {
+            ctx: CoreContext::test_mock(fb),
+            reponame: "testrepo".to_string(),
+            external_sender: Arc::new(NoopEdenapiSender::default()),
+            cancellation_requested: Arc::new(AtomicBool::new(false)),
+            first_failure: first_failure.clone(),
+        };
+        let (trees_sender, trees_recv) = mpsc::channel(1);
+        let send_manager = SendManager {
+            _stop_on_drop: Arc::new(StopManagersOnDrop(Arc::new(AtomicBool::new(false)))),
+            content_sender: mpsc::channel(1).0,
+            files_sender: mpsc::channel(1).0,
+            trees_sender,
+            changeset_sender: mpsc::channel(1).0,
+            first_failure,
+        };
+
+        managers.spawn(
+            "trees",
+            StoppingManager {
+                _recv: trees_recv,
+                failure,
+            },
+        );
+        send_manager.trees_sender.closed().await;
+
+        let (trees_done, _) = oneshot::channel();
+        send_manager
+            .send_tree(TreeMessage::TreesDone(trees_done))
+            .await
+            .expect_err("sending to a stopped manager must fail")
+    }
+
+    #[mononoke::fbinit_test]
+    async fn send_to_failed_manager_names_the_failure(fb: FacebookInit) {
+        let failure = anyhow!("Expected 2 responses, got 0").context("uploading trees");
+        let err = send_tree_after_manager_stops(fb, Some(failure)).await;
+        // The failure is already recorded when the channel closes.
+        assert_eq!(
+            err.to_string(),
+            "trees channel closed: trees manager failed: uploading trees: \
+             Expected 2 responses, got 0"
+        );
+    }
+
+    #[mononoke::fbinit_test]
+    async fn send_to_manager_that_stopped_cleanly_has_no_cause(fb: FacebookInit) {
+        let err = send_tree_after_manager_stops(fb, None).await;
+        assert_eq!(
+            err.to_string(),
+            "trees channel closed",
+            "a manager that returns Ok must not record a failure"
+        );
+    }
+
+    /// Runs until cancellation is requested, like the real manager loops,
+    /// whether or not its channel is still open.
+    struct LoopingManager<T> {
+        _recv: mpsc::Receiver<T>,
+    }
+
+    impl<T: Send> Manager for LoopingManager<T> {
+        async fn run(
+            &mut self,
+            _ctx: CoreContext,
+            _reponame: String,
+            _external_sender: Arc<dyn EdenapiSender + Send + Sync>,
+            cancellation_requested: Arc<AtomicBool>,
+        ) -> Result<()> {
+            while !cancellation_requested.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(())
+        }
+    }
+
+    #[mononoke::fbinit_test]
+    async fn dropping_the_last_send_manager_stops_the_managers(fb: FacebookInit) {
+        let cancellation_requested = Arc::new(AtomicBool::new(false));
+        let managers = ManagerSpawner {
+            ctx: CoreContext::test_mock(fb),
+            reponame: "testrepo".to_string(),
+            external_sender: Arc::new(NoopEdenapiSender::default()),
+            cancellation_requested: cancellation_requested.clone(),
+            first_failure: FirstFailure::default(),
+        };
+        let (trees_sender, trees_recv) = mpsc::channel(1);
+        // Stays open after the SendManager handles are gone, so the manager
+        // can only stop because it was told to, not because its channel closed.
+        let other_trees_sender = trees_sender.clone();
+        let send_manager = SendManager {
+            _stop_on_drop: Arc::new(StopManagersOnDrop(cancellation_requested.clone())),
+            content_sender: mpsc::channel(1).0,
+            files_sender: mpsc::channel(1).0,
+            trees_sender,
+            changeset_sender: mpsc::channel(1).0,
+            first_failure: FirstFailure::default(),
+        };
+        managers.spawn("trees", LoopingManager { _recv: trees_recv });
+
+        let clone = send_manager.clone();
+        drop(send_manager);
+        assert!(
+            !cancellation_requested.load(Ordering::Relaxed),
+            "a remaining handle can still send, so the managers keep running"
+        );
+
+        drop(clone);
+        assert!(cancellation_requested.load(Ordering::Relaxed));
+        tokio::time::timeout(Duration::from_secs(10), other_trees_sender.closed())
+            .await
+            .expect("the manager must stop once the last handle is dropped");
+    }
 
     #[mononoke::test]
     fn bookmark_counter_names_are_readable_and_category_specific() -> Result<()> {

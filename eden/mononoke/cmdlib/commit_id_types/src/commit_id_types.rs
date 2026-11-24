@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
-use std::num::NonZeroU64;
 
 use anyhow::Error;
 use anyhow::Result;
@@ -18,7 +17,7 @@ use clap::ArgAction;
 use clap::ArgGroup;
 use clap::ArgMatches;
 use clap::builder::ValueRange;
-use faster_hex::hex_decode;
+use faster_hex::hex_decode_array;
 use faster_hex::hex_string;
 
 pub(crate) const ARG_COMMIT_ID: &str = "commit-id";
@@ -29,7 +28,6 @@ pub(crate) const ARG_GIT_SHA1: &str = "git-sha1";
 pub(crate) const ARG_GLOBALREV: &str = "globalrev";
 pub(crate) const ARG_SVNREV: &str = "svnrev";
 pub(crate) const ARG_P4_CHANGELIST: &str = "p4-changelist";
-pub(crate) const ARG_BUBBLE_ID: &str = "bubble-id";
 pub(crate) const ARG_SNAPSHOT_ID: &str = "snapshot-id";
 
 // Unfortunately we can't use clap derive API here directly because we care about
@@ -222,7 +220,7 @@ pub enum CommitId {
     BonsaiId([u8; 32]),
 
     /// Bonsai ID with bubble
-    EphemeralBonsai([u8; 32], Option<NonZeroU64>),
+    EphemeralBonsai([u8; 32]),
 
     /// Hg commit ID.
     HgId([u8; 20]),
@@ -257,12 +255,7 @@ impl fmt::Display for CommitId {
         match self {
             CommitId::Resolve(id) => write!(f, "commit id '{id}'"),
             CommitId::BonsaiId(bonsai) => write!(f, "bonsai id '{}'", hex_string(bonsai)),
-            CommitId::EphemeralBonsai(bonsai, bubble_id) => write!(
-                f,
-                "bonsai id '{}' on bubble {}",
-                hex_string(bonsai),
-                bubble_id.map_or_else(|| "unknown".to_string(), |id| id.to_string()),
-            ),
+            CommitId::EphemeralBonsai(bonsai) => write!(f, "snapshot id '{}'", hex_string(bonsai)),
             CommitId::HgId(id) => write!(f, "hg commit id '{}'", hex_string(id)),
             CommitId::GitSha1(id) => write!(f, "git sha1 '{}'", hex_string(id)),
             CommitId::Globalrev(rev) => write!(f, "globalrev '{rev}'"),
@@ -359,13 +352,6 @@ fn add_commit_id_args_impl(
                 .action(ArgAction::Append)
                 .number_of_values(1)
                 .help("Perforce changelist number to query"),
-        )
-        .arg(
-            Arg::new(ARG_BUBBLE_ID)
-                .long("bubble-id")
-                .num_args(1)
-                .number_of_values(1)
-                .help("Bubble id on which to check the bonsai commits"),
         )
         .group(
             ArgGroup::new("commit")
@@ -469,10 +455,6 @@ fn get_commit_ids_with_names<Names: CommitIdNames>(
 
 /// Get the commit ids specified by the user.  They are returned in the order specified.
 fn get_commit_ids_impl(matches: &ArgMatches) -> Result<BTreeMap<usize, CommitId>, Error> {
-    let bubble_id = matches
-        .get_one::<String>(ARG_BUBBLE_ID)
-        .map(|id| id.parse::<NonZeroU64>())
-        .transpose()?;
     let mut commit_ids = BTreeMap::new();
     if let (Some(indices), Some(values)) = (
         matches.indices_of(ARG_BOOKMARK),
@@ -487,8 +469,7 @@ fn get_commit_ids_impl(matches: &ArgMatches) -> Result<BTreeMap<usize, CommitId>
         matches.get_many::<String>(ARG_HG_COMMIT_ID),
     ) {
         for (index, value) in indices.zip(values) {
-            let mut id = [0; 20];
-            hex_decode(value.as_bytes(), &mut id)?;
+            let id = hex_decode_array::<20>(value.as_bytes())?;
             commit_ids.insert(index, CommitId::HgId(id));
         }
     }
@@ -497,8 +478,7 @@ fn get_commit_ids_impl(matches: &ArgMatches) -> Result<BTreeMap<usize, CommitId>
         matches.get_many::<String>(ARG_BONSAI_ID),
     ) {
         for (index, value) in indices.zip(values) {
-            let mut id = [0; 32];
-            hex_decode(value.as_bytes(), &mut id)?;
+            let id = hex_decode_array::<32>(value.as_bytes())?;
             commit_ids.insert(index, CommitId::BonsaiId(id));
         }
     }
@@ -507,9 +487,8 @@ fn get_commit_ids_impl(matches: &ArgMatches) -> Result<BTreeMap<usize, CommitId>
         matches.get_many::<String>(ARG_SNAPSHOT_ID),
     ) {
         for (index, value) in indices.zip(values) {
-            let mut id = [0; 32];
-            hex_decode(value.as_bytes(), &mut id)?;
-            commit_ids.insert(index, CommitId::EphemeralBonsai(id, bubble_id));
+            let id = hex_decode_array::<32>(value.as_bytes())?;
+            commit_ids.insert(index, CommitId::EphemeralBonsai(id));
         }
     }
     if let (Some(indices), Some(values)) = (
@@ -517,8 +496,7 @@ fn get_commit_ids_impl(matches: &ArgMatches) -> Result<BTreeMap<usize, CommitId>
         matches.get_many::<String>(ARG_GIT_SHA1),
     ) {
         for (index, value) in indices.zip(values) {
-            let mut hash = [0; 20];
-            hex_decode(value.as_bytes(), &mut hash)?;
+            let hash = hex_decode_array::<20>(value.as_bytes())?;
             commit_ids.insert(index, CommitId::GitSha1(hash));
         }
     }

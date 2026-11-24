@@ -84,6 +84,13 @@ if sys.platform == "win32":
         ],
         "redirect_test.RedirectTestHg": ["test_disallow_bind_mount_outside_repo"],
         "remount_test.RemountTestHg": True,
+        # On Windows, a bind redirection is a symlink.
+        # `eden rm` removes the symlink. It does not unmount a file system.
+        # So `eden rm` cannot hang on a busy redirection.
+        "remove_test.RemoveTest": [
+            "test_remove_with_busy_bind_mount_0_rust",
+            "test_remove_with_busy_bind_mount_1_python",
+        ],
         "rename_test.RenameTestHg": True,
         "restart_test.RestartTestAdHoc": True,
         "restart_test.RestartTestManaged": True,
@@ -102,6 +109,7 @@ if sys.platform == "win32":
         "start_test.StartWithRepoTestHg": True,
         "stats_test.GenericStatsTest": [
             "test_summary_counters_available",  # counter not implemented for PrjFS (T147669123)
+            "test_debug_counters_report_statfs",  # the test checks a FUSE counter
         ],
         "stats_test.ObjectCacheStatsTest": [
             "test_get_tree_memory",  # unloadInodeForPath not implemented
@@ -276,6 +284,7 @@ elif sys.platform.startswith("darwin"):
     # We can enable this test once those are added (T147665665)
     TEST_DISABLED["stats_test.GenericStatsTest"] = [
         "test_summary_counters_available",
+        "test_debug_counters_report_statfs",  # the test checks a FUSE counter
     ]
 
     TEST_DISABLED["takeover_test.TakeoverTestHg"] = [
@@ -331,6 +340,7 @@ if sys.platform != "win32":
         {
             "changes_test.ChangesTestWin": True,
             "windows_fsck_test.WindowsFsckTest": True,
+            "windows_fsck_test.WindowsFsckExecutableBitTest": True,
             "prjfs_stress.PrjFSStress": True,
             "prjfs_stress.PrjfsStressNoListenToFull": True,
             "projfs_buffer.PrjFSBuffer": True,

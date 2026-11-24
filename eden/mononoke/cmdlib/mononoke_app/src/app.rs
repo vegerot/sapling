@@ -49,6 +49,7 @@ use metaconfig_types::BlobConfig;
 use metaconfig_types::BlobstoreId;
 use metaconfig_types::Redaction;
 use metaconfig_types::RepoConfig;
+use metaconfig_types::RepoConfigRef;
 use metaconfig_types::ShardedService;
 use mononoke_configs::MononokeConfigs;
 #[allow(unused)]
@@ -59,6 +60,7 @@ use redactedblobstore::RedactionConfigBlobstore;
 use repo_blobstore::RepoBlobstore;
 use repo_factory::RepoFactory;
 use repo_factory::RepoFactoryBuilder;
+use repos::MononokeService;
 use running::ShutdownGracePeriod;
 use running::run_until_terminated;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -116,14 +118,18 @@ impl MononokeApp {
     pub(crate) fn new(
         fb: FacebookInit,
         config_mode: ConfigMode,
+        default_service: Option<MononokeService>,
         args: ArgMatches,
         runtime: Runtime,
         env: MononokeEnvironment,
         extension_args: HashMap<TypeId, Box<dyn BoxedAppExtensionArgs>>,
     ) -> Result<Self> {
         let env = Arc::new(env);
-        let configs = ConfigArgs::from_arg_matches(&args)?
-            .create_mononoke_configs(runtime.handle().clone(), &env.as_ref().config_store)?;
+        let configs = ConfigArgs::from_arg_matches(&args)?.create_mononoke_configs(
+            runtime.handle().clone(),
+            &env.as_ref().config_store,
+            default_service,
+        )?;
 
         let repo_factory = Arc::new(RepoFactory::new(env.clone(), configs.clone()));
 
@@ -470,9 +476,10 @@ impl MononokeApp {
             .map(|(repo_name, repo_config)| {
                 let repo_factory = self.repo_factory.clone();
                 let common_config = common_config.clone();
+                let source = self.configs.repo_config_source(&repo_name);
                 async move {
                     repo_factory
-                        .build(repo_name, repo_config, common_config)
+                        .build(repo_name, repo_config, common_config, source)
                         .await
                 }
             })
@@ -504,9 +511,10 @@ impl MononokeApp {
         let repo_arg = repo_args.as_repo_arg();
         let (repo_name, repo_config) = self.repo_config(repo_arg)?;
         let common_config = self.repo_configs().common.clone();
+        let source = self.configs.repo_config_source(&repo_name);
         let repo = self
             .repo_factory
-            .build(repo_name, repo_config, common_config)
+            .build(repo_name, repo_config, common_config, source)
             .await?;
         Ok(repo)
     }
@@ -524,9 +532,10 @@ impl MononokeApp {
             .get_or_load_repo_config_by_id(repo_id.id())
             .with_context(|| format!("unknown repoid: {repo_id:?}"))?;
         let common_config = self.repo_configs().common.clone();
+        let source = self.configs.repo_config_source(&repo_name);
         let repo = self
             .repo_factory
-            .build(repo_name, repo_config, common_config)
+            .build(repo_name, repo_config, common_config, source)
             .await?;
         Ok(repo)
     }
@@ -544,11 +553,12 @@ impl MononokeApp {
         let repo_arg = repo_args.as_repo_arg();
         let (repo_name, repo_config) = self.repo_config(repo_arg)?;
         let common_config = self.repo_configs().common.clone();
+        let source = self.configs.repo_config_source(&repo_name);
         let mut repo_factory = self.repo_factory.clone();
         let repo_factory = Arc::make_mut(&mut repo_factory);
         customize_repo_factory(repo_factory);
         let repo = repo_factory
-            .build(repo_name, repo_config, common_config)
+            .build(repo_name, repo_config, common_config, source)
             .await?;
         Ok(repo)
     }
@@ -566,12 +576,13 @@ impl MononokeApp {
         let repo_arg = repo_args.as_repo_arg();
         let (repo_name, mut repo_config) = self.repo_config(repo_arg)?;
         let common_config = self.repo_configs().common.clone();
+        let source = self.configs.repo_config_source(&repo_name);
         repo_config.redaction = Redaction::Disabled;
         let mut repo_factory = self.repo_factory.clone();
         let repo_factory = Arc::make_mut(&mut repo_factory);
         customize_repo_factory(repo_factory);
         let repo = repo_factory
-            .build(repo_name, repo_config, common_config)
+            .build(repo_name, repo_config, common_config, source)
             .await?;
         Ok(repo)
     }
@@ -585,10 +596,11 @@ impl MononokeApp {
         let repo_arg = repo_args.as_repo_arg();
         let (repo_name, mut repo_config) = self.repo_config(repo_arg)?;
         let common_config = self.repo_configs().common.clone();
+        let source = self.configs.repo_config_source(&repo_name);
         repo_config.redaction = Redaction::Disabled;
         let repo = self
             .repo_factory
-            .build(repo_name, repo_config, common_config)
+            .build(repo_name, repo_config, common_config, source)
             .await?;
         Ok(repo)
     }
@@ -604,6 +616,7 @@ impl MononokeApp {
     {
         let (repo_name, mut repo_config) = self.repo_config(repo_arg.as_repo_arg())?;
         let common_config = self.repo_configs().common.clone();
+        let source = self.configs.repo_config_source(&repo_name);
         if let Some(id) = maybe_inner_blobstore_id {
             self.override_blobconfig(&mut repo_config.storage_config.blobstore, id)?;
         }
@@ -620,7 +633,7 @@ impl MononokeApp {
         }
         let repo = self
             .repo_factory
-            .build(repo_name, repo_config, common_config)
+            .build(repo_name, repo_config, common_config, source)
             .await?;
         Ok(repo)
     }
@@ -637,6 +650,7 @@ impl MononokeApp {
     {
         let (repo_name, mut repo_config) = self.repo_config(repo_arg.as_repo_arg())?;
         let common_config = self.repo_configs().common.clone();
+        let source = self.configs.repo_config_source(&repo_name);
         if let Some(id) = maybe_inner_blobstore_id {
             self.override_blobconfig(&mut repo_config.storage_config.blobstore, id)?;
         }
@@ -654,7 +668,7 @@ impl MononokeApp {
         repo_config.redaction = Redaction::Disabled;
         let repo = self
             .repo_factory
-            .build(repo_name, repo_config, common_config)
+            .build(repo_name, repo_config, common_config, source)
             .await?;
         Ok(repo)
     }
@@ -672,12 +686,20 @@ impl MononokeApp {
         let (target_repo_name, target_repo_config) =
             self.repo_config(repo_args.target_repo.as_repo_arg())?;
         let common_config = self.repo_configs().common.clone();
-        let source_repo_fut =
-            self.repo_factory
-                .build(source_repo_name, source_repo_config, common_config.clone());
-        let target_repo_fut =
-            self.repo_factory
-                .build(target_repo_name, target_repo_config, common_config);
+        let source_source = self.configs.repo_config_source(&source_repo_name);
+        let target_source = self.configs.repo_config_source(&target_repo_name);
+        let source_repo_fut = self.repo_factory.build(
+            source_repo_name,
+            source_repo_config,
+            common_config.clone(),
+            source_source,
+        );
+        let target_repo_fut = self.repo_factory.build(
+            target_repo_name,
+            target_repo_config,
+            common_config,
+            target_source,
+        );
 
         let (source_repo, target_repo) = try_join!(source_repo_fut, target_repo_fut)?;
         Ok((source_repo, target_repo))
@@ -691,6 +713,7 @@ impl MononokeApp {
     ) -> Result<MononokeReposManager<Repo>>
     where
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + RepoConfigRef
             + Send
             + Sync
             + 'static,
@@ -709,6 +732,7 @@ impl MononokeApp {
     ) -> Result<MononokeReposManager<Repo>>
     where
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + RepoConfigRef
             + Send
             + Sync
             + 'static,
@@ -727,6 +751,7 @@ impl MononokeApp {
     ) -> Result<MononokeReposManager<Repo>>
     where
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + RepoConfigRef
             + Send
             + Sync
             + 'static,
@@ -800,20 +825,16 @@ impl MononokeApp {
         // conservative parse-independent proxy (deep repos load on demand, fail-open).
         let serves_all = service.is_none();
         let manifest = self.configs.manifest();
-        let non_deep: HashSet<&str> = manifest
-            .as_ref()
-            .map(|m| {
-                m.repos
-                    .iter()
-                    .filter(|e| !e.is_deep_sharded)
-                    .map(|e| e.repo_name.as_str())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let non_deep = |name: &str| {
+            manifest
+                .as_ref()
+                .and_then(|m| m.repo(name))
+                .is_some_and(|entry| !entry.is_deep_sharded)
+        };
         let repo_filter = self.environment().filter_repos.clone();
         let blocking = startup_blocking_failures(
             failed,
-            |n| serves_all || non_deep.contains(n),
+            |n| serves_all || non_deep(n),
             |n| repo_filter.as_ref().is_none_or(|f| f(n)),
         );
         startup_parse_failure_decision(&blocking)
@@ -829,6 +850,7 @@ impl MononokeApp {
     where
         Names: IntoIterator<Item = String>,
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + RepoConfigRef
             + Send
             + Sync
             + 'static,
@@ -853,6 +875,7 @@ impl MononokeApp {
     where
         Names: IntoIterator<Item = String>,
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + RepoConfigRef
             + Send
             + Sync
             + 'static,
@@ -875,6 +898,7 @@ impl MononokeApp {
     where
         Names: IntoIterator<Item = String>,
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + RepoConfigRef
             + Send
             + Sync
             + 'static,
@@ -913,6 +937,7 @@ impl MononokeApp {
     ) -> Result<MononokeReposManager<Repo>>
     where
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + RepoConfigRef
             + Send
             + Sync
             + 'static,
@@ -1051,7 +1076,11 @@ impl MononokeApp {
     pub async fn redaction_config_blobstore(&self) -> Result<Arc<RedactionConfigBlobstore>> {
         self.repo_factory
             .redaction_config_blobstore_from_config(
-                &self.repo_configs().common.redaction_config.blobstore,
+                &self
+                    .repo_configs()
+                    .common
+                    .require_redaction_config()?
+                    .blobstore,
             )
             .await
     }

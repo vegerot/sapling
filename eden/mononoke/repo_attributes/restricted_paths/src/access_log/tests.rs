@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15,6 +16,9 @@ use anyhow::anyhow;
 use context::CoreContext;
 use context::SessionContainer;
 use fbinit::FacebookInit;
+use justknobs::test_helpers::JustKnobsInMemory;
+use justknobs::test_helpers::KnobVal;
+use justknobs::test_helpers::with_just_knobs;
 use metaconfig_types::AclManifestMode;
 use metadata::ClientPathAclCompatibility;
 use metadata::Metadata;
@@ -27,7 +31,6 @@ use serde_json::Value;
 use serde_json::json;
 
 use super::RestrictedPathAccessData;
-use super::log_source_results_to_scuba;
 use super::log_source_results_to_scuba_with_enforcement;
 use super::restriction_check_result_for_source_results;
 use crate::ManifestType;
@@ -117,34 +120,26 @@ impl<T: SourceRestrictionCheck> ShadowComparisonFieldFixture<T> {
         Self { ctx, ..self }
     }
 
-    fn log_with(
+    fn log(self) -> Result<Vec<serde_json::Map<String, Value>>> {
+        self.log_with_decision(None)
+    }
+
+    fn log_result(self) -> Result<(Result<()>, Vec<serde_json::Map<String, Value>>)> {
+        self.log_result_with_decision(None)
+    }
+
+    fn log_with_decision(
         self,
-        log_results: impl FnOnce(
-            &CoreContext,
-            RepositoryId,
-            &SourceRestrictionResult<T>,
-            Option<&SourceRestrictionResult<T>>,
-            AclManifestMode,
-            RestrictedPathAccessData,
-            MononokeScubaSampleBuilder,
-        ) -> Result<()>,
+        enforcement_decision: Option<EnforcementDecision>,
     ) -> Result<Vec<serde_json::Map<String, Value>>> {
-        let (log_result, samples) = self.log_with_result(log_results)?;
+        let (log_result, samples) = self.log_result_with_decision(enforcement_decision)?;
         log_result?;
         Ok(samples)
     }
 
-    fn log_with_result(
+    fn log_result_with_decision(
         self,
-        log_results: impl FnOnce(
-            &CoreContext,
-            RepositoryId,
-            &SourceRestrictionResult<T>,
-            Option<&SourceRestrictionResult<T>>,
-            AclManifestMode,
-            RestrictedPathAccessData,
-            MononokeScubaSampleBuilder,
-        ) -> Result<()>,
+        enforcement_decision: Option<EnforcementDecision>,
     ) -> Result<(Result<()>, Vec<serde_json::Map<String, Value>>)> {
         let Self {
             fb: _,
@@ -158,12 +153,16 @@ impl<T: SourceRestrictionCheck> ShadowComparisonFieldFixture<T> {
             log_path,
         } = self;
 
-        let log_result = log_results(
+        // Tests run with the reconciliation JustKnob on (see `just_knobs.json`).
+        let reconcile_sources = true;
+        let log_result = log_source_results_to_scuba_with_enforcement(
             &ctx,
             repo_id,
             &config_result,
             acl_manifest_result.as_ref(),
             acl_manifest_mode,
+            reconcile_sources,
+            enforcement_decision,
             access_data,
             scuba,
         );
@@ -188,7 +187,7 @@ async fn test_shadow_mismatch_summary_fields_are_logged(fb: FacebookInit) -> Res
         )?),
         full_path_access_data()?,
     )?
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1);
     let sample = &samples[0];
@@ -252,7 +251,7 @@ async fn test_shadow_matching_restricted_sources_log_row_without_mismatch(
         )?),
         full_path_access_data()?,
     )?
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1);
     let sample = &samples[0];
@@ -294,7 +293,7 @@ async fn test_shadow_root_only_differences_do_not_set_shadow_mismatch(
         )?),
         manifest_access_data(ManifestType::HgAugmented),
     )?
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1);
     let sample = &samples[0];
@@ -320,7 +319,7 @@ async fn test_shadow_aggregate_fields_stay_config_authoritative(fb: FacebookInit
         Some(unrestricted_result()),
         manifest_access_data(ManifestType::HgAugmented),
     )?
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1);
     let sample = &samples[0];
@@ -376,7 +375,7 @@ async fn test_shadow_comparison_errors_are_logged(fb: FacebookInit) -> Result<()
         Some(error_result("acl manifest lookup failed")),
         full_path_access_data()?,
     )?
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1);
     let sample = &samples[0];
@@ -419,7 +418,7 @@ async fn test_shadow_config_errors_are_returned(fb: FacebookInit) -> Result<()> 
         Some(error_result("acl manifest lookup failed")),
         full_path_access_data()?,
     )?
-    .log_with_result(log_source_results_to_scuba)?;
+    .log_result()?;
 
     let err = match log_result {
         Ok(()) => {
@@ -484,7 +483,7 @@ async fn test_both_aggregate_fields_union_source_results(fb: FacebookInit) -> Re
         full_path_access_data()?,
     )?
     .with_acl_manifest_mode(AclManifestMode::Both)
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1);
     let sample = &samples[0];
@@ -519,6 +518,136 @@ async fn test_both_aggregate_fields_union_source_results(fb: FacebookInit) -> Re
     Ok(())
 }
 
+/// What it tests: reconciled Both-mode rows log `authorization_detail` only
+/// when its sampling JustKnob passes.
+/// Expected: a row the knob samples out keeps the reconciled aggregate fields
+/// and omits the detail.
+#[mononoke::fbinit_test]
+async fn test_both_sampled_out_row_omits_authorization_detail(fb: FacebookInit) -> Result<()> {
+    let fixture = ShadowComparisonFieldFixture::new(
+        fb,
+        restricted_path_result(false, false, "config_acl", "shared/restricted")?,
+        Some(restricted_path_result(
+            true,
+            true,
+            "acl_manifest_acl",
+            "shared/restricted",
+        )?),
+        full_path_access_data()?,
+    )?
+    .with_acl_manifest_mode(AclManifestMode::Both);
+
+    let samples = with_just_knobs(
+        JustKnobsInMemory::new(HashMap::from([(
+            "scm/mononoke:path_acls_log_authorization_detail".to_string(),
+            KnobVal::Bool(false),
+        )])),
+        || fixture.log(),
+    )?;
+
+    assert_eq!(samples.len(), 1);
+    let sample = &samples[0];
+    assert_eq!(sample_field(sample, "authorization_detail"), None);
+    assert_eq!(
+        sample_field(sample, "has_authorization"),
+        Some("false".to_string()),
+        "the reconciled decision still needs config's ACL",
+    );
+    assert_eq!(
+        sample_array(sample, "acls"),
+        vec![
+            "REPO_REGION:acl_manifest_acl".to_string(),
+            "REPO_REGION:config_acl".to_string(),
+        ]
+    );
+    Ok(())
+}
+
+/// What it tests: Both-mode logging does not synthesize reconciliation detail
+/// when the config source fails.
+/// Expected: the config error is returned, the successful AclManifest result is
+/// logged as the aggregate, and authorization detail is omitted.
+#[mononoke::fbinit_test]
+async fn test_both_config_error_omits_authorization_detail(fb: FacebookInit) -> Result<()> {
+    let (log_result, samples) = ShadowComparisonFieldFixture::new(
+        fb,
+        error_result("config lookup failed"),
+        Some(restricted_path_result(
+            false,
+            false,
+            "acl_manifest_acl",
+            "acl_manifest/restricted",
+        )?),
+        full_path_access_data()?,
+    )?
+    .with_acl_manifest_mode(AclManifestMode::Both)
+    .log_result()?;
+
+    let err = match log_result {
+        Ok(()) => {
+            return Err(anyhow!(
+                "expected config error, logged samples: {samples:?}"
+            ));
+        }
+        Err(err) => err,
+    };
+    assert!(
+        format!("{err:#}").contains("config lookup failed"),
+        "the config error should be returned: {err:#}",
+    );
+    assert_eq!(samples.len(), 1);
+    let sample = &samples[0];
+    assert!(
+        sample_field(sample, "config_error")
+            .is_some_and(|value| value.contains("config lookup failed"))
+    );
+    assert_eq!(sample_field(sample, "acl_manifest_error"), None);
+    assert_eq!(sample_field(sample, "authorization_detail"), None);
+    assert_eq!(
+        sample_field(sample, "has_authorization"),
+        Some("false".to_string())
+    );
+    assert_eq!(
+        sample_array(sample, "acls"),
+        vec!["REPO_REGION:acl_manifest_acl".to_string()]
+    );
+    Ok(())
+}
+
+/// What it tests: Both-mode logging does not synthesize reconciliation detail
+/// when the AclManifest source fails.
+/// Expected: the successful config result remains the aggregate, the source
+/// error is logged, and authorization detail is omitted.
+#[mononoke::fbinit_test]
+async fn test_both_acl_manifest_error_omits_authorization_detail(fb: FacebookInit) -> Result<()> {
+    let samples = ShadowComparisonFieldFixture::new(
+        fb,
+        restricted_path_result(false, false, "config_acl", "config/restricted")?,
+        Some(error_result("acl manifest lookup failed")),
+        full_path_access_data()?,
+    )?
+    .with_acl_manifest_mode(AclManifestMode::Both)
+    .log()?;
+
+    assert_eq!(samples.len(), 1);
+    let sample = &samples[0];
+    assert_eq!(sample_field(sample, "config_error"), None);
+    assert!(
+        sample_field(sample, "acl_manifest_error")
+            .is_some_and(|value| value.contains("acl manifest lookup failed"))
+    );
+    assert_eq!(sample_field(sample, "authorization_detail"), None);
+    assert_eq!(
+        sample_field(sample, "has_authorization"),
+        Some("false".to_string())
+    );
+    assert_eq!(
+        sample_array(sample, "acls"),
+        vec!["REPO_REGION:config_acl".to_string()]
+    );
+    Ok(())
+}
+
 // What it tests: Both-mode source-comparison callers return the union of
 // successful source results, matching the aggregate logging semantics.
 // Expected: an AclManifest-only restriction is denied instead of returning the
@@ -531,6 +660,7 @@ async fn test_both_check_result_unions_acl_manifest_only_restriction(
         restricted_path_result(false, false, "acl_manifest_acl", "acl_manifest/restricted")?;
     let result = restriction_check_result_for_source_results(
         AclManifestMode::Both,
+        true,
         &unrestricted_result(),
         Some(&acl_manifest_result),
     )?;
@@ -555,7 +685,7 @@ async fn test_shadow_skipped_comparison_source_is_not_logged(fb: FacebookInit) -
         None,
         manifest_access_data(ManifestType::Hg),
     )?
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1);
     let sample = &samples[0];
@@ -582,7 +712,7 @@ async fn test_shadow_unrestricted_sources_do_not_log_rows(fb: FacebookInit) -> R
         Some(unrestricted_result()),
         full_path_access_data()?,
     )?
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples, Vec::<serde_json::Map<String, Value>>::new());
     Ok(())
@@ -656,20 +786,7 @@ async fn test_enforcement_decision_is_logged(fb: FacebookInit) -> Result<()> {
             )?),
             full_path_access_data()?,
         )?
-        .log_with(
-            |ctx, repo_id, config, acl_manifest, mode, access_data, scuba| {
-                log_source_results_to_scuba_with_enforcement(
-                    ctx,
-                    repo_id,
-                    config,
-                    acl_manifest,
-                    mode,
-                    Some(decision),
-                    access_data,
-                    scuba,
-                )
-            },
-        )?;
+        .log_with_decision(Some(decision))?;
 
         assert_eq!(samples.len(), 1, "{decision:?} should log one row");
         assert_eq!(
@@ -707,7 +824,7 @@ async fn test_enforcement_decision_is_omitted_without_enforcement(fb: FacebookIn
         )?),
         full_path_access_data()?,
     )?
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1, "a restricted access should log one row");
     assert_eq!(
@@ -745,7 +862,7 @@ async fn test_client_user_agent_is_logged(fb: FacebookInit) -> Result<()> {
         full_path_access_data()?,
     )?
     .with_user_agent("Sapling/1.2.3")
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1);
     assert_eq!(
@@ -772,7 +889,7 @@ async fn test_missing_user_agent_is_not_logged(fb: FacebookInit) -> Result<()> {
         )?),
         full_path_access_data()?,
     )?
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1);
     assert_eq!(
@@ -796,7 +913,7 @@ async fn test_default_client_path_acl_compatibility_is_logged(fb: FacebookInit) 
         )?),
         full_path_access_data()?,
     )?
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1);
     assert_eq!(
@@ -824,7 +941,7 @@ async fn test_non_default_client_path_acl_compatibility_is_logged(fb: FacebookIn
             full_path_access_data()?,
         )?
         .with_client_path_acl_compatibility(state)
-        .log_with(log_source_results_to_scuba)?;
+        .log()?;
 
         assert_eq!(samples.len(), 1);
         assert_eq!(
@@ -849,7 +966,7 @@ async fn test_client_id_is_logged_when_present(fb: FacebookInit) -> Result<()> {
         full_path_access_data()?,
     )?
     .with_upstream_client_id("SomeSCMQueryCaller")
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1);
     assert_eq!(
@@ -873,7 +990,7 @@ async fn test_client_id_is_omitted_when_absent(fb: FacebookInit) -> Result<()> {
         )?),
         full_path_access_data()?,
     )?
-    .log_with(log_source_results_to_scuba)?;
+    .log()?;
 
     assert_eq!(samples.len(), 1);
     assert_eq!(

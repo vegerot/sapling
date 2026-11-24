@@ -12,6 +12,7 @@
 
 
 import itertools
+import sys
 import weakref
 
 import bindings
@@ -693,6 +694,9 @@ class nameset(abstractsmartset):
             # NameSet does not contain virtual "null" ids.
             # Do not bother looking up remotely.
             return False
+        # The Rust IdMap only takes i64 revision numbers; no revision lies outside.
+        if isinstance(rev, int) and not -(1 << 63) <= rev < (1 << 63):
+            return False
         try:
             node = self._tonode(rev)
         except error.CommitLookupError:
@@ -882,7 +886,10 @@ class nameset(abstractsmartset):
         if take <= 0:
             return baseset([], repo=repo)
 
-        newset = self._set.skip(skip).take(take)
+        # The Rust skip() and take() take a u64. No set has 2**64 members, so
+        # clamping does not change the result.
+        maxu64 = (1 << 64) - 1
+        newset = self._set.skip(min(skip, maxu64)).take(min(take, maxu64))
         s = self._constructor(newset, repo=self.repo())
         # preserve order
         if self.isascending():
@@ -1115,7 +1122,11 @@ class slicedset(abstractsmartset):
         self._set = None
 
     def _iteritems(self, it):
-        return itertools.islice(it, self._start, max(self._start, self._stop))
+        # islice() takes at most sys.maxsize, which is more than any set can
+        # hold, so clamping does not change the result.
+        start = min(self._start, sys.maxsize)
+        stop = min(max(self._start, self._stop), sys.maxsize)
+        return itertools.islice(it, start, stop)
 
     def _materialize(self):
         if self._set is None:

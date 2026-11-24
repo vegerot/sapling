@@ -44,9 +44,11 @@ use gotham_ext::middleware::TlsSessionDataMiddleware;
 use gotham_ext::serve;
 use http::header::HeaderValue;
 use metaconfig_types::RepoConfig;
+use metaconfig_types::RepoConfigSource;
 use metaconfig_types::ShardedService;
 use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
+use mononoke_app::MononokeService;
 use mononoke_app::args::ReadonlyArgs;
 use mononoke_app::args::RepoFilterAppExtension;
 use mononoke_app::args::ShutdownTimeoutArgs;
@@ -100,6 +102,9 @@ pub struct Repo {
 
     #[facet]
     repo_config: RepoConfig,
+
+    #[facet]
+    repo_config_source: RepoConfigSource,
 
     #[facet]
     filestore_config: FilestoreConfig,
@@ -204,6 +209,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     };
 
     let app = MononokeAppBuilder::new(fb)
+        .with_default_service(MononokeService::LFS_SERVER)
         .with_entry_point(ClientEntryPoint::LfsServer)
         .with_app_extension(MonitoringAppExtension {})
         .with_app_extension(RepoFilterAppExtension {})

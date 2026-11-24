@@ -143,7 +143,7 @@ py_class!(pub class client |py| {
 
         let mut builder = Builder::from_config(&config).map_pyerr(py)?;
         if let Some(repo_url) = &repo_url {
-            builder = builder.repo_url(repo_url).map_pyerr(py)?;
+            builder = builder.repo_url(repo_url);
         }
         let inner = builder.repo_name(reponame).build().map_pyerr(py)?;
 
@@ -559,22 +559,18 @@ py_class!(pub class client |py| {
     ) -> PyResult<Serde<EphemeralExtendResponse>>
     {
         let api = self.inner(py).as_ref();
-        let bubble_id = bubble_id
-            .map(|id| {
-                NonZeroU64::new(id).ok_or_else(|| {
-                    PyErr::new::<cpython::exc::ValueError, _>(py, "bubble_id must be non-zero")
-                })
-            })
-            .transpose()?;
-        let snapshot_id = snapshot_id.map(|id| id.0);
-        if bubble_id.is_none() && snapshot_id.is_none() {
+        if bubble_id.is_some() {
             return Err(PyErr::new::<cpython::exc::ValueError, _>(
                 py,
-                "either bubble_id or snapshot_id must be provided",
+                "bubble_id is no longer supported, pass snapshot_id instead",
             ));
         }
+        let snapshot_id = snapshot_id
+            .ok_or_else(|| {
+                PyErr::new::<cpython::exc::ValueError, _>(py, "snapshot_id must be provided")
+            })?
+            .0;
         let request = EphemeralExtendRequest {
-            bubble_id,
             custom_duration_secs,
             snapshot_id,
         };

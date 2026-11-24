@@ -14,7 +14,6 @@ use context::CoreContext;
 use futures::channel::oneshot;
 use mercurial_types::HgManifestId;
 use metaconfig_types::ModernSyncChannelConfig;
-use mononoke_macros::mononoke;
 use stats::define_stats;
 use stats::prelude::*;
 use tokio::sync::mpsc;
@@ -65,7 +64,7 @@ struct TreeRunner {
 }
 
 impl TreeRunner {
-    async fn run(&mut self, trees_recv: &mut mpsc::Receiver<TreeMessage>) {
+    async fn run(&mut self, trees_recv: &mut mpsc::Receiver<TreeMessage>) -> anyhow::Result<()> {
         let mut timer = interval(Duration::from_millis(self.config.flush_interval_ms as u64));
         while !self.cancelled() {
             let action = tokio::select! {
@@ -83,9 +82,11 @@ impl TreeRunner {
             };
             match action {
                 LoopAction::Continue => {}
-                LoopAction::Exit => return,
+                LoopAction::Exit => return Ok(()),
+                LoopAction::Fail(err) => return Err(err),
             }
         }
+        Ok(())
     }
 
     async fn handle_message(&mut self, msg: Option<TreeMessage>) -> LoopAction {
@@ -131,7 +132,7 @@ impl TreeRunner {
             let senders = std::mem::take(&mut self.pending_senders);
             if let Err(e) = self.pipeline.barrier(senders).await {
                 tracing::error!("Trees flush failed: {:?}", e);
-                return LoopAction::Exit;
+                return LoopAction::Fail(e);
             }
         }
         self.poll_completions()
@@ -160,7 +161,7 @@ impl TreeRunner {
         let senders = std::mem::take(&mut self.pending_senders);
         if let Err(e) = self.pipeline.barrier(senders).await {
             tracing::error!("Trees flush failed: {:?}", e);
-            return LoopAction::Exit;
+            return LoopAction::Fail(e);
         }
         LoopAction::Exit
     }
@@ -243,8 +244,8 @@ impl TreeRunner {
         // This channel already logged the failure; drop locally
         // queued signals so downstream winds down silently
         // instead of logging the same failure again per signal.
-        self.pipeline.abort(err);
-        LoopAction::Exit
+        self.pipeline.abort(&err);
+        LoopAction::Fail(err)
     }
 
     // Drain completions after every select event so the watermark keeps
@@ -282,38 +283,33 @@ impl TreeRunner {
 }
 
 impl Manager for TreeManager {
-    fn start(
-        self,
+    async fn run(
+        &mut self,
         ctx: CoreContext,
         reponame: String,
         trees_es: Arc<dyn EdenapiSender + Send + Sync>,
         cancellation_requested: Arc<AtomicBool>,
-    ) {
-        mononoke::spawn_task(async move {
-            let Self {
-                config,
-                mut trees_recv,
-            } = self;
-            // Trees carry bare IDs with unknown sizes, so only the request
-            // semaphore bounds this channel; see the byte-pool docs.
-            let pipeline = FlushPipeline::new(
-                reponame.clone(),
-                "trees",
-                config.max_concurrent_flushes,
-                None,
-            );
-            let mut runner = TreeRunner {
-                ctx,
-                reponame,
-                trees_es,
-                cancellation_requested,
-                config,
-                pipeline,
-                encountered_error: None,
-                batch_trees: Vec::new(),
-                pending_senders: Vec::new(),
-            };
-            runner.run(&mut trees_recv).await;
-        });
+    ) -> anyhow::Result<()> {
+        let Self { config, trees_recv } = self;
+        // Trees carry bare IDs with unknown sizes, so only the request
+        // semaphore bounds this channel; see the byte-pool docs.
+        let pipeline = FlushPipeline::new(
+            reponame.clone(),
+            "trees",
+            config.max_concurrent_flushes,
+            None,
+        );
+        let mut runner = TreeRunner {
+            ctx,
+            reponame,
+            trees_es,
+            cancellation_requested,
+            config: config.clone(),
+            pipeline,
+            encountered_error: None,
+            batch_trees: Vec::new(),
+            pending_senders: Vec::new(),
+        };
+        runner.run(trees_recv).await
     }
 }

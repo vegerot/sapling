@@ -29,6 +29,8 @@ use filestore::FilestoreConfig;
 use fixtures::Linear;
 use fixtures::TestRepoFixture;
 use mercurial_derivation::MappedHgChangesetId;
+use metaconfig_types::RepoConfig;
+use metaconfig_types::RepoConfigArc;
 use mononoke_macros::mononoke;
 use mononoke_repos::MononokeRepos;
 use repo_blobstore::RepoBlobstore;
@@ -62,6 +64,7 @@ struct TestRepo(
     dyn Bookmarks,
     dyn RepoEventPublisher,
     FilestoreConfig,
+    RepoConfig,
 );
 
 /// Test that the bookmark service correctly passes the scope parameter to the cache.
@@ -95,7 +98,6 @@ async fn test_service_uses_scope_parameter(fb: FacebookInit) -> Result<()> {
         &repo.bookmark_update_log_arc(),
         &repo.repo_identity_arc(),
         &repo.repo_event_publisher_arc(),
-        false,
         warmers,
         InitMode::Warm, // Wait for warming to complete
         bookmarks_cache::WarmerRequirement::AllKinds,
@@ -106,6 +108,7 @@ async fn test_service_uses_scope_parameter(fb: FacebookInit) -> Result<()> {
     let service_repo = BookmarkServiceRepo {
         repo_identity: repo.repo_identity_arc(),
         scoped_bookmarks_cache: Arc::new(cache),
+        repo_config: repo.repo_config_arc(),
     };
 
     // Create a MononokeRepos and add our test repo

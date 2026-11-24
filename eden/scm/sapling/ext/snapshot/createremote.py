@@ -412,8 +412,8 @@ def createremote(ui, repo, *pats, **opts) -> None:
                         )
                         storesnapshotmetadata(repo, continuationof_bytes, metadata)
                     ui.status(
-                        _("found bubble {} for {} via remote lookup\n").format(
-                            previousbubble, continuationof
+                        _("found bubble for {} via remote lookup\n").format(
+                            continuationof
                         ),
                         component="snapshot",
                     )
@@ -427,14 +427,15 @@ def createremote(ui, repo, *pats, **opts) -> None:
             #   2. Subsequent snapshots: Use --continuation-of <id> --keep-ttl for fast creation
             #      in quick succession without unnecessary TTL extension overhead
 
-            reuse = {"bubble_id": previousbubble, "keep_ttl": keepttl}
-            if ui.configbool("snapshot", "extend-by-snapshot-id", True):
-                reuse["snapshot_id"] = continuationof
-            bubble_strategy = {"reuse": reuse}
+            bubble_strategy = {
+                "reuse": {
+                    "bubble_id": previousbubble,
+                    "keep_ttl": keepttl,
+                    "snapshot_id": continuationof,
+                }
+            }
             ui.status(
-                _("continuing from snapshot {} using bubble {}\n").format(
-                    continuationof, previousbubble
-                ),
+                _("continuing from snapshot {}\n").format(continuationof),
                 component="snapshot",
             )
         elif previousbubble is not None:

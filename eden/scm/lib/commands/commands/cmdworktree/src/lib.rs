@@ -99,7 +99,9 @@ pub fn doc() -> &'static str {
       label [PATH] TEXT [--remove]                      Set or remove a worktree label
 
     If PATH is omitted from `add`, `worktree.path-generator` is used to
-    choose the destination path.
+    choose the destination path. Without a generator, the worktree is created
+    in `NAME.worktrees` next to the main worktree `NAME`, named after `--label`
+    or given a random name.
 
     Config options::
 
@@ -110,7 +112,6 @@ pub fn doc() -> &'static str {
       worktree.path-generator=CMD              Shell command to generate PATH when omitted
       worktree.snapshot-direct-copy=true       Use direct copy for --snapshot
       worktree.git-enabled=true                Enable worktree commands in native Git repositories
-      worktree.direct-eden-removal=false       Remove EdenFS checkouts via edenfsctl instead of in-process (default: true)
       worktree.check-shelves-on-remove=false   Let remove delete a checkout with shelved changes without --force (default: true)
 
     In native Git repositories, `add` creates a detached checkout and `remove`

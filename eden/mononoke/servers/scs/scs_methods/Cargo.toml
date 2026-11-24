@@ -9,6 +9,7 @@ license = "GPLv2+"
 
 [dependencies]
 anyhow = "1.0.104"
+artillery_http_ext = { version = "0.1.0", path = "../../../common/rust/artillery_http_ext" }
 async-stream = "0.3"
 async-trait = "0.1.92"
 async_requests = { version = "0.1.0", path = "../../../features/async_requests" }
@@ -33,7 +34,7 @@ diff_service_if = { version = "0.1.0", path = "../../diff_service/if" }
 diff_service_if_clients = { version = "0.1.0", path = "../../diff_service/if/clients" }
 environment = { version = "0.1.0", path = "../../../cmdlib/environment" }
 ephemeral_blobstore = { version = "0.1.0", path = "../../../blobstore/ephemeral_blobstore" }
-faster-hex = "0.6.1"
+faster-hex = "2.0.0"
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures-util = { version = "0.3.34", features = ["compat"] }
@@ -75,6 +76,7 @@ sapling-clientinfo = { version = "0.1.0", path = "../../../../scm/lib/clientinfo
 scribe_ext = { version = "0.1.0", path = "../../../common/scribe_ext" }
 scs_errors = { version = "0.1.0", path = "../scs_errors" }
 scuba_ext = { version = "0.1.0", path = "../../../common/scuba_ext" }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 source_control = { version = "0.1.0", path = "../../../scs/if" }

@@ -80,11 +80,14 @@ use tests_utils::CreateCommitContext;
 use tests_utils::bookmark;
 use tests_utils::drawdag::extend_from_dag_with_actions;
 use tests_utils::list_working_copy;
+use tests_utils::list_working_copy_utf8;
 use tests_utils::list_working_copy_with_types;
 use tests_utils::resolve_cs_id;
 use tokio::sync::oneshot;
 
 use super::*;
+
+mod source_revision_guard;
 
 fn init_just_knobs_for_test() {
     override_just_knobs(JustKnobsInMemory::new(hashmap! {
@@ -92,6 +95,20 @@ fn init_just_knobs_for_test() {
         "scm/mononoke:pushrebase_merge_resolution_derive_fsnodes".to_string() => KnobVal::Bool(true),
         "scm/mononoke:pushrebase_range_diff_use_content_manifests".to_string() => KnobVal::Bool(false),
         "scm/mononoke:pushrebase_replay_from_fork_point".to_string() => KnobVal::Int(0),
+        "scm/mononoke:pushrebase_far_root_manifest_conflicts".to_string() => KnobVal::Bool(false),
+    }));
+}
+
+/// The standard map with the far-root manifest check switched as asked.
+fn init_just_knobs_far_root(enabled: bool) {
+    override_just_knobs(JustKnobsInMemory::new(hashmap! {
+        "scm/mononoke:pushrebase_enable_merge_resolution".to_string() => KnobVal::Bool(false),
+        "scm/mononoke:pushrebase_merge_resolution_derive_fsnodes".to_string() => KnobVal::Bool(false),
+        "scm/mononoke:pushrebase_range_diff_use_content_manifests".to_string() => KnobVal::Bool(false),
+        "scm/mononoke:pushrebase_replay_from_fork_point".to_string() => KnobVal::Int(0),
+        "scm/mononoke:pushrebase_max_merge_conflicts".to_string() => KnobVal::Int(100),
+        "scm/mononoke:pushrebase_max_merge_file_size".to_string() => KnobVal::Int(1_000_000),
+        "scm/mononoke:pushrebase_far_root_manifest_conflicts".to_string() => KnobVal::Bool(enabled),
     }));
 }
 
@@ -156,6 +173,7 @@ fn queued_pushrebase_request(
         ctx: ctx.clone(),
         stack,
         retry_num: PushrebaseRetryNum(0),
+        preparation_rounds: 0,
         response_tx,
         enqueued_at: tokio::time::Instant::now(),
     }
@@ -199,7 +217,7 @@ async fn do_pushrebase(
     init_just_knobs_for_test();
     let pushed = fetch_bonsai_changesets(ctx, repo, pushed_set).await?;
 
-    let res = do_pushrebase_bonsai(ctx, repo, config, onto_bookmark, &pushed, &[]).await?;
+    let res = do_pushrebase_bonsai(ctx, repo, config, onto_bookmark, &pushed, &[], None).await?;
 
     Ok(res)
 }
@@ -378,6 +396,7 @@ async fn pushrebase_one_commit_transaction_hook(fb: FacebookInit) -> Result<(), 
         &book,
         &hashset![bcs.clone()],
         &hooks,
+        None,
     )
     .map_err(|err| format_err!("{err:?}"))
     .await?;
@@ -399,6 +418,7 @@ async fn pushrebase_one_commit_transaction_hook(fb: FacebookInit) -> Result<(), 
         &book,
         &hashset![bcs],
         &hooks,
+        None,
     )
     .map_err(|err| format_err!("{err:?}"))
     .await?;
@@ -2963,6 +2983,1017 @@ async fn pushrebase_recursion_limit(fb: FacebookInit) -> Result<(), Error> {
     Ok(())
 }
 
+/// Commits landed on master above the stack root in the far-root fixtures.
+/// Over twice `FAR_ROOT_SPLIT_START`, so the split lands inside them.
+const FAR_ROOT_FIXTURE_COMMITS: usize = 400;
+/// `recursion_limit` the far-root tests run with: under the fixture depth.
+const FAR_ROOT_TEST_LIMIT: usize = 128;
+
+/// Lands `FAR_ROOT_FIXTURE_COMMITS` commits (`f0`, `f1`, ...) on `book`
+/// above `base`, each adding the file of its name. Returns the new tip.
+async fn land_far_root_filler(
+    ctx: &CoreContext,
+    repo: &PushrebaseTestRepo,
+    book: &BookmarkKey,
+    base: ChangesetId,
+) -> Result<ChangesetId, Error> {
+    let (_, bcss) = stream::iter((0..FAR_ROOT_FIXTURE_COMMITS).map(Ok))
+        .try_fold((base, vec![]), async |(head, mut bcss), index| {
+            let bcs = CreateCommitContext::new(ctx, repo, vec![head])
+                .add_file(format!("f{index}").as_str(), format!("{index}"))
+                .commit()
+                .await?;
+            bcss.push(bcs);
+            Result::<_, Error>::Ok((bcs, bcss))
+        })
+        .await?;
+    let pushed = stream::iter(bcss)
+        .map(|bcs| async move { bcs.load(ctx, repo.repo_blobstore()).await })
+        .buffer_unordered(20)
+        .try_collect::<HashSet<_>>()
+        .await?;
+    init_just_knobs_for_test();
+    let outcome =
+        do_pushrebase_bonsai(ctx, repo, &Default::default(), book, &pushed, &[], None).await?;
+    Ok(outcome.head)
+}
+
+/// The Linear fixture with the filler landed on master above the stack root
+/// `2d7d4ba9`.
+async fn far_root_fixture(
+    fb: FacebookInit,
+) -> Result<(CoreContext, PushrebaseTestRepo, ChangesetId, BookmarkKey), Error> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
+    let root = repo
+        .bonsai_hg_mapping()
+        .get_bonsai_from_hg(
+            &ctx,
+            HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536")?,
+        )
+        .await?
+        .ok_or_else(|| Error::msg("Root is missing"))?;
+    let book = master_bookmark();
+    set_bookmark(
+        ctx.clone(),
+        &repo,
+        &book,
+        "a5ffa77602a066db7d5cfb9fb5823a0895717c5a",
+    )
+    .await?;
+    land_far_root_filler(&ctx, &repo, &book, root).await?;
+    Ok((ctx, repo, root, book))
+}
+
+/// The commit `find_far_root_split` picks first: `FAR_ROOT_SPLIT_START`
+/// first parents below the bookmark.
+async fn far_root_split_point(
+    ctx: &CoreContext,
+    repo: &PushrebaseTestRepo,
+    book: &BookmarkKey,
+) -> Result<ChangesetId, Error> {
+    let onto = get_bookmark_value(ctx, repo, book)
+        .await?
+        .expect("bookmark set");
+    let depth = repo
+        .commit_graph()
+        .changeset_linear_depth(ctx, onto)
+        .await?;
+    Ok(repo
+        .commit_graph()
+        .p1_linear_graph()
+        .skip_tree_level_ancestor(ctx, onto, depth - FAR_ROOT_SPLIT_START)
+        .await?
+        .expect("fixture deeper than the split distance")
+        .cs_id)
+}
+
+/// Derives the root and split-point content manifests and the split's
+/// case-conflict skeleton manifest: the far-root check's inputs.
+async fn derive_far_root_manifests(
+    ctx: &CoreContext,
+    repo: &PushrebaseTestRepo,
+    book: &BookmarkKey,
+    root: ChangesetId,
+) -> Result<ChangesetId, Error> {
+    let split = far_root_split_point(ctx, repo, book).await?;
+    derive_content_manifests(ctx, repo, &[root, split]).await?;
+    derive_ccsm(ctx, repo, split).await?;
+    Ok(split)
+}
+
+async fn derive_ccsm(
+    ctx: &CoreContext,
+    repo: &PushrebaseTestRepo,
+    cs_id: ChangesetId,
+) -> Result<(), Error> {
+    repo.repo_derived_data()
+        .derive::<RootCaseConflictSkeletonManifestId>(ctx, cs_id, DerivationPriority::HIGH)
+        .await?;
+    Ok(())
+}
+
+fn far_root_flags(merge: MergeResolutionOverride) -> PushrebaseFlags {
+    PushrebaseFlags {
+        recursion_limit: Some(FAR_ROOT_TEST_LIMIT),
+        casefolding_check: true,
+        merge_resolution_override: merge,
+        ..Default::default()
+    }
+}
+
+/// Pushrebases a linear stack ending at `head` with the far-root check on.
+async fn pushrebase_far_root_stack(
+    ctx: &CoreContext,
+    repo: &PushrebaseTestRepo,
+    book: &BookmarkKey,
+    root: ChangesetId,
+    head: ChangesetId,
+    merge: MergeResolutionOverride,
+) -> Result<PushrebaseOutcome, PushrebaseError> {
+    init_just_knobs_far_root(true);
+    let pushed = fetch_bonsai_range_ancestor_not_included(ctx, repo, root, head)
+        .await?
+        .into_iter()
+        .collect();
+    do_pushrebase_bonsai(ctx, repo, &far_root_flags(merge), book, &pushed, &[], None).await
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_split_check_lands(fb: FacebookInit) -> Result<(), Error> {
+    let (ctx, repo, root, book) = far_root_fixture(fb).await?;
+    let old_master = get_bookmark_value(&ctx, &repo, &book)
+        .await?
+        .expect("master set");
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+    assert!(
+        fetch_root_manifest_id(&ctx, &repo, old_master)
+            .await?
+            .is_none(),
+        "the tip stays underived: nothing here derives it"
+    );
+
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("file", "data")
+        .commit()
+        .await?;
+    let outcome = pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await?;
+
+    assert!(
+        outcome.pushrebase_distance.0 >= FAR_ROOT_FIXTURE_COMMITS,
+        "distance {} counts the whole range",
+        outcome.pushrebase_distance.0
+    );
+    assert_eq!(
+        get_bookmark_value(&ctx, &repo, &book).await?,
+        Some(outcome.head)
+    );
+    let head = outcome.head.load(&ctx, repo.repo_blobstore()).await?;
+    assert_eq!(head.parents().collect::<Vec<_>>(), vec![old_master]);
+    assert!(
+        head.file_changes_map()
+            .contains_key(&NonRootMPath::new("file")?)
+    );
+    assert!(
+        fetch_root_manifest_id(&ctx, &repo, old_master)
+            .await?
+            .is_none(),
+        "the tip is still underived after the land"
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_split_derivation_covers_the_root(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    // Deriving the split point derives its ancestors, the root among them,
+    // which is the state the tailer leaves a long-lived bookmark in.
+    let (ctx, repo, root, book) = far_root_fixture(fb).await?;
+    let split = far_root_split_point(&ctx, &repo, &book).await?;
+    derive_content_manifests(&ctx, &repo, &[split]).await?;
+    derive_ccsm(&ctx, &repo, split).await?;
+    assert!(fetch_root_manifest_id(&ctx, &repo, root).await?.is_some());
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("file", "data")
+        .commit()
+        .await?;
+    pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await?;
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_split_steps_back_to_a_derived_commit(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let (ctx, repo, root, book) = far_root_fixture(fb).await?;
+    // Only the root and a commit twice as far back as the first probe are
+    // derived; the first probe misses and the second finds it.
+    let onto = get_bookmark_value(&ctx, &repo, &book)
+        .await?
+        .expect("master set");
+    let depth = repo
+        .commit_graph()
+        .changeset_linear_depth(&ctx, onto)
+        .await?;
+    let second_probe = repo
+        .commit_graph()
+        .p1_linear_graph()
+        .skip_tree_level_ancestor(&ctx, onto, depth - 2 * FAR_ROOT_SPLIT_START)
+        .await?
+        .expect("fixture deeper than two probes")
+        .cs_id;
+    derive_content_manifests(&ctx, &repo, &[root, second_probe]).await?;
+    derive_ccsm(&ctx, &repo, second_probe).await?;
+
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("file", "data")
+        .commit()
+        .await?;
+    pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await?;
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_split_needs_ccsm_for_case_check(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    // Content manifests alone do not make a split point while the case
+    // check is on; with it off they do.
+    let (ctx, repo, root, book) = far_root_fixture(fb).await?;
+    let split = far_root_split_point(&ctx, &repo, &book).await?;
+    derive_content_manifests(&ctx, &repo, &[root, split]).await?;
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("file", "data")
+        .commit()
+        .await?;
+    match pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await
+    {
+        Err(PushrebaseError::RootTooFarBehind) => {}
+        other => panic!("expected RootTooFarBehind without a ccsm at the split, got {other:?}"),
+    }
+    init_just_knobs_far_root(true);
+    let config = PushrebaseFlags {
+        casefolding_check: false,
+        ..far_root_flags(MergeResolutionOverride::UseJk)
+    };
+    let pushed = hashset![bcs.load(&ctx, repo.repo_blobstore()).await?];
+    do_pushrebase_bonsai(&ctx, &repo, &config, &book, &pushed, &[], None).await?;
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_without_any_split_rejects(fb: FacebookInit) -> Result<(), Error> {
+    let (ctx, repo, root, book) = far_root_fixture(fb).await?;
+    derive_content_manifests(&ctx, &repo, &[root]).await?;
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("file", "data")
+        .commit()
+        .await?;
+    match pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await
+    {
+        Err(PushrebaseError::RootTooFarBehind) => Ok(()),
+        other => panic!("expected RootTooFarBehind with no derived split, got {other:?}"),
+    }
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_conflicts_in_either_part(fb: FacebookInit) -> Result<(), Error> {
+    let (ctx, repo, root, book) = far_root_fixture(fb).await?;
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+
+    // `f5` was added early on the branch: before the split.
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("f5", "other")
+        .commit()
+        .await?;
+    match pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await
+    {
+        Err(PushrebaseError::Conflicts(conflicts)) => assert_eq!(
+            conflicts,
+            vec![PushrebaseConflict::new(
+                MPath::new("f5")?,
+                MPath::new("f5")?
+            )]
+        ),
+        other => panic!("expected a conflict on f5, got {other:?}"),
+    }
+
+    // `f390` was added late on the branch: after the split.
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("f390", "other")
+        .commit()
+        .await?;
+    match pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await
+    {
+        Err(PushrebaseError::Conflicts(conflicts)) => assert_eq!(
+            conflicts,
+            vec![PushrebaseConflict::new(
+                MPath::new("f390")?,
+                MPath::new("f390")?
+            )]
+        ),
+        other => panic!("expected a conflict on f390, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_merges_in_either_part(fb: FacebookInit) -> Result<(), Error> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = TestRepoFactory::new(fb)?.build().await?;
+    let book = master_bookmark();
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("old", NINE_LINES)
+        .add_file("recent", NINE_LINES)
+        .add_file("both", NINE_LINES)
+        .commit()
+        .await?;
+    // Before the split: the branch changes line 1 of `old` and `both`.
+    let early = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("old", NINE_LINES.replace("l1\n", "E1\n"))
+        .add_file("both", NINE_LINES.replace("l1\n", "E1\n"))
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(early).await?;
+    let filler_tip = land_far_root_filler(&ctx, &repo, &book, early).await?;
+    // After the split: the branch changes line 1 of `recent` and line 2 of
+    // `both`.
+    let late = CreateCommitContext::new(&ctx, &repo, vec![filler_tip])
+        .add_file("recent", NINE_LINES.replace("l1\n", "L1\n"))
+        .add_file(
+            "both",
+            NINE_LINES.replace("l1\n", "E1\n").replace("l2\n", "L2\n"),
+        )
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(late).await?;
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+
+    // The stack changes line 9 of all three.
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("old", NINE_LINES.replace("l9\n", "C9\n"))
+        .add_file("recent", NINE_LINES.replace("l9\n", "C9\n"))
+        .add_file("both", NINE_LINES.replace("l9\n", "C9\n"))
+        .commit()
+        .await?;
+    let outcome = pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::ForceOn,
+    )
+    .await?;
+    let files = list_working_copy_utf8(&ctx, &repo, outcome.head).await?;
+    assert_eq!(
+        files[&NonRootMPath::new("old")?],
+        NINE_LINES.replace("l1\n", "E1\n").replace("l9\n", "C9\n"),
+        "old-part merge against the split state"
+    );
+    assert_eq!(
+        files[&NonRootMPath::new("recent")?],
+        NINE_LINES.replace("l1\n", "L1\n").replace("l9\n", "C9\n"),
+        "recent-part merge from the range walk"
+    );
+    assert_eq!(
+        files[&NonRootMPath::new("both")?],
+        NINE_LINES
+            .replace("l1\n", "E1\n")
+            .replace("l2\n", "L2\n")
+            .replace("l9\n", "C9\n"),
+        "a path changed in both parts takes the recent merge, against the destination"
+    );
+    let resolved = outcome.merge_resolved_paths.expect("merges were resolved");
+    assert_eq!(resolved.len(), 3);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_case_conflicts(fb: FacebookInit) -> Result<(), Error> {
+    let (ctx, repo, root, book) = far_root_fixture(fb).await?;
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+
+    // Differs only in case from `f5`, added before the split.
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("F5", "data")
+        .commit()
+        .await?;
+    match pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await
+    {
+        Err(PushrebaseError::PotentialCaseConflict(path)) => {
+            assert_eq!(path, NonRootMPath::new("F5")?);
+        }
+        other => panic!("expected a case conflict on F5, got {other:?}"),
+    }
+
+    // Differs only in case from `f390`, added after the split.
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("F390", "data")
+        .commit()
+        .await?;
+    match pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await
+    {
+        Err(PushrebaseError::PotentialCaseConflict(_)) => {}
+        other => panic!("expected a case conflict on F390, got {other:?}"),
+    }
+
+    // Two new names in the stack itself that differ only in case.
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("g1", "data")
+        .add_file("G1", "data")
+        .commit()
+        .await?;
+    match pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await
+    {
+        Err(PushrebaseError::PotentialCaseConflict(path)) => {
+            assert!(
+                path == NonRootMPath::new("g1")? || path == NonRootMPath::new("G1")?,
+                "unexpected path {path}"
+            );
+        }
+        other => panic!("expected a case conflict within the stack, got {other:?}"),
+    }
+
+    // A new name that only shares a prefix is fine.
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("f5000", "data")
+        .commit()
+        .await?;
+    pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await?;
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_case_check_honours_exclusions(fb: FacebookInit) -> Result<(), Error> {
+    let (ctx, repo, root, book) = far_root_fixture(fb).await?;
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+    init_just_knobs_far_root(true);
+    let config = PushrebaseFlags {
+        casefolding_check_excluded_paths: PrefixTrie::from_iter(
+            vec![Some(NonRootMPath::new("F5")?)].into_iter(),
+        ),
+        ..far_root_flags(MergeResolutionOverride::UseJk)
+    };
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("F5", "data")
+        .commit()
+        .await?;
+    let pushed = hashset![bcs.load(&ctx, repo.repo_blobstore()).await?];
+    do_pushrebase_bonsai(&ctx, &repo, &config, &book, &pushed, &[], None).await?;
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_merge_in_stack_rejects(fb: FacebookInit) -> Result<(), Error> {
+    let (ctx, repo, root, book) = far_root_fixture(fb).await?;
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+    let left = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("left", "l")
+        .commit()
+        .await?;
+    let right = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("right", "r")
+        .commit()
+        .await?;
+    let merge = CreateCommitContext::new(&ctx, &repo, vec![left, right])
+        .commit()
+        .await?;
+    init_just_knobs_far_root(true);
+    let pushed = hashset![
+        left.load(&ctx, repo.repo_blobstore()).await?,
+        right.load(&ctx, repo.repo_blobstore()).await?,
+        merge.load(&ctx, repo.repo_blobstore()).await?,
+    ];
+    match do_pushrebase_bonsai(
+        &ctx,
+        &repo,
+        &far_root_flags(MergeResolutionOverride::UseJk),
+        &book,
+        &pushed,
+        &[],
+        None,
+    )
+    .await
+    {
+        Err(PushrebaseError::RootTooFarBehind) => Ok(()),
+        other => panic!("expected RootTooFarBehind for a merge in the stack, got {other:?}"),
+    }
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_recased_directory_conflicts(fb: FacebookInit) -> Result<(), Error> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = TestRepoFactory::new(fb)?.build().await?;
+    let book = master_bookmark();
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("lib/Utils/a.py", "a")
+        .commit()
+        .await?;
+    // The branch re-cases the directory before the split, then grows.
+    let recased = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .delete_file("lib/Utils/a.py")
+        .add_file("lib/utils/a.py", "a")
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(recased).await?;
+    land_far_root_filler(&ctx, &repo, &book, recased).await?;
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+
+    // A new file under the old casing would recreate `lib/Utils` beside
+    // `lib/utils`.
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("lib/Utils/b.py", "b")
+        .commit()
+        .await?;
+    match pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await
+    {
+        Err(PushrebaseError::PotentialCaseConflict(path)) => {
+            assert_eq!(path, NonRootMPath::new("lib/Utils/b.py")?);
+        }
+        other => panic!("expected a case conflict on lib/Utils/b.py, got {other:?}"),
+    }
+
+    // A new file under the branch's casing lands.
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("lib/utils/b.py", "b")
+        .commit()
+        .await?;
+    pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await?;
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_precompute_carries_into_the_batch(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = TestRepoFactory::new(fb)?.build().await?;
+    let book = master_bookmark();
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("old", NINE_LINES)
+        .commit()
+        .await?;
+    let early = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("old", NINE_LINES.replace("l1\n", "E1\n"))
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(early).await?;
+    let tip = land_far_root_filler(&ctx, &repo, &book, early).await?;
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("old", NINE_LINES.replace("l9\n", "C9\n"))
+        .commit()
+        .await?;
+    init_just_knobs_far_root(true);
+    let config = far_root_flags(MergeResolutionOverride::ForceOn);
+    let mut stack = index_pushrebase_request(
+        &ctx,
+        &repo,
+        &config,
+        &book,
+        &hashset![bcs.load(&ctx, repo.repo_blobstore()).await?],
+    )
+    .await?;
+    // The far-root work happens here, outside the critical section.
+    stack.precompute(&ctx, &repo, &config, &book).await?;
+    assert_eq!(stack.conflict_check_base, tip);
+    assert_eq!(stack.carried_merge_file_info.len(), 1);
+    assert_eq!(
+        stack.carried_merge_file_info[0].path,
+        NonRootMPath::new("old")?
+    );
+
+    // Master moves under the queued request and touches the merged path;
+    // the batch only walks the delta and takes its destination state.
+    let later = CreateCommitContext::new(&ctx, &repo, vec![tip])
+        .add_file(
+            "old",
+            NINE_LINES.replace("l1\n", "E1\n").replace("l5\n", "D5\n"),
+        )
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(later).await?;
+    let (tx, rx) = oneshot::channel();
+    let requeued = do_batched_pushrebase(
+        &ctx,
+        &repo,
+        &config,
+        &book,
+        vec![queued_pushrebase_request(&ctx, stack, tx)],
+        &[],
+    )
+    .await;
+    assert!(requeued.is_empty());
+    let outcome = rx.await?.map_err(|error| anyhow!(error))?;
+    let head = outcome.head.load(&ctx, repo.repo_blobstore()).await?;
+    assert_eq!(head.parents().collect::<Vec<_>>(), vec![later]);
+    let files = list_working_copy_utf8(&ctx, &repo, outcome.head).await?;
+    assert_eq!(
+        files[&NonRootMPath::new("old")?],
+        NINE_LINES
+            .replace("l1\n", "E1\n")
+            .replace("l5\n", "D5\n")
+            .replace("l9\n", "C9\n")
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_long_recent_range_rejects(fb: FacebookInit) -> Result<(), Error> {
+    // A merge in the recent part brings a side branch longer than the
+    // first-parent distance allows into the range.
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = TestRepoFactory::new(fb)?.build().await?;
+    let book = master_bookmark();
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("base", "b")
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(root).await?;
+    let tip = land_far_root_filler(&ctx, &repo, &book, root).await?;
+    // Side branch of 1,000 commits forked after the split, merged at the tip.
+    let (side, _) = stream::iter((0..1000usize).map(Ok))
+        .try_fold((tip, ()), async |(head, ()), index| {
+            let bcs = CreateCommitContext::new(&ctx, &repo, vec![head])
+                .add_file(format!("side/{index}").as_str(), "s")
+                .commit()
+                .await?;
+            Result::<_, Error>::Ok((bcs, ()))
+        })
+        .await?;
+    let onto = CreateCommitContext::new(&ctx, &repo, vec![tip, side])
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(onto).await?;
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("file", "data")
+        .commit()
+        .await?;
+    match pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await
+    {
+        Err(PushrebaseError::RootTooFarBehind) => Ok(()),
+        other => panic!("expected RootTooFarBehind for a long recent range, got {other:?}"),
+    }
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_case_check_follows_deletions(fb: FacebookInit) -> Result<(), Error> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = TestRepoFactory::new(fb)?.build().await?;
+    let book = master_bookmark();
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("Own", "o")
+        .add_file("Full/a", "a")
+        .add_file("Full/b", "b")
+        .add_file("Part/a", "a")
+        .add_file("Part/b", "b")
+        .add_file("Part/c", "c")
+        .commit()
+        .await?;
+    // Before the split the branch adds `Early`; after it, it deletes it.
+    let early = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("Early", "e")
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(early).await?;
+    let tip = land_far_root_filler(&ctx, &repo, &book, early).await?;
+    let late = CreateCommitContext::new(&ctx, &repo, vec![tip])
+        .delete_file("Early")
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(late).await?;
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+
+    // Re-casing a file the stack itself added, a file that existed at the
+    // root, and a directory the stack empties all land; a name the branch
+    // added before the split and removed after it is free again.
+    let c1 = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("Mine", "m")
+        .commit()
+        .await?;
+    let c2 = CreateCommitContext::new(&ctx, &repo, vec![c1])
+        .delete_file("Mine")
+        .add_file("mine", "m")
+        .delete_file("Own")
+        .add_file("own", "o")
+        .delete_file("Full/a")
+        .delete_file("Full/b")
+        .add_file("full/x", "x")
+        .add_file("early", "e")
+        .commit()
+        .await?;
+    pushrebase_far_root_stack(&ctx, &repo, &book, root, c2, MergeResolutionOverride::UseJk).await?;
+
+    // A directory the stack only partly empties keeps its name.
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .delete_file("Part/a")
+        .delete_file("Part/b")
+        .add_file("part/x", "x")
+        .commit()
+        .await?;
+    match pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await
+    {
+        Err(PushrebaseError::PotentialCaseConflict(path)) => {
+            assert_eq!(path, NonRootMPath::new("part/x")?);
+        }
+        other => panic!("expected a case conflict on part/x, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_case_check_follows_server_deletions(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    // The branch empties `Dir` and re-creates it as `dir` after the split:
+    // a stack adding under `dir` lands, and a stack deleting a file of
+    // `Dir` meets a plain conflict, not a case conflict.
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = TestRepoFactory::new(fb)?.build().await?;
+    let book = master_bookmark();
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("Dir/a", "a")
+        .add_file("Dir/b", "b")
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(root).await?;
+    let tip = land_far_root_filler(&ctx, &repo, &book, root).await?;
+    let emptied = CreateCommitContext::new(&ctx, &repo, vec![tip])
+        .delete_file("Dir/a")
+        .delete_file("Dir/b")
+        .commit()
+        .await?;
+    let recased = CreateCommitContext::new(&ctx, &repo, vec![emptied])
+        .add_file("dir/x", "x")
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(recased).await?;
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("dir/c", "c")
+        .commit()
+        .await?;
+    pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await?;
+
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .delete_file("Dir/a")
+        .commit()
+        .await?;
+    match pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await
+    {
+        Err(PushrebaseError::Conflicts(conflicts)) => assert_eq!(
+            conflicts,
+            vec![PushrebaseConflict::new(
+                MPath::new("Dir/a")?,
+                MPath::new("Dir/a")?
+            )]
+        ),
+        other => panic!("expected a conflict on Dir/a, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_case_check_needs_ccsm_enabled(fb: FacebookInit) -> Result<(), Error> {
+    // A repo without the ccsm derived data type keeps the old error.
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = TestRepoFactory::new(fb)?
+        .with_config_override(|config| {
+            let name = config.derived_data_config.enabled_config_name.clone();
+            if let Some(types) = config.derived_data_config.available_configs.get_mut(&name) {
+                types.types.remove(&DerivableType::Ccsm);
+            }
+        })
+        .build()
+        .await?;
+    let book = master_bookmark();
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("a", "a")
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(root).await?;
+    land_far_root_filler(&ctx, &repo, &book, root).await?;
+    let split = far_root_split_point(&ctx, &repo, &book).await?;
+    derive_content_manifests(&ctx, &repo, &[root, split]).await?;
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("b", "b")
+        .commit()
+        .await?;
+    match pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await
+    {
+        Err(PushrebaseError::RootTooFarBehind) => Ok(()),
+        other => panic!("expected RootTooFarBehind without ccsm enabled, got {other:?}"),
+    }
+}
+
+#[mononoke::fbinit_test]
+async fn pushrebase_far_root_case_check_ignores_existing_conflicts(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    // Two casings already at the split do not block a third, as the walk
+    // never flags a pre-existing conflict either.
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = TestRepoFactory::new(fb)?.build().await?;
+    let book = master_bookmark();
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("Both", "1")
+        .add_file("both", "2")
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(root).await?;
+    land_far_root_filler(&ctx, &repo, &book, root).await?;
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("BOTH", "3")
+        .commit()
+        .await?;
+    pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await?;
+
+    // Nor does anything under them: `Dir/a` and `dir/b` are left out of the
+    // seeds together, so this lands as it does through the walk.
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("Dir/a", "a")
+        .add_file("dir/b", "b")
+        .commit()
+        .await?;
+    bookmark(&ctx, &repo, book.clone()).set_to(root).await?;
+    land_far_root_filler(&ctx, &repo, &book, root).await?;
+    derive_far_root_manifests(&ctx, &repo, &book, root).await?;
+    let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .delete_file("Dir/a")
+        .add_file("dir/B", "B")
+        .commit()
+        .await?;
+    pushrebase_far_root_stack(
+        &ctx,
+        &repo,
+        &book,
+        root,
+        bcs,
+        MergeResolutionOverride::UseJk,
+    )
+    .await?;
+    Ok(())
+}
+
 #[mononoke::fbinit_test]
 async fn pushrebase_rewritedates(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
@@ -2995,6 +4026,7 @@ async fn pushrebase_rewritedates(fb: FacebookInit) -> Result<(), Error> {
         &BookmarkKey::new("keep")?,
         &source,
         &[],
+        None,
     )
     .await?;
 
@@ -3009,6 +4041,7 @@ async fn pushrebase_rewritedates(fb: FacebookInit) -> Result<(), Error> {
         &BookmarkKey::new("rewrite")?,
         &source,
         &[],
+        None,
     )
     .await?;
 
@@ -3451,6 +4484,7 @@ async fn pushrebase_simultaneously(fb: FacebookInit) -> Result<(), Error> {
                 &book,
                 &hashset![bcs],
                 &hooks,
+                None,
             )
             .await
         };
@@ -3540,6 +4574,7 @@ async fn pushrebase_simultaneously_and_create_new(fb: FacebookInit) -> Result<()
                 &book,
                 &hashset![bcs],
                 &hooks,
+                None,
             )
             .await
         };
@@ -4581,6 +5616,12 @@ async fn branch_merge(ctx: &CoreContext, augmented_for_onto: bool) -> Result<Bra
     } else {
         vec![p1, p2, merge]
     };
+    if !augmented_for_onto {
+        // Derivation would derive `onto`'s augmented manifest along with its
+        // Hg changeset, so store the Hg changeset as an upload does.
+        repo.derive_hg_changeset(ctx, p1).await?;
+        fixtures::store_hg_changesets_as_uploaded(ctx, &repo, vec![onto]).await?;
+    }
     for cs_id in [p1, p2, merge, onto] {
         repo.derive_hg_changeset(ctx, cs_id).await?;
     }
@@ -4615,6 +5656,7 @@ async fn pushrebase_branch_merge(
         &master_bookmark(),
         &hashset![branch_merge.merge.clone()],
         &[],
+        None,
     )
     .await
 }
@@ -5448,6 +6490,7 @@ async fn pushrebase_merge_resolution_clean(fb: FacebookInit) -> Result<(), Error
         &book,
         &hashset![client_bcs],
         &[],
+        None,
     )
     .await?;
 
@@ -5509,6 +6552,7 @@ async fn pushrebase_merge_resolution_identical_lfs_is_already_applied(
         &book,
         &hashset![client_bcs],
         &[],
+        None,
     )
     .await?;
 
@@ -5570,6 +6614,7 @@ async fn pushrebase_merge_resolution_identical_lfs_alone_follows_noop_policy(
         &book,
         &hashset![client_bcs],
         &[],
+        None,
     )
     .await;
     match result {
@@ -5619,6 +6664,7 @@ async fn pushrebase_merge_resolution_differing_lfs_still_conflicts(
         &book,
         &hashset![client_bcs],
         &[],
+        None,
     )
     .await;
 
@@ -5673,6 +6719,7 @@ async fn pushrebase_merge_resolution_conflict(fb: FacebookInit) -> Result<(), Er
         &book,
         &hashset![client_bcs],
         &[],
+        None,
     )
     .await;
 
@@ -6058,6 +7105,7 @@ line 8
         &book,
         &hashset![client_bcs_1.clone(), client_bcs_2.clone()],
         &[],
+        None,
     )
     .await?;
 
@@ -6200,6 +7248,7 @@ line 5.1
         &book,
         &hashset![client_bcs_1, client_bcs_2],
         &[],
+        None,
     )
     .await;
 
@@ -6924,6 +7973,7 @@ async fn pushrebase_noop_merge_detected_only_when_jk_off(fb: FacebookInit) -> Re
         &book,
         &hashset![client_bcs],
         &[],
+        None,
     )
     .await?;
 
@@ -6968,6 +8018,7 @@ async fn pushrebase_noop_merge_rejected_single_file(fb: FacebookInit) -> Result<
         &book,
         &hashset![client_bcs],
         &[],
+        None,
     )
     .await;
 
@@ -7032,6 +8083,7 @@ async fn pushrebase_noop_merge_mixed_commit_lands(fb: FacebookInit) -> Result<()
         &book,
         &hashset![client_bcs],
         &[],
+        None,
     )
     .await?;
 
@@ -7090,6 +8142,7 @@ async fn pushrebase_noop_merge_in_stack_rejects_entire_stack(
         &book,
         &hashset![c1_bcs, c2_bcs],
         &[],
+        None,
     )
     .await;
 
@@ -7151,6 +8204,7 @@ async fn pushrebase_noop_merge_rejected_all_files_duplicate(fb: FacebookInit) ->
         &book,
         &hashset![client_bcs],
         &[],
+        None,
     )
     .await;
 
@@ -7212,6 +8266,7 @@ async fn pushrebase_noop_merge_genuine_merge_not_flagged(fb: FacebookInit) -> Re
         &book,
         &hashset![client_bcs],
         &[],
+        None,
     )
     .await?;
 
@@ -7277,6 +8332,7 @@ async fn pushrebase_noop_merge_local_equals_base_not_flagged(
         &book,
         &hashset![client_bcs],
         &[],
+        None,
     )
     .await?;
 
@@ -7334,8 +8390,16 @@ async fn pushrebase_merge_resolution_override_forces_off(fb: FacebookInit) -> Re
         ..Default::default()
     };
 
-    let result =
-        do_pushrebase_bonsai(&ctx, &repo, &config, &book, &hashset![client_bcs], &[]).await;
+    let result = do_pushrebase_bonsai(
+        &ctx,
+        &repo,
+        &config,
+        &book,
+        &hashset![client_bcs],
+        &[],
+        None,
+    )
+    .await;
 
     should_have_conflicts(result);
     Ok(())
@@ -7359,8 +8423,16 @@ async fn pushrebase_merge_resolution_override_forces_on(fb: FacebookInit) -> Res
         ..Default::default()
     };
 
-    let result =
-        do_pushrebase_bonsai(&ctx, &repo, &config, &book, &hashset![client_bcs], &[]).await?;
+    let result = do_pushrebase_bonsai(
+        &ctx,
+        &repo,
+        &config,
+        &book,
+        &hashset![client_bcs],
+        &[],
+        None,
+    )
+    .await?;
 
     let result_hg = repo.derive_hg_changeset(&ctx, result.head).await?;
     let expected_content = "modified_line1\nline2\nline3\nline4\nmodified_line5\n";
@@ -7396,8 +8468,16 @@ async fn pushrebase_merge_resolution_override_none_falls_through(
         ..Default::default()
     };
 
-    let result =
-        do_pushrebase_bonsai(&ctx, &repo, &config, &book, &hashset![client_bcs], &[]).await;
+    let result = do_pushrebase_bonsai(
+        &ctx,
+        &repo,
+        &config,
+        &book,
+        &hashset![client_bcs],
+        &[],
+        None,
+    )
+    .await;
 
     should_have_conflicts(result);
     Ok(())
@@ -7680,6 +8760,52 @@ async fn manifest_rebase_forward_clean_and_deterministic(fb: FacebookInit) -> Re
 
     let again = rebase_stack_onto_manifest(&ctx, &repo, &flags, root, b, onto, MAX_PATHS).await?;
     assert_eq!(again.new_head, rebased.new_head, "deterministic rewrite");
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn manifest_rebase_casefolding_check(fb: FacebookInit) -> Result<(), Error> {
+    init_just_knobs_for_test();
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = TestRepoFactory::new(fb)?.build().await?;
+
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("base", "base")
+        .commit()
+        .await?;
+    let a = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("Foo", "upper")
+        .commit()
+        .await?;
+    let b = CreateCommitContext::new(&ctx, &repo, vec![a])
+        .add_file("foo", "lower")
+        .commit()
+        .await?;
+    let onto = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("server_file", "server")
+        .commit()
+        .await?;
+    derive_content_manifests(&ctx, &repo, &[root, onto]).await?;
+
+    let flags = PushrebaseFlags {
+        casefolding_check: true,
+        ..manifest_rebase_flags(MergeResolutionOverride::ForceOn)
+    };
+    match rebase_stack_onto_manifest(&ctx, &repo, &flags, root, b, onto, MAX_PATHS).await {
+        Err(PushrebaseError::PotentialCaseConflict(conflict)) => {
+            assert_eq!(conflict, NonRootMPath::new("foo")?);
+        }
+        Err(err) => panic!("expected PotentialCaseConflict, got {err}"),
+        Ok(_) => panic!("expected PotentialCaseConflict, stack rebased"),
+    }
+
+    // With the check off, the same stack rebases.
+    let flags = PushrebaseFlags {
+        casefolding_check: false,
+        ..manifest_rebase_flags(MergeResolutionOverride::ForceOn)
+    };
+    let rebased = rebase_stack_onto_manifest(&ctx, &repo, &flags, root, b, onto, MAX_PATHS).await?;
+    assert_eq!(rebased.rebased_changesets.len(), 2);
     Ok(())
 }
 
@@ -8350,6 +9476,7 @@ async fn pushrebase_merge_resolution_delete_then_readd_still_lands(
         &book,
         &hashset![c1_bcs, c2_bcs],
         &[],
+        None,
     )
     .await?;
 
@@ -9217,7 +10344,7 @@ async fn pushrebase_take_incoming_resolves_same_artifact_race(
     init_just_knobs_for_take_incoming_test(true);
     let flags = take_incoming_flags(&["ArtA", "prebuilt_manifest.json"]);
     let result =
-        do_pushrebase_bonsai(&ctx, &repo, &flags, &book, &hashset![client_bcs], &[]).await?;
+        do_pushrebase_bonsai(&ctx, &repo, &flags, &book, &hashset![client_bcs], &[], None).await?;
 
     // ArtA is the client's (incoming wins); ArtB, which only the server
     // changed, is the server's; the pointer is the client's, still LFS.
@@ -9261,6 +10388,7 @@ async fn pushrebase_take_incoming_off_is_todays_conflict(fb: FacebookInit) -> Re
         &book,
         &hashset![client_bcs.clone()],
         &[],
+        None,
     )
     .await;
     assert!(matches!(res, Err(PushrebaseError::Conflicts(_))), "{res:?}");
@@ -9275,6 +10403,7 @@ async fn pushrebase_take_incoming_off_is_todays_conflict(fb: FacebookInit) -> Re
         &book,
         &hashset![client_bcs],
         &[],
+        None,
     )
     .await;
     assert!(matches!(res, Err(PushrebaseError::Conflicts(_))), "{res:?}");
@@ -9293,7 +10422,8 @@ async fn pushrebase_take_incoming_rejects_conflict_outside_prefixes(
     // and the whole land rejects, exactly as today.
     init_just_knobs_for_take_incoming_test(true);
     let flags = take_incoming_flags(&["prebuilt_manifest.json"]);
-    let res = do_pushrebase_bonsai(&ctx, &repo, &flags, &book, &hashset![client_bcs], &[]).await;
+    let res =
+        do_pushrebase_bonsai(&ctx, &repo, &flags, &book, &hashset![client_bcs], &[], None).await;
     assert!(matches!(res, Err(PushrebaseError::Conflicts(_))), "{res:?}");
     Ok(())
 }
@@ -9320,7 +10450,7 @@ async fn pushrebase_take_incoming_requested_resolves_without_prefixes(
     init_just_knobs_for_take_incoming_test(true);
     let flags = take_incoming_requested_flags();
     let result =
-        do_pushrebase_bonsai(&ctx, &repo, &flags, &book, &hashset![client_bcs], &[]).await?;
+        do_pushrebase_bonsai(&ctx, &repo, &flags, &book, &hashset![client_bcs], &[], None).await?;
 
     let result_hg = repo.derive_hg_changeset(&ctx, result.head).await?;
     ensure_content(
@@ -9356,7 +10486,8 @@ async fn pushrebase_take_incoming_requested_needs_the_knob(fb: FacebookInit) -> 
 
     init_just_knobs_for_take_incoming_test(false);
     let flags = take_incoming_requested_flags();
-    let res = do_pushrebase_bonsai(&ctx, &repo, &flags, &book, &hashset![client_bcs], &[]).await;
+    let res =
+        do_pushrebase_bonsai(&ctx, &repo, &flags, &book, &hashset![client_bcs], &[], None).await;
     assert!(matches!(res, Err(PushrebaseError::Conflicts(_))), "{res:?}");
     Ok(())
 }
@@ -9389,7 +10520,8 @@ async fn pushrebase_take_incoming_requested_still_rejects_both_sides_added(
 
     init_just_knobs_for_take_incoming_test(true);
     let flags = take_incoming_requested_flags();
-    let res = do_pushrebase_bonsai(&ctx, &repo, &flags, &book, &hashset![client_bcs], &[]).await;
+    let res =
+        do_pushrebase_bonsai(&ctx, &repo, &flags, &book, &hashset![client_bcs], &[], None).await;
     assert!(matches!(res, Err(PushrebaseError::Conflicts(_))), "{res:?}");
     Ok(())
 }
@@ -9439,6 +10571,7 @@ async fn pushrebase_take_incoming_rejects_already_landed_and_superseded(
         &book,
         &hashset![retry_bcs.clone()],
         &[],
+        None,
     )
     .await;
     assert!(matches!(res, Err(PushrebaseError::Conflicts(_))), "{res:?}");
@@ -9532,5 +10665,174 @@ async fn pushrebase_take_incoming_manifest_mode_keeps_todays_outcome(
         },
     )
     .await?;
+    Ok(())
+}
+
+/// Trunk is A-B-C with F a draft child of A, and M merges F into B, so a push
+/// of {F, M} has the candidate roots A and B, and B is its merge base with
+/// the trunk.
+struct RequiredRootMerge {
+    a: ChangesetId,
+    b: ChangesetId,
+    c: ChangesetId,
+    f: ChangesetId,
+    m: ChangesetId,
+    pushed: HashSet<BonsaiChangeset>,
+}
+
+async fn required_root_merge(
+    ctx: &CoreContext,
+    repo: &PushrebaseTestRepo,
+) -> Result<RequiredRootMerge, Error> {
+    init_just_knobs_for_test();
+    let a = CreateCommitContext::new_root(ctx, repo)
+        .add_file("a", "a")
+        .commit()
+        .await?;
+    let b = CreateCommitContext::new(ctx, repo, vec![a])
+        .add_file("b", "b")
+        .commit()
+        .await?;
+    let c = CreateCommitContext::new(ctx, repo, vec![b])
+        .add_file("c", "c")
+        .commit()
+        .await?;
+    let f = CreateCommitContext::new(ctx, repo, vec![a])
+        .add_file("f", "f")
+        .commit()
+        .await?;
+    let m = CreateCommitContext::new(ctx, repo, vec![b, f])
+        .add_file("m", "m")
+        .commit()
+        .await?;
+    let pushed = hashset![
+        f.load(ctx, repo.repo_blobstore()).await?,
+        m.load(ctx, repo.repo_blobstore()).await?,
+    ];
+    Ok(RequiredRootMerge {
+        a,
+        b,
+        c,
+        f,
+        m,
+        pushed,
+    })
+}
+
+fn assert_bookmark_moved(
+    result: Result<impl std::fmt::Debug, PushrebaseError>,
+    expected_root: ChangesetId,
+) {
+    match result {
+        Err(PushrebaseError::BookmarkMoved { required_root, .. }) => {
+            assert_eq!(required_root, expected_root)
+        }
+        other => panic!("expected BookmarkMoved, got {other:?}"),
+    }
+}
+
+#[mononoke::fbinit_test]
+async fn required_root_rejects_another_closest_root(fb: FacebookInit) -> Result<(), Error> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = test_repo_factory::build_empty(ctx.fb).await?;
+    let merge = required_root_merge(&ctx, &repo).await?;
+    let book = master_bookmark();
+
+    // With the bookmark at A, A is the closest root, so B is not the root
+    // pushrebase would rebase from.
+    bookmark(&ctx, &repo, book.clone()).set_to(merge.a).await?;
+    let result = do_pushrebase_bonsai(
+        &ctx,
+        &repo,
+        &PushrebaseFlags::default(),
+        &book,
+        &merge.pushed,
+        &[],
+        Some(merge.b),
+    )
+    .await;
+    assert_bookmark_moved(result, merge.b);
+    assert_eq!(resolve_cs_id(&ctx, &repo, "master").await?, merge.a);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn required_root_lands_from_it(fb: FacebookInit) -> Result<(), Error> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = test_repo_factory::build_empty(ctx.fb).await?;
+    let merge = required_root_merge(&ctx, &repo).await?;
+    let book = master_bookmark();
+
+    // The bookmark moved forward to C: only M is rebased, and F lands
+    // unchanged as its second parent.
+    bookmark(&ctx, &repo, book.clone()).set_to(merge.c).await?;
+    let outcome = do_pushrebase_bonsai(
+        &ctx,
+        &repo,
+        &PushrebaseFlags::default(),
+        &book,
+        &merge.pushed,
+        &[],
+        Some(merge.b),
+    )
+    .await?;
+    assert_eq!(
+        outcome
+            .rebased_changesets
+            .iter()
+            .map(|pair| pair.id_old)
+            .collect::<Vec<_>>(),
+        vec![merge.m]
+    );
+    let head = outcome.head.load(&ctx, repo.repo_blobstore()).await?;
+    assert_eq!(head.parents().collect::<Vec<_>>(), vec![merge.c, merge.f]);
+    assert_eq!(resolve_cs_id(&ctx, &repo, "master").await?, outcome.head);
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn required_root_rejects_bookmark_moved_back_before_landing(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: PushrebaseTestRepo = test_repo_factory::build_empty(ctx.fb).await?;
+    let merge = required_root_merge(&ctx, &repo).await?;
+    let book = master_bookmark();
+    let config = PushrebaseFlags::default();
+
+    // The stack is indexed with the bookmark at B, then the bookmark moves
+    // back to A before it lands.
+    bookmark(&ctx, &repo, book.clone()).set_to(merge.b).await?;
+    let mut stack = index_pushrebase_request(&ctx, &repo, &config, &book, &merge.pushed).await?;
+    stack.require_root(&book, merge.b)?;
+    bookmark(&ctx, &repo, book.clone()).set_to(merge.a).await?;
+
+    let result = rebase_in_loop(&ctx, &repo, &config, &book, &stack, &[]).await;
+    assert_bookmark_moved(result, merge.b);
+    assert_eq!(resolve_cs_id(&ctx, &repo, "master").await?, merge.a);
+
+    let (tx, rx) = oneshot::channel();
+    let requeued = do_batched_pushrebase(
+        &ctx,
+        &repo,
+        &config,
+        &book,
+        vec![queued_pushrebase_request(&ctx, stack, tx)],
+        &[],
+    )
+    .await;
+    assert!(requeued.is_empty());
+    let result = rx.await?.map_err(|e| match e.inner() {
+        PushrebaseError::BookmarkMoved {
+            bookmark,
+            required_root,
+        } => PushrebaseError::BookmarkMoved {
+            bookmark: bookmark.clone(),
+            required_root: *required_root,
+        },
+        other => PushrebaseError::Error(format_err!("{other:?}")),
+    });
+    assert_bookmark_moved(result, merge.b);
+    assert_eq!(resolve_cs_id(&ctx, &repo, "master").await?, merge.a);
     Ok(())
 }

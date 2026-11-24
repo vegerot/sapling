@@ -293,6 +293,19 @@ function mononoke_admin {
     "$@"
 }
 
+# Like mononoke_admin, but with the config flags given first instead of the
+# test tier: `mononoke_admin_with --deployment test <command>` loads the test
+# tier rendered as a deployment.
+function mononoke_admin_with {
+  render_mononoke_config
+  GLOG_minloglevel=5 "$MONONOKE_ADMIN" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
+    --log-level INFO \
+    --tracing-test-format \
+    "$@"
+}
+
 function mononoke_import {
   render_mononoke_config
   GLOG_minloglevel=5 "$MONONOKE_IMPORT" \
@@ -426,6 +439,44 @@ function start_and_wait_for_mononoke_server_with_client_certs {
 function start_and_wait_for_mononoke_server {
     mononoke "$@"
     wait_for_mononoke
+}
+
+# Assign the shards given after "$1" to the server started with
+# `--local-shardmanager-path "$1"`, in place of its earlier assignments.
+function set_local_shards {
+  local path="$1"
+  shift
+  printf '%s\n' "$@" > "$path.new" && mv "$path.new" "$path"
+}
+
+# Wait until the server started with `--local-shardmanager-path "$1"` has set
+# up exactly the shards assigned in "$1".
+function wait_for_local_shards {
+  local path="$1"
+  local wanted
+  wanted="$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d' "$path" | LC_ALL=C sort -u)"
+  for _ in $(seq 1 300); do
+    if [[ -f "$path.active" && "$(cat "$path.active")" == "$wanted" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "Timed out waiting for the shards in $path to be set up" >&2
+  cat "$path.active" "$path.errors" >&2
+  return 1
+}
+
+# Wait until shard "$2" has failed to set up on the server started with
+# `--local-shardmanager-path "$1"`.
+function wait_for_local_shard_error {
+  for _ in $(seq 1 300); do
+    if grep -q "^$2: " "$1.errors" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "Timed out waiting for shard $2 to fail" >&2
+  return 1
 }
 
 # Wait until cache warmup finishes
@@ -566,6 +617,16 @@ function backfill_mapping {
     "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id "$REPOID" \
+    --config-tier "$MONONOKE_CONFIG_TIER" \
+    --tracing-test-format \
+    "$@"
+}
+
+function blob_type_annihilator {
+  render_mononoke_config
+  GLOG_minloglevel=5 "$MONONOKE_BLOB_TYPE_ANNIHILATOR" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
     --config-tier "$MONONOKE_CONFIG_TIER" \
     --tracing-test-format \
     "$@"
@@ -776,20 +837,48 @@ function wait_for_bookmark_move_edenapi() {
 function wait_for_git_bookmark_move() {
   local bookmark_name="$1"
   local last_bookmark_target="$2"
+  local expected_bookmark_target="${3-}"
+  local current_bookmark_target
   local attempt=1
   local max_attempts=${MAX_ATTEMPTS:-30}
   local sleep_time=${SLEEP_TIME:-2}
-  last_status_regex="$last_bookmark_target\s+$bookmark_name"
-  last_status="$last_bookmark_target$bookmark_name"
-  while [[ "$(git_client ls-remote --quiet | grep -E "$last_status_regex" | tr -d '[:space:]')" == "$last_status" ]]
+  while true
+  do
+    current_bookmark_target=$(git_client ls-remote --quiet | awk -v ref="$bookmark_name" '$2 == ref { print $1 }')
+    if [[ -n "$expected_bookmark_target" ]]; then
+      [[ "$current_bookmark_target" == "$expected_bookmark_target" ]] && return 0
+    elif [[ "$current_bookmark_target" != "$last_bookmark_target" ]]; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    if [[ $attempt -gt $max_attempts ]]
+    then
+        echo "bookmark move of $bookmark_name away from $last_bookmark_target to ${expected_bookmark_target:-a different target} has not happened"
+        return 1
+    fi
+    sleep "$sleep_time"
+  done
+}
+
+# Wait until `git ls-remote` advertises `bookmark_name` at exactly
+# `expected_target`. Unlike wait_for_git_bookmark_move, this does not return
+# early when the advertised value is some other stale value (for example a
+# target from before an earlier push the git server has not caught up with).
+function wait_for_git_bookmark_target() {
+  local bookmark_name="$1"
+  local expected_target="$2"
+  local attempt=1
+  local max_attempts=${MAX_ATTEMPTS:-30}
+  local sleep_time=${SLEEP_TIME:-2}
+  while [[ "$(git_client ls-remote --quiet 2>/dev/null | awk -v ref="$bookmark_name" '$2 == ref { print $1 }')" != "$expected_target" ]]
   do
     attempt=$((attempt + 1))
     if [[ $attempt -gt $max_attempts ]]
     then
-        echo "bookmark move of $bookmark away from $last_bookmark_target has not happened"
+        echo "bookmark $bookmark_name did not move to $expected_target"
         return 1
     fi
-    sleep $sleep_time
+    sleep "$sleep_time"
   done
 }
 
@@ -1705,15 +1794,6 @@ if [ -z "$HAS_FB" ]; then
       jq -S 'del(.[].server_tier, .[].tw_task_id, .[].tw_handle, .[].datacenter, .[].region, .[].region_datacenter_prefix, .normvector.enabled_experiments_jk, .normvector.use_maybe_stale_freshness_for_bookmarks)'
   }
 fi
-
-function microwave_builder() {
-  render_mononoke_config
-  GLOG_minloglevel=5 "$MONONOKE_MICROWAVE_BUILDER" \
-    "${CACHE_ARGS[@]}" \
-    "${COMMON_ARGS[@]}" \
-    --config-tier "$MONONOKE_CONFIG_TIER" \
-    "$@"
-}
 
 function derivation_pipeline_tailer {
   render_mononoke_config

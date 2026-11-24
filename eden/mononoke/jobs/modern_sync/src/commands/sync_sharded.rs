@@ -21,7 +21,6 @@ use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
 use mononoke_app::MononokeApp;
 use mononoke_app::args::SourceRepoArgs;
-use repo_blobstore::RepoBlobstoreRef;
 use sharding_ext::RepoShard;
 
 use crate::ModernSyncArgs;
@@ -43,21 +42,14 @@ pub struct ModernSyncProcess {
     app: Arc<MononokeApp>,
     sync_args: Arc<CommandArgs>,
     exit_file: PathBuf,
-    cancellation_requested: Arc<AtomicBool>,
 }
 
 impl ModernSyncProcess {
-    fn new(
-        app: Arc<MononokeApp>,
-        sync_args: Arc<CommandArgs>,
-        exit_file: PathBuf,
-        cancellation_requested: Arc<AtomicBool>,
-    ) -> Self {
+    fn new(app: Arc<MononokeApp>, sync_args: Arc<CommandArgs>, exit_file: PathBuf) -> Self {
         Self {
             app,
             sync_args,
             exit_file,
-            cancellation_requested,
         }
     }
 }
@@ -67,7 +59,6 @@ impl RepoShardedProcess for ModernSyncProcess {
     async fn setup(&self, repo: &RepoShard) -> anyhow::Result<Arc<dyn RepoShardedProcessExecutor>> {
         if fs::metadata(self.exit_file.clone()).is_ok() {
             tracing::warn!("Exit file detected, stopping sync");
-            self.cancellation_requested.store(true, Ordering::Relaxed);
             return Err(anyhow!("Exit file detected, stopping sync"));
         }
 
@@ -97,19 +88,12 @@ impl RepoShardedProcess for ModernSyncProcess {
         let config = repo.repo_config.modern_sync_config.clone().ok_or(anyhow!(
             "No modern sync config found for repo {source_repo_name}"
         ))?;
-        let repo_blobstore = repo.repo_blobstore();
 
         // Check that we can connect to the target repo
         let app_args = self.app.args::<ModernSyncArgs>()?;
-        _ = crate::sync::build_edenfs_client(
-            ctx,
-            &app_args,
-            &target_repo_name,
-            &config,
-            repo_blobstore,
-        )
-        .await
-        .with_context(|| format!("checking that we can connect to {target_repo_name}"))?;
+        _ = crate::sync::build_edenfs_client(ctx, &app_args, &target_repo_name, &config, &repo)
+            .await
+            .with_context(|| format!("checking that we can connect to {target_repo_name}"))?;
 
         Ok(Arc::new(ModernSyncProcessExecutor {
             app: self.app.clone(),
@@ -117,7 +101,9 @@ impl RepoShardedProcess for ModernSyncProcess {
             source_repo_args,
             dest_repo_name: target_repo_name,
             exit_file: self.exit_file.clone(),
-            cancellation_requested: self.cancellation_requested.clone(),
+            // One per shard: stopping this shard must not stop the others on
+            // this task.
+            cancellation_requested: Arc::new(AtomicBool::new(false)),
         }))
     }
 }
@@ -150,7 +136,15 @@ impl RepoShardedProcessExecutor for ModernSyncProcessExecutor {
         Ok(())
     }
 
+    /// ShardManager moved the shard away. Stop now instead of syncing on
+    /// until the executor aborts `execute()`, which would leave the managers
+    /// uploading their queues alongside the new owner.
     async fn stop(&self) -> Result<()> {
+        tracing::info!(
+            "Stopping sync to {} on ShardManager request",
+            self.dest_repo_name
+        );
+        self.cancellation_requested.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -159,13 +153,11 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
     let args = Arc::new(args);
     let app_args = &app.args::<ModernSyncArgs>()?;
     let exit_file = app_args.exit_file.clone();
-    let cancellation_requested = Arc::new(AtomicBool::new(false));
 
     let process = Arc::new(ModernSyncProcess::new(
         Arc::new(app),
         args.clone(),
         exit_file,
-        cancellation_requested,
     ));
 
     if let Some(executor) = app_args.sharded_executor_args.clone().build_executor(

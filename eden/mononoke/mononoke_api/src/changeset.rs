@@ -76,6 +76,7 @@ use mononoke_types::ContentManifestId;
 use mononoke_types::FileChange;
 pub use mononoke_types::Generation;
 use mononoke_types::NonRootMPath;
+use mononoke_types::P4_FILE_REVS_EXTRA;
 use mononoke_types::P4ChangelistId;
 use mononoke_types::SkeletonManifestId;
 use mononoke_types::SubtreeChange;
@@ -94,7 +95,6 @@ use repo_identity::RepoIdentityRef;
 use repo_permission_checker::RepoPermissionCheckerRef;
 use restricted_paths::DenyingRestriction;
 use restricted_paths::RestrictedPathsArc;
-use restricted_paths::check_path_restriction_infos;
 use skeleton_manifest::RootSkeletonManifestId;
 use skeleton_manifest_v2::RootSkeletonManifestV2Id;
 use smallvec::SmallVec;
@@ -302,27 +302,37 @@ pub enum PathVisibility<R> {
     Denied(DenyingRestriction),
 }
 
+impl<R> PathVisibility<R> {
+    /// The visible side, if the path resolved.
+    fn present(self) -> Option<ChangesetPathContentContext<R>> {
+        match self {
+            Self::Present(ctx) => Some(ctx),
+            Self::Denied(_) => None,
+        }
+    }
+}
+
 /// Classify one side of a diff pair under partial-response semantics.
 ///
 /// `Strict` propagates any error. `SkipAndCollect` converts only
-/// restricted-path denials into `None` (recording them against the denying
-/// restriction); repo-auth denials and all other errors still fail. Callers
-/// map `None` to omit-or-downgrade per the per-side absent rule.
+/// restricted-path denials into `Denied`, carrying the denying
+/// restriction so the caller can record the denial once it knows the
+/// pair outcome (omitted or downgraded). Repo-auth denials and all
+/// other errors still fail.
 async fn policy_side<R, F>(
     fut: F,
     policy: &RestrictedPathsPolicy,
-) -> Result<Option<ChangesetPathContentContext<R>>, MononokeError>
+) -> Result<PathVisibility<R>, MononokeError>
 where
     F: Future<Output = Result<ChangesetPathContentContext<R>, MononokeError>>,
 {
     match fut.await {
-        Ok(ctx) => Ok(Some(ctx)),
+        Ok(ctx) => Ok(PathVisibility::Present(ctx)),
         Err(e) => match policy {
-            RestrictedPathsPolicy::SkipAndCollect(collector)
+            RestrictedPathsPolicy::SkipAndCollect(_)
                 if let Some(denial) = e.restricted_paths_denial() =>
             {
-                collector.record(denial.denying_restriction());
-                Ok(None)
+                Ok(PathVisibility::Denied(denial.denying_restriction().clone()))
             }
             _ => Err(e),
         },
@@ -342,7 +352,7 @@ where
     stream.filter_map(move |res| match res {
         Err(e) => {
             if let Some(denial) = e.restricted_paths_denial() {
-                collector.record(denial.denying_restriction());
+                collector.record_omission(denial.denying_restriction(), denial.denied_path());
                 futures::future::ready(None)
             } else {
                 futures::future::ready(Some(Err(e)))
@@ -794,12 +804,15 @@ impl<R: RepoDerivedDataRef + RepoDerivedDataArc + RepoBlobstoreArc> ChangesetCon
         Ok(self.changeset_info().await?.message().to_string())
     }
 
-    /// All mercurial commit extras as (name, value) pairs.
+    /// Mercurial commit extras as (name, value) pairs, without p4-file-revs: megabytes on a
+    /// big changelist, and it lists every path, bypassing path ACLs. Read it through
+    /// `p4_file_revisions`.
     pub async fn hg_extras(&self) -> Result<Vec<(String, Vec<u8>)>, MononokeError> {
         Ok(self
             .changeset_info()
             .await?
             .hg_extra()
+            .filter(|(name, _)| *name != P4_FILE_REVS_EXTRA)
             .map(|(name, value)| (name.to_string(), Vec::from(value)))
             .collect())
     }
@@ -1530,7 +1543,7 @@ where
             })
             .collect();
 
-        stream::iter(candidates)
+        let scanned = stream::iter(candidates)
             .map(|path| async move {
                 let (new_side, old_side) = try_join(
                     policy_side(
@@ -1543,25 +1556,57 @@ where
                     ),
                 )
                 .await?;
-                if new_side.is_none() && old_side.is_none() {
-                    Ok(None)
-                } else {
-                    ChangesetPathDiffContext::new_file(
-                        self.clone(),
-                        path,
-                        new_side,
-                        old_side,
-                        CopyInfo::None,
-                        None,
-                    )
-                    .map(Some)
+                match (new_side, old_side) {
+                    (PathVisibility::Denied(new), PathVisibility::Denied(old)) => {
+                        policy.record_omission(&new, Some(&path));
+                        policy.record_omission(&old, Some(&path));
+                        Ok((path, None))
+                    }
+                    (new_side, old_side) => {
+                        // Exactly one side denied: the entry stays visible
+                        // but downgraded, so the entry path downgrades.
+                        if let PathVisibility::Denied(restriction) = &new_side {
+                            policy.record_downgrade(restriction, &path);
+                        }
+                        if let PathVisibility::Denied(restriction) = &old_side {
+                            policy.record_downgrade(restriction, &path);
+                        }
+                        ChangesetPathDiffContext::new_file(
+                            self.clone(),
+                            path.clone(),
+                            new_side.present(),
+                            old_side.present(),
+                            CopyInfo::None,
+                            None,
+                        )
+                        .map(|ctx| (path, Some(ctx)))
+                    }
                 }
             })
-            .buffered(LFS_PATH_CONTEXT_CONCURRENCY)
-            .try_filter_map(|opt| futures::future::ready(Ok(opt)))
-            .take(max_entries)
-            .try_collect()
-            .await
+            .buffered(LFS_PATH_CONTEXT_CONCURRENCY);
+        // See `diff`: the budget covers scanned entries only when the
+        // caller asked for omitted paths. Entry noting stays downstream
+        // of the take.
+        if policy.omitted_path_retention() {
+            Ok(scanned
+                .take(max_entries)
+                .try_collect::<Vec<_>>()
+                .await?
+                .into_iter()
+                .filter_map(|(path, entry)| {
+                    if entry.is_none() {
+                        policy.note_omitted_entry(Some(&path));
+                    }
+                    entry
+                })
+                .collect())
+        } else {
+            scanned
+                .try_filter_map(|(_, entry)| async move { Ok(entry) })
+                .take(max_entries)
+                .try_collect()
+                .await
+        }
     }
 
     /// If the given path is part of a subtree copy, get the subtree copy source, as well as the replacement path
@@ -1602,6 +1647,10 @@ where
     /// side downgrades `Changed` to `Added`, an entry denied on both sides is
     /// omitted), recording denials against their denying restriction.
     /// Repo-auth denials and all other errors still fail the whole diff.
+    ///
+    /// When the policy retains omitted paths, `limit` covers scanned
+    /// entries, so omissions count toward it; otherwise pages fill with
+    /// visible entries.
     pub async fn diff(
         &self,
         other: &ChangesetContext<R>,
@@ -1703,6 +1752,8 @@ where
                         .any(|path| within_restrictions(path, &path_restrictions))
                 });
             }
+        }
+        if !copy_path_map.is_empty() {
             let to_paths: HashSet<MPath> = copy_path_map.values().flatten().cloned().collect();
 
             let other_root_manifest_id = other.root_content_manifest_id().await?;
@@ -1809,17 +1860,20 @@ where
         // We check if `self` contains paths that were source for copy or move in `other`
         // If self does contain a path, then we consider it to be a copy, otherwise
         // it's a move to the first location it was copied to.
-        let copied_paths = self
-            .root_content_manifest_id()
-            .await?
-            .find_entries(
-                self.ctx().clone(),
-                self.repo_ctx().repo().repo_blobstore().clone(),
-                copy_path_map.keys().cloned(),
-            )
-            .map_ok(|(from_path, _)| from_path)
-            .try_collect::<HashSet<_>>()
-            .await?;
+        let copied_paths = if copy_path_map.is_empty() {
+            HashSet::new()
+        } else {
+            self.root_content_manifest_id()
+                .await?
+                .find_entries(
+                    self.ctx().clone(),
+                    self.repo_ctx().repo().repo_blobstore().clone(),
+                    copy_path_map.keys().cloned(),
+                )
+                .map_ok(|(from_path, _)| from_path)
+                .try_collect::<HashSet<_>>()
+                .await?
+        };
 
         let diff_files = diff_items.contains(&ChangesetDiffItem::FILES);
         let diff_trees = diff_items.contains(&ChangesetDiffItem::TREES);
@@ -1906,7 +1960,7 @@ where
             }
         };
 
-        let mut change_contexts: Vec<ChangesetPathDiffContext<R>> = diff
+        let scanned = diff
             .map_err(MononokeError::from)
             .try_filter_map(|diff_entry| {
                 async {
@@ -1952,24 +2006,40 @@ where
                                     policy,
                                 )
                                 .await?;
-                                let Some(new_ctx) = new_side else {
-                                    // New side denied: nothing visible to show.
-                                    return Ok(None);
+                                let new_ctx = match new_side {
+                                    PathVisibility::Present(new_ctx) => new_ctx,
+                                    PathVisibility::Denied(restriction) => {
+                                        // New side denied: nothing visible to
+                                        // show.
+                                        policy.record_omission(&restriction, Some(&path));
+                                        if let PathVisibility::Denied(from_restriction) = from {
+                                            policy.record_omission(&from_restriction, Some(&path));
+                                        }
+                                        return Ok(Some((path, None)));
+                                    }
                                 };
                                 // Copy-from denied: hide provenance, show a
                                 // plain Added rather than leaking the source.
+                                // The entry path downgrades; the source never
+                                // leaves the server.
                                 let (from_opt, copy_info) = match from {
-                                    Some(from) => (Some(from), copy_info),
-                                    None => (None, CopyInfo::None),
+                                    PathVisibility::Present(from) => (Some(from), copy_info),
+                                    PathVisibility::Denied(restriction) => {
+                                        policy.record_downgrade(&restriction, &path);
+                                        (None, CopyInfo::None)
+                                    }
                                 };
-                                Some(ChangesetPathDiffContext::new_file(
-                                    self.clone(),
-                                    path,
-                                    Some(new_ctx),
-                                    from_opt,
-                                    copy_info,
-                                    None,
-                                )?)
+                                Some((
+                                    path.clone(),
+                                    Some(ChangesetPathDiffContext::new_file(
+                                        self.clone(),
+                                        path,
+                                        Some(new_ctx),
+                                        from_opt,
+                                        copy_info,
+                                        None,
+                                    )?),
+                                ))
                             } else {
                                 let new_side = policy_side(
                                     ChangesetPathContentContext::new_with_manifest_entry(
@@ -1981,16 +2051,22 @@ where
                                 )
                                 .await?;
                                 match new_side {
-                                    Some(new_ctx) => Some(ChangesetPathDiffContext::new_file(
-                                        self.clone(),
-                                        path,
-                                        Some(new_ctx),
-                                        None,
-                                        CopyInfo::None,
-                                        None,
-                                    )?),
+                                    PathVisibility::Present(new_ctx) => Some((
+                                        path.clone(),
+                                        Some(ChangesetPathDiffContext::new_file(
+                                            self.clone(),
+                                            path,
+                                            Some(new_ctx),
+                                            None,
+                                            CopyInfo::None,
+                                            None,
+                                        )?),
+                                    )),
                                     // New side denied: nothing visible to show.
-                                    None => None,
+                                    PathVisibility::Denied(restriction) => {
+                                        policy.record_omission(&restriction, Some(&path));
+                                        Some((path, None))
+                                    }
                                 }
                             }
                         }
@@ -2019,16 +2095,24 @@ where
                                 )
                                 .await?;
                                 match old_side {
-                                    Some(old_ctx) => Some(ChangesetPathDiffContext::new_file(
-                                        self.clone(),
-                                        path,
-                                        None,
-                                        Some(old_ctx),
-                                        CopyInfo::None,
-                                        replacement_path,
-                                    )?),
+                                    PathVisibility::Present(old_ctx) => Some((
+                                        path.clone(),
+                                        Some(ChangesetPathDiffContext::new_file(
+                                            self.clone(),
+                                            path,
+                                            None,
+                                            Some(old_ctx),
+                                            CopyInfo::None,
+                                            replacement_path,
+                                        )?),
+                                    )),
                                     // Visible side denied: nothing to show.
-                                    None => None,
+                                    // The entry path omits; a hidden subtree
+                                    // source never leaves the server.
+                                    PathVisibility::Denied(restriction) => {
+                                        policy.record_omission(&restriction, Some(&path));
+                                        Some((path, None))
+                                    }
                                 }
                             }
                         }
@@ -2064,21 +2148,37 @@ where
                                     policy,
                                 )
                                 .await?;
-                                if new_side.is_none() && old_side.is_none() {
-                                    // Both sides denied: nothing visible.
-                                    None
-                                } else {
-                                    // One denied side downgrades Changed to
-                                    // Added (old denied) or Removed (new
-                                    // denied); new_file takes Option sides.
-                                    Some(ChangesetPathDiffContext::new_file(
-                                        self.clone(),
-                                        path,
-                                        new_side,
-                                        old_side,
-                                        CopyInfo::None,
-                                        replacement_path,
-                                    )?)
+                                match (new_side, old_side) {
+                                    (PathVisibility::Denied(new), PathVisibility::Denied(old)) => {
+                                        // Both sides denied: nothing visible.
+                                        policy.record_omission(&new, Some(&path));
+                                        policy.record_omission(&old, Some(&path));
+                                        Some((path, None))
+                                    }
+                                    (new_side, old_side) => {
+                                        // One denied side downgrades Changed to
+                                        // Added (old denied) or Removed (new
+                                        // denied); new_file takes Option sides.
+                                        // The entry path downgrades, never a
+                                        // hidden source.
+                                        if let PathVisibility::Denied(restriction) = &new_side {
+                                            policy.record_downgrade(restriction, &path);
+                                        }
+                                        if let PathVisibility::Denied(restriction) = &old_side {
+                                            policy.record_downgrade(restriction, &path);
+                                        }
+                                        Some((
+                                            path.clone(),
+                                            Some(ChangesetPathDiffContext::new_file(
+                                                self.clone(),
+                                                path,
+                                                new_side.present(),
+                                                old_side.present(),
+                                                CopyInfo::None,
+                                                replacement_path,
+                                            )?),
+                                        ))
+                                    }
                                 }
                             }
                         }
@@ -2096,14 +2196,20 @@ where
                                 )
                                 .await?;
                                 match new_side {
-                                    Some(new_ctx) => Some(ChangesetPathDiffContext::new_tree(
-                                        self.clone(),
-                                        path,
-                                        Some(new_ctx),
-                                        None,
-                                        None,
-                                    )?),
-                                    None => None,
+                                    PathVisibility::Present(new_ctx) => Some((
+                                        path.clone(),
+                                        Some(ChangesetPathDiffContext::new_tree(
+                                            self.clone(),
+                                            path,
+                                            Some(new_ctx),
+                                            None,
+                                            None,
+                                        )?),
+                                    )),
+                                    PathVisibility::Denied(restriction) => {
+                                        policy.record_omission(&restriction, Some(&path));
+                                        Some((path, None))
+                                    }
                                 }
                             }
                         }
@@ -2127,14 +2233,22 @@ where
                                 )
                                 .await?;
                                 match old_side {
-                                    Some(old_ctx) => Some(ChangesetPathDiffContext::new_tree(
-                                        self.clone(),
-                                        path,
-                                        None,
-                                        Some(old_ctx),
-                                        replacement_path,
-                                    )?),
-                                    None => None,
+                                    PathVisibility::Present(old_ctx) => Some((
+                                        path.clone(),
+                                        Some(ChangesetPathDiffContext::new_tree(
+                                            self.clone(),
+                                            path,
+                                            None,
+                                            Some(old_ctx),
+                                            replacement_path,
+                                        )?),
+                                    )),
+                                    // The entry path omits; a hidden subtree
+                                    // source never leaves the server.
+                                    PathVisibility::Denied(restriction) => {
+                                        policy.record_omission(&restriction, Some(&path));
+                                        Some((path, None))
+                                    }
                                 }
                             }
                         }
@@ -2170,16 +2284,33 @@ where
                                     policy,
                                 )
                                 .await?;
-                                if new_side.is_none() && old_side.is_none() {
-                                    None
-                                } else {
-                                    Some(ChangesetPathDiffContext::new_tree(
-                                        self.clone(),
-                                        path,
-                                        new_side,
-                                        old_side,
-                                        replacement_path,
-                                    )?)
+                                match (new_side, old_side) {
+                                    (PathVisibility::Denied(new), PathVisibility::Denied(old)) => {
+                                        policy.record_omission(&new, Some(&path));
+                                        policy.record_omission(&old, Some(&path));
+                                        Some((path, None))
+                                    }
+                                    (new_side, old_side) => {
+                                        // Exactly one side denied: the entry
+                                        // path downgrades, never a hidden
+                                        // source.
+                                        if let PathVisibility::Denied(restriction) = &new_side {
+                                            policy.record_downgrade(restriction, &path);
+                                        }
+                                        if let PathVisibility::Denied(restriction) = &old_side {
+                                            policy.record_downgrade(restriction, &path);
+                                        }
+                                        Some((
+                                            path.clone(),
+                                            Some(ChangesetPathDiffContext::new_tree(
+                                                self.clone(),
+                                                path,
+                                                new_side.present(),
+                                                old_side.present(),
+                                                replacement_path,
+                                            )?),
+                                        ))
+                                    }
                                 }
                             }
                         }
@@ -2190,9 +2321,35 @@ where
                     Ok(entry)
                 }
             })
-            .take(limit.unwrap_or(usize::MAX))
-            .try_collect::<Vec<_>>()
-            .await?;
+            .boxed();
+        // Entries noted before this call, so the window below can measure
+        // its own omissions against a shared per-request policy.
+        let entries_before = policy.omitted_entry_count().unwrap_or(0);
+        // When the caller asked for omitted paths, the page budget covers
+        // scanned entries, so omissions count toward it; otherwise pages
+        // fill with visible entries as before. Entry noting stays
+        // downstream of the take.
+        let mut change_contexts: Vec<ChangesetPathDiffContext<R>> =
+            if policy.omitted_path_retention() {
+                scanned
+                    .take(limit.unwrap_or(usize::MAX))
+                    .try_collect::<Vec<_>>()
+                    .await?
+                    .into_iter()
+                    .filter_map(|(path, entry)| {
+                        if entry.is_none() {
+                            policy.note_omitted_entry(Some(&path));
+                        }
+                        entry
+                    })
+                    .collect()
+            } else {
+                scanned
+                    .try_filter_map(|(_, entry)| async move { Ok(entry) })
+                    .take(limit.unwrap_or(usize::MAX))
+                    .try_collect::<Vec<_>>()
+                    .await?
+            };
 
         let supplement_enabled = first_parent_is_other
             && diff_files
@@ -2208,21 +2365,35 @@ where
                 Some(self.repo_ctx().name()),
             );
         if supplement_enabled {
+            // Omitted entries noted by this call so far (main window, plus
+            // the supplement once it runs): the scanned count is visible
+            // entries plus these. Zero when omissions are not counted.
+            let window_entries = || policy.omitted_entry_count().unwrap_or(0) - entries_before;
             // Ordered mode only needs supplement paths up to the final manifest
             // entry in this page: anything after it cannot affect the first
             // `limit` entries of the sorted union. If the manifest page is
             // short, scan to the end so supplement-only tail entries can fill
             // it.
-            let supplement_before_or_at =
-                if is_ordered && limit.is_some_and(|l| change_contexts.len() == l) {
-                    change_contexts.last().map(|d| d.path().clone())
-                } else {
-                    None
-                };
+            let supplement_before_or_at = if is_ordered
+                && limit.is_some_and(|l| change_contexts.len() + window_entries() == l)
+            {
+                // Bound the supplement to the window end: the maximum of
+                // the last visible entry and every noted omission, so an
+                // all-omitted window still bounds it.
+                let visible_last = change_contexts.last().map(|d| d.path().clone());
+                visible_last
+                    .into_iter()
+                    .chain(policy.max_omitted_mpath())
+                    .max()
+            } else {
+                None
+            };
             let supplement_max = if is_ordered {
                 limit.unwrap_or(usize::MAX)
             } else {
-                limit.map_or(usize::MAX, |l| l.saturating_sub(change_contexts.len()))
+                limit.map_or(usize::MAX, |l| {
+                    l.saturating_sub(change_contexts.len() + window_entries())
+                })
             };
 
             if supplement_max > 0 {
@@ -2286,7 +2457,8 @@ where
         let diff_files = diff_items.contains(&ChangesetDiffItem::FILES);
         let diff_trees = diff_items.contains(&ChangesetDiffItem::TREES);
 
-        self.find_entries(to_vec1(path_restrictions), ordering)
+        let scanned = self
+            .find_entries(to_vec1(path_restrictions), ordering)
             .watched()
             .await?
             .yield_periodically()
@@ -2301,41 +2473,61 @@ where
                 }
             })
             .map_err(MononokeError::from)
-            // Filter-then-limit: the page budget applies to visible entries,
-            // so denied paths never consume it and an all-denied page still
-            // advances past the walked entries.
             .try_filter_map(|(path, is_tree)| async move {
                 let side = policy_side(
                     ChangesetPathContentContext::new(self.clone(), path.clone()),
                     policy,
                 )
                 .await?;
-                Ok(side.map(|base| (base, path, is_tree)))
-            })
-            .take(limit.unwrap_or(usize::MAX))
-            .and_then(|(base, path, is_tree)| async move {
-                if is_tree {
-                    Ok(ChangesetPathDiffContext::new_tree(
-                        self.clone(),
-                        path,
-                        Some(base),
-                        None,
-                        None,
-                    )?)
+                Ok(Some((path, side, is_tree)))
+            });
+        // When the caller asked for omitted paths, the page budget covers
+        // scanned entries, so omissions count toward it; otherwise pages
+        // fill with visible entries as before. Entry noting stays
+        // downstream of the take.
+        let limit = limit.unwrap_or(usize::MAX);
+        let scanned: Vec<(MPath, PathVisibility<R>, bool)> = if policy.omitted_path_retention() {
+            scanned.take(limit).try_collect().watched().await?
+        } else {
+            scanned
+                .try_filter_map(|(path, side, is_tree)| async move {
+                    match side {
+                        PathVisibility::Denied(restriction) => {
+                            // Dropped denied entries still record their
+                            // omission.
+                            policy.record_omission(&restriction, Some(&path));
+                            Ok(None)
+                        }
+                        side => Ok(Some((path, side, is_tree))),
+                    }
+                })
+                .take(limit)
+                .try_collect()
+                .watched()
+                .await?
+        };
+        let mut change_contexts = Vec::with_capacity(scanned.len());
+        for (path, side, is_tree) in scanned {
+            match side {
+                PathVisibility::Present(base) => change_contexts.push(if is_tree {
+                    ChangesetPathDiffContext::new_tree(self.clone(), path, Some(base), None, None)?
                 } else {
-                    Ok(ChangesetPathDiffContext::new_file(
+                    ChangesetPathDiffContext::new_file(
                         self.clone(),
                         path,
                         Some(base),
                         None,
                         CopyInfo::None,
                         None,
-                    )?)
+                    )?
+                }),
+                PathVisibility::Denied(restriction) => {
+                    policy.record_omission(&restriction, Some(&path));
+                    policy.note_omitted_entry(Some(&path));
                 }
-            })
-            .try_collect::<Vec<_>>()
-            .watched()
-            .await
+            }
+        }
+        Ok(change_contexts)
     }
 }
 
@@ -2584,9 +2776,9 @@ impl<R: MononokeRepo> ChangesetContext<R> {
     /// When false, `has_access` will be `None`.
     pub async fn paths_restriction_info(
         &self,
-        paths: Vec<NonRootMPath>,
+        paths: Vec<MPath>,
         check_permissions: bool,
-    ) -> Result<Vec<(NonRootMPath, Vec<PathAccessInfo>)>, MononokeError> {
+    ) -> Result<Vec<(MPath, Vec<PathAccessInfo>)>, MononokeError> {
         stream::iter(paths)
             .map(|path| async move {
                 let restriction_ctx = self.path_restriction(path.clone()).await?;
@@ -2615,16 +2807,10 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         let restricted_paths = self.repo_ctx().repo().restricted_paths_arc();
         let cs_id = self.id();
 
-        let restriction_infos = restricted_paths
-            .find_restricted_descendants(self.ctx(), Some(cs_id), roots)
-            .await?;
-
         if check_permissions {
-            // TODO(T289977216): Route this through the Both-mode-aware checker
-            // so tri-state factors are reconciled before producing has_access.
-            let restriction_checks =
-                check_path_restriction_infos(self.ctx(), &restricted_paths, restriction_infos)
-                    .await?;
+            let restriction_checks = restricted_paths
+                .find_restricted_descendant_checks(self.ctx(), Some(cs_id), roots)
+                .await?;
             return Ok(restriction_checks
                 .into_iter()
                 .map(|restriction_check| PathAccessInfo {
@@ -2633,6 +2819,10 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                 })
                 .collect());
         }
+
+        let restriction_infos = restricted_paths
+            .find_restricted_descendants(self.ctx(), Some(cs_id), roots)
+            .await?;
 
         Ok(restriction_infos
             .into_iter()

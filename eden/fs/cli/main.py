@@ -20,6 +20,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import time
 import traceback
 import typing
 from dataclasses import dataclass
@@ -174,6 +175,7 @@ from . import (
     rage as rage_mod,
     redirect as redirect_mod,
     stats as stats_mod,
+    stats_print,
     subcmd as subcmd_mod,
     top as top_mod,
     trace as trace_mod,
@@ -181,7 +183,12 @@ from . import (
     util,
     version as version_mod,
 )
-from .cmd_util import get_eden_instance, get_fsck_command, require_checkout
+from .cmd_util import (
+    find_checkout,
+    get_eden_instance,
+    get_fsck_command,
+    require_checkout,
+)
 from .config import EdenCheckout, EdenInstance, ListMountInfo
 from .constants import (
     SHUTDOWN_EXIT_CODE_ERROR,
@@ -571,15 +578,10 @@ class CloneCmd(Subcmd):
             "--backing-store",
             help=(
                 "Clone the path with a specified Backing Store implementation. "
-                "Currently only supports 'filteredhg' (all), 'recas' (Linux), "
-                "and 'http' (Linux). Takes precedent over the inferred backing"
-                "store type from the existing repository we're cloning from."
+                "Currently only supports 'filteredhg' (all) and 'http' (Linux). "
+                "Takes precedent over the inferred backing store type from the "
+                "existing repository we're cloning from."
             ),
-        )
-
-        parser.add_argument(
-            "--re-use-case",
-            help="The Remote Execution use-case to use when --backing-store=recas",
         )
 
         parser.add_argument(
@@ -756,7 +758,6 @@ is case-sensitive. This is not recommended and is intended only for testing."""
                 args.case_sensitive,
                 overlay_type=args.overlay_type,
                 backing_store_type=args.backing_store,
-                re_use_case=args.re_use_case,
                 off_mount_repo_dir=instance.get_config_bool(
                     "clone.off-mount-repo-dir",
                     # Enable by default in tests.
@@ -814,18 +815,6 @@ is case-sensitive. This is not recommended and is intended only for testing."""
                     )
                     return 1
 
-        elif args.backing_store == "recas":
-            if sys.platform != "linux":
-                print_stderr(
-                    "error: recas backing store was passed but this feature is only available on Linux"
-                )
-                return 1
-            if args.rev is not None:
-                commit = args.rev
-            else:
-                NULL_REVISION = "0" * 40
-                # A special digest for RE CAS representing an empty folder
-                commit = f"{NULL_REVISION}:0"
         elif args.backing_store == "http":
             if sys.platform != "linux":
                 print_stderr(
@@ -1814,7 +1803,7 @@ def remove_legacyephemeral_checkouts(
                 preserve_mount_point=False,
                 use_force=True,
                 complain_about_redirections=False,
-                skip_destroy=False,
+                skip_destroy=True,
                 debug=False,
             )
 
@@ -1825,20 +1814,26 @@ def remove_legacyephemeral_checkouts(
                     "  Continuing with config cleanup...\n"
                 )
 
+            try:
+                out.write(f"Deleting mount {path}...\n")
+                instance.destroy_mount(str(path), preserve_mount_point=False)
+            except Exception as e:
+                result.destroy_error = e
+
+            if result.cleanup_error:
+                out.write(
+                    f"  Warning: Failed to clean up mount point {path}: {result.cleanup_error}\n"
+                    "  Manual cleanup recommended.\n"
+                    f"  Run: rm -rf {path}\n"
+                )
+
             if result.destroy_error:
                 out.write(
                     f"  Error deleting configuration for {path}: {result.destroy_error}\n"
                     "  This checkout will fail to mount. Manual cleanup recommended.\n"
-                    f"  Run: sudo unmount -f {path} && rm -rf {path}\n"
+                    f"  Run: eden rm {path}\n"
                 )
             else:
-                if result.cleanup_error:
-                    out.write(
-                        f"  Warning: Failed to cleanup mount point {path}: {result.cleanup_error}\n"
-                        "  Manual cleanup recommended.\n"
-                        f"  Run: rm -rf {path}\n"
-                    )
-
                 out.write(f"  Removed {path}\n")
                 removed_count += 1
 
@@ -1874,6 +1869,7 @@ def remove_checkout_impl(
     use_force: bool = True,
     complain_about_redirections: bool = True,
     skip_destroy: bool = False,
+    cleanup_only: bool = False,
     debug: bool = False,
     proceed_on_unmount_failure: bool = True,
     aux_timeout: Optional[int] = None,
@@ -1892,9 +1888,12 @@ def remove_checkout_impl(
         preserve_mount_point: If True, don't delete the mount point directory
         use_force: If True, use force unmount
         complain_about_redirections: If True, log warnings about failing to unmount redirections
-        skip_destroy: If True, skip the destroy_mount step (for CLEANUP_ONLY case)
+        skip_destroy: If True, skip the destroy_mount step
+        cleanup_only: If True, the mount point holds nothing but EdenFS's own leftovers
+            (the CLEANUP_ONLY case): only the README and the directory itself are
+            deleted, so that nothing written there since the check is lost
         debug: If True, include debug info in cleanup_mount
-        proceed_on_unmount_failure: If True, continue with destroy/cleanup even if unmount fails.
+        proceed_on_unmount_failure: If True, continue with cleanup/destroy even if unmount fails.
             If False, return early with unmount_error set.
         aux_timeout: Timeout in seconds for stopping auxiliary processes. If None, uses the default.
     """
@@ -1933,26 +1932,28 @@ def remove_checkout_impl(
             if not proceed_on_unmount_failure:
                 # Caller wants to abort on unmount failure
                 return result
-            # Otherwise continue to destroy/cleanup
+            # Otherwise continue to cleanup/destroy
 
-    # Step 2: Destroy mount config and overlay
+    # Step 2: Cleanup mount point directory
+    # Note: This runs even when skip_destroy=True (e.g., CLEANUP_ONLY case)
+    try:
+        output.write(f"Cleaning up mount {path}...\n")
+        if cleanup_only:
+            _remove_leftover_mount_point(Path(path), preserve_mount_point)
+        else:
+            instance.cleanup_mount(Path(path), preserve_mount_point, debug)
+    except Exception as e:
+        result.cleanup_error = e
+        # Keep the checkout registered, so that a retry removes it
+        return result
+
+    # Step 3: Destroy mount config and overlay
     if not skip_destroy:
         try:
             output.write(f"Deleting mount {path}...\n")
             instance.destroy_mount(path, preserve_mount_point)
         except Exception as e:
             result.destroy_error = e
-            # Don't attempt cleanup if destroy failed
-            return result
-
-    # Step 3: Cleanup mount point directory
-    # Note: This runs even when skip_destroy=True (e.g., CLEANUP_ONLY case)
-    try:
-        output.write(f"Cleaning up mount {path}...\n")
-        instance.cleanup_mount(Path(path), preserve_mount_point, debug)
-    except Exception as e:
-        result.cleanup_error = e
-        # Cleanup failure is less severe - don't mark as total failure
 
     return result
 
@@ -1973,6 +1974,14 @@ def _is_registered_checkout(path: str, configured_mounts: List[str]) -> bool:
     return path in configured_mounts or os.path.realpath(path) in configured_mounts
 
 
+def _inside_registered_checkout(path: str, configured_mounts: List[str]) -> bool:
+    """True when `path` lies under a checkout config.json lists. Such a path
+    belongs to the checkout even while the checkout is unmounted."""
+    return any(
+        path.startswith(mount.rstrip(os.sep) + os.sep) for mount in configured_mounts
+    )
+
+
 def _path_is_missing(path: str) -> bool:
     """True only when nothing exists at `path`: no entry, or a parent that is a
     plain file. `os.path.exists` is also False for a stale mount left by a dead
@@ -1985,6 +1994,115 @@ def _path_is_missing(path: str) -> bool:
     except OSError:
         return False
     return False
+
+
+def _is_leftover_mount_point(path: str) -> bool:
+    """True when the directory holds nothing but what EdenFS itself leaves at
+    a mount point: it is empty, or it holds only the not-mounted README."""
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return False
+    return all(entry == config_mod.NOT_MOUNTED_README_PATH for entry in entries)
+
+
+def _remove_leftover_mount_point(path: Path, preserve_mount_point: bool) -> None:
+    """Delete a leftover mount point: the README EdenFS put there, then the
+    directory itself. The removal is not recursive, so a file written into the
+    directory after `_is_leftover_mount_point` saw it empty makes the `rmdir`
+    fail instead of being deleted."""
+    if sys.platform != "win32":
+        path.chmod(0o755)
+    (path / config_mod.NOT_MOUNTED_README_PATH).unlink(missing_ok=True)
+    if not preserve_mount_point:
+        path.rmdir()
+
+
+# How long `eden rm` may spend measuring the redirection backing it leaves behind.
+# Build output can hold hundreds of GB, which takes minutes to walk.
+REDIRECTION_BACKING_SIZE_BUDGET_SECONDS = 5.0
+
+
+def _redirection_backing_dirs(checkout: EdenCheckout) -> List[Path]:
+    """The scratch directories that hold the data of `checkout`'s bind and
+    symlink redirections, such as the repository's build output. `eden rm`
+    unmounts the redirections but leaves these directories in place."""
+    backing = []
+    for redir in redirect_mod.get_configured_redirections(checkout).values():
+        if redir.type not in (
+            redirect_mod.RedirectionType.BIND,
+            redirect_mod.RedirectionType.SYMLINK,
+        ):
+            continue
+        try:
+            target = redir.expand_target_abspath(checkout)
+        except (OSError, subprocess.CalledProcessError) as ex:
+            print_stderr(
+                f"warning: cannot find where the {redir.repo_path} redirection of "
+                f"{checkout.path} stores its data: {ex}"
+            )
+            continue
+        if target is not None and not target.is_relative_to(checkout.path):
+            backing.append(target)
+    return backing
+
+
+def _measure_dir(path: Path, deadline: float) -> Tuple[int, bool]:
+    """Return the bytes stored under `path` and whether every entry was counted
+    before `deadline`, a `time.monotonic()` value."""
+    total = 0
+    complete = True
+    pending = [path]
+    while pending:
+        try:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    if time.monotonic() > deadline:
+                        return total, False
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(Path(entry.path))
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                    total += (
+                        st.st_size if sys.platform == "win32" else st.st_blocks * 512
+                    )
+        except OSError:
+            complete = False
+    return total, complete
+
+
+def _describe_size(size: int, complete: bool) -> str:
+    if complete:
+        return stats_print.format_size(size)
+    if size == 0:
+        return "size not measured"
+    return f"at least {stats_print.format_size(size)}"
+
+
+def _print_redirection_backing_left_behind(backing: Sequence[Path]) -> None:
+    left = [path for path in backing if path.is_dir()]
+    if not left:
+        return
+    # Each directory gets an equal share of the budget, so a huge first
+    # directory doesn't leave the others unmeasured.
+    budget = REDIRECTION_BACKING_SIZE_BUDGET_SECONDS / len(left)
+    lines = []
+    for path in left:
+        size, complete = _measure_dir(path, time.monotonic() + budget)
+        lines.append(f"  {path} ({_describe_size(size, complete)})")
+    delete_cmd = (
+        "Remove-Item -Recurse -Force <path>"
+        if sys.platform == "win32"
+        else "rm -rf <path>"
+    )
+    print(
+        "EdenFS did not delete the data of this checkout's redirections, such as "
+        "build output:\n"
+        + "\n".join(lines)
+        + f"\nTo free the space, delete these directories with `{delete_cmd}`, or "
+        "run `eden du --clean-orphaned` to delete the redirection data of every "
+        "removed checkout."
+    )
 
 
 # Types of removal
@@ -2063,8 +2181,9 @@ class RemoveCmd(Subcmd):
 
     def _prepare_checkout_for_removal(
         self, args: argparse.Namespace, mount: str, default_instance: EdenInstance
-    ) -> EdenInstance:
-        """Return the instance that serves `mount`.
+    ) -> Tuple[EdenInstance, List[Path]]:
+        """Return the instance that serves `mount` and the directories that hold
+        the data of its redirections, which the removal leaves behind.
 
         Rewrites the checkout config without its redirection targets so the
         redirected paths can be deleted. A checkout whose state cannot be
@@ -2075,13 +2194,21 @@ class RemoveCmd(Subcmd):
         try:
             instance, checkout, _rel_path = require_checkout(args, mount)
         except subcmd_mod.CmdError:
-            return default_instance
+            return default_instance, []
         except Exception as ex:
             print_stderr(
                 f"warning: cannot find the checkout state of {mount}, removing it "
                 f"anyway: {ex}"
             )
-            return default_instance
+            return default_instance, []
+        try:
+            backing = _redirection_backing_dirs(checkout)
+        except (config_mod.CheckoutConfigCorruptedError, OSError) as ex:
+            print_stderr(
+                f"warning: cannot read the redirections of {mount}, removing it "
+                f"anyway: {ex}"
+            )
+            backing = []
         try:
             config = checkout.get_config()._replace(redirection_targets={})
             checkout.save_config(config)
@@ -2090,7 +2217,7 @@ class RemoveCmd(Subcmd):
                 f"warning: cannot update the config of {mount} before removing "
                 f"it, removing it anyway: {ex}"
             )
-        return instance
+        return instance, backing
 
     def _register_before_removal(
         self, instance: EdenInstance, mount: str
@@ -2241,6 +2368,12 @@ Do you still want to delete {path}?"""
                                                 FAILURE_KIND_CLEANUP,
                                                 f"Error: cannot remove contents of {path} even after trying to kill processes holding resources: {ex}",
                                             )
+                        elif _is_leftover_mount_point(
+                            path
+                        ) and not _inside_registered_checkout(
+                            mount_path, configured_mounts
+                        ):
+                            remove_type = RemoveType.CLEANUP_ONLY
                         else:
                             # We can't ask the user what their true intentions are,
                             # so let's fail by default.
@@ -2291,7 +2424,7 @@ Do you still want to delete {path}?"""
             )
             for mount, remove_type in mounts:
                 print(f"Removing {mount}...")
-                mount_instance = self._prepare_checkout_for_removal(
+                mount_instance, backing = self._prepare_checkout_for_removal(
                     args, mount, instance
                 )
                 if remove_type == RemoveType.ACTIVE_UNREGISTERED:
@@ -2307,13 +2440,33 @@ Do you still want to delete {path}?"""
                         )
                     remove_type = registered_type
 
+                # On Windows, `.eden\config` stays in the folder after the checkout
+                # is unmounted, so the daemon is asked as well. It's asked here,
+                # not before the prompt, because the checkout can be mounted in
+                # the meantime. If it can't answer, the folder decides, as it
+                # does on the other platforms.
+                is_mounted = remove_type in (
+                    RemoveType.ACTIVE_MOUNT,
+                    RemoveType.ACTIVE_UNREGISTERED,
+                )
+                if (
+                    is_mounted
+                    and sys.platform == "win32"
+                    and mount in configured_mounts
+                ):
+                    try:
+                        with instance.get_thrift_client() as client:
+                            is_mounted = Path(mount) in {
+                                Path(os.fsdecode(m.mountPoint))
+                                for m in client.listMounts()
+                            }
+                    except (EdenNotRunningError, TransportError):
+                        pass
+
                 result = remove_checkout_impl(
                     instance=mount_instance,
                     path=mount,
-                    is_mounted=(
-                        remove_type
-                        in (RemoveType.ACTIVE_MOUNT, RemoveType.ACTIVE_UNREGISTERED)
-                    ),
+                    is_mounted=is_mounted,
                     output=ui.get_output(),
                     preserve_mount_point=args.preserve_mount_point,
                     use_force=not args.no_force,
@@ -2322,6 +2475,7 @@ Do you still want to delete {path}?"""
                         remove_type
                         in (RemoveType.CLEANUP_ONLY, RemoveType.ACTIVE_UNREGISTERED)
                     ),
+                    cleanup_only=(remove_type == RemoveType.CLEANUP_ONLY),
                     debug=args.debug,
                     proceed_on_unmount_failure=False,
                     aux_timeout=aux_timeout,
@@ -2355,7 +2509,7 @@ Do you still want to delete {path}?"""
                     # pyre-fixme[6]: Pyre doesn't narrow Optional type after if guard
                     self.optional_traceback(result.destroy_error, args.debug)
                 else:
-                    # Handle cleanup errors if destroy succeeded
+                    # Handle cleanup errors, which stop the removal before destroy
                     if result.cleanup_error:
                         msg = f"error cleaning up mount {mount}: {result.cleanup_error}"
                         if (
@@ -2368,6 +2522,11 @@ Do you still want to delete {path}?"""
                         )
                         # pyre-fixme[6]: Pyre doesn't narrow Optional type after if guard
                         self.optional_traceback(result.cleanup_error, args.debug)
+                    else:
+                        # Only a removed checkout leaves its redirection data behind:
+                        # a cleanup error keeps the checkout registered, so the data
+                        # is still in use and `eden du --clean-orphaned` skips it.
+                        _print_redirection_backing_left_behind(backing)
 
                     # Continue around the loop removing any other mount points
 
@@ -2391,7 +2550,6 @@ Do you still want to delete {path}?"""
 @subcmd("unmount", "Temporarily unmount a specific checkout")
 class UnmountCmd(Subcmd):
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("--destroy", action="store_true", help=argparse.SUPPRESS)
         parser.add_argument(
             "paths",
             nargs=argparse.ONE_OR_MORE,
@@ -2408,35 +2566,70 @@ class UnmountCmd(Subcmd):
             help=argparse.SUPPRESS,
         )
 
+    def _resolve_daemon_only_mount(
+        self,
+        instance: EdenInstance,
+        path: str,
+        mount_paths: dict[Path, set[bytes]],
+    ) -> str | None:
+        """Authorize an exact daemon mount root without relying on checkout state."""
+        state_dir = instance.state_dir.resolve(strict=False)
+        if state_dir not in mount_paths:
+            try:
+                with instance.get_thrift_client(timeout=3) as client:
+                    mount_paths[state_dir] = {
+                        mount.mountPoint for mount in client.listMounts()
+                    }
+            except (EdenError, EdenNotRunningError, TransportError) as ex:
+                print_stderr(f"error: could not verify that EdenFS serves {path}: {ex}")
+                return None
+        mount_path = normalize_path_arg(path)
+        if os.fsencode(mount_path) not in mount_paths[state_dir]:
+            print_stderr(f"error: no EdenFS checkout found at {path}")
+            return None
+        return mount_path
+
     def run(self, args: argparse.Namespace) -> int:
-        if args.destroy:
-            print_stderr(
-                'note: "eden unmount --destroy" is deprecated; '
-                'prefer using "eden rm" instead'
-            )
-
+        mount_paths: dict[Path, set[bytes]] = {}
+        exit_code = 0
         for path in args.paths:
-            # Removing redirection targets from checkout config to allow deletion of redirected paths
-            instance, checkout, _rel_path = require_checkout(args, path)
-            config = checkout.get_config()
-            config._replace(
-                redirection_targets={},
-            )
-            checkout.save_config(config)
-
-            path = normalize_path_arg(path)
+            instance, checkout, _rel_path = find_checkout(args, path)
+            if checkout is None:
+                if args.debug_mark_unintentional:
+                    print_stderr(
+                        "error: checkout metadata is required for "
+                        f"--debug-mark-unintentional at {path}"
+                    )
+                    exit_code = 1
+                    continue
+                mount_path = self._resolve_daemon_only_mount(
+                    instance, path, mount_paths
+                )
+                if mount_path is None:
+                    exit_code = 1
+                    continue
+                path = mount_path
+            else:
+                # Removing redirection targets from checkout config to allow deletion of redirected paths
+                config = checkout.get_config()
+                config._replace(
+                    redirection_targets={},
+                )
+                checkout.save_config(config)
+                path = normalize_path_arg(path)
             try:
                 instance.unmount(
                     path,
                     use_force=not args.no_force,
                     unintentional_unmount=args.debug_mark_unintentional,
                 )
-                if args.destroy:
-                    instance.destroy_mount(path)
             except (EdenError, EdenNotRunningError) as ex:
                 print_stderr(f"error: {ex}")
                 return 1
-        return 0
+            cached_paths = mount_paths.get(instance.state_dir.resolve(strict=False))
+            if cached_paths is not None:
+                cached_paths.discard(os.fsencode(path))
+        return exit_code
 
 
 DBG_LOG_LEVELS: set[str] = {"DBG" + str(i) for i in range(10)}
@@ -3093,6 +3286,9 @@ class RestartCmd(Subcmd):
                 telemetry_sample,
                 "Graceful restart failed, and old EdenFS process resumed",
             )
+            daemon_error = daemon.last_daemon_error()
+            if daemon_error is not None:
+                telemetry_sample.add_string("error_reason", daemon_error)
             print(
                 "error: failed to perform graceful restart. The old "
                 "edenfs daemon has resumed processing and was not restarted.",

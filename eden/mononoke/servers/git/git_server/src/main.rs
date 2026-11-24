@@ -59,6 +59,7 @@ use mononoke_api::Repo;
 use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_app::MononokeReposManager;
+use mononoke_app::MononokeService;
 use mononoke_app::ShutdownGracePeriod;
 use mononoke_app::args::McrouterAppExtension;
 use mononoke_app::args::ReadonlyArgs;
@@ -295,10 +296,12 @@ fn construct_memory_health_check(
 fn main(fb: FacebookInit) -> Result<(), Error> {
     let cachelib_settings = CachelibSettings {
         expected_item_size_bytes: Some(CACHE_OBJECT_SIZE),
+        empty_pool_recovery: true,
         ..Default::default()
     };
 
     let app = MononokeAppBuilder::new(fb)
+        .with_default_service(MononokeService::GIT_SERVER)
         .with_default_scuba_dataset("mononoke_git_server")
         .with_entry_point(ClientEntryPoint::MononokeGitServer)
         .with_bookmarks_cache(BookmarkCacheOptions {
@@ -350,9 +353,8 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     // service name as None while opening repos.
     let service_name = args
         .sharded_executor_args
-        .sharded_service_name
-        .as_ref()
-        .map(|_| ShardedService::MononokeGitServer);
+        .is_sharded()
+        .then_some(ShardedService::MononokeGitServer);
     app.start_monitoring(app.runtime(), SERVICE_NAME, AliveService)?;
     app.start_stats_aggregation()?;
     let rate_limiter = {
@@ -428,6 +430,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                 justknobs::get_as::<u64>("scm/mononoke:git_server_perf_log_sampling", None);
             git_scuba.sampled(perf_sampling.try_into()?);
             let handler = MononokeHttpHandler::builder()
+                .with_root_trace_selector(crate::service::select_root_trace_endpoint)
                 .add(TlsSessionDataMiddleware::new(tls_session_data_log)?)
                 .add(ServerIdentityMiddleware::new(HeaderValue::from_static(
                     "mononoke_git_server",

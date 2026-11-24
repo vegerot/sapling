@@ -409,10 +409,10 @@ mod tests {
 
     fn repo_config_by_id(repo_configs: &RepoConfigs, id: RepositoryId) -> Result<RepoConfig> {
         repo_configs
-            .repos
-            .values()
+            .iter()
+            .map(|(_, config)| config)
             .find(|config| config.repoid == id)
-            .map(|config| (**config).clone())
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("no config for {id}"))
     }
 
@@ -1029,6 +1029,9 @@ mod tests {
             .add_file("dir/b", "b")
             .commit()
             .await?;
+        // Derivation would also derive augmented manifests, so store the Hg
+        // changesets as an upload does.
+        fixtures::store_hg_changesets_as_uploaded(ctx, &repo, vec![cs_id]).await?;
         with_just_knobs_async(
             hg_manifest_knobs(false),
             repo.derive_hg_changeset(ctx, cs_id).boxed(),

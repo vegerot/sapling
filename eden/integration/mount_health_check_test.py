@@ -7,6 +7,7 @@
 import os
 import re
 import sys
+import time
 import unittest
 from typing import Dict, List, Optional
 
@@ -65,16 +66,35 @@ class MountHealthCheckTest(MountHealthCheckTestBase):
         self.wait_for_counter("timed_out")
         self.assertEqual(0, self.counter("not_started"))
 
-    def test_probe_waiting_for_a_thread_is_counted_as_not_started(self) -> None:
+    def test_probe_waiting_for_a_thread_runs_late(self) -> None:
         stuck = [self.mount, os.path.join(self.mounts_dir, "second")]
         self.eden.clone(self.repo.path, stuck[1])
         self.eden.clone(self.repo.path, os.path.join(self.mounts_dir, "third"))
         self.wait_for_counter("healthy")
         # Two stuck probes hold both health check threads, so the third
-        # checkout's probe cannot start.
+        # checkout's probe waits for one.
         for mount in stuck:
             self.delay_next_probe(8, mount)
+        poll_until(lambda: True if self.counter("timed_out") >= 2 else None, timeout=30)
+        self.assertEqual(0, self.counter("not_started"))
+        # It runs once a thread is free, and counts the wait.
         self.wait_for_counter("not_started")
+        self.assertEqual(2, self.counter("timed_out"))
+
+    def test_probe_done_in_time_is_not_reported(self) -> None:
+        # Checkouts are probed in path order. The second checkout's probe
+        # finishes at once, while the probes before and after it are stuck and
+        # hold both health check threads.
+        stuck = [self.mount, os.path.join(self.mounts_dir, "third")]
+        self.eden.clone(self.repo.path, os.path.join(self.mounts_dir, "second"))
+        self.eden.clone(self.repo.path, stuck[1])
+        self.wait_for_counter("healthy")
+        for mount in stuck:
+            self.delay_next_probe(8, mount)
+        poll_until(lambda: True if self.counter("timed_out") >= 2 else None, timeout=30)
+        # Let the stuck probes return.
+        time.sleep(10)
+        self.assertEqual(2, self.counter("timed_out"))
 
 
 @testcase.eden_repo_test(run_on_nfs=False, run_coroutines=False, run_io_uring=False)
@@ -111,3 +131,24 @@ class HangThresholdMountHealthCheckTest(MountHealthCheckTestBase):
         self.wait_for_counter("slow")
         self.assertEqual(0, self.counter("timed_out"))
         self.assertEqual(0, self.counter("hung"))
+        self.assertEqual(0, self.counter("slow_not_reported"))
+
+
+@testcase.eden_repo_test(run_on_nfs=False, run_coroutines=False, run_io_uring=False)
+@unittest.skipIf(sys.platform != "linux", "exercised on Linux FUSE mounts")
+class SlowReportTicksMountHealthCheckTest(MountHealthCheckTestBase):
+    def mount_config(self) -> List[str]:
+        return super().mount_config() + [
+            'mount-health-check-hang-threshold = "10s"',
+            'mount-health-check-slow-report-ticks = "2"',
+        ]
+
+    def test_slow_probe_is_reported_once_slow_probes_recur(self) -> None:
+        self.wait_for_counter("healthy")
+        self.delay_next_probe(7)
+        self.wait_for_counter("slow_not_reported")
+        self.assertEqual(1, self.counter("slow"))
+        # The next slow probe runs in a later tick, the second with a slow probe.
+        self.delay_next_probe(7)
+        poll_until(lambda: True if self.counter("slow") == 2 else None, timeout=30)
+        self.assertEqual(1, self.counter("slow_not_reported"))

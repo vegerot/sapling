@@ -103,8 +103,19 @@ Repo config validation lives in the repo config parser
 
 - `RestrictedPaths::new` checks that the derived data types the restriction
   sources need are enabled.
-- An access is denied if any source denies, and metadata lookups return the
-  union (for the same root, the AclManifest entry wins).
+- When both sources restrict a root and the repo's reconciliation JustKnob
+  (`RECONCILE_BOTH_MODE_SOURCES_JK` in `lib.rs`) is on, enforcement, the
+  combined checks and the access log reconcile them
+  (`ReconciledAuthorization`): every distinct ACL is required, and the tent's
+  rollout allowlist group is the `.slacl` one when set and config's
+  otherwise. Rootless manifest restrictions stay separate. A reconciled denial
+  names the `.slacl` ACL before config's. With the knob off, each source
+  decides on its own and an access is denied if either source denies.
+  Metadata lookups return the union (for the same root, the AclManifest entry
+  wins).
+- If one source read fails, enforcement falls back to the per-source outcomes:
+  a denial from the other source wins, otherwise the error is returned. With a
+  matching exemption, the error is returned even over a denial.
 - Use `may_have_restricted_paths()`, not config emptiness, to decide whether a
   repo can have restrictions: it accounts for `.slacl` files.
 
@@ -113,7 +124,8 @@ Repo config validation lives in the repo config parser
 Each matched restriction is authorized on its own
 (`check_restriction_authorization_with_acl`). The caller is authorized for a
 restriction through `read` on its REPO_REGION ACL or a configured allowlist
-group.
+group. When both sources restrict a root, their checks are reconciled first
+(see above).
 
 - An access is denied if **any** of its restrictions denies. Nested and
   multiple tents are conjunctive: access to one tent never authorizes another.
@@ -125,7 +137,10 @@ group.
 ## Metadata APIs
 
 Restriction metadata and check APIs are implemented in `restriction_info.rs`
-and `restriction_check.rs`.
+and `restriction_check.rs`. They report restrictions and authorization, not
+enforcement. A client that asks whether a fetch would be served (SLAPI
+`check_manifest_permission`) goes through the manifest enforcement entry
+point instead, so its answer is the fetch's decision and logs as one.
 
 ## `.slacl` change validation
 
@@ -136,6 +151,11 @@ re-implement its checks at call sites.
 
 Rows are built in `access_log.rs` and written to `ACCESS_LOG_SCUBA_TABLE` and
 the schematized logger. A new or renamed column must be added to both.
+Exception: `authorization_detail`, the per-restriction JSON of a reconciled
+Both-mode access, is raw Scuba only. It is a free-form debug column for the
+reconciliation rollout, logged on the share of rows set by the sample rate of
+`LOG_AUTHORIZATION_DETAIL_JK` (`access_log.rs`); the other columns stay
+unsampled.
 Logged enum values come from `strum::AsRefStr` derives; renaming a variant
 changes logged data.
 
@@ -153,10 +173,33 @@ Record new decisions here with their reason.
    authorization.
 5. **One enforcement flow, evaluated once.** Path and manifest enforcement
    share `spawn_enforce_restricted_access`.
-6. **Two restriction sources.** Config and `.slacl`; an access is denied if
-   either denies.
+6. **Two restriction sources, reconciled per restriction.** Config and
+   `.slacl`. When both restrict a root, every distinct ACL is required and the
+   `.slacl` rollout allowlist group wins when set, so lookups and enforcement
+   agree and one source's missing group never overrules the other's. The
+   `.slacl` source also wins the reported denial, as Path ACLs move to it.
+   Rootless manifest restrictions and failed reads are not reconciled (see
+   decision 8). Reconciliation changes access decisions in both directions, so
+   a per-repo JustKnob gates it, default off.
 7. **Cheap guards before I/O.** Avoid per-tree store I/O that cannot match a
    restriction.
+8. **Fail closed on a failed source read.** Enforcement falls back to the
+   per-source outcomes instead of guessing the failed source's policy: a
+   denial from the other source wins, otherwise the error is returned, and
+   with a matching exemption the error is returned even over a denial. The
+   denial can name an ACL that the failed source's rollout group would have
+   waived; access is refused either way.
+9. **Caller dependence is recorded on the request.** A server whose response
+   cache does not key on the caller (the diff service behind ThriftCache,
+   whose key is SCS) must not store a response that another caller would get
+   differently (S729206). The two functions that consult the caller's
+   identities for a restriction, `has_repo_region_acls_for_action` and
+   `is_part_of_group`, call `CoreContext::set_response_depends_on_caller`, so
+   every entry point is covered whatever the decision, and an access that no
+   restriction covers records nothing. Enforcement also records it when no
+   condition set matches the caller, since nothing is consulted then. The
+   crate records the fact only; each server decides what it means for its
+   cache. ACL regions do not record it.
 
 ## Changing this code safely
 

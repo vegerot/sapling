@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use cached_config::ModificationTime;
 use cached_config::TestSource;
+use metaconfig_parser::parse_manifest_common_and_storage;
 use metaconfig_types::CommonConfig;
 use mononoke_macros::mononoke;
 use repos::RawAllowlistIdentity;
@@ -24,6 +25,7 @@ use repos::RawMetadataConfig;
 use repos::RawRedactionConfig;
 use repos::RawRepoConfig;
 use repos::RawStorageConfig;
+use repos::TierManifest;
 use repos::TierRepoEntry;
 
 use super::*;
@@ -43,9 +45,10 @@ fn empty_configs() -> MononokeConfigs {
         update_receivers: Arc::new(ArcSwap::from_pointee(vec![])),
         maybe_config_updater: None,
         maybe_liveness_updater: None,
-        maybe_manifest_handle: None,
+        manifest_source: None,
         repo_handles: Arc::new(RwLock::new(HashMap::new())),
         config_store: None,
+        repo_config_store: None,
         tier_name: None,
         repo_handle_event_tx: None,
     }
@@ -79,11 +82,12 @@ fn configs_with_manifest(
     let store = make_store(&all);
 
     let mut cfg = empty_configs();
-    cfg.maybe_manifest_handle = Some(
+    cfg.manifest_source = Some(Arc::new(ManifestSource::tier(
         store
             .get_config_handle::<TierManifest>(manifest_path.to_string())
             .unwrap(),
-    );
+    )));
+    cfg.repo_config_store = Some(store.clone());
     cfg.config_store = Some(store);
     cfg
 }
@@ -270,11 +274,12 @@ fn batch_configs(entries: Vec<TierRepoEntry>, extra_paths: &[(&str, &str)]) -> M
     let store = make_store(&all);
 
     let mut cfg = empty_configs();
-    cfg.maybe_manifest_handle = Some(
+    cfg.manifest_source = Some(Arc::new(ManifestSource::tier(
         store
             .get_config_handle::<TierManifest>(manifest_path.to_string())
             .unwrap(),
-    );
+    )));
+    cfg.repo_config_store = Some(store.clone());
     cfg.config_store = Some(store);
     cfg.tier_name = Some(TEST_TIER.to_string());
     cfg
@@ -431,7 +436,7 @@ fn test_load_all_repo_configs_checked_unions_and_partitions() {
 // A split-loaded repo must record the source-reported config version;
 // mutation id is not plumbed yet and must stay None.
 #[mononoke::test]
-fn test_get_or_load_repo_config_records_config_version() {
+fn test_get_or_load_repo_config_records_config_source() {
     let spec_path = "test/repos/good";
     let manifest_path = "test/manifest";
     let manifest = TierManifest {
@@ -456,54 +461,73 @@ fn test_get_or_load_repo_config_records_config_version() {
     let store = ConfigStore::new(Arc::new(source), Duration::from_secs(1), None);
 
     let mut cfg = empty_configs();
-    cfg.maybe_manifest_handle = Some(
+    cfg.manifest_source = Some(Arc::new(ManifestSource::tier(
         store
             .get_config_handle::<TierManifest>(manifest_path.to_string())
             .unwrap(),
-    );
+    )));
+    cfg.repo_config_store = Some(store.clone());
     cfg.config_store = Some(store);
     cfg.tier_name = Some(TEST_TIER.to_string());
 
-    let config = cfg
-        .get_or_load_repo_config("good/repo")
+    let (_, source) = cfg
+        .get_or_load_repo_config_and_source("good/repo")
         .expect("split-loaded repo must load");
 
     assert_eq!(
-        config.config_version.as_deref(),
+        source.version.as_deref(),
         Some("config-version-7"),
         "split-loaded repo must record the source-reported config version"
     );
     assert_eq!(
-        config.config_mutation_id, None,
+        source.mutation_id, None,
         "mutation id is not plumbed yet and must stay None"
     );
 
     // The cached fast path must serve the same provenance.
-    let cached = cfg
-        .get_or_load_repo_config("good/repo")
+    let (_, cached) = cfg
+        .get_or_load_repo_config_and_source("good/repo")
         .expect("cached repo must load");
     assert_eq!(
-        cached.config_version.as_deref(),
-        Some("config-version-7"),
-        "the cached entry must carry the same recorded config version"
+        cached, source,
+        "the cached entry must carry the same source"
     );
+    assert_eq!(cfg.repo_config_source("good/repo"), source);
+
+    // Reconcile builds from the live spec, which reports the same source.
+    let (_, live) = cfg
+        .live_repo_spec_with_source("good/repo")
+        .expect("a subscribed repo has a live spec");
+    assert_eq!(live, source);
 }
 
 // --- Sourcing `common`/`storage` from the manifest ---
 
-/// A default `RawCommonConfig` is not parsable: two required fields fail conversion.
+/// A `RawCommonConfig` that names a redaction blobstore that is not defined, so it
+/// fails conversion.
+pub(crate) fn unparsable_raw_common_config() -> RawCommonConfig {
+    RawCommonConfig {
+        redaction_config: Some(RawRedactionConfig {
+            blobstore: "undefined_storage".to_string(),
+            redaction_sets_location: "test/redaction_sets".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 pub(crate) fn test_raw_common_config(trusted_tier: &str) -> RawCommonConfig {
     RawCommonConfig {
         trusted_parties_hipster_tier: Some(trusted_tier.to_string()),
-        internal_identity: RawAllowlistIdentity {
+        internal_identity: Some(RawAllowlistIdentity {
             identity_type: "SERVICE_IDENTITY".to_string(),
             identity_data: "internal".to_string(),
-        },
-        redaction_config: RawRedactionConfig {
+        }),
+        redaction_config: Some(RawRedactionConfig {
             blobstore: TEST_STORAGE.to_string(),
             redaction_sets_location: "test/redaction_sets".to_string(),
             ..Default::default()
-        },
+        }),
         ..Default::default()
     }
 }
@@ -572,8 +596,8 @@ fn test_tier_mode_constructs_from_manifest() {
 // Fail-closed startup: an unparsable manifest aborts construction.
 #[mononoke::test]
 fn test_tier_mode_fails_closed_on_unparsable_manifest() {
-    // Default RawCommonConfig is unparsable (required fields fail conversion).
     let bad_manifest = TierManifest {
+        common: unparsable_raw_common_config(),
         storage: test_storage_map(),
         ..Default::default()
     };
@@ -636,4 +660,280 @@ fn test_watcher_bootstrap_serves_manifest_repos_without_a_change() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+// --- Deployments ---
+
+const DEPLOYMENT_PATH: &str = "scm/mononoke/deployments/prod";
+
+fn prod_location() -> DeploymentLocation {
+    DeploymentLocation {
+        root: ConfigRoot::ConfigStore,
+        name: "prod".to_owned(),
+    }
+}
+
+/// A deployment with an SCS server serving `hg` and `git`, and a git server
+/// serving `git`, each with its own legacy tier.
+fn test_deployment() -> repos::Deployment {
+    let repo = |name: &str, repo_id, services: Vec<MononokeService>| repos::DeploymentRepo {
+        repo_name: name.to_owned(),
+        repo_id,
+        spec_path: name.to_owned(),
+        is_deep_sharded: true,
+        services: Some(
+            services
+                .into_iter()
+                .map(|service| (service, true))
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    repos::Deployment {
+        common: test_raw_common_config("deployment_tier"),
+        storage: test_storage_map().into_iter().collect(),
+        services: std::collections::BTreeMap::from([
+            (
+                MononokeService::SCS_SERVER,
+                repos::ServiceConfig {
+                    legacy_tier: "scs".to_owned(),
+                    loadlimiter_category: Some("mononoke-apiserver".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                MononokeService::GIT_SERVER,
+                repos::ServiceConfig {
+                    legacy_tier: "gitimport_content".to_owned(),
+                    ..Default::default()
+                },
+            ),
+        ]),
+        repos: vec![
+            repo("hg", 1, vec![MononokeService::SCS_SERVER]),
+            repo(
+                "git",
+                2,
+                vec![MononokeService::SCS_SERVER, MononokeService::GIT_SERVER],
+            ),
+        ],
+        ..Default::default()
+    }
+}
+
+/// A spec whose callsign each legacy tier overrides, so a parse shows which
+/// tier resolved it.
+fn tiered_repo_spec_json(repo_id: i32, repo_name: &str) -> String {
+    let callsign = |callsign: &str| RawRepoConfig {
+        phabricator_callsign: Some(callsign.to_owned()),
+        ..Default::default()
+    };
+    let spec = RepoSpec {
+        repo_id,
+        repo_name: repo_name.to_owned(),
+        tiers: vec!["scs".to_owned(), "gitimport_content".to_owned()],
+        default_commit_identity_scheme: RawCommitIdentityScheme::GIT,
+        repo_config: Some(RawRepoConfig {
+            storage_config: Some(TEST_STORAGE.to_string()),
+            ..Default::default()
+        }),
+        tier_overrides: Some(HashMap::from([
+            ("scs".to_owned(), callsign("SCS")),
+            ("gitimport_content".to_owned(), callsign("GIT")),
+        ])),
+        ..Default::default()
+    };
+    serde_json::to_string(&spec).expect("RepoSpec serializes")
+}
+
+#[mononoke::test]
+fn test_deployment_mode_loads_the_service_view() {
+    let deployment = serde_json::to_string(&test_deployment()).unwrap();
+    let hg = tiered_repo_spec_json(1, "hg");
+    let git = tiered_repo_spec_json(2, "git");
+    let store = make_store(&[
+        (DEPLOYMENT_PATH, deployment.as_str()),
+        ("scm/mononoke/repos/hg", hg.as_str()),
+        ("scm/mononoke/repos/git", git.as_str()),
+    ]);
+    let rt = test_runtime();
+    let location = prod_location();
+
+    let git_server = MononokeConfigs::new_from_deployment(
+        &location,
+        MononokeService::GIT_SERVER,
+        &store,
+        rt.handle().clone(),
+    )
+    .expect("the git server's view loads");
+    assert_eq!(git_server.service(), Some(MononokeService::GIT_SERVER));
+    assert_eq!(git_server.tier_name(), Some("gitimport_content"));
+    let names: Vec<_> = git_server
+        .manifest()
+        .expect("deployment mode has a manifest")
+        .repos()
+        .iter()
+        .map(|entry| entry.repo_name.clone())
+        .collect();
+    assert_eq!(names, vec!["git".to_owned()]);
+    let config = git_server
+        .get_or_load_repo_config("git")
+        .expect("git loads");
+    assert_eq!(
+        config.phabricator_callsign.as_deref(),
+        Some("GIT"),
+        "the service's legacy tier resolves tier_overrides"
+    );
+    assert!(
+        git_server.get_or_load_repo_config("hg").is_err(),
+        "a repo the service does not serve is not in its manifest"
+    );
+
+    // The SCS server's view, with its common config field applied.
+    let default = MononokeConfigs::new_from_deployment(
+        &location,
+        MononokeService::SCS_SERVER,
+        &store,
+        rt.handle().clone(),
+    )
+    .expect("the SCS server's view loads");
+    assert_eq!(default.service(), Some(MononokeService::SCS_SERVER));
+    assert_eq!(
+        default
+            .repo_configs()
+            .common
+            .loadlimiter_category
+            .as_deref(),
+        Some("mononoke-apiserver")
+    );
+    assert_eq!(
+        default
+            .get_or_load_repo_config("hg")
+            .expect("hg loads")
+            .phabricator_callsign
+            .as_deref(),
+        Some("SCS")
+    );
+
+    assert!(
+        MononokeConfigs::new_from_deployment(
+            &location,
+            MononokeService::LFS_SERVER,
+            &store,
+            rt.handle().clone(),
+        )
+        .is_err(),
+        "a service the deployment does not have refuses to start"
+    );
+}
+
+#[mononoke::test]
+fn test_deployment_mode_reads_a_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("deployments")).unwrap();
+    std::fs::create_dir_all(dir.path().join("repos")).unwrap();
+    std::fs::write(
+        dir.path().join("deployments/prod.json"),
+        serde_json::to_string(&test_deployment()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("repos/git.json"),
+        tiered_repo_spec_json(2, "git"),
+    )
+    .unwrap();
+    let location = DeploymentLocation {
+        root: ConfigRoot::Directory(dir.path().to_path_buf()),
+        name: "prod".to_owned(),
+    };
+    // The configerator store has nothing: everything comes from the files.
+    let store = make_store(&[]);
+    let rt = test_runtime();
+
+    let configs = MononokeConfigs::new_from_deployment(
+        &location,
+        MononokeService::GIT_SERVER,
+        &store,
+        rt.handle().clone(),
+    )
+    .expect("the deployment loads from files");
+    assert_eq!(
+        configs
+            .get_or_load_repo_config("git")
+            .expect("git loads from its file")
+            .phabricator_callsign
+            .as_deref(),
+        Some("GIT")
+    );
+}
+
+#[mononoke::test]
+fn test_deployment_source_keeps_its_legacy_tier() {
+    let source = Arc::new(TestSource::new());
+    let publish = |deployment: &repos::Deployment, timestamp, version: &str| {
+        source.insert_config_with_version(
+            DEPLOYMENT_PATH,
+            &serde_json::to_string(deployment).unwrap(),
+            ModificationTime::UnixTimestamp(timestamp),
+            version,
+        );
+        source.insert_to_refresh(DEPLOYMENT_PATH.to_owned());
+    };
+    let mut deployment = test_deployment();
+    publish(&deployment, 0, "v0");
+    let store = ConfigStore::new(source.clone(), Duration::from_secs(3600), None);
+    let handle = metaconfig_parser::deployment_config_handle(DEPLOYMENT_PATH, &store).unwrap();
+    let location = prod_location();
+    let manifest_source = ManifestSource::deployment(handle, location, MononokeService::GIT_SERVER)
+        .expect("the view loads");
+    assert_eq!(manifest_source.get().repos().len(), 1);
+    assert_eq!(manifest_source.version().as_deref(), Some("v0"));
+
+    // A change to the service's repos is picked up.
+    deployment.repos[0]
+        .services
+        .get_or_insert_default()
+        .insert(MononokeService::GIT_SERVER, true);
+    publish(&deployment, 1, "v1");
+    store.force_update_configs();
+    let accepted = manifest_source.get();
+    assert_eq!(accepted.repos().len(), 2);
+    assert_eq!(manifest_source.version().as_deref(), Some("v1"));
+
+    // A change to its legacy tier is refused: the last good view, version and
+    // deployment stay, and repeated reads reuse them without converting again.
+    deployment
+        .services
+        .get_mut(&MononokeService::GIT_SERVER)
+        .unwrap()
+        .legacy_tier = "scs".to_owned();
+    deployment.repos.pop();
+    publish(&deployment, 2, "v2");
+    store.force_update_configs();
+    for _ in 0..3 {
+        assert!(Arc::ptr_eq(&manifest_source.get(), &accepted));
+        assert_eq!(manifest_source.version().as_deref(), Some("v1"));
+        let (_, applied) = manifest_source
+            .applied_deployment()
+            .expect("a deployment source");
+        assert_eq!(
+            applied.services[&MononokeService::GIT_SERVER].legacy_tier,
+            "gitimport_content"
+        );
+    }
+    assert_eq!(
+        manifest_source.deployment_service(),
+        Some((MononokeService::GIT_SERVER, "gitimport_content"))
+    );
+
+    // A later valid change is picked up again.
+    deployment
+        .services
+        .get_mut(&MononokeService::GIT_SERVER)
+        .unwrap()
+        .legacy_tier = "gitimport_content".to_owned();
+    publish(&deployment, 3, "v3");
+    store.force_update_configs();
+    assert_eq!(manifest_source.get().repos().len(), 1);
+    assert_eq!(manifest_source.version().as_deref(), Some("v3"));
 }

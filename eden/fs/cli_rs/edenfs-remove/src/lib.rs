@@ -24,6 +24,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use edenfs_core::checkout::CheckoutConfig;
 use edenfs_core::checkout::EdenFsCheckout;
+use edenfs_core::checkout::dot_eden_client_dir;
 use edenfs_core::checkout::find_checkout;
 use edenfs_core::checkout::get_mounts;
 use edenfs_core::fsutil;
@@ -32,9 +33,11 @@ use edenfs_core::instance::EdenFsInstance;
 use edenfs_core::redirect::Redirection;
 use edenfs_core::redirect::RedirectionBackingCleanupAction;
 use edenfs_core::redirect::RedirectionBackingCleanupPlanner;
+use edenfs_core::redirect::check_scratch_namespace_owner;
 #[cfg(target_os = "linux")]
 use edenfs_core::redirect::finish_backing_cleanup_unmount;
 use edenfs_core::redirect::get_effective_redirections;
+use edenfs_core::redirect::plan_unmounted_checkout_backing_cleanup;
 #[cfg(target_os = "linux")]
 use edenfs_core::redirect::redirection_mount_status;
 use edenfs_utils::is_active_eden_mount;
@@ -106,11 +109,11 @@ pub enum RemoveCheckoutWarning {
     RedirectionUnmountTimedOut { path: PathBuf, timeout: Duration },
     /// Managed backing cleanup was skipped because the checkout's client config is missing.
     BackingCleanupSkipped { path: PathBuf },
-    /// Managed backing cleanup skipped repository-configured redirections because the checkout
-    /// is not mounted.
-    RepositoryRedirectionCleanupSkipped { path: PathBuf },
     /// Some managed backing could not be planned or deleted before checkout removal continued.
     BackingCleanupFailed { path: PathBuf, error: String },
+    /// An unregistered mount's `.eden` metadata did not name one of this instance's unused
+    /// client directories, so no client directory is deleted.
+    ClientDirectoryUnknown { path: PathBuf },
 }
 
 /// Progress and non-fatal warnings reported while removing a checkout.
@@ -147,9 +150,9 @@ impl fmt::Display for RemoveCheckoutWarning {
                 "Skipping redirection backing cleanup for {} because its checkout config is missing. {BACKING_CLEANUP_RECOVERY}",
                 path.display()
             ),
-            Self::RepositoryRedirectionCleanupSkipped { path } => write!(
+            Self::ClientDirectoryUnknown { path } => write!(
                 formatter,
-                "Cannot inspect repository-configured redirections while {} is unmounted. Their backing storage may remain. {BACKING_CLEANUP_RECOVERY}",
+                "the client directory of unregistered mount {} is unknown; its state directory is not deleted",
                 path.display()
             ),
             Self::BackingCleanupFailed { path, error } => write!(
@@ -194,9 +197,40 @@ pub async fn remove_checkout_with_event_handler(
     mut event_handler: impl FnMut(RemoveCheckoutEvent),
 ) -> Result<()> {
     let path = canonicalize_checkout_path(path).await?;
-    let client_name = registered_client(instance, &path)?
-        .ok_or_else(|| anyhow!("{} is not a registered EdenFS checkout", path.display()))?;
     let checkout_is_mounted = is_mounted_checkout(instance, &path).await;
+    let client_name = match registered_client(instance, &path)? {
+        Some(client_name) => client_name,
+        // A mount the daemon serves but the directory map does not list: an `eden clone`
+        // that stopped between the mount and the directory-map write (`eden list` shows
+        // it as "(unconfigured)"). Registered first, with the client directory its
+        // `.eden/client` link names, it is removed like any other checkout, and a
+        // removal that stops halfway leaves a registered checkout a retry can finish.
+        None if checkout_is_mounted => match unregistered_client_dir(instance, &path)? {
+            Some(client_name) => {
+                instance
+                    .add_path_to_directory_map(&path, &client_name)
+                    .with_context(|| {
+                        format!("failed to register unregistered mount {}", path.display())
+                    })?;
+                client_name
+            }
+            None => {
+                return remove_unregistered_active_checkout(
+                    instance,
+                    &path,
+                    options,
+                    &mut event_handler,
+                )
+                .await;
+            }
+        },
+        None => {
+            return Err(anyhow!(
+                "{} is not a registered EdenFS checkout",
+                path.display()
+            ));
+        }
+    };
 
     let client_config = instance.config_directory(&client_name).join("config.toml");
     let backing_cleanup = match options.backing_cleanup {
@@ -236,18 +270,10 @@ pub async fn remove_checkout_with_event_handler(
     }
     match redirection_cleanup {
         Some(BackingCleanupPolicy::DeleteManaged) => {
-            // `.eden-redirections` is checkout content, so only client config redirections
-            // can be planned while the checkout is unmounted.
-            if !checkout_is_mounted {
-                event_handler(RemoveCheckoutEvent::Warning(
-                    RemoveCheckoutWarning::RepositoryRedirectionCleanupSkipped {
-                        path: path.clone(),
-                    },
-                ));
-            }
             clean_up_managed_backing(
                 instance,
                 &path,
+                &client_name,
                 checkout_is_mounted,
                 options.auxiliary_process_timeout,
                 &mut event_handler,
@@ -371,17 +397,21 @@ struct ManagedBackingCleanupPlan {
 async fn plan_managed_backing_cleanup(
     instance: &EdenFsInstance,
     path: &Path,
+    client_name: &str,
     timeout: Duration,
 ) -> Result<ManagedBackingCleanupPlan> {
     let instance = instance.clone();
     let path = path.to_path_buf();
     let path_for_error = path.clone();
+    let data_dir = instance.config_directory(client_name);
     run_blocking_operation_with_timeout("eden-backing-cleanup-plan", timeout, move || {
-        let checkout = find_checkout(&instance, &path)
-            .with_context(|| format!("failed to find checkout for {}", path.display()))?;
+        let config = CheckoutConfig::parse_config(&data_dir).with_context(|| {
+            format!("failed to parse checkout config in {}", data_dir.display())
+        })?;
+        let checkout = EdenFsCheckout::from_config(path.clone(), data_dir.clone(), config);
         let mut redirections = Vec::new();
         let mut failures = Vec::new();
-        let mut planner = RedirectionBackingCleanupPlanner::new(&path);
+        let mut planner = RedirectionBackingCleanupPlanner::new(&path, &data_dir);
         for (repo_path, redirection) in get_effective_redirections(&instance, &checkout)
             .with_context(|| format!("failed to get redirections for {}", path.display()))?
         {
@@ -538,6 +568,62 @@ async fn remove_active_checkout(
     remove_inactive_checkout(instance, path, client_name, options, event_handler).await
 }
 
+/// Remove a mount the daemon serves whose client directory cannot be told from its
+/// `.eden` metadata: only the mount and the mount point go, and the caller is warned.
+async fn remove_unregistered_active_checkout(
+    instance: &EdenFsInstance,
+    path: &Path,
+    options: RemoveCheckoutOptions,
+    event_handler: &mut impl FnMut(RemoveCheckoutEvent),
+) -> Result<()> {
+    event_handler(RemoveCheckoutEvent::Warning(
+        RemoveCheckoutWarning::ClientDirectoryUnknown {
+            path: path.to_path_buf(),
+        },
+    ));
+    event_handler(RemoveCheckoutEvent::UnmountingCheckout);
+    edenfs_core::unmount::unmount_for_removal(instance, path, options.no_force)
+        .await
+        .with_context(|| format!("failed to unmount mount point at {}", path.display()))?;
+
+    if !options.preserve_mount_point {
+        clean_mount_point(path)?;
+    }
+    validate_removal_completion(instance, path, options.preserve_mount_point).await
+}
+
+/// The name of the client directory an unregistered mount uses, from its `.eden`
+/// metadata, when that directory is one of this instance's, holds a checkout config and
+/// no registered checkout uses it. A stale or foreign link must not register, and later
+/// delete, another checkout's state: `None` means the link names no such directory.
+/// A directory map that cannot be read is an error, not an unknown directory.
+fn unregistered_client_dir(instance: &EdenFsInstance, path: &Path) -> Result<Option<String>> {
+    let Some(client_dir) = dot_eden_client_dir(path) else {
+        return Ok(None);
+    };
+    let clients_dir = fs::canonicalize(instance.clients_dir()).with_context(|| {
+        format!(
+            "failed to canonicalize the clients directory {}",
+            instance.clients_dir().display()
+        )
+    })?;
+    // A dangling link names nothing.
+    let Ok(resolved) = fs::canonicalize(&client_dir) else {
+        return Ok(None);
+    };
+    if resolved.parent() != Some(clients_dir.as_path()) || !resolved.join("config.toml").is_file() {
+        return Ok(None);
+    }
+    let Some(name) = resolved.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let registered = instance.get_configured_mounts_map()?;
+    if registered.values().any(|client_name| client_name == name) {
+        return Ok(None);
+    }
+    Ok(Some(name.to_owned()))
+}
+
 /// How much of a redirection's backing can be deleted after trying to unmount it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BackingDeletionScope {
@@ -552,6 +638,7 @@ enum BackingDeletionScope {
 async fn clean_up_managed_backing<EventHandler>(
     instance: &EdenFsInstance,
     path: &Path,
+    client_name: &str,
     checkout_is_mounted: bool,
     timeout: Duration,
     event_handler: &mut EventHandler,
@@ -559,7 +646,7 @@ async fn clean_up_managed_backing<EventHandler>(
     EventHandler: FnMut(RemoveCheckoutEvent),
 {
     let start = Instant::now();
-    let plan = plan_managed_backing_cleanup(instance, path, timeout).await;
+    let plan = plan_managed_backing_cleanup(instance, path, client_name, timeout).await;
     debug!(path = %path.display(), elapsed = ?start.elapsed(), "Finished planning redirection backing cleanup");
     let ManagedBackingCleanupPlan {
         checkout,
@@ -652,6 +739,25 @@ async fn clean_up_managed_backing<EventHandler>(
     .await;
 
     debug!(path = %path.display(), elapsed = ?start.elapsed(), "Finished unmounting redirections");
+    if let Err(error) = instance
+        .get_configured_mounts_map()
+        .context("failed to read registered checkouts before backing cleanup")
+        .and_then(|checkouts| check_scratch_namespace_owner(path, checkouts.into_keys()))
+    {
+        event_handler(RemoveCheckoutEvent::Warning(
+            RemoveCheckoutWarning::BackingCleanupFailed {
+                path: path.to_path_buf(),
+                error: format!("{error:#}"),
+            },
+        ));
+        return;
+    }
+    // The sweep below can't tell which redirection an entry belongs to.
+    let leftover_scope = if scopes.contains(&BackingDeletionScope::Contents) {
+        BackingDeletionScope::Contents
+    } else {
+        BackingDeletionScope::Target
+    };
     let deletions = redirections
         .into_iter()
         .zip(scopes)
@@ -663,6 +769,52 @@ async fn clean_up_managed_backing<EventHandler>(
         })
         .collect();
     if let Err(error) = execute_backing_cleanup_actions(deletions, event_handler).await {
+        event_handler(RemoveCheckoutEvent::Warning(
+            RemoveCheckoutWarning::BackingCleanupFailed {
+                path: path.to_path_buf(),
+                error: format!("{error:#}"),
+            },
+        ));
+    }
+    if !checkout_is_mounted {
+        delete_leftover_backing(
+            path,
+            checkout.data_dir(),
+            leftover_scope,
+            timeout,
+            event_handler,
+        )
+        .await;
+    }
+}
+
+/// Delete the redirection backing of an unmounted checkout that the planner couldn't find,
+/// because the redirections configured in its `.eden-redirections` can't be read.
+async fn delete_leftover_backing(
+    path: &Path,
+    data_dir: PathBuf,
+    scope: BackingDeletionScope,
+    timeout: Duration,
+    event_handler: &mut impl FnMut(RemoveCheckoutEvent),
+) {
+    let checkout_path = path.to_path_buf();
+    let plan =
+        run_blocking_operation_with_timeout("eden-backing-cleanup-sweep", timeout, move || {
+            Ok(plan_unmounted_checkout_backing_cleanup(
+                &checkout_path,
+                &data_dir,
+            )?)
+        })
+        .await
+        .context("failed to plan cleanup of leftover redirection backing");
+    let result = match plan {
+        Ok(actions) => {
+            let deletions = actions.into_iter().map(|action| (action, scope)).collect();
+            execute_backing_cleanup_actions(deletions, event_handler).await
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
         event_handler(RemoveCheckoutEvent::Warning(
             RemoveCheckoutWarning::BackingCleanupFailed {
                 path: path.to_path_buf(),
@@ -986,7 +1138,7 @@ pub fn clean_mount_point(path: &Path) -> Result<()> {
 
 /// What a directory is to EdenFS, decided from checkout-local metadata and the
 /// directory map without talking to the daemon.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalCheckoutState {
     /// The directory carries live checkout metadata. On Windows that metadata outlives
     /// an unmount, so removal still has to find the checkout in the directory map.
@@ -995,10 +1147,12 @@ pub enum LocalCheckoutState {
     Inactive,
     /// Unregistered and not recognizably a checkout.
     Unknown,
+    /// Inside a mounted checkout whose root is `root`: not something `remove` takes.
+    InsideCheckout { root: PathBuf },
 }
 
-/// Classify `path` before removing it. Fails if `path` lies inside a mounted checkout
-/// rather than being its root.
+/// Classify `path` before removing it. A `path` inside a mounted checkout rather than at
+/// its root is `InsideCheckout`, which the caller refuses.
 pub async fn classify_checkout(
     instance: &EdenFsInstance,
     path: &Path,
@@ -1013,11 +1167,9 @@ pub async fn classify_checkout(
         .skip(1)
         .find(|ancestor| is_active_eden_mount(ancestor))
     {
-        return Err(anyhow!(
-            "{} is not the root of checkout {}, not removing",
-            path.display(),
-            root.display()
-        ));
+        return Ok(LocalCheckoutState::InsideCheckout {
+            root: root.to_path_buf(),
+        });
     }
     if registered_client(instance, &path)?.is_some() {
         return Ok(LocalCheckoutState::Inactive);
@@ -1272,6 +1424,98 @@ mod tests {
         );
     }
 
+    /// An unregistered mount's client directory is taken from its `.eden/client` link only
+    /// when it is one of this instance's, holds a checkout config and is not registered to
+    /// another checkout; registering it uses the directory map's own writer.
+    #[cfg(unix)]
+    #[test]
+    fn unregistered_mount_is_registered_with_its_own_client_directory() {
+        let temp_dir = tempdir().expect("temp directory should be created");
+        let config_dir = temp_dir.path().join("eden");
+        let clients_dir = config_dir.join("clients");
+        let other = temp_dir.path().join("other");
+        fs::create_dir_all(&clients_dir).expect("clients dir");
+        fs::create_dir_all(&other).expect("other checkout");
+        fs::write(
+            config_dir.join("config.json"),
+            serde_json::to_vec(&BTreeMap::from([(
+                other.canonicalize().expect("other path"),
+                "other",
+            )]))
+            .expect("directory map should serialize"),
+        )
+        .expect("directory map should be written");
+        let instance = EdenFsInstance::with_daemon(
+            config_dir.clone(),
+            config_dir.join("etc"),
+            None,
+            Arc::new(DisconnectedDaemon),
+        );
+        let mount = |name: &str, client_dir: &Path| {
+            let path = temp_dir.path().join(name);
+            fs::create_dir_all(path.join(".eden")).expect("mount point");
+            std::os::unix::fs::symlink(client_dir, path.join(".eden").join("client"))
+                .expect("client link");
+            path
+        };
+        for name in ["unused", "other"] {
+            let client_dir = clients_dir.join(name);
+            fs::create_dir(&client_dir).expect("client dir");
+            fs::write(client_dir.join("config.toml"), "").expect("checkout config");
+        }
+        let unused = clients_dir.join("unused");
+        let bare = clients_dir.join("bare");
+        fs::create_dir(&bare).expect("client dir without config");
+        let foreign = temp_dir.path().join("foreign-client");
+        fs::create_dir(&foreign).expect("foreign dir");
+        fs::write(foreign.join("config.toml"), "").expect("checkout config");
+
+        let registrable = mount("registrable", &unused);
+        let client_dir_of = |path: &Path| unregistered_client_dir(&instance, path).expect("lookup");
+        assert_eq!(client_dir_of(&registrable), Some("unused".to_owned()));
+        assert_eq!(
+            client_dir_of(&mount("taken", &clients_dir.join("other"))),
+            None,
+            "a client directory another checkout is registered with is not taken over"
+        );
+        assert_eq!(
+            client_dir_of(&mount("bare", &bare)),
+            None,
+            "a client directory without a checkout config is not a checkout's"
+        );
+        assert_eq!(
+            client_dir_of(&mount("foreign", &foreign)),
+            None,
+            "a link outside the clients directory is not followed"
+        );
+        assert_eq!(
+            client_dir_of(&mount("dangling", &clients_dir.join("gone"))),
+            None,
+            "a dangling link names nothing"
+        );
+        let directory_map = fs::read(config_dir.join("config.json")).expect("directory map");
+        fs::write(config_dir.join("config.json"), b"not json").expect("broken directory map");
+        assert!(
+            unregistered_client_dir(&instance, &registrable).is_err(),
+            "a directory map that cannot be read is an error, not an unknown directory"
+        );
+        fs::write(config_dir.join("config.json"), directory_map).expect("directory map restored");
+
+        instance
+            .add_path_to_directory_map(&registrable, "unused")
+            .expect("registration");
+        assert_eq!(
+            registered_client(&instance, &registrable).expect("directory map"),
+            Some("unused".to_owned())
+        );
+        assert!(
+            instance
+                .add_path_to_directory_map(&registrable, "unused")
+                .is_err(),
+            "a registered path is not registered twice"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn classify_checkout_rejects_a_directory_inside_a_mounted_checkout() {
@@ -1310,12 +1554,12 @@ mod tests {
             LocalCheckoutState::Active,
             "a nested checkout root is a mount, not a directory inside its parent"
         );
-        let error = classify_checkout(&instance, &inside)
+        let state = classify_checkout(&instance, &inside)
             .await
-            .expect_err("a directory inside a mounted checkout must be rejected");
+            .expect("a directory inside a mounted checkout is classified, not an error");
         assert!(
-            error.to_string().contains("is not the root of checkout"),
-            "{error:#}"
+            matches!(state, LocalCheckoutState::InsideCheckout { ref root } if root == &checkout),
+            "{state:?}"
         );
     }
 

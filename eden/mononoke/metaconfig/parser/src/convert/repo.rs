@@ -43,7 +43,7 @@ use metaconfig_types::DirectoryBranchClusterFixedCluster;
 use metaconfig_types::DirectoryBranchClusterFixedConfig;
 use metaconfig_types::EnforcementConditionSet;
 use metaconfig_types::EnforcementExemptionSet;
-use metaconfig_types::GitBundleURIConfig;
+use metaconfig_types::GitBundleUriConfig;
 use metaconfig_types::GitConcurrencyParams;
 use metaconfig_types::GitConfigs;
 use metaconfig_types::GitDeltaManifestV2Config;
@@ -185,7 +185,6 @@ impl Convert for RawCacheWarmupConfig {
                 .map(|v| v.try_into())
                 .transpose()?
                 .unwrap_or(200000),
-            microwave_preload: self.microwave_preload.unwrap_or(false),
         })
     }
 }
@@ -541,6 +540,8 @@ impl Convert for RawPushrebaseParams {
             remote_mode: self
                 .remote_mode
                 .map_or(Ok(default.remote_mode), Convert::convert)?,
+            // `RawPushrebaseParams` has no field for it yet.
+            source_revision_guard: default.source_revision_guard,
         })
     }
 }
@@ -856,6 +857,10 @@ impl Convert for RawDerivedDataConfig {
                 .pipeline_config_v2
                 .map(|raw| raw.convert())
                 .transpose()?,
+            shadow_pipeline_config: self
+                .shadow_pipeline_config
+                .map(|raw| raw.convert())
+                .transpose()?,
         })
     }
 }
@@ -1008,7 +1013,15 @@ impl Convert for RawDerivationPipelineStageConfig {
             .into_iter()
             .map(|p| MPath::new(p.as_bytes()))
             .collect::<Result<Vec<_>>>()?;
-        Ok(DerivationPipelineStageConfig { dependencies })
+        Ok(DerivationPipelineStageConfig {
+            dependencies,
+            partition_cut_points: self
+                .partition_cut_points
+                .unwrap_or_default()
+                .into_iter()
+                .map(u8::try_from)
+                .collect::<Result<_, _>>()?,
+        })
     }
 }
 
@@ -1040,7 +1053,22 @@ impl Convert for RawDerivationPipelineConfig {
                     self.batch_size,
                 )
             })?;
+        let stages_by_type = self
+            .stages_by_type
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, stages)| {
+                Ok((
+                    DerivableType::from_name(&name)?,
+                    stages
+                        .into_iter()
+                        .map(|(path, config)| Ok((MPath::new(path.as_bytes())?, config.convert()?)))
+                        .collect::<Result<HashMap<_, _>>>()?,
+                ))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
         let config = DerivationPipelineConfig {
+            stages_by_type,
             types,
             bookmarks,
             stages,
@@ -1303,26 +1331,26 @@ impl Convert for RawZelosConfig {
 }
 
 impl Convert for RawGitBundleURIConfig {
-    type Output = GitBundleURIConfig;
+    type Output = GitBundleUriConfig;
 
     fn convert(self) -> Result<Self::Output> {
         match self.uri_generator_type {
-            RawUriGeneratorType::cdn(cdn) => Ok(GitBundleURIConfig {
+            RawUriGeneratorType::cdn(cdn) => Ok(GitBundleUriConfig {
                 uri_generator_type: UriGeneratorType::Cdn {
                     bucket: cdn.bucket,
                     api_key: cdn.api_key,
                 },
                 trusted_only: self.trusted_only,
             }),
-            RawUriGeneratorType::manifold(manifold) => Ok(GitBundleURIConfig {
+            RawUriGeneratorType::manifold(manifold) => Ok(GitBundleUriConfig {
                 uri_generator_type: UriGeneratorType::Manifold {
                     bucket: manifold.bucket,
                     api_key: manifold.api_key,
                 },
                 trusted_only: self.trusted_only,
             }),
-            RawUriGeneratorType::local_fs(_) => Ok(GitBundleURIConfig {
-                uri_generator_type: UriGeneratorType::LocalFS,
+            RawUriGeneratorType::local_fs(_) => Ok(GitBundleUriConfig {
+                uri_generator_type: UriGeneratorType::LocalFs,
                 trusted_only: self.trusted_only,
             }),
             RawUriGeneratorType::UnknownField(f) => {
@@ -1459,6 +1487,7 @@ impl Convert for RawP4SourceConfig {
         Ok(P4SourceConfig {
             server_alias: self.server_alias,
             depot: self.depot,
+            path_charsets: self.path_charsets,
         })
     }
 }
@@ -1846,6 +1875,7 @@ mod tests {
 
     fn raw_pipeline_config_with_batch_size(batch_size: i64) -> RawDerivationPipelineConfig {
         RawDerivationPipelineConfig {
+            stages_by_type: Default::default(),
             types: Default::default(),
             bookmarks: Default::default(),
             stages: Default::default(),

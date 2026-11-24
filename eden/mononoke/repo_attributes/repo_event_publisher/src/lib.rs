@@ -25,7 +25,17 @@ mod repo_name_provider;
 
 use anyhow::Result;
 #[cfg(fbcode_build)]
+pub use facebook::fanout_listener::FanoutListener;
+#[cfg(fbcode_build)]
+pub use facebook::from_scribe::FromScribe;
+#[cfg(fbcode_build)]
+pub use facebook::parsed_bookmark_event::ParsedBookmarkEventNotification;
+#[cfg(fbcode_build)]
+pub use facebook::repo_id_provider::RepoIdProvider;
+#[cfg(fbcode_build)]
 pub use facebook::scribe_listener::ScribeListener;
+#[cfg(fbcode_build)]
+pub use facebook::scribe_repo_event_publisher::ArcBookmarkEventFanoutListener;
 #[cfg(fbcode_build)]
 pub use facebook::scribe_repo_event_publisher::ScribeRepoEventPublisher;
 #[cfg(fbcode_build)]
@@ -34,6 +44,8 @@ pub use mononoke_bookmark_event_notification::BookmarkCategory;
 pub use mononoke_bookmark_event_notification::BookmarkEventNotification;
 #[cfg(fbcode_build)]
 pub use notification_filter::AllBookmarksFilter;
+#[cfg(fbcode_build)]
+pub use notification_filter::NotificationFilter;
 #[cfg(not(fbcode_build))]
 pub use oss::UnsupportedRepoEventPublisher;
 use repo_update_logger::GitContentRefInfo;

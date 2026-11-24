@@ -145,6 +145,7 @@ use mercurial_mutation::CachedHgMutationStore;
 use mercurial_mutation::SqlHgMutationStoreBuilder;
 use metaconfig_types::ArcCommonConfig;
 use metaconfig_types::ArcRepoConfig;
+use metaconfig_types::ArcRepoConfigSource;
 use metaconfig_types::BlobConfig;
 use metaconfig_types::CommitIdentityScheme;
 use metaconfig_types::CommonConfig;
@@ -154,6 +155,7 @@ use metaconfig_types::Redaction;
 #[cfg(fbcode_build)]
 use metaconfig_types::RemoteDerivationConfig;
 use metaconfig_types::RepoConfig;
+use metaconfig_types::RepoConfigSource;
 use metaconfig_types::RepoReadOnly;
 #[cfg(fbcode_build)]
 use metaconfig_types::ZelosConfig;
@@ -187,6 +189,8 @@ use repo_cross_repo::RepoCrossRepo;
 use repo_derivation_queues::ArcRepoDerivationQueues;
 use repo_derived_data::ArcRepoDerivedData;
 use repo_derived_data::RepoDerivedData;
+#[cfg(fbcode_build)]
+use repo_event_publisher::ArcBookmarkEventFanoutListener;
 use repo_event_publisher::ArcRepoEventPublisher;
 #[cfg(fbcode_build)]
 use repo_event_publisher::ScribeRepoEventPublisher;
@@ -363,6 +367,8 @@ pub struct RepoFactory {
     #[cfg(fbcode_build)]
     zelos_clients: RepoFactoryCache<ZelosConfig, Arc<dyn ZeusClient>>,
     repo_event_publishers: RepoFactoryCache<Option<MetadataCacheConfig>, ArcRepoEventPublisher>,
+    #[cfg(fbcode_build)]
+    bookmark_event_fanout_listener: ArcBookmarkEventFanoutListener,
     blobstore_override: Option<Arc<dyn RepoFactoryOverride<Arc<dyn Blobstore>>>>,
     scrub_handler: Arc<dyn ScrubHandler>,
     blobstore_component_sampler: Option<Arc<dyn ComponentSamplingHandler>>,
@@ -380,6 +386,8 @@ impl RepoFactory {
             #[cfg(fbcode_build)]
             zelos_clients: RepoFactoryCache::new(env.fb, "zelos_clients"),
             repo_event_publishers: RepoFactoryCache::new(env.fb, "repo_event_publishers"),
+            #[cfg(fbcode_build)]
+            bookmark_event_fanout_listener: Default::default(),
             blobstore_override: None,
             scrub_handler: default_scrub_handler(),
             blobstore_component_sampler: None,
@@ -514,7 +522,8 @@ impl RepoFactory {
             redacted_blobs,
             repo_identity.id(),
             censored_scuba_builder,
-        );
+        )
+        .with_hg_manifest_read_check(repo_identity.name());
 
         Ok(repo_blobstore)
     }
@@ -619,11 +628,14 @@ impl RepoFactory {
     ) -> Result<Arc<RedactedBlobs>> {
         self.redacted_blobs
             .get_or_try_init(db_config, || async move {
+                let redaction_config = common_config.require_redaction_config().context(
+                    "redaction is enabled for this repo; to serve it without redaction, set `redaction` to false in its config",
+                )?;
                 let blobstore = self.redaction_config_blobstore(common_config).await?;
                 Ok(Arc::new(
                     RedactedBlobs::from_configerator(
                         &self.env.config_store,
-                        &common_config.redaction_config.redaction_sets_location,
+                        &redaction_config.redaction_sets_location,
                         ctx,
                         blobstore,
                     )
@@ -862,10 +874,22 @@ pub enum RepoFactoryError {
     PushRedirectConfig,
 }
 
-#[facet::factory(name: String, repo_config_param: RepoConfig, common_config_param: CommonConfig)]
+#[facet::factory(
+    name: String,
+    repo_config_param: RepoConfig,
+    common_config_param: CommonConfig,
+    repo_config_source_param: RepoConfigSource
+)]
 impl RepoFactory {
     pub fn repo_config(&self, repo_config_param: &RepoConfig) -> ArcRepoConfig {
         Arc::new(repo_config_param.clone())
+    }
+
+    pub fn repo_config_source(
+        &self,
+        repo_config_source_param: &RepoConfigSource,
+    ) -> ArcRepoConfigSource {
+        Arc::new(repo_config_source_param.clone())
     }
 
     pub fn common_config(&self, common_config_param: &CommonConfig) -> ArcCommonConfig {
@@ -1140,17 +1164,11 @@ impl RepoFactory {
             .context(RepoFactoryError::GitBundleUri)?
             .build(repo_identity.id());
 
-        let config = &repo_config
-            .git_configs
-            .git_bundle_uri
-            .as_ref()
-            .ok_or(RepoFactoryError::GitBundleUri)?;
-
         Ok(bundle_uri::bundle_uri_arc(
             self.env.fb,
             git_bundle_uri_storage,
             repo_config.repoid,
-            config,
+            repo_config.git_configs.git_bundle_uri.as_ref(),
         ))
     }
 
@@ -1423,8 +1441,10 @@ impl RepoFactory {
         &self,
         common_config: &ArcCommonConfig,
     ) -> Result<ArcRedactionConfigBlobstore> {
-        self.redaction_config_blobstore_from_config(&common_config.redaction_config.blobstore)
-            .await
+        self.redaction_config_blobstore_from_config(
+            &common_config.require_redaction_config()?.blobstore,
+        )
+        .await
     }
 
     pub async fn repo_ephemeral_store(
@@ -1504,7 +1524,7 @@ impl RepoFactory {
     /// Restricted paths
     pub fn restricted_paths(
         &self,
-        _repo_identity: &ArcRepoIdentity,
+        repo_identity: &ArcRepoIdentity,
         restricted_paths_config_based: &ArcRestrictedPathsConfigBased,
         repo_derived_data: &ArcRepoDerivedData,
     ) -> Result<ArcRestrictedPaths> {
@@ -1518,6 +1538,7 @@ impl RepoFactory {
         };
 
         let restricted_paths = RestrictedPaths::new(
+            repo_identity.name().to_string(),
             restricted_paths_config_based.clone(),
             self.env.acl_provider.clone(),
             scuba_builder,
@@ -1857,19 +1878,13 @@ impl RepoFactory {
                     repo_identity.clone(),
                     repo_event_publisher.clone(),
                     warmer_requirement,
-                )
-                .with_event_router_coordinator_enabled(
-                    repo_config
-                        .metadata_cache_config
-                        .as_ref()
-                        .is_some_and(|config| config.wbc_process_bookmark_notifications),
-                )
-                .with_event_router_batching_enabled(
-                    repo_config
-                        .metadata_cache_config
-                        .as_ref()
-                        .is_some_and(|config| config.wbc_event_router_batching_enabled),
                 );
+                #[cfg(fbcode_build)]
+                if let Some(metadata) = repo_config.metadata_cache_config.as_ref() {
+                    wbc_builder.set_event_router_configured(
+                        metadata.wbc_event_router_scribe_category().is_some(),
+                    );
+                }
 
                 match effective_derived_data {
                     BookmarkCacheDerivedData::HgOnly => {
@@ -2201,7 +2216,10 @@ impl RepoFactory {
                         self.env.fb,
                         self.configs.clone(),
                         repo_config.metadata_cache_config.as_ref(),
-                    )?;
+                    )?
+                    .with_bookmark_event_fanout_listener(
+                        self.bookmark_event_fanout_listener.clone(),
+                    );
                     Ok(Arc::new(event_publisher) as ArcRepoEventPublisher)
                 }
                 #[cfg(not(fbcode_build))]
@@ -2359,6 +2377,7 @@ mod tests {
         Some(P4SourceConfig {
             server_alias: "test1".to_string(),
             depot: "//test1/".to_string(),
+            path_charsets: None,
         })
     }
 

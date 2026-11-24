@@ -7,9 +7,13 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+#[cfg(feature = "coloring")]
+use std::sync::Arc;
 
 use crate::column::Column;
 use crate::column::ColumnsExt;
+#[cfg(feature = "coloring")]
+use crate::pipeline::coloring;
 use crate::pipeline::types::Ancestor;
 use crate::pipeline::types::DashStyle;
 use crate::pipeline::types::GraphRowShape;
@@ -28,6 +32,10 @@ pub struct GraphRowShaper<N> {
     columns: Vec<Column<N>>,
     options: GraphRowShapeOptions,
     previous_node_column: Option<usize>,
+    #[cfg(feature = "coloring")]
+    coloring: coloring::ColoringState,
+    #[cfg(feature = "coloring")]
+    line_id_allocator: Option<Arc<coloring::LineIdAllocator<N>>>,
 }
 
 impl<N> GraphRowShaper<N>
@@ -45,7 +53,23 @@ where
             columns: Vec::new(),
             options,
             previous_node_column: None,
+            #[cfg(feature = "coloring")]
+            coloring: Default::default(),
+            #[cfg(feature = "coloring")]
+            line_id_allocator: None,
         }
+    }
+
+    /// Enable line tracking with an allocator for every outgoing parent connection.
+    /// `None` disables tracking. Configure this before rendering the first row
+    /// so incoming lines are tracked. The allocator is shared when its `Arc` is cloned.
+    #[cfg(feature = "coloring")]
+    pub fn with_line_id_allocator(
+        mut self,
+        allocator: Option<Arc<coloring::LineIdAllocator<N>>>,
+    ) -> Self {
+        self.line_id_allocator = allocator;
+        self
     }
 
     /// Return the graph-shape options used by this renderer.
@@ -138,6 +162,13 @@ where
         let is_head = existing_column
             .is_none_or(|index| matches!(self.columns.get(index), Some(Column::Reserved(_))));
         let is_root = parents.is_empty();
+
+        #[cfg(feature = "coloring")]
+        let mut row_coloring = self.line_id_allocator.as_ref().map(|allocator| {
+            let state = &mut self.coloring;
+            let row = state.begin_row(self.columns.len(), column);
+            (allocator, state, row)
+        });
         self.columns[column] = Column::Empty;
 
         let merge = parents.len() > 1;
@@ -146,8 +177,6 @@ where
         node_line[column] = NodeLine::Node;
 
         let mut link_line: Vec<_> = self.columns.iter().map(column_to_link_line).collect();
-        let mut link_line_from_node: Vec<_> =
-            self.columns.iter().map(|_| LinkLine::default()).collect();
         let mut need_link_line = false;
 
         let mut term_line: Vec<_> = self.columns.iter().map(|_| false).collect();
@@ -157,27 +186,42 @@ where
 
         let mut parent_columns = BTreeMap::new();
         for parent in parents.iter() {
-            if let Some(parent_id) = ancestor_id(parent) {
-                if let Some(index) = self.columns.find(parent_id) {
+            let index =
+                if let Some(index) = ancestor_id(parent).and_then(|id| self.columns.find(id)) {
                     self.columns[index].merge(&ancestor_to_column(parent));
-                    parent_columns.insert(index, parent);
-                    continue;
-                }
+                    index
+                } else if let Some(index) = self.columns.find_empty(column) {
+                    self.columns[index].merge(&ancestor_to_column(parent));
+                    index
+                } else {
+                    let index = self.columns.len();
+                    node_line.push(NodeLine::Blank);
+                    ancestry_line.push(PadLine::Blank);
+                    link_line.push(LinkLine::default());
+                    term_line.push(false);
+                    self.columns.push(ancestor_to_column(parent));
+                    index
+                };
+            #[cfg(feature = "coloring")]
+            if let Some((allocator, state, row)) = row_coloring.as_mut() {
+                state.add_parent(
+                    row,
+                    index,
+                    |before_link, column_line_ids, allocated_line_ids| {
+                        allocator(&coloring::LineIdContext {
+                            node: &node,
+                            parent,
+                            parent_count: parents.len(),
+                            node_column: column,
+                            parent_column: index,
+                            before_link,
+                            column_line_ids,
+                            allocated_line_ids,
+                        })
+                    },
+                );
             }
-
-            if let Some(index) = self.columns.find_empty(column) {
-                self.columns[index].merge(&ancestor_to_column(parent));
-                parent_columns.insert(index, parent);
-                continue;
-            }
-
-            parent_columns.insert(self.columns.len(), parent);
-            node_line.push(NodeLine::Blank);
-            ancestry_line.push(PadLine::Blank);
-            link_line.push(LinkLine::default());
-            link_line_from_node.push(LinkLine::default());
-            term_line.push(false);
-            self.columns.push(ancestor_to_column(parent));
+            parent_columns.insert(index, parent);
         }
 
         for (index, parent) in parent_columns.iter() {
@@ -197,41 +241,33 @@ where
             if let Some((&parent_column, _)) = parent_columns.iter().next() {
                 if parent_column > column {
                     self.columns.swap(column, parent_column);
+                    #[cfg(feature = "coloring")]
+                    if let Some((_, state, row)) = row_coloring.as_mut() {
+                        state.move_parent(row, parent_column);
+                    }
                     if let Some(parent) = parent_columns.remove(&parent_column) {
                         parent_columns.insert(column, parent);
                     }
 
                     let was_direct = link_line[parent_column].contains(LinkLine::VERT_PARENT);
-                    link_both(
-                        &mut link_line,
-                        &mut link_line_from_node,
-                        column,
-                        if was_direct {
-                            LinkLine::RIGHT_FORK_PARENT
-                        } else {
-                            LinkLine::RIGHT_FORK_ANCESTOR
-                        },
-                    );
+                    link_line[column] |= if was_direct {
+                        LinkLine::RIGHT_FORK_PARENT
+                    } else {
+                        LinkLine::RIGHT_FORK_ANCESTOR
+                    };
                     #[allow(clippy::needless_range_loop)]
                     for i in column + 1..parent_column {
-                        link_both(
-                            &mut link_line,
-                            &mut link_line_from_node,
-                            i,
-                            if was_direct {
-                                LinkLine::HORIZ_PARENT
-                            } else {
-                                LinkLine::HORIZ_ANCESTOR
-                            },
-                        );
+                        link_line[i] |= if was_direct {
+                            LinkLine::HORIZ_PARENT
+                        } else {
+                            LinkLine::HORIZ_ANCESTOR
+                        };
                     }
-                    let value = if was_direct {
+                    link_line[parent_column] = if was_direct {
                         LinkLine::LEFT_MERGE_PARENT
                     } else {
                         LinkLine::LEFT_MERGE_ANCESTOR
                     };
-                    link_line[parent_column] = value;
-                    link_line_from_node[parent_column] |= value;
                     need_link_line = true;
                     ancestry_line[parent_column] = PadLine::Blank;
                 }
@@ -240,48 +276,23 @@ where
 
         if let Some(bounds) = AncestorColumnBounds::new(&parent_columns, column) {
             for i in bounds.range() {
-                link_both(
-                    &mut link_line,
-                    &mut link_line_from_node,
-                    i,
-                    bounds.horizontal_line(i),
-                );
+                link_line[i] |= bounds.horizontal_line(i);
                 need_link_line = true;
             }
 
             if bounds.max_parent > column {
-                link_both(
-                    &mut link_line,
-                    &mut link_line_from_node,
-                    column,
-                    LinkLine::RIGHT_MERGE_PARENT,
-                );
+                link_line[column] |= LinkLine::RIGHT_MERGE_PARENT;
                 need_link_line = true;
             } else if bounds.max_ancestor > column {
-                link_both(
-                    &mut link_line,
-                    &mut link_line_from_node,
-                    column,
-                    LinkLine::RIGHT_MERGE_ANCESTOR,
-                );
+                link_line[column] |= LinkLine::RIGHT_MERGE_ANCESTOR;
                 need_link_line = true;
             }
 
             if bounds.min_parent < column {
-                link_both(
-                    &mut link_line,
-                    &mut link_line_from_node,
-                    column,
-                    LinkLine::LEFT_MERGE_PARENT,
-                );
+                link_line[column] |= LinkLine::LEFT_MERGE_PARENT;
                 need_link_line = true;
             } else if bounds.min_ancestor < column {
-                link_both(
-                    &mut link_line,
-                    &mut link_line_from_node,
-                    column,
-                    LinkLine::LEFT_MERGE_ANCESTOR,
-                );
+                link_line[column] |= LinkLine::LEFT_MERGE_ANCESTOR;
                 need_link_line = true;
             }
 
@@ -289,38 +300,23 @@ where
             for (&index, parent) in parent_columns.iter() {
                 ancestry_line[index] = column_to_pad_line(&self.columns[index]);
                 if index < column {
-                    link_both(
-                        &mut link_line,
-                        &mut link_line_from_node,
-                        index,
-                        ancestor_to_link_line(
-                            parent,
-                            LinkLine::RIGHT_FORK_PARENT,
-                            LinkLine::RIGHT_FORK_ANCESTOR,
-                        ),
+                    link_line[index] |= ancestor_to_link_line(
+                        parent,
+                        LinkLine::RIGHT_FORK_PARENT,
+                        LinkLine::RIGHT_FORK_ANCESTOR,
                     );
                 } else if index == column {
-                    link_both(
-                        &mut link_line,
-                        &mut link_line_from_node,
-                        index,
-                        LinkLine::CHILD
-                            | ancestor_to_link_line(
-                                parent,
-                                LinkLine::VERT_PARENT,
-                                LinkLine::VERT_ANCESTOR,
-                            ),
-                    );
-                } else {
-                    link_both(
-                        &mut link_line,
-                        &mut link_line_from_node,
-                        index,
-                        ancestor_to_link_line(
+                    link_line[index] |= LinkLine::CHILD
+                        | ancestor_to_link_line(
                             parent,
-                            LinkLine::LEFT_FORK_PARENT,
-                            LinkLine::LEFT_FORK_ANCESTOR,
-                        ),
+                            LinkLine::VERT_PARENT,
+                            LinkLine::VERT_ANCESTOR,
+                        );
+                } else {
+                    link_line[index] |= ancestor_to_link_line(
+                        parent,
+                        LinkLine::LEFT_FORK_PARENT,
+                        LinkLine::LEFT_FORK_ANCESTOR,
                     );
                 }
             }
@@ -332,6 +328,11 @@ where
         self.columns.reset();
         self.previous_node_column = Some(column);
 
+        let link_line = need_link_line.then_some(link_line);
+        #[cfg(feature = "coloring")]
+        let line_ids = row_coloring
+            .map(|(_, state, row)| state.finish_row(row, link_line.as_deref(), &self.columns));
+
         GraphRowShape {
             node,
             merge,
@@ -341,11 +342,12 @@ where
             node_column: column,
             parent_columns: parent_columns.keys().copied().collect(),
             node_line,
-            link_line: Some(link_line).filter(|_| need_link_line),
-            link_line_from_node: Some(link_line_from_node).filter(|_| need_link_line),
+            link_line,
             term_line: Some(term_line).filter(|_| need_term_line),
             ancestry_line,
             separator_line,
+            #[cfg(feature = "coloring")]
+            line_ids,
         }
     }
 
@@ -441,17 +443,6 @@ impl AncestorColumnBounds {
             LinkLine::empty()
         }
     }
-}
-
-// Update both link_line and link_line_from_node.
-fn link_both(
-    link_line: &mut [LinkLine],
-    link_line_from_node: &mut [LinkLine],
-    index: usize,
-    value: LinkLine,
-) {
-    link_line[index] |= value;
-    link_line_from_node[index] |= value;
 }
 
 fn ancestor_to_column<N>(ancestor: &Ancestor<N>) -> Column<N>

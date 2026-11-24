@@ -20,12 +20,12 @@ borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/r
 bounded_traversal = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 bytes = { version = "1.12.1", features = ["serde"] }
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
-chrono-english = "0.1.8"
+chrono-english = "0.2.1"
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 context = { version = "0.1.0", path = "../servers/slapi/slapi_server/context" }
 derivative = "2.2"
 derived_data_type_if = { version = "0.1.0", path = "../derived_data/if" }
-faster-hex = "0.6.1"
+faster-hex = "2.0.0"
 fbthrift = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 fn-error-context = "0.2"
 futures = { version = "0.3.34", features = ["async-await", "compat"] }
@@ -48,7 +48,7 @@ sapling-xdiff = { version = "0.1.0", path = "../../scm/lib/xdiff" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_derive = "1.0.229"
 sha1 = "0.10.7"
-smallvec = { version = "1.16.4", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
+smallvec = { version = "1.16.5", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 strum = { version = "0.28.0", features = ["derive"] }

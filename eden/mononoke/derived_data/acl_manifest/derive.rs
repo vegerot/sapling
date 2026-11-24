@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -18,7 +19,8 @@ use cloned::cloned;
 use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use derived_data_manager::DerivationContext;
-use derived_data_manager::ManifestDerivation;
+use derived_data_manager::ManifestDerivationInput;
+use derived_data_manager::ManifestStageOutput;
 use filestore::fetch_concat;
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -101,7 +103,11 @@ pub(crate) async fn derive_single(
         ctx,
         blobstore,
         &bonsai,
-        &parent_ids,
+        parent_ids
+            .iter()
+            .copied()
+            .map(|id| ManifestStageOutput::Entry(Some(Entry::Tree(id))))
+            .collect(),
         &acl_file_name,
         &MPath::ROOT,
     )
@@ -272,11 +278,47 @@ async fn inner_derive(
 pub(crate) async fn derive_acl_manifest_entry(
     ctx: &CoreContext,
     blobstore: &Arc<dyn KeyedBlobstore>,
-    input: ManifestDerivation<AclManifestId, AclManifestRestriction>,
-    changes: Vec<(NonRootMPath, Option<RestrictedPathsAclFile>)>,
+    input: ManifestDerivationInput<
+        AclManifestId,
+        AclManifestRestriction,
+        LoadableShardedMapV2Node<AclManifestEntry>,
+    >,
+    changes: Vec<(NonRootMPath, AclFileChange)>,
     acl_file_name: &str,
-) -> Result<Option<Entry<AclManifestId, AclManifestRestriction>>> {
+) -> Result<
+    ManifestStageOutput<
+        AclManifestId,
+        AclManifestRestriction,
+        LoadableShardedMapV2Node<AclManifestEntry>,
+    >,
+> {
     let acl_file_bytes: Vec<u8> = acl_file_name.as_bytes().to_vec();
+    let prepared: HashMap<_, _> = prepare_acl_file_changes(
+        ctx,
+        blobstore,
+        changes
+            .iter()
+            .filter(|(path, _)| input.contains_change(path) || path.is_prefix_of(input.path()))
+            .cloned()
+            .collect(),
+        acl_file_name,
+    )
+    .await?
+    .into_iter()
+    .collect();
+    let changes = changes
+        .into_iter()
+        .map(|(path, change)| {
+            let change = match change {
+                AclFileChange::AddOrModify(id) if !matches!(prepared.get(&path), Some(None)) => {
+                    Some(id)
+                }
+                _ => None,
+            };
+            (path, change)
+        })
+        .collect();
+    let create_leaf = acl_create_leaf_callback(ctx.clone(), blobstore.clone());
 
     input
         .derive(
@@ -284,7 +326,36 @@ pub(crate) async fn derive_acl_manifest_entry(
             blobstore.clone(),
             changes,
             acl_create_tree_callback(ctx.clone(), blobstore.clone(), acl_file_bytes),
-            acl_create_leaf_callback(ctx.clone(), blobstore.clone()),
+            move |LeafInfo {
+                      path,
+                      change,
+                      parents,
+                  }| {
+                let change = change
+                    .map(|_: ContentId| {
+                        prepared
+                            .get(&path)
+                            .and_then(Option::as_ref)
+                            .cloned()
+                            .with_context(|| format!("missing prepared ACL file at {path}"))
+                    })
+                    .transpose();
+                let create_leaf = create_leaf.clone();
+                async move {
+                    create_leaf(LeafInfo {
+                        path,
+                        change: change?,
+                        parents,
+                    })
+                    .await
+                }
+            },
+            |subentries| async move {
+                Ok(LoadableShardedMapV2Node::Inlined(
+                    create_acl_manifest_subentries(ctx.clone(), blobstore.clone(), subentries)
+                        .await?,
+                ))
+            },
         )
         .await
 }
@@ -292,6 +363,44 @@ pub(crate) async fn derive_acl_manifest_entry(
 // ---------------------------------------------------------------------------
 // create_tree callback
 // ---------------------------------------------------------------------------
+
+pub(crate) async fn create_acl_manifest_subentries(
+    ctx: CoreContext,
+    blobstore: Arc<dyn KeyedBlobstore>,
+    subentries: TreeInfoSubentries<
+        AclManifestId,
+        AclManifestRestriction,
+        AclManifestNodeInfo,
+        LoadableShardedMapV2Node<AclManifestEntry>,
+    >,
+) -> Result<ShardedMapV2Node<AclManifestEntry>> {
+    // Convert subentries, loading child manifests for boundary-reuse entries.
+    let acl_subentries: TrieMap<
+        Either<AclManifestEntry, LoadableShardedMapV2Node<AclManifestEntry>>,
+    > = stream::iter(subentries)
+        .then(|(prefix, entry_or_map)| {
+            cloned!(ctx, blobstore);
+            async move {
+                let converted = match entry_or_map {
+                    Either::Left((maybe_info, entry)) => {
+                        let acl_entry =
+                            convert_manifest_entry(&ctx, &blobstore, maybe_info, entry).await?;
+                        Either::Left(acl_entry)
+                    }
+                    Either::Right(map) => Either::Right(map),
+                };
+                Ok::<_, anyhow::Error>((prefix, converted))
+            }
+        })
+        .try_collect()
+        .await?;
+
+    // Build the ShardedMapV2.
+    let subentries =
+        ShardedMapV2Node::from_entries_and_partial_maps(&ctx, &blobstore, acl_subentries).await?;
+
+    Ok(subentries)
+}
 
 /// Build an `AclManifest` node from `derive_manifest`'s subentries.
 ///
@@ -323,30 +432,8 @@ pub(crate) async fn create_acl_manifest(
         Either::Right(reused_map) => reused_map.rollup_data().has_restricted,
     });
 
-    // Convert subentries, loading child manifests for boundary-reuse entries.
-    let acl_subentries: TrieMap<
-        Either<AclManifestEntry, LoadableShardedMapV2Node<AclManifestEntry>>,
-    > = stream::iter(subentries)
-        .then(|(prefix, entry_or_map)| {
-            cloned!(ctx, blobstore);
-            async move {
-                let converted = match entry_or_map {
-                    Either::Left((maybe_info, entry)) => {
-                        let acl_entry =
-                            convert_manifest_entry(&ctx, &blobstore, maybe_info, entry).await?;
-                        Either::Left(acl_entry)
-                    }
-                    Either::Right(map) => Either::Right(map),
-                };
-                Ok::<_, anyhow::Error>((prefix, converted))
-            }
-        })
-        .try_collect()
-        .await?;
-
-    // Build the ShardedMapV2.
     let subentries =
-        ShardedMapV2Node::from_entries_and_partial_maps(&ctx, &blobstore, acl_subentries).await?;
+        create_acl_manifest_subentries(ctx.clone(), blobstore.clone(), subentries).await?;
 
     // Look up the ACL file to determine this directory's restriction.
     let restriction = match subentries.lookup(&ctx, &blobstore, acl_file_name).await? {
@@ -430,7 +517,13 @@ pub(crate) async fn get_acl_file_changes(
     ctx: &CoreContext,
     blobstore: &Arc<dyn KeyedBlobstore>,
     bonsai: &BonsaiChangeset,
-    parent_ids: &[AclManifestId],
+    parents: Vec<
+        ManifestStageOutput<
+            AclManifestId,
+            AclManifestRestriction,
+            LoadableShardedMapV2Node<AclManifestEntry>,
+        >,
+    >,
     acl_file_name: &str,
     stage_path: &MPath,
 ) -> Result<Vec<(NonRootMPath, AclFileChange)>> {
@@ -472,16 +565,16 @@ pub(crate) async fn get_acl_file_changes(
         .collect();
 
     let implicit_deletes: Vec<(NonRootMPath, AclFileChange)> =
-        if addition_prefixes.is_empty() || parent_ids.is_empty() {
+        if addition_prefixes.is_empty() || parents.is_empty() {
             vec![]
         } else {
             // Check each parent manifest for .slacl leaves under replaced paths.
-            let all_implicit: HashSet<NonRootMPath> = stream::iter(parent_ids.iter())
-                .then(|parent_id| {
+            let all_implicit: HashSet<NonRootMPath> = stream::iter(parents)
+                .then(|parent| {
                     cloned!(ctx, blobstore, stage_prefix);
                     let prefixes = addition_prefixes.clone();
                     async move {
-                        parent_id
+                        parent
                             .find_entries(ctx, blobstore, prefixes)
                             .try_filter_map(|(rel_path, entry)| {
                                 cloned!(stage_prefix);

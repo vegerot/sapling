@@ -21,7 +21,7 @@ chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-fea
 futures = { version = "0.3.34", features = ["async-await", "std"], default-features = false }
 hashbrown = "0.17.1"
 itertools = "0.15.0"
-parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard", "serde"] }
+parking_lot = { version = "0.13.0", features = ["arc_lock", "send_guard", "serde"] }
 sapling-async-runtime = { version = "0.1.0", path = "../async-runtime" }
 sapling-cats = { version = "0.1.0", path = "../cats" }
 sapling-cats-constants = { version = "0.1.0", path = "../cats/constants" }
@@ -44,3 +44,7 @@ serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw
 tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 url = "2.5.8"
+
+[dev-dependencies]
+sapling-auth = { version = "0.1.0", path = "../auth" }
+tempfile = "3.27.0"

@@ -36,6 +36,7 @@ use mononoke_api::Mononoke;
 use mononoke_api::Repo;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_app::MononokeReposManager;
+use mononoke_app::MononokeService;
 use mononoke_app::args::HooksAppExtension;
 use mononoke_app::args::RepoFilterAppExtension;
 use mononoke_app::args::ShutdownTimeoutArgs;
@@ -165,15 +166,15 @@ fn configured_repo_ids(repos_mgr: &MononokeReposManager<Repo>) -> Vec<Repository
     repos_mgr
         .configs()
         .repo_configs()
-        .repos
-        .values()
-        .map(|config| config.repoid)
+        .iter()
+        .map(|(_, config)| config.repoid)
         .collect()
 }
 
 #[fbinit::main]
 fn main(fb: FacebookInit) -> Result<()> {
     let app = MononokeAppBuilder::new(fb)
+        .with_default_service(MononokeService::ASYNC_REQUESTS_WORKER)
         .with_bookmarks_cache(BookmarkCacheOptions {
             cache_kind: BookmarkCacheKind::Local,
             derived_data: BookmarkCacheDerivedData::NoDerivation,

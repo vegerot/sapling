@@ -646,13 +646,6 @@ class ThriftRequestScope {
 };
 
 template <typename ReturnType>
-Future<ReturnType> wrapFuture(
-    std::unique_ptr<ThriftRequestScope> logHelper,
-    folly::Future<ReturnType>&& f) {
-  return std::move(f).ensure([logHelper = std::move(logHelper)]() {});
-}
-
-template <typename ReturnType>
 ImmediateFuture<ReturnType> wrapImmediateFuture(
     std::unique_ptr<ThriftRequestScope> logHelper,
     ImmediateFuture<ReturnType>&& f) {
@@ -727,9 +720,9 @@ facebook::eden::InodePtr inodeFromUserPath(
 
 // INSTRUMENT_THRIFT_CALL returns a unique pointer to
 // ThriftRequestScope object. The returned pointer can be used to call
-// wrapFuture() to attach a log message on the completion of the Future. This
-// must be called in a Thrift worker thread because the calling pid of
-// getAndRegisterClientPid is stored in a thread local variable.
+// wrapImmediateFuture() to attach a log message on the completion of the
+// Future. This must be called in a Thrift worker thread because the calling pid
+// of getAndRegisterClientPid is stored in a thread local variable.
 //
 // For coroutine methods, thread-local storage is unreliable due to
 // potential thread switching. Use INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION
@@ -1126,8 +1119,8 @@ void EdenServiceHandler::listMounts(std::vector<MountInfo>& results) {
   }
 }
 
-folly::SemiFuture<std::unique_ptr<std::vector<CheckoutConflict>>>
-EdenServiceHandler::semifuture_checkOutRevision(
+folly::coro::Task<std::unique_ptr<std::vector<CheckoutConflict>>>
+EdenServiceHandler::co_checkOutRevision(
     std::unique_ptr<std::string> mountPoint,
     std::unique_ptr<std::string> hash,
     CheckoutMode checkoutMode,
@@ -1135,43 +1128,19 @@ EdenServiceHandler::semifuture_checkOutRevision(
   // Noted when the checkout starts and again when it ends, so that a
   // graceful restart asked to wait for an idle daemon stays away from it.
   server_->noteActivity("checkOutRevision");
-  auto noteEnd = [this] { server_->noteActivity("checkOutRevision"); };
-  auto config = server_->getServerState()->getEdenConfig();
-  bool useCoroutines = config->enableCoroutines.getValue() &&
-      config->enableCoroutinesPhase7.getValue();
-  if (useCoroutines) {
-    auto requestContext = getRequestContext();
-    // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-    return folly::coro::co_invoke(
-               [this](
-                   apache::thrift::Cpp2RequestContext* ctx,
-                   std::unique_ptr<std::string> mp,
-                   std::unique_ptr<std::string> h,
-                   CheckoutMode mode,
-                   std::unique_ptr<CheckOutRevisionParams> p)
-                   -> folly::coro::Task<
-                       std::unique_ptr<std::vector<CheckoutConflict>>> {
-                 co_return co_await co_checkOutRevisionImpl(
-                     ctx, std::move(mp), std::move(h), mode, std::move(p));
-               },
-               requestContext,
-               std::move(mountPoint),
-               std::move(hash),
-               checkoutMode,
-               std::move(params))
-        .semi()
-        .deferEnsure(noteEnd);
-  }
-  return semifuture_checkOutRevisionImpl(
-             std::move(mountPoint),
-             std::move(hash),
-             checkoutMode,
-             std::move(params))
-      .deferEnsure(noteEnd);
+  SCOPE_EXIT {
+    server_->noteActivity("checkOutRevision");
+  };
+  co_return co_await checkOutRevisionImpl(
+      getRequestContext(),
+      std::move(mountPoint),
+      std::move(hash),
+      checkoutMode,
+      std::move(params));
 }
 
 folly::coro::now_task<std::unique_ptr<std::vector<CheckoutConflict>>>
-EdenServiceHandler::co_checkOutRevisionImpl(
+EdenServiceHandler::checkOutRevisionImpl(
     apache::thrift::Cpp2RequestContext* requestContext,
     std::unique_ptr<std::string> mountPoint,
     std::unique_ptr<std::string> hash,
@@ -1214,54 +1183,6 @@ EdenServiceHandler::co_checkOutRevisionImpl(
       checkoutMode);
   co_return std::make_unique<std::vector<CheckoutConflict>>(
       std::move(result.conflicts));
-}
-
-folly::SemiFuture<std::unique_ptr<std::vector<CheckoutConflict>>>
-EdenServiceHandler::semifuture_checkOutRevisionImpl(
-    std::unique_ptr<std::string> mountPoint,
-    std::unique_ptr<std::string> hash,
-    CheckoutMode checkoutMode,
-    std::unique_ptr<CheckOutRevisionParams> params) {
-  auto rootIdOptions = params->rootIdOptions().ensure();
-  auto requestContext = getRequestContext();
-  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
-      DBG1,
-      true,
-      requestContext,
-      *mountPoint,
-      logHash(*hash),
-      apache::thrift::util::enumName(checkoutMode, "(unknown)"),
-      params->hgRootManifest().has_value() ? logHash(*params->hgRootManifest())
-                                           : "(unspecified hg root manifest)",
-      rootIdOptions.fid().has_value() ? folly::hexlify(*rootIdOptions.fid())
-                                      : "no fid provided");
-  helper->getThriftFetchContext().fillClientRequestInfo(params->cri());
-  auto& fetchContext = helper->getFetchContext();
-
-  auto mountHandle = lookupMount(mountPoint);
-
-  // If we were passed a FilterID, create a RootID that contains the
-  // filter and a varint that indicates the length of the original id.
-  std::string parsedId =
-      resolveRootId(std::move(*hash), rootIdOptions, mountHandle);
-  hash.reset();
-
-  auto mountPath = absolutePathFromThrift(*mountPoint);
-  auto checkoutFuture = server_->checkOutRevision(
-      mountPath,
-      parsedId,
-      params->hgRootManifest().to_optional(),
-      fetchContext,
-      helper->getFunctionName(),
-      checkoutMode);
-
-  return wrapImmediateFuture(
-             std::move(helper),
-             std::move(checkoutFuture).thenValue([](CheckoutResult&& result) {
-               return std::make_unique<std::vector<CheckoutConflict>>(
-                   std::move(result.conflicts));
-             }))
-      .semi();
 }
 
 folly::SemiFuture<folly::Unit>
@@ -3815,40 +3736,20 @@ EdenServiceHandler::co_getEntryInformation(
       std::move(mountPoint), std::move(paths), std::move(sync));
 }
 
-folly::SemiFuture<std::unique_ptr<std::vector<FileInformationOrError>>>
-EdenServiceHandler::semifuture_getFileInformation(
+folly::coro::Task<std::unique_ptr<std::vector<FileInformationOrError>>>
+EdenServiceHandler::co_getFileInformation(
     std::unique_ptr<std::string> mountPoint,
     std::unique_ptr<std::vector<std::string>> paths,
     std::unique_ptr<SyncBehavior> sync) {
-  if (server_->getServerState()
-          ->getEdenConfig()
-          ->enableCoroutinesPhase9.getValue()) {
-    // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-    return folly::coro::co_invoke(
-               [self = shared_from_this()](
-                   std::unique_ptr<std::string> mountPoint,
-                   std::unique_ptr<std::vector<std::string>> paths,
-                   std::unique_ptr<SyncBehavior> sync)
-                   -> folly::coro::Task<
-                       std::unique_ptr<std::vector<FileInformationOrError>>> {
-                 co_return co_await self->co_getFileInformationImpl(
-                     std::move(mountPoint), std::move(paths), std::move(sync));
-               },
-               std::move(mountPoint),
-               std::move(paths),
-               std::move(sync))
-        .semi();
-  }
-  return semifuture_getFileInformationImpl(
+  co_return co_await getFileInformationImpl(
       std::move(mountPoint), std::move(paths), std::move(sync));
 }
 
 folly::coro::now_task<std::unique_ptr<std::vector<FileInformationOrError>>>
-EdenServiceHandler::co_getFileInformationImpl(
+EdenServiceHandler::getFileInformationImpl(
     std::unique_ptr<std::string> mountPoint,
     std::unique_ptr<std::vector<std::string>> paths,
     std::unique_ptr<SyncBehavior> sync) {
-  XLOG(DBG6, "Using coroutine path for getFileInformation");
   auto helper = INSTRUMENT_THRIFT_CALL(
       DBG3, *mountPoint, getSyncTimeout(*sync), toLogArg(*paths));
   auto& fetchContext = helper->getFetchContext();
@@ -3895,74 +3796,6 @@ EdenServiceHandler::co_getFileInformationImpl(
   }
 
   co_return out;
-}
-
-folly::SemiFuture<std::unique_ptr<std::vector<FileInformationOrError>>>
-EdenServiceHandler::semifuture_getFileInformationImpl(
-    std::unique_ptr<std::string> mountPoint,
-    std::unique_ptr<std::vector<std::string>> paths,
-    std::unique_ptr<SyncBehavior> sync) {
-  auto helper = INSTRUMENT_THRIFT_CALL(
-      DBG3, *mountPoint, getSyncTimeout(*sync), toLogArg(*paths));
-  auto mountHandle = lookupMount(mountPoint);
-  auto& fetchContext = helper->getFetchContext();
-  auto lastCheckoutTime =
-      mountHandle.getEdenMount().getLastCheckoutTime().toTimespec();
-
-  return wrapImmediateFuture(
-             std::move(helper),
-             waitForPendingWrites(mountHandle.getEdenMount(), *sync)
-                 .thenValue([mountHandle,
-                             paths = std::move(paths),
-                             lastCheckoutTime,
-                             fetchContext = fetchContext.copy()](auto&&) {
-                   return applyToVirtualInode(
-                       mountHandle.getRootInode(),
-                       *paths,
-                       [mountHandle,
-                        lastCheckoutTime,
-                        fetchContext = fetchContext.copy()](
-                           const VirtualInode& inode, const RelativePath&) {
-                         return inode
-                             .stat(
-                                 lastCheckoutTime,
-                                 mountHandle.getObjectStorePtr(),
-                                 fetchContext)
-                             .thenValue([](struct stat st) {
-                               FileInformation info;
-                               info.size() = st.st_size;
-                               auto ts = stMtime(st);
-                               info.mtime()->seconds() = ts.tv_sec;
-                               info.mtime()->nanoSeconds() = ts.tv_nsec;
-                               info.mode() = st.st_mode;
-
-                               FileInformationOrError result;
-                               result.info() = info;
-
-                               return result;
-                             })
-                             .semi();
-                       },
-                       mountHandle.getObjectStorePtr(),
-                       fetchContext);
-                 })
-                 .thenValue([](vector<Try<FileInformationOrError>>&& done) {
-                   auto out =
-                       std::make_unique<vector<FileInformationOrError>>();
-                   out->reserve(done.size());
-                   for (auto& item : done) {
-                     if (item.hasException()) {
-                       FileInformationOrError result;
-                       result.error() = newEdenError(item.exception());
-                       out->emplace_back(std::move(result));
-                     } else {
-                       out->emplace_back(item.value());
-                     }
-                   }
-                   return out;
-                 }))
-      .ensure([mountHandle] {})
-      .semi();
 }
 
 namespace {
@@ -4274,43 +4107,6 @@ EdenServiceHandler::co_readdir(std::unique_ptr<ReaddirParams> params) {
   co_return res;
 }
 
-ImmediateFuture<std::vector<folly::Try<EntryAttributes>>>
-EdenServiceHandler::getEntryAttributes(
-    const EdenMount& edenMount,
-    const std::vector<std::string>& paths,
-    EntryAttributeFlags reqBitmask,
-    AttributesRequestScope reqScope,
-    SyncBehavior sync,
-    const ObjectFetchContextPtr& fetchContext) {
-  if (server_->getServerState()
-          ->getEdenConfig()
-          ->enableCoroutinesPhase10.getValue()) {
-    return ImmediateFuture{
-        // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-        folly::coro::co_invoke(
-            [self = shared_from_this()](
-                std::shared_ptr<const EdenMount> mountPtr,
-                std::vector<std::string> paths,
-                EntryAttributeFlags reqBitmask,
-                AttributesRequestScope reqScope,
-                SyncBehavior sync,
-                ObjectFetchContextPtr fetchContext)
-                -> folly::coro::Task<std::vector<folly::Try<EntryAttributes>>> {
-              co_return co_await self->co_getEntryAttributes(
-                  *mountPtr, paths, reqBitmask, reqScope, sync, fetchContext);
-            },
-            edenMount.shared_from_this(),
-            paths,
-            reqBitmask,
-            reqScope,
-            sync,
-            fetchContext.copy())
-            .semi()};
-  }
-  return getEntryAttributesImpl(
-      edenMount, paths, reqBitmask, reqScope, sync, fetchContext);
-}
-
 folly::coro::now_task<std::vector<folly::Try<EntryAttributes>>>
 EdenServiceHandler::co_getEntryAttributes(
     const EdenMount& edenMount,
@@ -4372,67 +4168,6 @@ EdenServiceHandler::co_getEntryAttributes(
       reqBitmask);
 }
 
-ImmediateFuture<std::vector<folly::Try<EntryAttributes>>>
-EdenServiceHandler::getEntryAttributesImpl(
-    const EdenMount& edenMount,
-    const std::vector<std::string>& paths,
-    EntryAttributeFlags reqBitmask,
-    AttributesRequestScope reqScope,
-    SyncBehavior sync,
-    const ObjectFetchContextPtr& fetchContext) {
-  auto localReqBitmask = reqBitmask;
-  if (reqBitmask.contains(ENTRY_ATTRIBUTE_ACLs)) {
-    localReqBitmask |= ENTRY_ATTRIBUTE_UNDER_ACL;
-  }
-  auto waitFuture = waitForPendingWrites(edenMount, sync);
-  return std::move(waitFuture)
-      .thenValue([this,
-                  &edenMount,
-                  paths = paths,
-                  fetchContext = fetchContext.copy(),
-                  reqBitmask,
-                  localReqBitmask,
-                  reqScope](auto&&) mutable {
-        vector<ImmediateFuture<EntryAttributes>> futures;
-        futures.reserve(paths.size());
-        for (const auto& path : paths) {
-          futures.emplace_back(getEntryAttributesForPath(
-              edenMount, localReqBitmask, reqScope, path, fetchContext));
-        }
-
-        auto objectStore = edenMount.getObjectStore();
-        auto checkedOutRootId = edenMount.getCheckedOutRootId();
-        return facebook::eden::collectAll(std::move(futures))
-            .thenValue(
-                [objectStore = std::move(objectStore),
-                 paths = std::move(paths),
-                 fetchContext = fetchContext.copy(),
-                 reqBitmask,
-                 checkedOutRootId = std::move(checkedOutRootId)](
-                    std::vector<folly::Try<EntryAttributes>> allRes) mutable
-                    -> ImmediateFuture<
-                        std::vector<folly::Try<EntryAttributes>>> {
-                  // A cancelled request fails as a whole; see
-                  // co_getEntryAttributes.
-                  fetchContext->throwIfCanceled();
-                  if (!reqBitmask.containsAnyOf(kAclPathAttributes)) {
-                    return allRes;
-                  }
-
-                  return ImmediateFuture<
-                      std::vector<folly::Try<EntryAttributes>>>{
-                      co_fetchPathAclLookupsForAttributes(
-                          objectStore,
-                          std::move(checkedOutRootId),
-                          fetchContext.copy(),
-                          std::move(allRes),
-                          std::move(paths),
-                          reqBitmask)
-                          .semi()};
-                });
-      });
-}
-
 namespace {
 bool dtypeMatchesRequestScope(
     const VirtualInode& inode,
@@ -4448,43 +4183,6 @@ bool dtypeMatchesRequestScope(
   }
 }
 } // namespace
-
-ImmediateFuture<EntryAttributes> EdenServiceHandler::getEntryAttributesForPath(
-    const EdenMount& edenMount,
-    EntryAttributeFlags reqBitmask,
-    AttributesRequestScope reqScope,
-    std::string_view path,
-    const ObjectFetchContextPtr& fetchContext) {
-  if (server_->getServerState()
-          ->getEdenConfig()
-          ->enableCoroutinesPhase10.getValue()) {
-    return ImmediateFuture{
-        // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-        folly::coro::co_invoke(
-            [self = shared_from_this()](
-                std::shared_ptr<const EdenMount> mountPtr,
-                EntryAttributeFlags reqBitmask,
-                AttributesRequestScope reqScope,
-                std::string pathStr,
-                ObjectFetchContextPtr fetchContext)
-                -> folly::coro::Task<EntryAttributes> {
-              co_return co_await self->co_getEntryAttributesForPath(
-                  *mountPtr,
-                  reqBitmask,
-                  reqScope,
-                  std::string_view{pathStr},
-                  fetchContext);
-            },
-            edenMount.shared_from_this(),
-            reqBitmask,
-            reqScope,
-            std::string{path},
-            fetchContext.copy())
-            .semi()};
-  }
-  return getEntryAttributesForPathImpl(
-      edenMount, reqBitmask, reqScope, path, fetchContext);
-}
 
 folly::coro::now_task<EntryAttributes>
 EdenServiceHandler::co_getEntryAttributesForPath(
@@ -4528,73 +4226,15 @@ EdenServiceHandler::co_getEntryAttributesForPath(
       fetchContext);
 }
 
-ImmediateFuture<EntryAttributes>
-EdenServiceHandler::getEntryAttributesForPathImpl(
-    const EdenMount& edenMount,
-    EntryAttributeFlags reqBitmask,
-    AttributesRequestScope reqScope,
-    std::string_view path,
-    const ObjectFetchContextPtr& fetchContext) {
-  if (path.empty()) {
-    return ImmediateFuture<EntryAttributes>(newEdenError(
-        EINVAL,
-        EdenErrorType::ARGUMENT_ERROR,
-        "path cannot be the empty string"));
-  }
-
-  try {
-    RelativePathPiece relativePath{path};
-
-    return edenMount.getVirtualInode(relativePath, fetchContext)
-        .thenValue([&edenMount,
-                    reqBitmask,
-                    reqScope,
-                    relativePath = relativePath.copy(),
-                    fetchContext =
-                        fetchContext.copy()](const VirtualInode& virtualInode) {
-          if (dtypeMatchesRequestScope(virtualInode, reqScope)) {
-            return virtualInode.getEntryAttributes(
-                reqBitmask,
-                relativePath,
-                edenMount.getObjectStore(),
-                edenMount.getLastCheckoutTime().toTimespec(),
-                fetchContext);
-          }
-          return makeImmediateFuture<EntryAttributes>(PathError(
-              reqScope == AttributesRequestScope::TREES ? ENOTDIR : EISDIR,
-              relativePath));
-        });
-  } catch (const std::exception& e) {
-    return ImmediateFuture<EntryAttributes>(
-        newEdenError(EINVAL, EdenErrorType::ARGUMENT_ERROR, e.what()));
-  }
-}
-
-folly::SemiFuture<std::unique_ptr<GetAttributesFromFilesResultV2>>
-EdenServiceHandler::semifuture_getAttributesFromFilesV2(
+folly::coro::Task<std::unique_ptr<GetAttributesFromFilesResultV2>>
+EdenServiceHandler::co_getAttributesFromFilesV2(
     std::unique_ptr<GetAttributesFromFilesParams> params) {
-  if (server_->getServerState()
-          ->getEdenConfig()
-          ->enableCoroutinesPhase10.getValue()) {
-    // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-    return folly::coro::co_invoke(
-               [self = shared_from_this()](
-                   std::unique_ptr<GetAttributesFromFilesParams> p)
-                   -> folly::coro::Task<
-                       std::unique_ptr<GetAttributesFromFilesResultV2>> {
-                 co_return co_await self->co_getAttributesFromFilesV2Impl(
-                     std::move(p));
-               },
-               std::move(params))
-        .semi();
-  }
-  return semifuture_getAttributesFromFilesV2Impl(std::move(params));
+  co_return co_await getAttributesFromFilesV2Impl(std::move(params));
 }
 
 folly::coro::now_task<std::unique_ptr<GetAttributesFromFilesResultV2>>
-EdenServiceHandler::co_getAttributesFromFilesV2Impl(
+EdenServiceHandler::getAttributesFromFilesV2Impl(
     std::unique_ptr<GetAttributesFromFilesParams> params) {
-  XLOG(DBG6, "Using coroutine path for getAttributesFromFilesV2");
   auto mountHandle = lookupMount(params->mountPoint());
   auto reqScope =
       params->scope().value_or(AttributesRequestScope::TREES_AND_FILES);
@@ -4632,58 +4272,6 @@ EdenServiceHandler::co_getAttributesFromFilesV2Impl(
     ++index;
   }
   co_return res;
-}
-
-folly::SemiFuture<std::unique_ptr<GetAttributesFromFilesResultV2>>
-EdenServiceHandler::semifuture_getAttributesFromFilesV2Impl(
-    std::unique_ptr<GetAttributesFromFilesParams> params) {
-  auto mountHandle = lookupMount(params->mountPoint());
-  auto reqScope =
-      params->scope().value_or(AttributesRequestScope::TREES_AND_FILES);
-  auto reqBitmask = EntryAttributeFlags::raw(
-      static_cast<std::underlying_type_t<FileAttributes>>(
-          *params->requestedAttributes()));
-  std::vector<std::string>& paths = params->paths().value();
-  auto requestContext = getRequestContext();
-  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
-      DBG3,
-      true,
-      requestContext,
-      *params->mountPoint(),
-      getSyncTimeout(*params->sync()),
-      toLogArg(paths));
-  auto& fetchContext = helper->getFetchContext();
-
-  auto entryAttributesFuture = getEntryAttributes(
-      mountHandle.getEdenMount(),
-      paths,
-      reqBitmask,
-      reqScope,
-      *params->sync(),
-      fetchContext);
-
-  return wrapImmediateFuture(
-             std::move(helper),
-             std::move(entryAttributesFuture)
-                 .thenValue(
-                     [reqBitmask, mountHandle, &paths](
-                         std::vector<folly::Try<EntryAttributes>>&& allRes) {
-                       auto res =
-                           std::make_unique<GetAttributesFromFilesResultV2>();
-                       res->res()->reserve(allRes.size());
-                       size_t index = 0;
-                       for (const auto& tryAttributes : allRes) {
-                         res->res()->emplace_back(serializeEntryAttributes(
-                             mountHandle.getObjectStore(),
-                             basename(paths.at(index)),
-                             tryAttributes,
-                             reqBitmask));
-                         ++index;
-                       }
-                       return res;
-                     }))
-      .ensure([mountHandle, params = std::move(params)]() {})
-      .semi();
 }
 
 folly::SemiFuture<std::unique_ptr<SetPathObjectIdResult>>

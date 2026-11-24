@@ -5,14 +5,19 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
@@ -23,20 +28,28 @@ use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
 use executor_lib::args::ShardedExecutorArgs;
 use fbinit::FacebookInit;
+use metaconfig_types::P4ServerConfig;
 use metaconfig_types::RepoConfig;
 use metaconfig_types::RepoConfigRef;
 use mononoke_app::MononokeApp;
 use mononoke_app::args::RepoArgs;
 use p4_import::ImportOptions;
+use p4_source::Keychain;
 use p4_source::P4Cli;
 use p4_source::P4CliSource;
+use p4_source::PathCharsets;
+use p4_source::PathCharsetsError;
 use repo_identity::RepoIdentityRef;
 use sharding_ext::RepoShard;
 use stats::define_stats;
 use stats::prelude::DynamicSingletonCounter;
+use stats_facebook::service_data::ServiceData;
+use stats_facebook::service_data::get_service_data_singleton;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::Repo;
+use crate::server;
 
 const SM_CLEANUP_TIMEOUT_SECS: u64 = 120;
 const BOOKMARK: &str = "master";
@@ -47,6 +60,7 @@ const ENABLED_JUST_KNOB: &str = "scm/mononoke:p4_sync_enabled";
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 /// Failed batches of a single changelist in a row before the repo counts as stuck.
 const STUCK_AFTER: u32 = 3;
+const FRESHNESS_INTERVAL: Duration = Duration::from_secs(30);
 
 define_stats! {
     prefix = "mononoke.p4_sync";
@@ -54,11 +68,22 @@ define_stats! {
     stuck: dynamic_singleton_counter("stuck.{}", (repo: String)),
 }
 
+/// The repo's gauge of the seconds since its last progress (see `LastProgress`), set every
+/// `FRESHNESS_INTERVAL` while the shard runs and removed when it stops. Not in
+/// `define_stats!`, whose key must be a literal, so that setting and removing it share this
+/// one name.
+pub(crate) fn secs_since_success_key(repo_name: &str) -> String {
+    format!("mononoke.p4_sync.secs_since_success.{repo_name}")
+}
+
 pub(crate) struct Settings {
     pub(crate) exit_file: PathBuf,
-    pub(crate) p4_server_alias: Option<String>,
+    /// The `--p4-server` clients, by alias: each wins over the tier's `p4_servers` entry.
+    pub(crate) servers: HashMap<String, P4Cli>,
+    pub(crate) p4_binary: PathBuf,
     pub(crate) batch_size: NonZeroUsize,
     pub(crate) idle_interval: Duration,
+    pub(crate) import_options: ImportOptions,
 }
 
 /// After `failures` failed batches in a row: 5s, 10s, 20s, … up to `MAX_RETRY_DELAY`.
@@ -108,6 +133,111 @@ impl BatchSize {
     }
 }
 
+/// When the shard last made progress: a successful pass (imported a batch, found nothing
+/// new, or was switched off by JK on purpose), or a step of the running batch (see
+/// `ImportOptions::progress`). Starts at the shard's start, so a shard that never progresses,
+/// held ones included, reports a growing value.
+pub(crate) struct LastProgress {
+    start: Instant,
+    secs_after_start: AtomicU64,
+    /// The running batch's steps, counted by p4_import.
+    steps: Arc<AtomicU64>,
+    /// The most steps of any batch since the last success. A retry repeats the failed
+    /// attempts' steps, so only steps past them count: a batch that keeps failing at the
+    /// same point still shows as a growing value.
+    furthest_steps: AtomicU64,
+}
+
+impl LastProgress {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            start: now,
+            secs_after_start: AtomicU64::new(0),
+            steps: Arc::default(),
+            furthest_steps: AtomicU64::new(0),
+        }
+    }
+
+    /// For `ImportOptions::progress`.
+    pub(crate) fn steps(&self) -> Arc<AtomicU64> {
+        self.steps.clone()
+    }
+
+    pub(crate) fn succeeded(&self, now: Instant) {
+        self.record(now);
+        self.steps.store(0, Ordering::Relaxed);
+        self.furthest_steps.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn failed(&self, now: Instant) {
+        self.note_steps(now);
+        self.steps.store(0, Ordering::Relaxed);
+    }
+
+    /// Records progress if the running batch has gone further than any since the last
+    /// success.
+    pub(crate) fn note_steps(&self, now: Instant) {
+        let steps = self.steps.load(Ordering::Relaxed);
+        if steps > self.furthest_steps.fetch_max(steps, Ordering::Relaxed) {
+            self.record(now);
+        }
+    }
+
+    fn record(&self, now: Instant) {
+        self.secs_after_start
+            .store(self.secs_to(now), Ordering::Relaxed);
+    }
+
+    pub(crate) fn secs_since(&self, now: Instant) -> u64 {
+        self.secs_to(now)
+            .saturating_sub(self.secs_after_start.load(Ordering::Relaxed))
+    }
+
+    fn secs_to(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.start).as_secs()
+    }
+}
+
+/// Runs `work`, setting `secs_since_success` every `FRESHNESS_INTERVAL` beside it, so a
+/// batch that never returns and makes no progress shows as a growing value. Removes the
+/// counter when `work` ends or is dropped: a stale value would read as fresh on a task that
+/// no longer has the shard.
+pub(crate) async fn report_freshness<T>(
+    fb: FacebookInit,
+    repo_name: &str,
+    last_progress: &LastProgress,
+    work: impl Future<Output = T>,
+) -> T {
+    let gauge = RemoveFreshnessOnDrop {
+        fb,
+        key: secs_since_success_key(repo_name),
+    };
+    let mut ticker = tokio::time::interval(FRESHNESS_INTERVAL);
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            output = &mut work => return output,
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                last_progress.note_steps(now);
+                get_service_data_singleton(fb)
+                    .set_counter(&gauge.key, last_progress.secs_since(now) as i64);
+            }
+        }
+    }
+}
+
+struct RemoveFreshnessOnDrop {
+    fb: FacebookInit,
+    key: String,
+}
+
+impl Drop for RemoveFreshnessOnDrop {
+    fn drop(&mut self) {
+        get_service_data_singleton(self.fb).clear_counter(&self.key);
+    }
+}
+
 /// Clears the repo's `stuck` gauge however its loop ends, a panic or a dropped future included.
 struct ClearStuckOnDrop {
     fb: FacebookInit,
@@ -136,28 +266,74 @@ fn log_state(current: &mut Option<State>, new: State, message: impl FnOnce() -> 
     }
 }
 
-/// Only `Depot` imports; the others hold the shard.
+/// Only `Depot` imports; the others hold the shard. `P` is the server entry, a [`Server`] in
+/// the job.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ConfiguredDepot {
+pub(crate) enum ConfiguredDepot<'a, P> {
     NotAMirror,
-    /// Without `--p4-server-alias`, no repo's server can be checked.
-    NoOwnAlias,
-    OtherServer {
+    /// `p4_source.server_alias` is neither in the tier's `p4_servers` nor a `--p4-server`.
+    UnknownServer {
         configured: String,
     },
-    Depot(String),
+    /// `p4_source.path_charsets` is empty or names a charset encoding_rs doesn't know.
+    InvalidCharsets(PathCharsetsError),
+    Depot {
+        alias: &'a str,
+        depot: String,
+        path_charsets: PathCharsets,
+        p4: &'a P,
+    },
 }
 
-pub(crate) fn configured_depot(config: &RepoConfig, own_alias: Option<&str>) -> ConfiguredDepot {
+/// A server of [`servers`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Server<'a, F> {
+    /// An entry of the tier's `p4_servers`; its client is built at shard setup, so a running
+    /// shard keeps it until the task restarts or the shard moves, whatever configerator says.
+    Tier(&'a P4ServerConfig),
+    /// A `--p4-server`'s client.
+    Flag(&'a F),
+}
+
+/// Every alias's server: its `--p4-server` while the spec gives one, else its entry in the
+/// tier's `p4_servers`. Dropping an alias's flag from the spec moves that alias to the map;
+/// putting the flag back rolls it back.
+pub(crate) fn servers<'a, F>(
+    tier: &'a BTreeMap<String, P4ServerConfig>,
+    flags: &'a HashMap<String, F>,
+) -> HashMap<String, Server<'a, F>> {
+    tier.iter()
+        .map(|(alias, server)| (alias.clone(), Server::Tier(server)))
+        .chain(
+            flags
+                .iter()
+                .map(|(alias, p4)| (alias.clone(), Server::Flag(p4))),
+        )
+        .collect()
+}
+
+pub(crate) fn configured_depot<'a, P>(
+    config: &RepoConfig,
+    servers: &'a HashMap<String, P>,
+) -> ConfiguredDepot<'a, P> {
     let Some(p4_source) = &config.p4_source else {
         return ConfiguredDepot::NotAMirror;
     };
-    match own_alias {
-        None => ConfiguredDepot::NoOwnAlias,
-        Some(own) if own != p4_source.server_alias => ConfiguredDepot::OtherServer {
+    let path_charsets = match p4_source.path_charsets.as_deref().map(PathCharsets::new) {
+        None => PathCharsets::default(),
+        Some(Ok(path_charsets)) => path_charsets,
+        Some(Err(err)) => return ConfiguredDepot::InvalidCharsets(err),
+    };
+    match servers.get_key_value(&p4_source.server_alias) {
+        None => ConfiguredDepot::UnknownServer {
             configured: p4_source.server_alias.clone(),
         },
-        Some(_) => ConfiguredDepot::Depot(p4_source.depot.clone()),
+        Some((alias, p4)) => ConfiguredDepot::Depot {
+            alias,
+            depot: p4_source.depot.clone(),
+            path_charsets,
+            p4,
+        },
     }
 }
 
@@ -171,8 +347,14 @@ fn exit_file_present(exit_file: &Path) -> bool {
 
 pub(crate) struct P4SyncProcess {
     app: Arc<MononokeApp>,
-    p4: P4Cli,
     settings: Arc<Settings>,
+}
+
+/// What a shard imports: its repo's depot, on the server the client reaches.
+pub(crate) struct Source {
+    alias: String,
+    depot: String,
+    p4: P4Cli,
 }
 
 #[async_trait]
@@ -184,19 +366,49 @@ impl RepoShardedProcess for P4SyncProcess {
         }
         let repo_args = RepoArgs::from_repo_name(shard.repo_name.clone());
         let repo: Repo = self.app.open_repo(&repo_args).await?;
-        let own_alias = self.settings.p4_server_alias.as_deref();
-        let depot = match configured_depot(repo.repo_config(), own_alias) {
-            ConfiguredDepot::Depot(depot) => Ok(depot),
-            ConfiguredDepot::NotAMirror => Err("no p4_source in its repo config".to_owned()),
-            ConfiguredDepot::NoOwnAlias => {
-                Err("no --p4-server-alias to check its p4_source.server_alias against".to_owned())
+        let repo_configs = self.app.repo_configs();
+        let servers = servers(&repo_configs.common.p4_servers, &self.settings.servers);
+        let source = match configured_depot(repo.repo_config(), &servers) {
+            ConfiguredDepot::Depot {
+                alias,
+                depot,
+                path_charsets,
+                p4,
+            } => {
+                let (from, p4) = match p4 {
+                    Server::Tier(server) => {
+                        let p4 = server::client(
+                            server,
+                            &self.settings.p4_binary,
+                            Arc::new(Keychain(self.app.fb)),
+                            self.app.environment().scuba_sample_builder.clone(),
+                        )
+                        .await
+                        .with_context(|| format!("{}: p4_servers[{alias}]", shard.repo_name))?;
+                        ("its p4_servers entry", p4)
+                    }
+                    Server::Flag(p4) => ("its --p4-server", P4Cli::clone(p4)),
+                };
+                tracing::info!(
+                    "{}: server {alias} from {from}, at {}",
+                    shard.repo_name,
+                    p4.port()
+                );
+                Ok(Source {
+                    alias: alias.to_owned(),
+                    depot,
+                    p4: p4.with_path_charsets(path_charsets),
+                })
             }
-            ConfiguredDepot::OtherServer { configured } => Err(format!(
-                "its p4_source.server_alias is {configured}, not this job's {}",
-                own_alias.unwrap_or_default()
+            ConfiguredDepot::NotAMirror => Err("no p4_source in its repo config".to_owned()),
+            ConfiguredDepot::UnknownServer { configured } => Err(format!(
+                "its p4_source.server_alias is {configured}, which is in neither the tier's p4_servers nor a --p4-server"
             )),
+            ConfiguredDepot::InvalidCharsets(err) => {
+                Err(format!("its p4_source.path_charsets: {err}"))
+            }
         };
-        if let Err(reason) = &depot {
+        if let Err(reason) = &source {
             tracing::warn!(
                 "{}: {reason}: holding its shard, importing nothing",
                 shard.repo_name
@@ -206,8 +418,7 @@ impl RepoShardedProcess for P4SyncProcess {
         Ok(Arc::new(P4SyncProcessExecutor {
             app: self.app.clone(),
             repo,
-            depot,
-            p4: self.p4.clone(),
+            source,
             settings: self.settings.clone(),
             cancellation_requested: AtomicBool::new(false),
             wake: Notify::new(),
@@ -219,8 +430,7 @@ pub(crate) struct P4SyncProcessExecutor {
     app: Arc<MononokeApp>,
     repo: Repo,
     /// Err: why the shard is held, importing nothing.
-    depot: Result<String, String>,
-    p4: P4Cli,
+    source: Result<Source, String>,
     settings: Arc<Settings>,
     cancellation_requested: AtomicBool,
     /// Ends a wait or a running batch when the shard is stopped.
@@ -229,13 +439,14 @@ pub(crate) struct P4SyncProcessExecutor {
 
 impl P4SyncProcessExecutor {
     /// A context per batch: its own `session_uuid` on the importer's rows and on each p4
-    /// command's, plus the repo.
-    fn batch_context(&self) -> CoreContext {
+    /// command's, plus the repo and its server.
+    fn batch_context(&self, p4_server: &str) -> CoreContext {
         let ctx = self.app.new_basic_context();
         ctx.with_mutated_scuba(|mut scuba| {
             scuba
                 .add_metadata(ctx.metadata())
-                .add("repo", self.repo.repo_identity().name());
+                .add("repo", self.repo.repo_identity().name())
+                .add("p4_server", p4_server);
             scuba
         })
     }
@@ -257,8 +468,35 @@ impl P4SyncProcessExecutor {
 impl RepoShardedProcessExecutor for P4SyncProcessExecutor {
     async fn execute(&self) -> Result<()> {
         let repo_name = self.repo.repo_identity().name();
+        let last_progress = LastProgress::new(Instant::now());
+        report_freshness(
+            self.app.fb,
+            repo_name,
+            &last_progress,
+            self.import_loop(repo_name, &last_progress),
+        )
+        .await
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.cancellation_requested.store(true, Ordering::Relaxed);
+        self.wake.notify_one();
+        Ok(())
+    }
+}
+
+impl P4SyncProcessExecutor {
+    async fn import_loop(&self, repo_name: &str, last_progress: &LastProgress) -> Result<()> {
         let bookmark = BookmarkKey::new(BOOKMARK)?;
-        let options = ImportOptions::default();
+        let options = ImportOptions {
+            progress: last_progress.steps(),
+            ..self.settings.import_options.clone()
+        };
+        // A caught-up depot has little to list, and windows would only add listings.
+        let caught_up_options = ImportOptions {
+            listing_window: None,
+            ..options.clone()
+        };
 
         let mut state = None;
         let mut failures = 0;
@@ -268,8 +506,8 @@ impl RepoShardedProcessExecutor for P4SyncProcessExecutor {
             repo_name: repo_name.to_owned(),
         };
         while !self.should_stop() {
-            let depot = match &self.depot {
-                Ok(depot) => depot,
+            let Source { alias, depot, p4 } = match &self.source {
+                Ok(source) => source,
                 Err(reason) => {
                     log_state(&mut state, State::Held, || {
                         format!("{repo_name}: {reason}, importing nothing")
@@ -279,6 +517,7 @@ impl RepoShardedProcessExecutor for P4SyncProcessExecutor {
                 }
             };
             if !import_enabled(repo_name) {
+                last_progress.succeeded(Instant::now());
                 log_state(&mut state, State::Disabled, || {
                     format!("{repo_name}: {ENABLED_JUST_KNOB} is off, importing nothing")
                 });
@@ -286,8 +525,8 @@ impl RepoShardedProcessExecutor for P4SyncProcessExecutor {
                 continue;
             }
 
-            let ctx = self.batch_context();
-            let source = P4CliSource::new(self.p4.with_scuba(ctx.scuba().clone()));
+            let ctx = self.batch_context(alias);
+            let source = P4CliSource::new(p4.with_scuba(ctx.scuba().clone()));
             let batch = p4_import::import_next(
                 &ctx,
                 &self.repo,
@@ -295,7 +534,10 @@ impl RepoShardedProcessExecutor for P4SyncProcessExecutor {
                 depot,
                 &bookmark,
                 batch_size.get(),
-                &options,
+                match state {
+                    Some(State::CaughtUp) => &caught_up_options,
+                    _ => &options,
+                },
             );
             // A batch can outlast `SM_CLEANUP_TIMEOUT_SECS` (derivation included), so a stop
             // drops it: its bookmark and mapping move in one transaction, all or nothing, and
@@ -308,11 +550,15 @@ impl RepoShardedProcessExecutor for P4SyncProcessExecutor {
                 }
             };
             match &result {
-                Ok(_) => batch_size.succeeded(),
+                Ok(_) => {
+                    last_progress.succeeded(Instant::now());
+                    batch_size.succeeded()
+                }
                 Err(error) if p4_import::failed_stage(error) != Some(p4_import::Stage::Prepare) => {
+                    last_progress.failed(Instant::now());
                     batch_size.failed()
                 }
-                Err(_) => {}
+                Err(_) => last_progress.failed(Instant::now()),
             }
             STATS::stuck.set_value(
                 self.app.fb,
@@ -324,7 +570,7 @@ impl RepoShardedProcessExecutor for P4SyncProcessExecutor {
                     failures = 0;
                     log_state(&mut state, State::CaughtUp, || {
                         format!(
-                            "{repo_name} is caught up with {depot}; looking again every {:?}",
+                            "{repo_name} is caught up with {depot} on {alias}; looking again every {:?}",
                             self.settings.idle_interval,
                         )
                     });
@@ -333,7 +579,7 @@ impl RepoShardedProcessExecutor for P4SyncProcessExecutor {
                 Ok(_) => {
                     failures = 0;
                     log_state(&mut state, State::Importing, || {
-                        format!("{repo_name}: importing {depot}")
+                        format!("{repo_name}: importing {depot} from {alias}")
                     });
                 }
                 // import_next has logged the failure, with its stage and changelist.
@@ -359,23 +605,15 @@ impl RepoShardedProcessExecutor for P4SyncProcessExecutor {
         tracing::info!("p4_sync released shard for repo {repo_name}");
         Ok(())
     }
-
-    async fn stop(&self) -> Result<()> {
-        self.cancellation_requested.store(true, Ordering::Relaxed);
-        self.wake.notify_one();
-        Ok(())
-    }
 }
 
 pub(crate) async fn run(
     app: MononokeApp,
     sharded_executor_args: ShardedExecutorArgs,
-    p4: P4Cli,
     settings: Settings,
 ) -> Result<()> {
     let process = Arc::new(P4SyncProcess {
         app: Arc::new(app),
-        p4,
         settings: Arc::new(settings),
     });
 

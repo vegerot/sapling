@@ -9,6 +9,8 @@
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use futures::FutureExt;
 use mononoke_macros::mononoke;
@@ -101,7 +103,7 @@ fn test_add_placeholder_does_not_unbuild_a_loaded_repo() {
     repos.add("foo", 1, 100);
 
     // An assignment arriving for a repo that is already built must leave it
-    // alone. Un-building is eviction, which this type does not do.
+    // alone. Only `unload_if_idle` un-builds a repo.
     repos.add_placeholder("foo", 1);
 
     assert_eq!(repos.get_by_name("foo").as_deref(), Some(&100));
@@ -472,4 +474,147 @@ async fn test_a_failed_rebuild_keeps_the_old_repo_without_a_hold() {
         .await
         .unwrap();
     assert_eq!(repo.as_deref(), Some(&42));
+}
+
+const IDLE_WINDOW: Duration = Duration::from_secs(60);
+
+/// A lazy collection with `foo` built as `100`.
+fn built_lazy_repo(loader: Arc<dyn RepoLoader<i32>>) -> MononokeRepos<i32> {
+    let repos = MononokeRepos::new_lazy(loader);
+    repos.add("foo", 1, 100);
+    repos
+}
+
+#[mononoke::test]
+fn test_unload_if_idle_unloads_an_idle_repo() {
+    let repos = built_lazy_repo(Arc::new(NeverLoads));
+
+    assert!(repos.unload_if_idle("foo", IDLE_WINDOW, Instant::now() + IDLE_WINDOW));
+
+    // Back to a placeholder: still assigned, no longer built.
+    assert!(repos.get_by_name("foo").is_none());
+    assert!(repos.get_by_id(1).is_none());
+    assert_eq!(repos.iter().count(), 0);
+    assert_eq!(repos.iter_loaded_names().count(), 0);
+    assert_eq!(repos.iter_names().collect::<Vec<_>>(), vec!["foo"]);
+    assert_eq!(repos.iter_ids().collect::<Vec<_>>(), vec![1]);
+}
+
+#[mononoke::test]
+async fn test_unload_if_idle_keeps_a_recently_looked_up_repo() {
+    let repos = built_lazy_repo(Arc::new(NeverLoads));
+    let before_lookup = Instant::now();
+    let _ = repos.get_by_name("foo");
+    assert!(
+        !repos.unload_if_idle("foo", IDLE_WINDOW, before_lookup + IDLE_WINDOW),
+        "get_by_name must count as use"
+    );
+
+    let repos = built_lazy_repo(Arc::new(NeverLoads));
+    let before_lookup = Instant::now();
+    let _ = repos.get_by_id(1);
+    assert!(
+        !repos.unload_if_idle("foo", IDLE_WINDOW, before_lookup + IDLE_WINDOW),
+        "get_by_id must count as use"
+    );
+
+    let repos = built_lazy_repo(Arc::new(NeverLoads));
+    let before_lookup = Instant::now();
+    let _ = repos.get("foo").await.unwrap();
+    assert!(
+        !repos.unload_if_idle("foo", IDLE_WINDOW, before_lookup + IDLE_WINDOW),
+        "get must count as use"
+    );
+}
+
+#[mononoke::test]
+async fn test_unload_if_idle_ignores_listing_and_rebuilds() {
+    let repos = built_lazy_repo(Arc::new(NeverLoads));
+    let before_listing = Instant::now();
+
+    // What periodic jobs do to every repo. None of it is a request for `foo`,
+    // so none of it may keep `foo` loaded.
+    assert_eq!(repos.iter().count(), 1);
+    assert_eq!(repos.iter_loaded_names().count(), 1);
+    let rebuilt = repos
+        .rebuild_if_present("foo", Arc::new(CountingLoader::default()))
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.as_deref(), Some(&42));
+    drop(rebuilt);
+
+    assert!(repos.unload_if_idle("foo", IDLE_WINDOW, before_listing + IDLE_WINDOW));
+}
+
+#[mononoke::test]
+fn test_unload_if_idle_keeps_a_repo_someone_holds() {
+    let repos = built_lazy_repo(Arc::new(NeverLoads));
+    let held = repos.get_by_name("foo").expect("foo is built");
+
+    assert!(
+        !repos.unload_if_idle("foo", IDLE_WINDOW, Instant::now() + IDLE_WINDOW),
+        "unloading a held repo would leave a second copy once it is rebuilt"
+    );
+    assert_eq!(repos.get_by_name("foo").as_deref(), Some(&100));
+
+    drop(held);
+    assert!(repos.unload_if_idle("foo", IDLE_WINDOW, Instant::now() + IDLE_WINDOW));
+}
+
+#[mononoke::test]
+async fn test_an_unloaded_repo_is_rebuilt_on_the_next_get() {
+    let loader = Arc::new(CountingLoader::default());
+    let repos = built_lazy_repo(loader.clone());
+    assert!(repos.unload_if_idle("foo", IDLE_WINDOW, Instant::now() + IDLE_WINDOW));
+
+    // Only `get` builds, exactly as for a placeholder.
+    assert!(repos.get_by_name("foo").is_none());
+    assert_eq!(loader.calls.load(Ordering::SeqCst), 0);
+
+    assert_eq!(repos.get("foo").await.unwrap().as_deref(), Some(&42));
+    assert_eq!(loader.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(repos.get_by_name("foo").as_deref(), Some(&42));
+}
+
+#[mononoke::test]
+async fn test_unload_if_idle_leaves_unbuilt_and_unknown_repos_alone() {
+    let later = Instant::now() + IDLE_WINDOW;
+
+    let repos: MononokeRepos<i32> = MononokeRepos::new_lazy(Arc::new(NeverLoads));
+    repos.add_placeholder("foo", 1);
+    assert!(!repos.unload_if_idle("foo", IDLE_WINDOW, later));
+    assert!(!repos.unload_if_idle("nope", IDLE_WINDOW, later));
+    assert_eq!(repos.iter_names().collect::<Vec<_>>(), vec!["foo"]);
+
+    // Building: the build still lands in the slot.
+    let gate = Arc::new(Gate::default());
+    let (repos, request) = start_build(&gate).await;
+    assert!(!repos.unload_if_idle("foo", IDLE_WINDOW, later));
+    gate.release.notify_one();
+    assert_eq!(request.await.unwrap().unwrap().as_deref(), Some(&42));
+    assert_eq!(repos.get_by_name("foo").as_deref(), Some(&42));
+
+    // Failed: the failure stays cached rather than the slot going back to
+    // `Empty`, which would let the next request retry at once.
+    let repos: MononokeRepos<i32> = MononokeRepos::new_lazy(Arc::new(FailingLoader));
+    repos.add_placeholder("foo", 1);
+    assert!(repos.get("foo").await.is_err());
+    assert!(!repos.unload_if_idle("foo", IDLE_WINDOW, later));
+    let err = repos.get("foo").await.unwrap_err();
+    assert!(
+        err.to_string().contains("Not retrying build of repo foo"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[mononoke::test]
+fn test_unload_if_idle_never_unloads_without_a_loader() {
+    let repos: MononokeRepos<i32> = MononokeRepos::new();
+    repos.add("foo", 1, 100);
+
+    assert!(
+        !repos.unload_if_idle("foo", IDLE_WINDOW, Instant::now() + IDLE_WINDOW),
+        "nothing could build the repo again"
+    );
+    assert_eq!(repos.get_by_name("foo").as_deref(), Some(&100));
 }

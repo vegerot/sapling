@@ -112,6 +112,8 @@ pub struct EphemeralCommitGraphStorage {
     /// Another view of the MemWrites storage to allow traversing the commit graph
     /// (through CommitGraphWriter::add_recursive) to create ChangesetEdges.
     mem_writes_commit_graph_writer: BaseCommitGraphWriter,
+    /// The persistent commit graph storage that mem-writes wraps.
+    persistent_storage: Arc<dyn CommitGraphStorage>,
 }
 
 /// A storage that allows fetching snapshot changesets.
@@ -131,7 +133,8 @@ impl EphemeralCommitGraphStorage {
         connections: SqlConnections,
         persistent_storage: Arc<dyn CommitGraphStorage>,
     ) -> Self {
-        let mem_writes_storage = Arc::new(MemWritesCommitGraphStorage::new(persistent_storage));
+        let mem_writes_storage =
+            Arc::new(MemWritesCommitGraphStorage::new(persistent_storage.clone()));
         Self {
             ephemeral_only_storage: Arc::new(EphemeralOnlyChangesetStorage::new(
                 repo_id,
@@ -143,6 +146,7 @@ impl EphemeralCommitGraphStorage {
             mem_writes_commit_graph_writer: BaseCommitGraphWriter::new(CommitGraph::new(
                 mem_writes_storage,
             )),
+            persistent_storage,
         }
     }
 }
@@ -402,6 +406,20 @@ impl CommitGraphStorage for EphemeralCommitGraphStorage {
         Ok(fetched_edges)
     }
 
+    /// Looks up only persistent changesets. Mem-writes memory can hold bubble
+    /// changesets that `add_recursive` added before their bubble rows were
+    /// written, so it must not report them as stored.
+    async fn maybe_fetch_many_edges_from_replica(
+        &self,
+        ctx: &CoreContext,
+        cs_ids: &[ChangesetId],
+        prefetch: Prefetch,
+    ) -> Result<HashMap<ChangesetId, FetchedChangesetEdges>> {
+        self.persistent_storage
+            .maybe_fetch_many_edges_from_replica(ctx, cs_ids, prefetch)
+            .await
+    }
+
     async fn maybe_fetch_many_edges(
         &self,
         ctx: &CoreContext,
@@ -525,6 +543,7 @@ mod test {
     use commit_graph_types::edges::ChangesetNodeParents;
     use context::CoreContext;
     use fbinit::FacebookInit;
+    use in_memory_commit_graph_storage::InMemoryCommitGraphStorage;
     use memblob::Memblob;
     use metaconfig_types::BubbleDeletionMode;
     use mononoke_macros::mononoke;
@@ -533,8 +552,10 @@ mod test {
     use mononoke_types_mocks::changesetid::ONES_CSID;
     use mononoke_types_mocks::changesetid::THREES_CSID;
     use mononoke_types_mocks::changesetid::TWOS_CSID;
+    use mononoke_types_mocks::repo::REPO_ONE;
     use mononoke_types_mocks::repo::REPO_ZERO;
     use repo_blobstore::RepoBlobstore;
+    use repo_identity::RepoIdentity;
     use scuba_ext::MononokeScubaSampleBuilder;
     use sql_construct::SqlConstruct;
 
@@ -544,6 +565,13 @@ mod test {
     use crate::builder::RepoEphemeralStoreBuilder;
 
     fn bootstrap(fb: FacebookInit) -> Result<(CoreContext, RepoBlobstore, RepoEphemeralStore)> {
+        bootstrap_with_mode(fb, BubbleDeletionMode::MarkAndDelete)
+    }
+
+    fn bootstrap_with_mode(
+        fb: FacebookInit,
+        deletion_mode: BubbleDeletionMode,
+    ) -> Result<(CoreContext, RepoBlobstore, RepoEphemeralStore)> {
         let ctx = CoreContext::test_mock(fb);
         let blobstore = Arc::new(Memblob::default()) as Arc<dyn BlobstoreEnumerableWithUnlink>;
         let repo_blobstore = RepoBlobstore::new(
@@ -557,7 +585,7 @@ mod test {
             blobstore,
             Duration::from_secs(30 * 24 * 3600),
             Duration::from_secs(6 * 3600),
-            BubbleDeletionMode::MarkAndDelete,
+            deletion_mode,
         );
         Ok((ctx, repo_blobstore, eph))
     }
@@ -606,6 +634,41 @@ mod test {
             subtree_source_skew_ancestor: None,
         }
         .freeze()
+    }
+
+    #[mononoke::fbinit_test]
+    async fn replica_lookup_ignores_unwritten_bubble_changesets(fb: FacebookInit) -> Result<()> {
+        let (ctx, repo_blobstore, eph) = bootstrap(fb)?;
+        let bubble = eph.create_bubble(&ctx, None, vec![]).await?;
+        let persistent = Arc::new(InMemoryCommitGraphStorage::new(Arc::new(
+            RepoIdentity::new(REPO_ZERO, "repo".to_string()),
+        )));
+        persistent
+            .add(&ctx, edges_with_parents(ONES_CSID, 1, vec![]))
+            .await?;
+        let storage = EphemeralCommitGraphStorage::new(
+            REPO_ZERO,
+            bubble.bubble_id(),
+            repo_blobstore,
+            bubble.sql_connections().clone(),
+            persistent,
+        );
+        // As `add_recursive` does for an ancestor before its bubble row is
+        // written.
+        storage
+            .mem_writes_storage
+            .add(&ctx, edges_with_parents(TWOS_CSID, 2, vec![ONES_CSID]))
+            .await?;
+
+        let found = storage
+            .maybe_fetch_many_edges_from_replica(&ctx, &[ONES_CSID, TWOS_CSID], Prefetch::None)
+            .await?;
+        assert_eq!(
+            found.into_keys().collect::<Vec<_>>(),
+            vec![ONES_CSID],
+            "only the persistent changeset counts as stored"
+        );
+        Ok(())
     }
 
     #[mononoke::fbinit_test]
@@ -704,6 +767,232 @@ mod test {
         assert!(
             rows.is_empty(),
             "parents rows for the deleted bubble should be gone"
+        );
+        Ok(())
+    }
+
+    async fn add_to_bubbles(
+        ctx: &CoreContext,
+        repo_blobstore: &RepoBlobstore,
+        bubbles: &[&Bubble],
+        cs_id: ChangesetId,
+    ) -> Result<()> {
+        let edges = edges_with_parents(cs_id, 1, vec![FIVES_CSID]);
+        for bubble in bubbles {
+            ephemeral_only_storage(bubble, repo_blobstore.clone())
+                .add(ctx, &edges)
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn bubble_from_changeset_prefers_latest_expiry(fb: FacebookInit) -> Result<()> {
+        let (ctx, repo_blobstore, eph) = bootstrap(fb)?;
+        let long_lived = eph
+            .create_bubble(&ctx, Some(Duration::from_secs(2 * 24 * 3600)), vec![])
+            .await?;
+        let short_lived = eph
+            .create_bubble(&ctx, Some(Duration::from_secs(3600)), vec![])
+            .await?;
+        add_to_bubbles(
+            &ctx,
+            &repo_blobstore,
+            &[&long_lived, &short_lived],
+            ONES_CSID,
+        )
+        .await?;
+
+        assert_eq!(
+            eph.bubble_from_changeset(&ctx, &ONES_CSID).await?,
+            Some(long_lived.bubble_id()),
+            "the older bubble expires later, so it should win over the newer bubble"
+        );
+        assert_eq!(
+            eph.bubble_from_changeset(&ctx, &TWOS_CSID).await?,
+            None,
+            "a changeset in no bubble should resolve to no bubble"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn bubble_from_changeset_prefers_labelled_bubble(fb: FacebookInit) -> Result<()> {
+        let (ctx, repo_blobstore, eph) = bootstrap(fb)?;
+        let labelled = eph
+            .create_bubble(
+                &ctx,
+                Some(Duration::from_secs(3600)),
+                vec!["keep".to_string()],
+            )
+            .await?;
+        let unlabelled = eph
+            .create_bubble(&ctx, Some(Duration::from_secs(30 * 24 * 3600)), vec![])
+            .await?;
+        add_to_bubbles(&ctx, &repo_blobstore, &[&labelled, &unlabelled], ONES_CSID).await?;
+
+        assert_eq!(
+            eph.bubble_from_changeset(&ctx, &ONES_CSID).await?,
+            Some(labelled.bubble_id()),
+            "a labelled bubble does not expire by time, so it should win over a later expiry"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn bubble_from_changeset_skips_expired_bubble(fb: FacebookInit) -> Result<()> {
+        let (ctx, repo_blobstore, eph) = bootstrap_with_mode(fb, BubbleDeletionMode::MarkOnly)?;
+        let alive = eph
+            .create_bubble(&ctx, Some(Duration::from_secs(3600)), vec![])
+            .await?;
+        let marked_expired = eph
+            .create_bubble(&ctx, Some(Duration::from_secs(30 * 24 * 3600)), vec![])
+            .await?;
+        add_to_bubbles(&ctx, &repo_blobstore, &[&alive, &marked_expired], ONES_CSID).await?;
+        // In MarkOnly mode this only marks the bubble as expired.
+        eph.delete_bubble(&ctx, marked_expired.bubble_id()).await?;
+
+        assert_eq!(
+            eph.bubble_from_changeset(&ctx, &ONES_CSID).await?,
+            Some(alive.bubble_id()),
+            "a bubble marked as expired should lose to a bubble that is still alive"
+        );
+
+        eph.delete_bubble(&ctx, alive.bubble_id()).await?;
+        assert_eq!(
+            eph.bubble_from_changeset(&ctx, &ONES_CSID).await?,
+            Some(marked_expired.bubble_id()),
+            "when every bubble is marked as expired, the lookup should still return one so the caller can report it as expired"
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn delete_bubble_keeps_changeset_in_other_bubble(fb: FacebookInit) -> Result<()> {
+        let (ctx, repo_blobstore, eph) = bootstrap(fb)?;
+        let older = eph.create_bubble(&ctx, None, vec![]).await?;
+        let newer = eph.create_bubble(&ctx, None, vec![]).await?;
+
+        let snapshot = ONES_CSID;
+        let edges = edges_with_parents(snapshot, 1, vec![FIVES_CSID]);
+        ephemeral_only_storage(&older, repo_blobstore.clone())
+            .add(&ctx, &edges)
+            .await?;
+        ephemeral_only_storage(&newer, repo_blobstore)
+            .add(&ctx, &edges)
+            .await?;
+
+        eph.delete_bubble(&ctx, newer.bubble_id()).await?;
+
+        assert_eq!(
+            eph.bubble_from_changeset(&ctx, &snapshot).await?,
+            Some(older.bubble_id()),
+            "after the newer bubble is deleted, the changeset should resolve to the older bubble"
+        );
+        assert_eq!(
+            eph.changesets_from_bubble(&ctx, &older.bubble_id()).await?,
+            vec![snapshot],
+            "deleting one bubble should not remove the changeset from another bubble"
+        );
+        Ok(())
+    }
+
+    /// What it tests: looking up the bubbles of a changeset that is stored in
+    /// two bubbles, and of a changeset that is in no bubble.
+    /// Expected: both bubbles are returned for the first, none for the second.
+    #[mononoke::fbinit_test]
+    async fn bubbles_from_changeset_returns_every_bubble(fb: FacebookInit) -> Result<()> {
+        let (ctx, repo_blobstore, eph) = bootstrap(fb)?;
+        let first = eph.create_bubble(&ctx, None, vec![]).await?;
+        let second = eph.create_bubble(&ctx, None, vec![]).await?;
+        let unrelated = eph.create_bubble(&ctx, None, vec![]).await?;
+
+        let snapshot_edges = edges_with_parents(ONES_CSID, 1, vec![FIVES_CSID]);
+        let unrelated_edges = edges_with_parents(TWOS_CSID, 1, vec![FIVES_CSID]);
+        ephemeral_only_storage(&first, repo_blobstore.clone())
+            .add(&ctx, &snapshot_edges)
+            .await?;
+        ephemeral_only_storage(&second, repo_blobstore.clone())
+            .add(&ctx, &snapshot_edges)
+            .await?;
+        ephemeral_only_storage(&unrelated, repo_blobstore)
+            .add(&ctx, &unrelated_edges)
+            .await?;
+
+        let mut bubbles = eph.bubbles_from_changeset(&ctx, &ONES_CSID).await?;
+        bubbles.sort();
+        assert_eq!(
+            bubbles,
+            vec![first.bubble_id(), second.bubble_id()],
+            "every bubble containing the changeset should be returned, and no other"
+        );
+        assert!(
+            eph.bubbles_from_changeset(&ctx, &THREES_CSID)
+                .await?
+                .is_empty(),
+            "a changeset that is in no bubble should have no bubbles"
+        );
+        Ok(())
+    }
+
+    /// What it tests: looking up the bubbles of a changeset when one of its
+    /// bubbles is marked as expired.
+    /// Expected: the marked-expired bubble is returned along with the active
+    /// one, so that no copy of the changeset is left behind.
+    #[mononoke::fbinit_test]
+    async fn bubbles_from_changeset_includes_marked_expired_bubbles(
+        fb: FacebookInit,
+    ) -> Result<()> {
+        let (ctx, repo_blobstore, eph) = bootstrap_with_mode(fb, BubbleDeletionMode::MarkOnly)?;
+        let marked_expired = eph.create_bubble(&ctx, None, vec![]).await?;
+        let active = eph.create_bubble(&ctx, None, vec![]).await?;
+
+        let edges = edges_with_parents(ONES_CSID, 1, vec![FIVES_CSID]);
+        ephemeral_only_storage(&marked_expired, repo_blobstore.clone())
+            .add(&ctx, &edges)
+            .await?;
+        ephemeral_only_storage(&active, repo_blobstore)
+            .add(&ctx, &edges)
+            .await?;
+        eph.delete_bubble(&ctx, marked_expired.bubble_id()).await?;
+
+        let mut bubbles = eph.bubbles_from_changeset(&ctx, &ONES_CSID).await?;
+        bubbles.sort();
+        assert_eq!(
+            bubbles,
+            vec![marked_expired.bubble_id(), active.bubble_id()],
+            "a bubble marked as expired still holds the changeset and should be returned"
+        );
+        Ok(())
+    }
+
+    /// What it tests: looking up the bubbles of a changeset that is stored in
+    /// a bubble of the repo and in a bubble of another repo sharing the same
+    /// SQL store.
+    /// Expected: only the bubble of the repo of the store is returned.
+    #[mononoke::fbinit_test]
+    async fn bubbles_from_changeset_ignores_other_repos(fb: FacebookInit) -> Result<()> {
+        let (ctx, repo_blobstore, eph) = bootstrap(fb)?;
+        let own = eph.create_bubble(&ctx, None, vec![]).await?;
+        let other_repo = eph.create_bubble(&ctx, None, vec![]).await?;
+
+        let edges = edges_with_parents(ONES_CSID, 1, vec![FIVES_CSID]);
+        ephemeral_only_storage(&own, repo_blobstore.clone())
+            .add(&ctx, &edges)
+            .await?;
+        EphemeralOnlyChangesetStorage::new(
+            REPO_ONE,
+            other_repo.bubble_id(),
+            repo_blobstore,
+            other_repo.sql_connections().clone(),
+        )
+        .add(&ctx, &edges)
+        .await?;
+
+        assert_eq!(
+            eph.bubbles_from_changeset(&ctx, &ONES_CSID).await?,
+            vec![own.bubble_id()],
+            "a bubble that holds the changeset for another repo should not be returned"
         );
         Ok(())
     }

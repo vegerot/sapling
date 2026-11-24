@@ -94,12 +94,13 @@ cpp_binary(
     ],
     deps = [
         "fbsource//third-party/benchmark:benchmark",
+        "fbsource//third-party/fmt:fmt",
         "fbsource//xplat/folly:file",
+        "fbsource//xplat/folly:utility",
         "fbsource//xplat/folly/container:array",
         "fbsource//xplat/folly/init:init",
         "fbsource//xplat/folly/io/async:async_socket",
         "fbsource//xplat/folly/logging:logging",
-        "fbsource//xplat/folly/synchronization/test:barrier",
         "//eden/common/utils:utils",
         "//eden/common/utils/benchharness:benchharness",
         "//eden/fs/service:thrift-cpp2-services",
@@ -137,26 +138,10 @@ cpp_binary(
     deps = [
         "fbsource//xplat/folly:exception",
         "fbsource//xplat/folly:likely",
+        "fbsource//xplat/folly:utility",
         "fbsource//xplat/folly/init:init",
         "fbsource//xplat/folly/portability:unistd",
-        "fbsource//xplat/folly/synchronization/test:barrier",
         "//eden/common/utils/benchharness:benchharness",
-    ],
-    external_deps = [
-        "gflags",
-    ],
-)
-
-cpp_binary(
-    name = "read_files_parallel",
-    srcs = ["read_files_parallel.cpp"],
-    compatible_with = [
-        "ovr_config//os:linux",
-        "ovr_config//os:macos",
-    ],
-    deps = [
-        "fbsource//xplat/folly/init:init",
-        "fbsource//xplat/folly/portability:unistd",
     ],
     external_deps = [
         "gflags",

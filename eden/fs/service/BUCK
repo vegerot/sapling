@@ -108,7 +108,6 @@ cpp_binary(
         "DEFAULT": [],
         "ovr_config//os:linux": [
             "//eden/fs/store/facebook/http:http",
-            "//eden/fs/store/facebook/recas:recas",
             "//eden/fs/telemetry/facebook:activity_recorder",
             "//services_efficiency/heap:init",
         ],
@@ -116,6 +115,9 @@ cpp_binary(
             "//eden/fs/telemetry/facebook:activity_recorder",
         ],
     }),
+    external_deps = [
+        "gflags",
+    ],
 )
 
 cpp_binary(
@@ -621,7 +623,7 @@ cpp_library(
         "fbsource//xplat/folly/coro:task",
         "fbsource//xplat/folly/logging:log_level",
         "fbsource//xplat/folly/logging:logging",
-        ":thrift-cpp2-types",
+        ":thrift-cpp2-serialization",
         "//eden/common/utils:utils",
         "//eden/fs/config:config",
         "//eden/fs/model:model",
